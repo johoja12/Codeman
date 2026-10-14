@@ -31,7 +31,7 @@ This file is the single source of truth for agent and contributor guidance in th
 **The working tree is shared with other agent sessions.** Several Codeman sessions run against THIS one checkout, so another session can `git checkout` a different branch, or leave half-finished untracked files, while you are mid-task.
 
 - **Always `git branch --show-current` immediately before committing.** Observed 2026-07-27: another session ran `git checkout -b feat/web-tabs`, a commit silently landed there instead of master, and the follow-up `git push origin master` cheerfully reported "Everything up-to-date".
-- To land a commit on `local` **without** switching branches (which would yank the tree out from under the other session): `git push bitbucket HEAD:local` then `git branch -f local HEAD`. Never `git checkout local` to "fix" it.
+- To land a commit on `local` **without** switching branches (which would yank the tree out from under the other session): `git push origin HEAD:local` then `git branch -f local HEAD`. Never `git checkout local` to "fix" it.
 - **Never `git add -A`/`git add .`** — stage explicit paths. A sweep will pick up another session's WIP.
 - Another session's broken WIP can block `npm run build`, since `tsc` is the first step and the build gates on it. That is not your bug to fix. ⚠️ `tsc` still EMITS on type errors, so a failed `npm run build` leaves a rebuilt `dist/index.js` compiled from their tree; check what it pulled in before restarting the service. To deploy frontend-only changes past a blocked `tsc`, run the asset stage of `scripts/build.mjs` (everything after the `tsc`/`chmod` lines is independent of it).
 - **A pre-push failure in a file you did not touch is another session's WIP.** Push with `CODEMAN_SKIP_PREPUSH=1 git push` and leave it alone. (The hook already skips itself when the tree has uncommitted changes in a path it checks, so this mostly happens once the other session has committed.)
@@ -70,34 +70,38 @@ When user says "COM":
 3. **Consume the changeset**: `npm run version-packages` (auto-bumps `package.json` files, updates `CHANGELOG.md`, runs `npm install --package-lock-only`, and verifies lockfile sync via `scripts/check-lockfile-sync.mjs` — all in one command; never hand-edit `CHANGELOG.md` or `package-lock.json` versions)
 4. **Sync AGENTS.md version**: Update the `**Version**` line below to match the new version from `package.json`
 5. **Commit and deploy**: verify the branch is `local` first (`git branch --show-current`), then stage EXPLICIT paths — never `git add -A`, which has swept another session's WIP into a release. `git status --short` and account for every line before committing:
-   `git add <paths> && git commit -m "chore: version packages" && git push bitbucket local && npm run build && systemctl --user restart codeman-web`
-6. **Wait for CI**: the push to `local` triggers Bitbucket Pipelines (`bitbucket-pipelines.yml`, the `full-gate` step). Confirm it passes before considering the release done.
-7. **Update Jira**: record the release version, commit and verification on the `COD` issue(s) it ships (see Fork Workflow).
+   `git add <paths> && git commit -m "chore: version packages" && git push origin local && npm run build && systemctl --user restart codeman-web`
+6. **Check CI**: use `gh run list --repo johoja12/Codeman` and `gh run view` for applicable GitHub checks. The current workflow runs on master/main pushes and pull requests; a direct `local` push does not trigger it. Run required checks locally before deploying and report remote CI separately.
+7. **Update GitHub issues**: record the release version, commit and verification on the issue(s) it ships using `gh --repo johoja12/Codeman` (see Fork Workflow).
 
 Never push, tag, publish, open releases or post announcements on `Ark0N/Codeman` (GitHub); it is off-limits for this checkout.
 
-Bitbucket Pipelines runs `npm run check:lockfile`, so lockfile drift fails the build even if the `version-packages` script is bypassed.
+GitHub CI runs `npm run check:lockfile`, so lockfile drift fails the build even if the `version-packages` script is bypassed.
 
 **Version**: 1.41.0 (must match `package.json`)
 
-## Fork Workflow: Bitbucket + Jira (this checkout)
+## Fork Workflow: GitHub + gh (this checkout)
 
-The working and deploy repository for this box is Bitbucket:
-`https://bitbucket.org/aamer_akhter/codeman/src`. Treat `Ark0N/Codeman` as off-limits:
-do not create issues, branches, commits, PRs, comments, or any other resources there. The local remotes may vary, so check
-`git remote -v`; on this checkout the Bitbucket remote is named `bitbucket` (`aamer_akhter/codeman`, which `local` tracks),
-`fork` is `aakhter/Codeman` on GitHub, and ⚠️ `origin` is the off-limits `Ark0N/Codeman`, read-only reference: never
-`git push origin`. Recent history uses Conventional Commit-style subjects, often with Jira keys:
-`fix(test): COD-25 stabilize mobile visual regression`, `feat: COD-18 add attachment history drawer`,
-`docs: COD-18 design session attachment history`. The Jira project key is `COD`; use `COD-###` in branch names, commit
-subjects, and PR titles for Jira-backed work. Never start implementation work on a bug or feature until a Jira issue exists
-for that work. Create and update issues through the local Jira CLI using `JIRA_PROFILE=work`, site
-`JIRA_SITE=https://aakhter.atlassian.net`, and project `COD` (for example, `JIRA_PROFILE=work JIRA_SITE=https://aakhter.atlassian.net jira create --project COD ...`);
-do not use Jira MCP, GitHub Issues, or Bitbucket Issues. For multi-PR efforts, create one
-parent `COD` issue and focused sub-issues per feature/fix PR. Update
-Jira with branch, PR, commit, and verification before marking work Done. PRs should summarize the problem and approach,
-link Jira/issues, and include screenshots for UI/mobile changes. Before review, run typecheck, lint, format check, lockfile
-check, and targeted tests.
+The working repository is `https://github.com/johoja12/Codeman`. Use the GitHub CLI (`gh`)
+authenticated as **johoja12** for issues, pull requests, reviews and CI. Verify with
+`gh auth status`; switch with `gh auth switch --hostname github.com --user johoja12`.
+The checkout's default gh repository is `johoja12/Codeman`; pass `--repo johoja12/Codeman`
+explicitly for writes.
+
+- `origin` is `https://github.com/johoja12/Codeman.git`; the working/deploy branch remains `local`.
+- `bitbucket` preserves the former repository as a backup/reference. Do not push there unless requested.
+- `upstream` is `Ark0N/Codeman`, read-only and off-limits for all writes/resources.
+- The GitHub repository's existing `master` has separate history. Never overwrite or force-push it
+  to migrate `local`; merging those histories is a separate task.
+
+Never start implementation on a bug or feature until an issue exists in **johoja12/Codeman**.
+Create/update it using `gh issue create`, `gh issue comment` and `gh issue close`, always with
+`--repo johoja12/Codeman`. Use Conventional Commit subjects and reference the GitHub issue.
+Historical `COD-###` Jira keys remain in history; Jira is no longer the default issue tracker.
+For multi-PR work, create a parent issue and focused linked issues. Record branch, PR, commit
+and verification before closing an issue. PRs should explain the problem and approach, link
+issues and include screenshots for UI/mobile changes. Before review, run typecheck, lint,
+format check, lockfile check and targeted tests.
 
 ## Project Overview
 
@@ -109,7 +113,7 @@ Codeman is a Claude Code session manager with web interface and autonomous Ralph
 
 **Requirements**: Node.js 22+, Claude CLI, tmux
 
-**Git**: The working and deploy branch is `local` on the `bitbucket` remote; `origin` (`Ark0N/Codeman`) is read-only reference, see Fork Workflow. Terminal session dashboard: `codeman tui` (`--list` to list, `codeman tui <n>` to attach).
+**Git**: The working and deploy branch is `local` on `origin` (`johoja12/Codeman`); `upstream` (`Ark0N/Codeman`) is read-only, see Fork Workflow. Terminal session dashboard: `codeman tui` (`--list` to list, `codeman tui <n>` to attach).
 
 ## Additional Commands
 
@@ -143,9 +147,15 @@ Codeman is a Claude Code session manager with web interface and autonomous Ralph
 | Dependency doctor              | `codeman doctor` (alias `check-deps`; `--json`, `--category core\|office\|other`). Probes Node/Claude CLI/tmux/LibreOffice/MS Office against `config/dependency-registry.ts`; engine is pure given an injectable `ProbeHost` |
 | Multi-user accounts            | `codeman users add <name>` / `passwd <name>` / `list` / `rm <name>` (writes `~/.codeman/users.json`, mode 0600; see Multi-user mode)                                                                            |
 
-**CI (this checkout)**: `bitbucket-pipelines.yml` gates pushes to `local` with one sequential `full-gate` step (lockfile, typecheck, lint, format, boot smoke, `npm run test:ci`); minutes are metered, see the file's header. The `.github/workflows/` files below are shared with upstream and only fire on GitHub, so they never gate work here.
+**CI (this checkout)**: GitHub Actions in `johoja12/Codeman`. `ci.yml` runs on master/main
+pushes and pull requests; direct pushes to `local` currently require local validation. Use
+`gh run list --repo johoja12/Codeman` and `gh pr checks --repo johoja12/Codeman` to inspect
+applicable checks. `bitbucket-pipelines.yml` is retained as historical/reference configuration.
 
-**Upstream CI (reference only)**: the `.github/workflows/` files (`ci.yml`, `wiki-sync.yml`) fire only on GitHub and never gate work here. `npm test` runs the same config as their test job; the `packages/xterm-zerolag-input` tests are NOT run by the root `npm test` (bare `npx vitest run` in that directory). `docs/wiki/**` is mirrored to the GitHub wiki, so fix wiki pages there. → [architecture-invariants#upstream-github-ci-reference-only](docs/architecture-invariants.md#upstream-github-ci-reference-only)
+**Shared CI**: `.github/workflows/` is shared with upstream, but repository operations here
+always target `johoja12/Codeman`. `npm test` runs the root CI test config;
+`packages/xterm-zerolag-input` tests require their own runner. Wiki source remains
+`docs/wiki/**`; see the wiki workflow before publishing.
 
 **Code style**: Prettier (`singleQuote: true`, `printWidth: 120`, `trailingComma: "es5"`) — config lives in the **`"prettier"` key of `package.json`**, not a `.prettierrc` (keeps the repo root short; editors read it natively). `.prettierignore` stays at the root because Prettier resolves it relative to cwd. ESLint flat config (`config/eslint.config.js`) allows `no-console`, warns on `@typescript-eslint/no-explicit-any`. Ignores: `app.js`, `scripts/**/*.mjs`, `src/web/public/vendor/**`, `scripts/remotion/**`.
 
