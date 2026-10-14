@@ -485,7 +485,8 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('appSettingsTunnelEnabled').checked = settings.tunnelEnabled ?? false;
     this.loadTunnelStatus();
     document.getElementById('appSettingsLocalEcho').checked = settings.localEchoEnabled ?? MobileDetection.isTouchDevice();
-    document.getElementById('appSettingsLiveMirror').checked = settings.liveMirrorEnabled ?? defaults.liveMirrorEnabled ?? true;
+    document.getElementById('appSettingsLiveMirror').checked = false;
+    document.getElementById('appSettingsLiveMirror').disabled = true;
     // Auto Copy (copy-on-select): per-device, default OFF everywhere. It quietly
     // overwrites the system clipboard on a gesture the user may have meant only as
     // a way to read, so it is opt-in rather than a default anyone has to discover.
@@ -2781,7 +2782,7 @@ Object.assign(CodemanApp.prototype, {
       imageWatcherEnabled: document.getElementById('appSettingsImageWatcherEnabled').checked,
       tunnelEnabled: document.getElementById('appSettingsTunnelEnabled').checked,
       localEchoEnabled: document.getElementById('appSettingsLocalEcho').checked,
-      liveMirrorEnabled: document.getElementById('appSettingsLiveMirror').checked,
+      liveMirrorEnabled: false,
       autoCopySelection: document.getElementById('appSettingsAutoCopySelection').checked,
       copyStripMargin: document.getElementById('appSettingsCopyStripMargin').checked,
       terminalFontFamily: document.getElementById('appSettingsTerminalFont').value.trim(),
@@ -3874,7 +3875,7 @@ Object.assign(CodemanApp.prototype, {
         // policy guard keeps passing.
         showPlanUsageLimits: false,
         showAttachmentsButton: false,
-        liveMirrorEnabled: true, // COD-187 live mirror for codex/gemini terminals
+        liveMirrorEnabled: false, // upstream-scrolling comparison branch
         showFileViewerButton: false,
         showRedrawButton: false,
         showSessionButton: false,

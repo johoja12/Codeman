@@ -1177,19 +1177,7 @@ class CodemanApp {
     this._historyEntryAccum = 0; // wheel-up accumulation toward history entry
     this._historyEntryAccumAt = 0;
     this._historyScrollFraction = 0; // fractional wheel rows accumulated while history owns xterm
-    // Cached setting flag (hot path) — read storage directly: the settings-ui
-    // mixin may not be attached yet at construct time. Default ON.
-    let liveMirror = true;
-    try {
-      const lmKey =
-        typeof MobileDetection !== 'undefined' && MobileDetection.getDeviceType() === 'mobile'
-          ? 'codeman-app-settings-mobile'
-          : 'codeman-app-settings';
-      liveMirror = JSON.parse(localStorage.getItem(lmKey) || '{}').liveMirrorEnabled !== false;
-    } catch {
-      /* default ON */
-    }
-    this._liveMirrorEnabled = liveMirror;
+    this._liveMirrorEnabled = false; // upstream-scrolling comparison branch
 
     // DOM element cache for performance (avoid repeated getElementById calls)
     this._elemCache = {};
@@ -4620,7 +4608,8 @@ class CodemanApp {
    * pane; Codeman history mode would intercept gestures the foreground app needs.
    */
   _isMirrorSession(sessionId) {
-    return this._liveMirrorEnabled && this._isMirrorEligible(sessionId);
+    // Comparison branch: upstream uses terminal/CLI history, never a frozen mirror.
+    return false;
   }
 
   /** Modes the live mirror applies to when the setting is ON. */
@@ -4631,13 +4620,8 @@ class CodemanApp {
 
   /** COD-187: settings hook — flips the cached flag and re-selects the active TUI tab so the mode applies immediately. */
   _applyLiveMirrorSetting(enabled) {
-    const on = enabled !== false; // default ON
-    if (this._liveMirrorEnabled === on) return;
-    this._liveMirrorEnabled = on;
-    const id = this.activeSessionId;
-    if (id && this._isMirrorEligible(id)) {
-      this.selectSession(id, { forceReload: true });
-    }
+    // Ignore previously saved fork settings on this upstream-scrolling branch.
+    this._liveMirrorEnabled = false;
   }
 
   /**

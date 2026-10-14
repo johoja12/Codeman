@@ -15,6 +15,22 @@ const termUi = readFileSync(resolve(import.meta.dirname, '..', 'src', 'web', 'pu
 const settingsUi = readFileSync(resolve(import.meta.dirname, '..', 'src', 'web', 'public', 'settings-ui.js'), 'utf8');
 
 describe('COD-187 live-mirror structural guards', () => {
+  it('keeps upstream scrolling for every agent even when saved mirror settings are enabled', () => {
+    const extract = (name: string) => {
+      const start = appJs.indexOf(`  ${name}(`);
+      const method = appJs.slice(start, appJs.indexOf('\n  }', start) + 4);
+      return new Function(`return ({${method}}).${name}`)();
+    };
+    const mirror = extract('_isMirrorSession');
+    const apply = extract('_applyLiveMirrorSetting');
+    const app = { _liveMirrorEnabled: true, _isMirrorEligible: () => true };
+    for (const id of ['claude', 'codex', 'gemini', 'opencode']) {
+      expect(mirror.call(app, id)).toBe(false);
+    }
+    apply.call(app, true);
+    expect(app._liveMirrorEnabled).toBe(false);
+  });
+
   it('history mode drops live output BEFORE the 128KB pending-cap accounting', () => {
     const start = appJs.indexOf('_onSessionTerminal(data) {');
     const body = appJs.slice(start, appJs.indexOf('batchTerminalWrite(data.data)', start));
@@ -109,16 +125,17 @@ describe('COD-187 live-mirror structural guards', () => {
     expect(body.slice(esc, esc + 200)).toContain('return false');
   });
 
-  it('all three scroll inputs funnel through _handleUserScrollIntent', () => {
+  it('upstream wheel routing bypasses the frozen-history funnel', () => {
     // The wheel handler never scrolls a mirror tab directly. The #205 merge
     // grew this listener (mouse-tracking/alt-buffer passthrough, the CLI-forward
     // branch and the opencode-mobile rAF batch all precede the funnel), so the
     // window has to cover the whole listener rather than its first 900 chars.
     const wheel = termUi.indexOf("addEventListener(\n      'wheel'");
     const wheelBody = termUi.slice(wheel, termUi.indexOf('{ passive: false, capture: true }', wheel));
-    expect(wheelBody).toContain('_handleUserScrollIntent(lines)');
+    expect(wheelBody).not.toContain('_handleUserScrollIntent(lines)');
+    expect(wheelBody).toContain('_maybePageCliTranscript(ev, lines)');
     // touchmove + momentum both call the funnel
-    expect(termUi.split('_handleUserScrollIntent(lines)').length - 1).toBeGreaterThanOrEqual(3);
+    expect(termUi.split('_handleUserScrollIntent(lines)').length - 1).toBeGreaterThanOrEqual(2);
   });
 
   it('typing exits history before flowing to the PTY (onData hook)', () => {
@@ -214,22 +231,22 @@ describe('COD-187 live-mirror structural guards', () => {
       appJs.indexOf('_isMirrorEligible(sessionId) {'),
       appJs.indexOf('_isMirrorEligible(sessionId) {') + 500
     );
-    expect(mirror).toContain('this._isMirrorEligible(sessionId)');
+    expect(mirror).toContain('return false;');
     expect(eligible).not.toContain("mode === 'opencode'");
   });
 
-  it('COD-209: opencode scroll gestures send foreground TUI wheel reports instead of Codeman history', () => {
+  it('OpenCode wheel uses upstream tracking and transcript paging instead of the fork override', () => {
     const wheel = termUi.indexOf("addEventListener(\n      'wheel'");
     const wheelBody = termUi.slice(wheel, wheel + 900);
-    expect(wheelBody).toContain('_handleForegroundTuiWheel(ev)');
-    expect(wheelBody.indexOf('_handleForegroundTuiWheel(ev)')).toBeLessThan(wheelBody.indexOf('preventDefault'));
+    expect(wheelBody).not.toContain('_handleForegroundTuiWheel(ev)');
+    expect(wheelBody.indexOf('mouseTrackingMode')).toBeLessThan(wheelBody.indexOf('preventDefault'));
 
     const helper = termUi.slice(
       termUi.indexOf('_shouldForwardScrollToForegroundTui() {'),
       termUi.indexOf('_shouldForwardScrollToForegroundTui() {') + 500
     );
-    expect(helper).toContain("session?.mode === 'opencode'");
-    expect(helper).toContain("this._viewMode === 'live'");
+    expect(helper).toContain('return false;');
+    expect(helper).toContain('upstream');
   });
 
   it('COD-211: opencode click gestures are routed to foreground TUI mouse reports', () => {
@@ -241,7 +258,7 @@ describe('COD-187 live-mirror structural guards', () => {
       termUi.indexOf('_handleForegroundTuiClick(ev) {'),
       termUi.indexOf('_handleForegroundTuiClick(ev) {') + 600
     );
-    expect(helper).toContain('_shouldForwardScrollToForegroundTui()');
+    expect(helper).toContain("session?.mode !== 'opencode'");
     expect(helper).toContain('_sendForegroundTuiClick(ev.clientX, ev.clientY)');
   });
 
@@ -254,6 +271,6 @@ describe('COD-187 live-mirror structural guards', () => {
     const dkEnd = settingsUi.indexOf('])', dk);
     expect(dkEnd).toBeGreaterThan(dk);
     expect(settingsUi.slice(dk, dkEnd)).toContain("'liveMirrorEnabled'");
-    expect(settingsUi).toContain('liveMirrorEnabled: true,');
+    expect(settingsUi).toContain('liveMirrorEnabled: false,');
   });
 });

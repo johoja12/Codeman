@@ -10,7 +10,8 @@
  * the CLI as paced reports: the first one immediately, the rest one eased batch
  * per animation frame.
  *
- * These drive the shipped methods in a VM with a controllable rAF + clock.
+ * This comparison branch retains the pacing helpers for rollback. VM tests cover
+ * those helpers; wiring tests verify actual gestures bypass them.
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -178,14 +179,17 @@ describe('COD-464 routing: which wheel events are paced to the CLI', () => {
     expect(h.app._shouldPaceWheelToCli(h.wheel(-100))).toBe(false);
   });
 
-  it('is consulted in the wheel listener BEFORE the PageUp fallback and the mirror history funnel', () => {
+  it('uses upstream forwarding then PageUp fallback without fork pacing', () => {
     const src = readFileSync(resolve(import.meta.dirname, '../src/web/public/terminal-ui.js'), 'utf8');
-    const listener = src.slice(src.indexOf("container.addEventListener(\n      'wheel',"));
-    const paced = listener.indexOf('this._shouldPaceWheelToCli(ev)');
-    expect(paced).toBeGreaterThan(-1);
-    expect(paced).toBeLessThan(listener.indexOf('this._maybePageCliTranscript(ev, lines)'));
-    expect(paced).toBeLessThan(listener.indexOf('this._handleUserScrollIntent(lines);\n          return;'));
-    expect(paced).toBeLessThan(listener.indexOf("this._logScrollRouting('forward-sgr');"));
+    const listener = src.slice(
+      src.indexOf("container.addEventListener(\n      'wheel',"),
+      src.indexOf('// OpenCode exposes clickable')
+    );
+    expect(listener).not.toContain('_shouldPaceWheelToCli');
+    expect(listener).not.toContain('_handleUserScrollIntent');
+    expect(listener.indexOf('this._shouldForwardWheelToApp(ev)')).toBeLessThan(
+      listener.indexOf('this._maybePageCliTranscript(ev, lines)')
+    );
   });
 });
 
@@ -387,18 +391,13 @@ describe('COD-464 1:1 distance and touch hold', () => {
     expect(h.app._wheelRowsFloat({ deltaY: -50, deltaMode: 0 })).toBe(-2); // fallback 25px
   });
 
-  it('the wheel listener feeds rows (1:1), not lines, to the pacer', () => {
-    expect(src).toContain('this._paceWheelToCli(ev.clientX, ev.clientY, this._wheelRowsFloat(ev));');
+  it('forwards upstream whole wheel lines instead of calibrated paced rows', () => {
+    expect(src).toContain('this._forwardScrollToApp(ev.clientX, ev.clientY, this._wheelScrollLines(ev));');
+    expect(src).not.toContain('this._paceWheelToCli(ev.clientX, ev.clientY, this._wheelRowsFloat(ev));');
   });
 
-  it('lifting after holding still does not fling on the paced route', () => {
-    const touchend = src.slice(src.indexOf("'touchend',"));
-    const hold = touchend.indexOf(
-      'performance.now() - lastMoveAt > window.CodemanTerminalInput.TOUCH_HOLD_NO_FLING_MS'
-    );
-    expect(hold).toBeGreaterThan(-1);
-    expect(hold).toBeLessThan(touchend.indexOf('scrollFrame = requestAnimationFrame(scrollLoop);'));
-    expect(src).toContain('velocity = delta * 1.2;\n            lastMoveAt = performance.now();');
+  it('does not use the fork pacing touch-hold path', () => {
+    expect(src).not.toContain('performance.now() - lastMoveAt > window.CodemanTerminalInput.TOUCH_HOLD_NO_FLING_MS');
   });
 });
 
@@ -456,33 +455,21 @@ describe('COD-464 reversal debounce (Claude ignores the report that reverses its
   });
 });
 
-describe('COD-464 touch: phone swipes take the same paced route', () => {
+describe('upstream comparison: touch routing bypasses retained pacing helpers', () => {
   // Measured on iPhone 15 Pro emulation with real CLIs: a swipe on a Claude/Codex
   // mirror tab opened the frozen history view, which holds ONE screen for these
   // CLIs, so nothing older than MARK-122 of 150 was reachable with any number of
   // drags. Through the paced route both reach MARK-1.
   const src = readFileSync(resolve(import.meta.dirname, '../src/web/public/terminal-ui.js'), 'utf8');
 
-  it('touchmove consults the paced route after the tap threshold and before opencode/mirror routing', () => {
-    const threshold = src.indexOf('if (Math.abs(pixelAccum) < getThreshold()) return;');
-    expect(threshold).toBeGreaterThan(-1);
-    const after = src.slice(threshold);
-    const paced = after.indexOf('if (this._shouldPaceWheelToCli({ shiftKey: false })) {');
-    expect(paced).toBeGreaterThan(-1);
-    expect(paced).toBeLessThan(after.indexOf('if (getIsOpencodeMobile()) {'));
-    expect(paced).toBeLessThan(after.indexOf('intent = this._handleUserScrollIntent(lines);'));
-    // The finger's own travel, NOT pixelAccum (which this path increments twice per move).
-    expect(after.slice(paced, paced + 300)).toContain(
-      'this._paceWheelToCli(touchLastX, touchLastY, delta / cellHeight());'
-    );
+  it('touchmove uses upstream transcript forwarding without the fork pacer', () => {
+    expect(src).not.toContain('this._paceWheelToCli(touchLastX, touchLastY, delta / cellHeight());');
+    expect(src).toContain('this._forwardScrollToApp(touchLastX, touchLastY, lines);');
   });
 
-  it('flick momentum feeds the paced route before the mirror/forward/page branches', () => {
-    const momentum = src.indexOf('// Momentum phase — convert pixel velocity to lines');
-    const block = src.slice(momentum - 600, momentum + 900);
-    const paced = block.indexOf('this._paceWheelToCli(touchLastX, touchLastY, velocity / cellHeight());');
-    expect(paced).toBeGreaterThan(-1);
-    expect(paced).toBeLessThan(block.indexOf('const intent = this._handleUserScrollIntent(lines);'));
+  it('flick momentum uses upstream PageUp/PageDown gesture routing', () => {
+    expect(src).not.toContain('this._paceWheelToCli(touchLastX, touchLastY, velocity / cellHeight());');
+    expect(src).toContain('this._maybePageCliTranscript({ shiftKey: false, touchId: touchContactId }, lines)');
   });
 
   it('per-move fractional touch travel adds up to whole reports (finger tracking)', () => {

@@ -624,8 +624,8 @@ Object.assign(CodemanApp.prototype, {
    * mode or moving browser scrollback.
    */
   _shouldForwardScrollToForegroundTui() {
-    const session = this.activeSessionId ? this.sessions.get(this.activeSessionId) : null;
-    return session?.mode === 'opencode' && this._viewMode === 'live';
+    // Comparison branch: use upstream's native tracking / PageUp routing.
+    return false;
   },
 
   _handleForegroundTuiWheel(ev) {
@@ -637,7 +637,9 @@ Object.assign(CodemanApp.prototype, {
   },
 
   _handleForegroundTuiClick(ev) {
-    if (!this._shouldForwardScrollToForegroundTui() || ev.button !== 0) return false;
+    // Keep the fork's click support independent of the scrolling comparison.
+    const session = this.activeSessionId ? this.sessions.get(this.activeSessionId) : null;
+    if (session?.mode !== 'opencode' || this._viewMode !== 'live' || ev.button !== 0) return false;
     ev.preventDefault();
     ev.stopPropagation();
     this._sendForegroundTuiClick(ev.clientX, ev.clientY);
@@ -1558,57 +1560,15 @@ Object.assign(CodemanApp.prototype, {
     //  - alternate buffer (direct-PTY fallback running vim/less): xterm's
     //    alt-scroll handling converts the wheel to cursor keys, which is what
     //    those apps expect.
-    let wheelRaf = 0;
-    let wheelDelta = 0;
     container.addEventListener(
       'wheel',
       (ev) => {
-        // A foreground TUI in the pane claims the wheel before anything else.
-        if (this._handleForegroundTuiWheel(ev)) return;
         const trackingMode = this.terminal?.modes?.mouseTrackingMode;
         if (trackingMode && trackingMode !== 'none') return;
         if (this.terminal?.buffer?.active?.type === 'alternate') return;
         ev.preventDefault();
         ev.stopPropagation();
-        // COD-187 live-mirror tabs retain first ownership of scroll intent so an
-        // up-scroll can open their frozen history instead of being forwarded.
-        const isLiveMirror =
-          this.activeSessionId && this._isMirrorSession?.(this.activeSessionId) && this._viewMode === 'live';
-        // COD-283: iPhone opencode coalesces the wheel into one rAF-batched SGR
-        // burst; forwarding every tiny delta separately stuttered badly there.
-        // isOpencodeMobile ? 8 : 50 threshold kept for static check
-        const _sess = this.activeSessionId ? this.sessions?.get?.(this.activeSessionId) : null;
-        const isOpencodeMobile =
-          _sess?.mode === 'opencode' &&
-          typeof MobileDetection !== 'undefined' &&
-          MobileDetection.isMobile?.() &&
-          MobileDetection.isMobile();
-        if (isOpencodeMobile) {
-          wheelDelta += ev.deltaY;
-          if (wheelRaf) return;
-          wheelRaf = requestAnimationFrame(() => {
-            const lines = Math.trunc(wheelDelta / 13);
-            wheelRaf = 0;
-            wheelDelta = 0;
-            if (!lines) return;
-            if (!isLiveMirror && this._shouldForwardWheelToApp(ev)) {
-              this._sendSyntheticSgrWheel(ev.clientX, ev.clientY, lines);
-              return;
-            }
-            this._handleUserScrollIntent(lines);
-          });
-          return;
-        }
-        // COD-464: when the CLI's `wheelForward` capability applies right now,
-        // the wheel goes to it as PACED SGR reports (first report immediately,
-        // then one eased batch per frame) — on live-mirror tabs too, where it used
-        // to fall through to the half-screen PageUp fallback below.
-        if (this._shouldPaceWheelToCli(ev)) {
-          this._logScrollRouting('forward-sgr-paced');
-          this._paceWheelToCli(ev.clientX, ev.clientY, this._wheelRowsFloat(ev));
-          return;
-        }
-        if (!isLiveMirror && this._shouldForwardWheelToApp(ev)) {
+        if (this._shouldForwardWheelToApp(ev)) {
           this._logScrollRouting('forward-sgr');
           this._forwardScrollToApp(ev.clientX, ev.clientY, this._wheelScrollLines(ev));
           return;
@@ -1620,13 +1580,6 @@ Object.assign(CodemanApp.prototype, {
         // …unless there is no local scrollback to scroll, in which case page the
         // CLI's own transcript instead of doing nothing (_maybePageCliTranscript).
         if (this._maybePageCliTranscript(ev, lines)) return;
-        // COD-187: mirror tabs and the frozen history view route through the
-        // intent funnel (an up-scroll there OPENS history rather than scrolling);
-        // every other session takes the eased local path from #205.
-        if (this._isMirrorSession?.(this.activeSessionId) || this._viewMode === 'history') {
-          this._handleUserScrollIntent(lines);
-          return;
-        }
         this._logScrollRouting('local-scrollback');
         this._noteTerminalUserScroll(lines);
         this._smoothScrollBy(lines);
@@ -1715,14 +1668,6 @@ Object.assign(CodemanApp.prototype, {
             } else {
               this._sendForegroundTuiWheel(velocity, touchLastX, touchLastY);
             }
-            velocity *= 0.92;
-            scrollFrame = requestAnimationFrame(scrollLoop);
-            return;
-          }
-          // COD-464: flick momentum keeps feeding the paced CLI route with
-          // fractional lines per frame (the pacer carries and caps).
-          if (this._shouldPaceWheelToCli({ shiftKey: false })) {
-            this._paceWheelToCli(touchLastX, touchLastY, velocity / cellHeight());
             velocity *= 0.92;
             scrollFrame = requestAnimationFrame(scrollLoop);
             return;
@@ -1964,18 +1909,6 @@ Object.assign(CodemanApp.prototype, {
             }
             pixelAccum += delta;
           if (Math.abs(pixelAccum) < getThreshold()) return;
-          // COD-464: same paced route as the desktop wheel. Measured on iPhone
-          // emulation with real CLIs: a swipe on a Claude/Codex mirror tab opened
-          // the frozen history view, which holds ONE screen for these CLIs (their
-          // transcript lives in the CLI, not in tmux), so nothing older than the
-          // last screen was reachable at all. The finger's own pixel travel is
-          // fed (delta / row height, fractional; the pacer carries the rest), not
-          // `pixelAccum`, which counts each delta twice on this path.
-          if (this._shouldPaceWheelToCli({ shiftKey: false })) {
-            this._logScrollRouting('forward-sgr-paced');
-            this._paceWheelToCli(touchLastX, touchLastY, delta / cellHeight());
-            return;
-          }
           if (getIsOpencodeMobile()) {
               pendingDelta += pixelAccum;
               if (touchMoveRaf) return;
@@ -2046,12 +1979,6 @@ Object.assign(CodemanApp.prototype, {
           const touch = this._endTerminalTouchGesture(touchGesture, ev.changedTouches, ev.touches);
           isTouching = false;
           if (touchMoveRaf) { cancelAnimationFrame(touchMoveRaf); touchMoveRaf = 0; pendingDelta = 0; }
-          if (
-            this._shouldPaceWheelToCli({ shiftKey: false }) &&
-            performance.now() - lastMoveAt > window.CodemanTerminalInput.TOUCH_HOLD_NO_FLING_MS
-          ) {
-            velocity = 0;
-          }
           if (!scrollFrame && Math.abs(velocity) > 0.3) {
             scrollFrame = requestAnimationFrame(scrollLoop);
           }

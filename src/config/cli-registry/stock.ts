@@ -281,25 +281,8 @@ const CLAUDE: CliEntry = {
     transcript: 'claude-jsonl',
     altScreen: 'strip-full',
     echo: { policy: 'buffer', anchor: { kind: 'glyph', glyph: '❯', offset: 2 } },
-    // COD-464, measured on 2.1.286 FULLSCREEN (isolated pane, real SGR writes): one
-    // transcript row per report (5-13 ms repaint), and the ONE report that reverses
-    // the last effective direction is ignored (U U U D→0 D D U→0 U …; only wheel
-    // reports change that state, not typing or Ctrl+End). Claude also accelerates once
-    // reports keep arriving under ~35 ms apart; that is its own feel, left alone.
-    // #498: the default INLINE renderer turns no mouse tracking on and ignores wheel
-    // reports, so every forwarding mode also requires `cliMouseTracking` (frontend
-    // `_wheelReportsFor`), which fullscreen claude sets and inline claude does not.
-    // Acceleration, measured the same way (one write per burst, and single writes at
-    // fixed spacing): the k-th report of a streak moves 1,1,1,1,2,2,2,3,3,3,3,4,4,4,5,5
-    // rows, then 6 for every later one (bursts of 16/20/24/28/32 moved 44/67/91/115/139),
-    // and a pause of 40 ms resets the streak while 30 ms does not.
-    wheelForward: {
-      mode: 'version-gated',
-      minVersion: '2.1.187',
-      rows: 1,
-      reversalDeadReports: 1,
-      streak: { resetMs: 35, steps: [1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 6] },
-    },
+    // Match upstream: version-gated Claude SGR forwarding without fork pacing.
+    wheelForward: { mode: 'version-gated', minVersion: '2.1.187' },
     transcriptPageKeys: true,
     keyboardAccessory: 'agent',
     privilegedCommandGate: false,
@@ -787,14 +770,8 @@ const CODEX: CliEntry = {
     transcript: 'codex-rollout',
     altScreen: 'strip-full',
     echo: { policy: 'predict', anchor: { kind: 'cursor' }, predictProfile: 'codex' },
-    // #227 measured codex-cli 0.147.0 never enabling mouse tracking and ignoring SGR
-    // wheel reports (inline viewport, transcript in tmux scrollback), and COD-458
-    // saw the same on 0.157.1. COD-464 re-measured 0.159.3: it turns mouse tracking
-    // on (`mouse_any_flag=1`, alternate screen) and scrolls exactly 3 rows per
-    // report at any rate (5-12 ms repaint), no reversal debounce. 'mouse-tracking'
-    // forwards ONLY while the pane has asked for mouse reports, so the older
-    // versions keep the PageUp/local fallback by construction.
-    wheelForward: { mode: 'mouse-tracking', rows: 3 },
+    // Match upstream: local history / PageUp fallback, without Codex SGR forwarding.
+    wheelForward: { mode: 'never' },
     transcriptPageKeys: true,
     maxFrameBytes: 32 * 1024,
     // codex's own bare-spawn default (no config sent) is already safe (no bypass flag), so
