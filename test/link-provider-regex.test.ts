@@ -17,6 +17,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import vm from 'node:vm';
 
 const publicFile = (name: string) => readFileSync(join(__dirname, '..', 'src', 'web', 'public', name), 'utf-8');
 
@@ -93,6 +94,30 @@ describe('terminal link-provider regexes (shipped source)', () => {
       expect(m, line).not.toBeNull();
       expect(m![2]).toBe(want);
     }
+  });
+
+  it('urlPattern matches webexteams deep links', () => {
+    const url = shippedPattern('urlPattern');
+    const line =
+      'review this room webexteams://im?space=db14f330-717d-11f1-92da-c19ce73d6ecd&message=05032d90-7b3a-11f1-9f3d-f3d08f0a5540';
+    url.lastIndex = 0;
+    const m = url.exec(line);
+    expect(m).not.toBeNull();
+    expect(m![0]).toBe(
+      'webexteams://im?space=db14f330-717d-11f1-92da-c19ce73d6ecd&message=05032d90-7b3a-11f1-9f3d-f3d08f0a5540'
+    );
+  });
+
+  it('findTerminalUrls excludes trailing punctuation from webexteams links', () => {
+    // COD-448: `)` is no longer excluded by the regex itself (a URL may contain a
+    // balanced `(…)`), so the unmatched paren and the full stop are trimmed by
+    // findTerminalUrls(), which is what the link provider actually uses.
+    const context = vm.createContext({ console, window: undefined });
+    vm.runInContext(`${CONSTANTS_SOURCE}\nglobalThis.__urls = findTerminalUrls;`, context);
+    const findTerminalUrls = (context as unknown as { __urls: (t: string) => Array<{ url: string }> }).__urls;
+    expect(findTerminalUrls('see webexteams://im?space=a&message=b).').map((u) => u.url)).toEqual([
+      'webexteams://im?space=a&message=b',
+    ]);
   });
 
   it('urlPattern keeps query strings whole (a single & is part of the URL)', () => {

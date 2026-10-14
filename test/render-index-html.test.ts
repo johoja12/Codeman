@@ -35,6 +35,10 @@ import { dirname } from 'node:path';
 vi.mock('../src/utils/claude-cli-resolver.js', () => ({
   isClaudeAvailable: vi.fn(() => false),
   findClaudeDir: vi.fn(() => null),
+  // The WebServer constructor probes the local Claude runtime version (COD-350).
+  // This mock fully replaces the module, so every export the server reaches for
+  // has to be listed here or construction throws before a single assertion runs.
+  getClaudeCliVersion: vi.fn(() => null),
 }));
 vi.mock('../src/utils/opencode-cli-resolver.js', () => ({
   isOpenCodeAvailable: vi.fn(() => false),
@@ -99,6 +103,7 @@ const TEMPLATE = [
   '</head>',
   '<body>',
   '<button class="btn-icon-header btn-multimonitor btn-multimonitor--hidden" aria-label="Open Codeman across all displays"></button>',
+  '<button class="btn-icon-header btn-away-digest btn-away-digest--hidden" aria-label="Open away digest"></button>',
   '</body>',
 ].join('\n');
 
@@ -137,6 +142,13 @@ describe('WebServer.renderIndexHtml', () => {
     expect(html).toContain('btn-multimonitor"'); // class list still present, only the marker stripped
   });
 
+  it('reveals the away-digest button when showAwayDigest is set', async () => {
+    const { server } = makeServer({ showAwayDigest: true });
+    const html = await render(server);
+    expect(html).not.toContain('btn-away-digest--hidden');
+    expect(html).toContain('btn-away-digest"');
+  });
+
   it('injects the solo global and skips settings for a /session/:id window', async () => {
     const { server, readSettings } = makeServer({ showMultiMonitorButton: true });
     const html = await render(server, 'sess-123');
@@ -173,6 +185,26 @@ describe('WebServer.renderIndexHtml', () => {
       expect(modes).toContain('opencode');
       expect(modes).not.toContain('shell');
       expect(modes).not.toContain('gemini');
+    }
+  });
+
+  it('COD-464: injects the wheelForward map from the capability, solo windows included', async () => {
+    const { server } = makeServer();
+    for (const solo of [undefined, 'sess-123']) {
+      const html = await render(server, solo);
+      const match = html.match(/window\.__codemanWheelForward=(\{[^<]*\});/);
+      expect(match, String(solo)).not.toBeNull();
+      const map = JSON.parse(match![1]) as Record<string, Record<string, unknown>>;
+      expect(map.claude).toEqual({
+        mode: 'version-gated',
+        minVersion: '2.1.187',
+        rows: 1,
+        reversalDeadReports: 1,
+        streak: { resetMs: 35, steps: [1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 6] },
+      });
+      expect(map.codex).toEqual({ mode: 'mouse-tracking', rows: 3, reversalDeadReports: 0 });
+      expect(map.shell).toBeUndefined();
+      expect(map.gemini).toBeUndefined();
     }
   });
 
@@ -336,7 +368,7 @@ describe('WebServer.renderIndexHtml', () => {
     try {
       const { server } = makeServer({});
       const html = await render(server);
-      expect(html.match(/<body>/g)).toHaveLength(1);
+      expect(html.match(/^\s*<body>/gm)).toHaveLength(1);
       const clis = JSON.parse(html.match(/window\.__codemanCustomModelClis=(\[.*?\]);/)![1]);
       expect(clis).toEqual([{ id: 'claude', label }]);
     } finally {
@@ -347,7 +379,7 @@ describe('WebServer.renderIndexHtml', () => {
   it("inserts a solo id containing $' verbatim, under the same replacer rule", async () => {
     const { server } = makeServer({});
     const html = await render(server, "sess$'x");
-    expect(html.match(/<body>/g)).toHaveLength(1);
+    expect(html.match(/^\s*<body>/gm)).toHaveLength(1);
     expect(html).toContain(`window.__CODEMAN_SOLO__="sess$'x"`);
   });
 

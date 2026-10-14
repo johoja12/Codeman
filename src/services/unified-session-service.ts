@@ -27,6 +27,8 @@ export type UnifiedSessionItem = {
   mode?: string;
   status?: string;
   isWorking?: boolean;
+  activityStatus?: string;
+  activityStatusSince?: number | null;
   workingDir?: string;
   createdAt?: number;
   lastActivityAt?: number;
@@ -63,6 +65,8 @@ export type LiveSessionInput = {
   mode?: string;
   status?: string;
   isWorking?: boolean;
+  activityStatus?: string;
+  activityStatusSince?: number | null;
   workingDir?: string;
   createdAt?: number;
   lastActivityAt?: number;
@@ -80,10 +84,10 @@ export type PersistedSessionInput = {
   workingDir?: string;
   createdAt?: number;
   lastActivityAt?: number;
-  /** Claude conversation ID this session resumes (`SessionState.resumeSessionId`). */
-  claudeSessionId?: string;
   pinned?: boolean;
   pinnedAt?: number;
+  /** Claude conversation ID this session resumes (`SessionState.resumeSessionId`). */
+  claudeSessionId?: string;
 };
 
 /** Lifecycle audit-log view. Entries are expected NEWEST-first (the order `SessionLifecycleLog.query()` returns). */
@@ -242,6 +246,8 @@ export function mergeUnifiedSessions(sources: UnifiedSources): UnifiedSessionIte
     overwrite(item, 'mode', v.mode);
     overwrite(item, 'status', v.status);
     overwrite(item, 'isWorking', v.isWorking);
+    overwrite(item, 'activityStatus', v.activityStatus);
+    overwrite(item, 'activityStatusSince', v.activityStatusSince);
     overwrite(item, 'workingDir', v.workingDir);
     overwrite(item, 'createdAt', v.createdAt);
     overwrite(item, 'lastActivityAt', v.lastActivityAt);

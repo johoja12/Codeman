@@ -44,6 +44,9 @@ function loadTerminalModule(): TerminalModule {
     setTimeout,
     clearTimeout,
     requestAnimationFrame: vi.fn(),
+    // terminal-ui.js reads performance.now() downstream; the vm context needs it
+    // or the module throws at load and the whole file collects zero tests.
+    performance,
     HTMLCanvasElement: class HTMLCanvasElement {},
     WebSocket: { OPEN: 1 },
     fetch: vi.fn(),

@@ -41,6 +41,15 @@
  */
 /* global CodemanApp, MobileDetection */
 
+// A child that is working, or waiting on / checking its own agents, draws an
+// active (marching) line; the two agent states also get a class of their own.
+function lineageActive(status) {
+  return status === 'working' || status === 'waiting_agents' || status === 'checking_agents';
+}
+function lineageActivityClass(status, base) {
+  return status === 'waiting_agents' || status === 'checking_agents' ? ` ${base}--${status.replaceAll('_', '-')}` : '';
+}
+
 Object.assign(CodemanApp.prototype, {
   /**
    * Per-device opt-out (App Settings → Appearance), cached because the draw path runs
@@ -120,7 +129,8 @@ Object.assign(CodemanApp.prototype, {
       // A parent that is gone (closed, or never came back after a restart) draws
       // nothing: the field is decoration, so a dangling one is simply not rendered.
       if (!parentId || parentId === id || !this.sessions.has(parentId)) continue;
-      edges.push({ parentId, childId: id, status: session.status || 'idle' });
+      const status = window.CodemanSessionActivity?.resolve(session).effectiveStatus || session.status || 'idle';
+      edges.push({ parentId, childId: id, status });
     }
     return edges;
   },
@@ -323,17 +333,20 @@ Object.assign(CodemanApp.prototype, {
       const routes = geom.routes
         .map((route) => ({ route, child: byId.get(route.id) }))
         .filter((r) => r.child)
-        .sort((a, b) => (b.child.edge.status === 'working') - (a.child.edge.status === 'working'));
+        .sort((a, b) => lineageActive(b.child.edge.status) - lineageActive(a.child.edge.status));
       for (const { route, child } of routes) {
         const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
         line.setAttribute('d', route.d);
         // `status` is the CHILD's, which is the interesting end: a working child's
         // route is dashed (and marches, motion permitting).
-        const working = child.edge.status === 'working' ? ' lineage-line--working' : '';
+        // Waiting on or checking its own agents counts as working (agent activity),
+        // and carries its own class so the stylesheet can tell the states apart.
+        const working = lineageActive(child.edge.status) ? ' lineage-line--working' : '';
+        const activity = lineageActivityClass(child.edge.status, 'lineage-line');
         const proxied = parentEndpoint.proxied || child.endpoint.proxied;
         line.setAttribute(
           'class',
-          'connection-line lineage-line' + working + (proxied ? ' lineage-line--proxied' : '')
+          'connection-line lineage-line' + working + activity + (proxied ? ' lineage-line--proxied' : '')
         );
         // The PARENT's colour rides a CSS custom property so the stylesheet keeps
         // owning weight and dash; an empty colour leaves the --session-blue fallback.
@@ -346,7 +359,8 @@ Object.assign(CodemanApp.prototype, {
       }
       // Direction marker at each CHILD end, after every path so no stroke covers it.
       for (const { route, child } of routes) {
-        const working = child.edge.status === 'working' ? ' lineage-line--working' : '';
+        const working = lineageActive(child.edge.status) ? ' lineage-line--working' : '';
+        const activity = lineageActivityClass(child.edge.status, 'lineage-line-dot');
         const proxied = parentEndpoint.proxied || child.endpoint.proxied;
         const dot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
         dot.setAttribute('cx', String(route.endX));
@@ -354,7 +368,10 @@ Object.assign(CodemanApp.prototype, {
         // Fallback radius only: styles.css sizes the dot through `--lineage-dot-r`
         // (larger in an emphasized family), and `lineage-dot-pulse` breathes from it.
         dot.setAttribute('r', '2.5');
-        dot.setAttribute('class', 'lineage-line-dot' + working + (proxied ? ' lineage-line-dot--proxied' : ''));
+        dot.setAttribute(
+          'class',
+          'lineage-line-dot' + working + activity + (proxied ? ' lineage-line-dot--proxied' : '')
+        );
         dot.setAttribute('data-child-tab', child.edge.childId);
         if (color) dot.style.setProperty('--lineage-color', color);
         group.appendChild(dot);

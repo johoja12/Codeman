@@ -40,6 +40,23 @@ describe('owner layout key', () => {
 });
 
 describe('normalizeOrMigrateOwnerTabLayout', () => {
+  it('migrates a prototype-like owner when the layouts object has no matching own key', () => {
+    const result = normalizeOrMigrateOwnerTabLayout(
+      baseInput({
+        owner: 'constructor',
+        layouts: {},
+        persistedSessions: [{ id: 'owned', owner: 'constructor', createdAt: 1 }],
+      })
+    );
+
+    expect(result.created).toBe(true);
+    expect(result.layout).toMatchObject({
+      version: 0,
+      ungrouped: [{ kind: 'session', id: 'owned' }],
+    });
+    expect(Object.hasOwn(result.layouts, 'constructor')).toBe(true);
+  });
+
   it('filters global sessionOrder by owner and appends remaining sessions deterministically', () => {
     const result = normalizeOrMigrateOwnerTabLayout(
       baseInput({
@@ -244,21 +261,26 @@ describe('StateStore tabLayouts allowlist', () => {
     expect(new StateStore(file).getTabLayout('alice')).toEqual(layout);
   });
 
-  it('does not treat an inherited constructor property as a persisted owner layout', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'codeman-tab-layout-'));
+  it('persists and reloads owner-and-case default groups across a restart', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codeman-case-default-group-'));
     tempDirs.push(dir);
     const file = join(dir, 'state.json');
-    const layout: TabLayout = {
-      version: 3,
-      groups: [],
-      ungrouped: [],
-      updatedAt: '2026-08-16T12:00:00.000Z',
-    };
 
     const store = new StateStore(file);
-    store.setTabLayout('alice', layout);
-    store.saveNow();
+    store.setCaseDefaultGroup('alice', 'nzbdav', 'group-nzbdav');
+    store.setCaseDefaultGroup('bob', 'nzbdav', null);
+    store.setCaseDefaultGroup('__proto__', 'constructor', 'group-prototype');
+    store.flush();
 
-    expect(store.getTabLayout('constructor')).toBeNull();
+    const persistedDefaults = JSON.parse(readFileSync(file, 'utf8')).caseDefaultGroups;
+    expect(persistedDefaults.alice).toEqual({ nzbdav: 'group-nzbdav' });
+    expect(persistedDefaults.bob).toEqual({ nzbdav: null });
+    expect(Object.hasOwn(persistedDefaults, '__proto__')).toBe(true);
+    expect(persistedDefaults.__proto__).toEqual({ constructor: 'group-prototype' });
+
+    const reloaded = new StateStore(file);
+    expect(reloaded.getCaseDefaultGroup('alice', 'nzbdav')).toBe('group-nzbdav');
+    expect(reloaded.getCaseDefaultGroup('bob', 'nzbdav')).toBeNull();
+    expect(reloaded.getCaseDefaultGroup('__proto__', 'constructor')).toBe('group-prototype');
   });
 });

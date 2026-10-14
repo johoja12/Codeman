@@ -4,8 +4,7 @@
  * Under VITEST, TmuxManager no-ops execSync (IS_TEST_MODE), so we can't drive
  * real tmux. Instead we assert the capture-arg construction directly from
  * source (same approach as tmux-capture-color.test.ts): a full-history capture
- * must use `capture-pane -p -e -J -S -<N>` (bounded to the configured history
- * limit, with an explicit exec maxBuffer) and skip the single-screen snapshot
+ * must use `capture-pane -p -e -S -` and skip the single-screen snapshot
  * repaint, while the visible capture keeps `capture-pane -p -e`.
  */
 import { readFileSync } from 'node:fs';
@@ -21,12 +20,19 @@ describe('tmux full-history pane capture (COD-47)', () => {
   const methodEnd = source.indexOf('captureActivePaneBuffer(muxName: string', methodStart);
   const methodBody = source.slice(methodStart, methodEnd);
 
-  it('capturePaneBuffer accepts pane-capture options with a fullHistory flag', () => {
-    expect(methodStart).toBeGreaterThan(-1);
-    // The method signature must carry the opts channel...
-    expect(source.slice(methodStart, methodStart + 160)).toContain('PaneCaptureOptions');
-    // ...and the body must branch on opts.fullHistory.
-    expect(methodBody).toContain('opts?.fullHistory === true');
+  it('capturePaneBuffer accepts a fullHistory option', () => {
+    const sig = source.indexOf('capturePaneBuffer(');
+    expect(sig).toBeGreaterThan(-1);
+    // The method signature must carry the opts.fullHistory channel (COD-187
+    // reformatted it multi-line and added lastLines for the lazy history page).
+    // The v1.16 upstream merge moved those fields out of an inline object type
+    // and into the shared PaneCaptureOptions, so follow the type rather than
+    // scraping for the field name next to the signature.
+    expect(source.slice(sig, sig + 240)).toContain('PaneCaptureOptions');
+    const muxInterface = readFileSync(resolve(import.meta.dirname, '../src/mux-interface.ts'), 'utf8');
+    const opts = muxInterface.slice(muxInterface.indexOf('export interface PaneCaptureOptions'));
+    expect(opts.slice(0, opts.indexOf('}'))).toContain('fullHistory');
+    expect(opts.slice(0, opts.indexOf('}'))).toContain('lastLines');
   });
 
   it('full-history mode captures scrollback bounded to the configured history limit (-J -S -<N>)', () => {
@@ -56,43 +62,96 @@ describe('tmux full-history pane capture (COD-47)', () => {
   it('returns full-history capture as raw scrollback (skips the single-screen repaint)', () => {
     // The fullHistory branch returns before the formatPaneSnapshot repaint,
     // which is single-screen and would clip a multi-screen history.
-    const branch = methodBody.indexOf('if (fullHistory) {\n        // Without geometry');
+    const branch = methodBody.indexOf('if (fullHistory) {\n        // COD-190');
     const snapshot = methodBody.indexOf('formatPaneSnapshot(');
     expect(branch).toBeGreaterThan(-1);
     expect(snapshot).toBeGreaterThan(-1);
     expect(branch).toBeLessThan(snapshot);
-    // …and what it returns is normalized linear scrollback, not a repaint.
-    expect(methodBody.slice(branch, snapshot)).toContain('normalizeScrollbackEol(');
+    // …and what it returns is linear scrollback (CRLF-normalized inside
+    // formatFullHistoryCapture), not a repaint.
+    expect(methodBody.slice(branch, snapshot)).toContain('formatFullHistoryCapture(');
   });
 
   it('appends the pane cursor to the full-history capture', () => {
     // A linear replay leaves the caret wherever the last character landed — the
     // status line, for an agent CLI — and every cursor-relative update the CLI
-    // sends afterwards is then measured from the wrong row.
-    const restore = methodBody.indexOf('formatCursorRestore(geometry)');
+    // sends afterwards is then measured from the wrong row. COD-433 anchors that
+    // move to the captured tail, which is what formatFullHistoryCapture does.
+    const restore = methodBody.indexOf('formatFullHistoryCapture(trimmed, geometry)');
     const snapshot = methodBody.indexOf('formatPaneSnapshot(');
     expect(restore).toBeGreaterThan(-1);
     expect(restore).toBeLessThan(snapshot);
   });
 
-  it('keeps the trailing rows only when a cursor move will follow', () => {
-    // Trailing blank rows are the bottom of the screen and the cursor move counts
-    // up from them, so the two decisions travel together: no geometry, no move,
-    // and the old trim applies instead.
+  it('keeps the trailing rows, and queries the cursor before deciding anything', () => {
+    // COD-190: trailing blank rows are the bottom of the screen and the cursor
+    // move counts up from them, so only the line terminator comes off. The
+    // geometry has to be in hand before that branch runs, since it is what the
+    // move is computed from.
     expect(methodBody).toContain("rawCapture.replace(/\\n$/, '')");
-    expect(methodBody).toContain("if (!geometry) return normalizeScrollbackEol(rawCapture.replace(/\\n+$/g, ''))");
+    const cursorQuery = methodBody.indexOf('queryPaneCursor(');
+    expect(cursorQuery).toBeGreaterThan(-1);
+    expect(cursorQuery).toBeLessThan(methodBody.indexOf('if (fullHistory) {\n        // COD-190'));
   });
 
   it('defers to the byte history when the pane holds nothing visible', () => {
     expect(methodBody).toContain("if (!hasVisibleContent(trimmed)) return ''");
   });
 
-  it('captureActivePaneBuffer forwards the capture options', () => {
+  it('captureActivePaneBuffer forwards the fullHistory option', () => {
     const sig = source.indexOf('captureActivePaneBuffer(muxName: string');
     expect(sig).toBeGreaterThan(-1);
     const body = source.slice(sig, sig + 800);
     expect(body).toContain('opts');
     expect(body).toContain('this.capturePaneBuffer(muxName, target, opts)');
+  });
+
+  it('COD-279: remote history capture targets the dedicated codeman-remote socket and codeman-ssh name', () => {
+    // Regression: owned remote sessions live on `-L codeman-remote` under a
+    // `codeman-ssh-<id8>` name. The history (full-history) capture must use the
+    // same socket the launcher created, or it resolves the wrong (nonexistent)
+    // tmux socket and degrades to the local wrapper -> "history unavailable".
+    const sig = source.indexOf('captureRemotePaneBuffer(');
+    expect(sig).toBeGreaterThan(-1);
+    const body = source.slice(sig, sig + 4000);
+    expect(body).toContain('REMOTE_TMUX_SOCKET');
+    expect(body).toContain('remoteTmuxSessionName(sessionId)');
+    expect(body).toContain('`tmux -L ${socket} capture-pane');
+    // COD-463: the full-history capture + cursor query are ONE ssh call, built
+    // by buildRemoteFullHistoryCommand with the same socket/target.
+    expect(body).toContain('buildRemoteFullHistoryCommand(target, socket, opts?.lastLines)');
+    const builder = source.slice(source.indexOf('export function buildRemoteFullHistoryCommand('));
+    expect(builder.slice(0, 800)).toContain('`tmux -L ${socket} display-message');
+    expect(builder.slice(0, 800)).toContain('`tmux -L ${socket} capture-pane');
+  });
+});
+
+describe('COD-189 local history-limit ordering', () => {
+  const source = readFileSync(resolve(import.meta.dirname, '../src/tmux-manager.ts'), 'utf8');
+
+  it('sets -g history-limit in the SAME invocation, BEFORE new-session (pane inherits it)', () => {
+    // history-limit only applies to panes created after it is set, and
+    // respawn-pane reuses the initial pane — an after-the-fact set never lands.
+    // Asserted as an ORDERING rather than one literal command string: the expression
+    // was refactored (`Math.floor(historyLimit)` -> `safeHistoryLimit`) and a tmux-3.7
+    // live-resize branch was added alongside it, which silently broke the old grep
+    // while the invariant itself still held (COD-385).
+    const assignment = source.slice(
+      source.indexOf('const createSessionCommand ='),
+      source.indexOf('execSync(createSessionCommand')
+    );
+    expect(assignment).not.toBe('');
+
+    // The legacy branch (tmux < 3.7, no live pane resize) is the one that must set the
+    // GLOBAL option first, because the pane inherits it only at creation time.
+    const legacyBranch = assignment.slice(assignment.indexOf(': `'));
+    const globalSet = legacyBranch.indexOf('set-option -g history-limit');
+    const newSession = legacyBranch.indexOf('new-session -ds');
+    expect(globalSet).toBeGreaterThan(-1);
+    expect(newSession).toBeGreaterThan(-1);
+    expect(globalSet).toBeLessThan(newSession);
+    // Same shell invocation (tmux command separator), not a follow-up call.
+    expect(legacyBranch.slice(globalSet, newSession)).toContain(';');
   });
 });
 
@@ -144,7 +203,7 @@ describe('the geometry a capture reports back', () => {
     const write = methodBody.indexOf('opts.capturedGeometry = { cols: geometry.cols, rows: geometry.rows }');
     // Anchor on the REPLAY branch, not the earlier `if (fullHistory)` that only
     // sizes the exec buffer.
-    const replayBranch = methodBody.indexOf('if (!geometry) return normalizeScrollbackEol(');
+    const replayBranch = methodBody.indexOf('return formatFullHistoryCapture(trimmed, geometry);');
     const visibleReturn = methodBody.indexOf('if (geometry) return formatPaneSnapshot(');
     expect(write).toBeGreaterThan(-1);
     expect(replayBranch).toBeGreaterThan(-1);

@@ -5,6 +5,7 @@
 import { EventEmitter } from 'node:events';
 import { vi } from 'vitest';
 import type { PromptCacheStatus, SessionAttachmentHistoryItem, SessionStatus, SessionRemote } from '../../src/types.js';
+import { sanitizeAttachmentHistory, upsertAttachmentHistory } from '../../src/session-attachment-history.js';
 
 /**
  * Enhanced mock session for testing RespawnController.
@@ -19,12 +20,6 @@ export class MockSession extends EventEmitter {
    * over ssh instead of with local `fs` (#415).
    */
   remote?: SessionRemote;
-  /** Mirrors Session.attachmentHistory (the attachment panel's source of truth). */
-  attachmentHistory: SessionAttachmentHistoryItem[] = [];
-  /** Mirrors Session.getAttachmentHistoryForPersist(). */
-  getAttachmentHistoryForPersist(): SessionAttachmentHistoryItem[] {
-    return this.attachmentHistory;
-  }
   /**
    * The REAL union, deliberately. This used to be `'idle' | 'working'`, and
    * `'working'` is not a `SessionStatus` at all — so `signalForStatus()` fell to its
@@ -34,6 +29,28 @@ export class MockSession extends EventEmitter {
   status: SessionStatus = 'idle';
   /** `null` once the PTY is gone (or before it has ever started) — see `pid` in Session. */
   pid: number | null = 12345;
+  /** Mirrors Session.blocksIdleAutomation (COD-350): background agents still working. */
+  blocksIdleAutomation = false;
+  /** Mirrors Session.isAutonomouslyIdle(): idle, and no agent work blocks automation. */
+  isAutonomouslyIdle(): boolean {
+    return this.status === 'idle' && !this.blocksIdleAutomation;
+  }
+  /** COD-124 — preserved conversation ref for claude-mode resume via --resume. */
+  resumeSessionId?: string;
+  /** COD-124 unit 2, Gap B — native external-CLI (codex) rollout id captured at park time. */
+  nativeResumeId: string | null = null;
+  setNativeResumeId = vi.fn((id: string | null) => {
+    this.nativeResumeId = id;
+  });
+  /** COD-124 unit 2, Gap B — codex-mode config surface read by captureNativeResumeId(). */
+  codexConfig?: { model?: string; resumeSessionId?: string };
+  /** Closed provider identity projection used by local Codex Read My Mind. */
+  getCodexProviderEnvironment = vi.fn<() => CodexProviderEnvironment>(() => ({}));
+  /** Narrow home-only projection used to scope competing Codex submit times. */
+  getCodexHomeOverride = vi.fn<() => string | undefined>(() => undefined);
+  /** Recovery fence when session-scoped credentials could not be persisted. */
+  hasLostCodexProviderCredentials = vi.fn(() => false);
+  codexLastSubmitAt?: number;
   isWorking: boolean = false;
   /**
    * Mirrors Session.watching — what the pane's footer says is still running in the
@@ -52,6 +69,8 @@ export class MockSession extends EventEmitter {
   ralphTracker: null = null;
   writeBuffer: string[] = [];
   terminalBuffer: string = '';
+  isCheckpointActive = false;
+  cancelCheckpoint = vi.fn();
   /** Mirrors Session.lastSubmitAt — the response viewer credits history entries by it. */
   lastSubmitAt: number = 0;
   /** Mirrors Session.claudeSessionId — the conversation the viewer reads. */
@@ -97,6 +116,11 @@ export class MockSession extends EventEmitter {
    * which is the state in which input used to disappear silently.
    */
   failWrites = false;
+  assistantInputLocked = false;
+  async performAuxiliaryInput(operation: () => Promise<void>): Promise<void> {
+    if (this.assistantInputLocked) throw new Error('Assistant owns session input');
+    await operation();
+  }
 
   /** Direct PTY write (used by session.write()). Mirrors the real boolean return. */
   write(data: string): boolean {
@@ -304,6 +328,9 @@ export class MockSession extends EventEmitter {
   /** Currently active tools */
   activeTools: unknown[] = [];
 
+  /** Session attachment history */
+  private _attachmentHistory: SessionAttachmentHistoryItem[] = [];
+
   /** Token tracking */
   inputTokens: number = 0;
   outputTokens: number = 0;
@@ -324,10 +351,71 @@ export class MockSession extends EventEmitter {
       color: this.color,
       mode: this.mode,
       muxName: this._muxName,
+      attachmentHistory: this.attachmentHistory.length > 0 ? this.attachmentHistory : undefined,
       pinned: this.pinned || undefined,
       pinnedAt: this.pinned ? (this.pinnedAt ?? undefined) : undefined,
+      resumeSessionId: this.resumeSessionId,
+      nativeResumeId: this.nativeResumeId,
     };
   }
+
+  /** COD-124 — stub for park(): detach + preserve for resume. Mirrors the
+   *  observable effects of production Session.park() (status → 'parked',
+   *  pid cleared) without touching any real tmux/PTY. */
+  park = vi.fn(async () => {
+    this.status = 'parked';
+    this.pid = null;
+  });
+
+  get attachmentHistory(): SessionAttachmentHistoryItem[] {
+    return sanitizeAttachmentHistory(this._attachmentHistory);
+  }
+
+  /** Test seeding only (the real Session has no setter): replaces the raw list. */
+  set attachmentHistory(history: SessionAttachmentHistoryItem[]) {
+    this._attachmentHistory = history.map((item) => ({ ...item }));
+  }
+
+  upsertAttachmentHistory = vi.fn((item: SessionAttachmentHistoryItem) => {
+    this._attachmentHistory = upsertAttachmentHistory(this._attachmentHistory, item);
+  });
+
+  getAttachmentHistoryForPersist = vi.fn(() =>
+    this._attachmentHistory.length > 0 ? this._attachmentHistory.map((item) => ({ ...item })) : undefined
+  );
+
+  removeAttachmentHistory = vi.fn((predicate: (item: SessionAttachmentHistoryItem) => boolean) => {
+    const before = this._attachmentHistory.length;
+    this._attachmentHistory = this._attachmentHistory.filter((item) => !predicate(item));
+    return before - this._attachmentHistory.length;
+  });
+
+  // ── Sources (COD-65) ──────────────────────────────────────────────────────
+  private _sources: SessionSource[] = [];
+
+  get sources(): SessionSource[] {
+    return [...this._sources];
+  }
+
+  addSource = vi.fn((item: SessionSource) => {
+    const idx = this._sources.findIndex((s) => s.id === item.id);
+    if (idx >= 0) {
+      this._sources[idx] = { ...item };
+    } else {
+      this._sources.push({ ...item });
+    }
+  });
+
+  removeSource = vi.fn((id: string) => {
+    this._sources = this._sources.filter((s) => s.id !== id);
+  });
+
+  restoreSources = vi.fn((data: SessionSource[] | undefined) => {
+    this._sources = data ? data.map((s) => ({ ...s })) : [];
+  });
+
+  getSourcesForPersist = vi.fn(() => (this._sources.length > 0 ? this._sources.map((s) => ({ ...s })) : undefined));
+  // ─────────────────────────────────────────────────────────────────────────
 
   /** Auto-resume on usage limit (token pause control) */
   autoResumeEnabled: boolean = false;
@@ -416,7 +504,7 @@ export class MockSession extends EventEmitter {
   /** Stub for startInteractive */
   startInteractive = vi.fn(async () => {});
 
-  /** Stub for resetRespawnBreaker (COD-118) */
+  /** Stub for resetRespawnBreaker (COD-118 — explicit restart clears the breaker) */
   resetRespawnBreaker = vi.fn();
 
   /** Stub for startShell */

@@ -7,9 +7,19 @@ export function isExplicitlyEnabled(value: string | undefined): boolean {
 }
 
 /**
- * True when unauthenticated network exposure is acceptable: either a password is
- * set (auth active) or the operator explicitly acknowledged it. Used by the
- * tunnel-enable guard (COD-55) to refuse publishing an unauthenticated public URL.
+ * True when running the app unauthenticated on a public network is acknowledged:
+ * either a password is configured (`CODEMAN_PASSWORD`) so requests are gated, or
+ * the operator has explicitly opted into unauthenticated network exposure via
+ * `CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK` (the same opt-in the non-loopback bind
+ * guard in server.ts honours, alongside the `--allow-unauthenticated-network` flag).
+ *
+ * Used by the bind guard and — stricter — by the tunnel-start guard (COD-55): a
+ * Cloudflare quick tunnel publishes the app to a public *.trycloudflare.com URL,
+ * so starting one WITHOUT this being true would expose unauthenticated terminal
+ * control (effectively RCE) to the internet.
+ *
+ * @param allowFlag optional CLI-level acknowledgement (e.g. the parsed
+ *   `--allow-unauthenticated-network` flag) ORed with the env opt-in.
  */
 export function isUnauthenticatedNetworkAcknowledged(allowFlag = false): boolean {
   if (process.env.CODEMAN_PASSWORD) return true;

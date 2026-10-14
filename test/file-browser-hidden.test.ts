@@ -38,7 +38,7 @@ interface FakeElement {
   textContent: string;
   classes: Set<string>;
   attrs: Record<string, string>;
-  classList: { toggle: (name: string, on: boolean) => void; contains: (name: string) => boolean };
+  classList: { toggle: (name: string, on: boolean) => void };
   setAttribute: (name: string, value: string) => void;
 }
 
@@ -54,9 +54,6 @@ function fakeElement(): FakeElement {
       toggle(name: string, on: boolean) {
         if (on) classes.add(name);
         else classes.delete(name);
-      },
-      contains(name: string) {
-        return classes.has(name);
       },
     },
     setAttribute(name: string, value: string) {
@@ -95,17 +92,22 @@ function loadPanel(store: Map<string, string> | null) {
   vm.runInContext(panelsJs, context, { filename: 'panels-ui.js' });
 
   const elements: Record<string, FakeElement> = {
-    fileBrowserPanel: fakeElement(),
     fileBrowserTree: fakeElement(),
     fileBrowserStatus: fakeElement(),
     fileBrowserHiddenBtn: fakeElement(),
   };
-  elements.fileBrowserPanel.classList.toggle('visible', true);
   const requests: string[] = [];
   const app = new CodemanApp() as Record<string, any>;
   app.$ = (id: string) => elements[id] ?? null;
   app.activeSessionId = 'sess-1';
   app.fileBrowserData = null;
+  // COD-231 ownership: loadFileBrowser stamps ++fileBrowserLoadGeneration and drops
+  // any response whose stamp no longer matches. Left undefined, ++ yields NaN and
+  // NaN !== NaN discards every load, so the panel silently never renders.
+  app.fileBrowserLoadGeneration = 0;
+  // Same model: refreshFileBrowser() reloads the session the PANEL owns, not the
+  // active tab, so the panel has to own one for a refresh to do anything.
+  app.fileBrowserSessionId = 'sess-1';
   app.fileBrowserExpandedDirs = new Set<string>();
   app.fileBrowserFilter = '';
   app.fileBrowserShowHidden = app._loadFileBrowserShowHidden();
@@ -154,12 +156,10 @@ describe('File Viewer show-hidden toggle', () => {
     const { app, requests } = loadPanel(store);
     await app.loadFileBrowser('sess-1');
     expect(requests[0]).toContain('showHidden=false');
-    const previousTreeEpoch = app._fileBrowserState.treeEpoch;
 
     await app.toggleFileBrowserHidden();
 
     expect(app.fileBrowserShowHidden).toBe(true);
-    expect(app._fileBrowserState.treeEpoch).toBe(previousTreeEpoch + 1);
     expect(requests).toHaveLength(2);
     expect(requests[1]).toContain('showHidden=true');
     expect(store.get(STORAGE_KEY)).toBe('1');

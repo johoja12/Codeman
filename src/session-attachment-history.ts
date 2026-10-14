@@ -14,6 +14,8 @@ export interface ExternalAttachmentHistoryInput {
   size: number;
   mtimeMs?: number;
   timestamp?: number;
+  generatedArtifactBoundary?: string;
+  uploadProvenance?: 'codeman-upload';
 }
 
 export function normalizeAttachmentExtension(extensionOrPath: string): string {
@@ -35,7 +37,7 @@ function safeExternalHistoryId(item: SessionAttachmentHistoryItem): string {
 }
 
 export function sanitizeAttachmentHistoryItem(item: SessionAttachmentHistoryItem): SessionAttachmentHistoryItem {
-  const { externalPath: _externalPath, ...safe } = item;
+  const { externalPath: _externalPath, generatedArtifactBoundary: _generatedArtifactBoundary, ...safe } = item;
   return {
     ...safe,
     id: item.source === 'external' ? safeExternalHistoryId(item) : item.id,
@@ -52,8 +54,13 @@ export function upsertAttachmentHistory(
   history: readonly SessionAttachmentHistoryItem[],
   item: SessionAttachmentHistoryItem
 ): SessionAttachmentHistoryItem[] {
-  const nextKey = historyKey(item);
-  return [item, ...history.filter((existing) => historyKey(existing) !== nextKey)].slice(0, ATTACHMENT_HISTORY_LIMIT);
+  const normalized = { ...item } as SessionAttachmentHistoryItem & { uploadProvenance?: unknown };
+  if (normalized.uploadProvenance !== 'codeman-upload') delete normalized.uploadProvenance;
+  const nextKey = historyKey(normalized);
+  return [normalized, ...history.filter((existing) => historyKey(existing) !== nextKey)].slice(
+    0,
+    ATTACHMENT_HISTORY_LIMIT
+  );
 }
 
 export function buildDetectedAttachmentHistoryItem(event: AttachmentDetectedEvent): SessionAttachmentHistoryItem {
@@ -88,5 +95,7 @@ export function buildExternalAttachmentHistoryItem(
     timestamp: input.timestamp ?? Date.now(),
     source: 'external',
     externalPath: input.externalPath,
+    ...(input.generatedArtifactBoundary ? { generatedArtifactBoundary: input.generatedArtifactBoundary } : {}),
+    ...(input.uploadProvenance ? { uploadProvenance: input.uploadProvenance } : {}),
   };
 }

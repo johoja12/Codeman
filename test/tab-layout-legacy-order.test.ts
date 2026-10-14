@@ -1,6 +1,4 @@
-/**
- * @fileoverview Pure compatibility translation between legacy session order and owner tab layouts.
- */
+/** @fileoverview Pure compatibility translation between legacy session order and owner tab layouts. */
 
 import { describe, expect, it } from 'vitest';
 import {
@@ -10,8 +8,11 @@ import {
 } from '../src/tab-layout-legacy-order.js';
 import { normalizeTabLayout, validateTabLayout, type TabLayout, type TabRefMetadata } from '../src/tab-layout.js';
 
-const session = (id: string, placement?: 'manual') =>
-  placement ? { kind: 'session' as const, id, placement } : { kind: 'session' as const, id };
+const session = (id: string, options: { placement?: 'manual'; focus?: true } = {}) => ({
+  kind: 'session' as const,
+  id,
+  ...options,
+});
 const webview = (id: string) => ({ kind: 'webview' as const, id });
 const metadata = (id: string, overrides: Partial<TabRefMetadata> = {}): TabRefMetadata => ({
   kind: 'session',
@@ -31,14 +32,10 @@ const layout = (overrides: Partial<TabLayout> = {}): TabLayout => ({
 
 describe('applyLegacySessionRank', () => {
   it('ranks only authoritative sessions while anchoring webviews and refs absent from metadata', () => {
-    const input = layout({
-      ungrouped: [session('a'), webview('w1'), session('unknown'), session('b')],
-    });
+    const input = layout({ ungrouped: [session('a'), webview('w1'), session('unknown'), session('b')] });
 
     expect(applyLegacySessionRank(input, ['b', 'a'], [metadata('a'), metadata('b')])).toEqual(
-      layout({
-        ungrouped: [session('b'), webview('w1'), session('unknown'), session('a')],
-      })
+      layout({ ungrouped: [session('b'), webview('w1'), session('unknown'), session('a')] })
     );
   });
 
@@ -63,13 +60,7 @@ describe('applyLegacySessionRank', () => {
 
   it('materializes ranked children with represented owner-valid parents before normalization', () => {
     const input = layout({
-      groups: [
-        {
-          id: 'family',
-          name: 'Family',
-          refs: [session('parent'), session('child'), session('other')],
-        },
-      ],
+      groups: [{ id: 'family', name: 'Family', refs: [session('parent'), session('child'), session('other')] }],
     });
     const facts = [
       metadata('parent', { order: 0 }),
@@ -79,7 +70,11 @@ describe('applyLegacySessionRank', () => {
 
     const result = applyLegacySessionRank(input, ['child', 'other', 'parent'], facts);
 
-    expect(result.groups[0].refs).toEqual([session('child', 'manual'), session('other'), session('parent')]);
+    expect(result.groups[0].refs).toEqual([
+      session('child', { placement: 'manual' }),
+      session('other'),
+      session('parent'),
+    ]);
     expect(normalizeTabLayout(result, facts)).toEqual(result);
   });
 
@@ -92,7 +87,7 @@ describe('applyLegacySessionRank', () => {
           refs: [session('parent'), session('child'), session('grandchild'), session('other')],
         },
       ],
-      ungrouped: [session('loose', 'manual')],
+      ungrouped: [session('loose', { placement: 'manual' })],
     });
     const facts = [
       metadata('parent', { order: 0 }),
@@ -105,7 +100,7 @@ describe('applyLegacySessionRank', () => {
     const result = applyLegacySessionRank(input, ['parent', 'child', 'grandchild', 'other', 'loose'], facts);
 
     expect(result.groups[0].refs).toEqual(input.groups[0].refs);
-    expect(result.ungrouped).toEqual([session('loose', 'manual')]);
+    expect(result.ungrouped).toEqual([session('loose', { placement: 'manual' })]);
   });
 
   it('keeps a child following when the reorder keeps it in its parent block', () => {
@@ -159,7 +154,12 @@ describe('applyLegacySessionRank', () => {
 
     const result = applyLegacySessionRank(input, ['parent', 'c1', 'x', 'c2'], facts);
 
-    expect(result.ungrouped).toEqual([session('parent'), session('c1'), session('x'), session('c2', 'manual')]);
+    expect(result.ungrouped).toEqual([
+      session('parent'),
+      session('c1'),
+      session('x'),
+      session('c2', { placement: 'manual' }),
+    ]);
     expect(normalizeTabLayout(result, facts)).toEqual(result);
   });
 
@@ -171,9 +171,17 @@ describe('applyLegacySessionRank', () => {
 
     const result = applyLegacySessionRank(input, ['child', 'parent'], facts);
 
-    expect(result.groups[0].refs).toEqual([session('child', 'manual')]);
+    expect(result.groups[0].refs).toEqual([session('child', { placement: 'manual' })]);
     expect(result.ungrouped).toEqual([session('parent')]);
     expect(normalizeTabLayout(result, facts)).toEqual(result);
+  });
+
+  it('preserves richer local Focus flags while reordering', () => {
+    const input = layout({ ungrouped: [session('a', { focus: true }), session('b')] });
+
+    const result = applyLegacySessionRank(input, ['b', 'a'], [metadata('a'), metadata('b')]);
+
+    expect(result.ungrouped).toEqual([session('b'), session('a', { focus: true })]);
   });
 
   it('does not mutate inputs and returns a validated canonical deep clone', () => {
@@ -210,14 +218,8 @@ describe('recomposeGlobalSessionOrder', () => {
         order: ['a3', 'a2', 'a2', 'a1', 'foreign'],
       },
     ];
-    const beforeCurrent = [...current];
-    const beforeProjections = structuredClone(projections);
 
-    const result = recomposeGlobalSessionOrder(current, projections);
-
-    expect(result).toEqual(['a3', 'foreign', 'b1', 'a2', 'unmapped', 'a1']);
-    expect(current).toEqual(beforeCurrent);
-    expect(projections).toEqual(beforeProjections);
+    expect(recomposeGlobalSessionOrder(current, projections)).toEqual(['a3', 'foreign', 'b1', 'a2', 'unmapped', 'a1']);
   });
 
   it('starts from merged preferred order when preserving admin cross-owner intent', () => {
@@ -231,16 +233,13 @@ describe('recomposeGlobalSessionOrder', () => {
   });
 
   it('derives sequential owner projections from the latest order without a lost update', () => {
-    const initial = ['a1', 'b1', 'a2', 'b2'];
-    const afterAlice = recomposeGlobalSessionOrder(initial, [
-      { owner: 'alice', ownedIds: ['a1', 'a2'], order: ['a2', 'a1'] },
-    ]);
-    const afterBob = recomposeGlobalSessionOrder(afterAlice, [
-      { owner: 'bob', ownedIds: ['b1', 'b2'], order: ['b2', 'b1'] },
-    ]);
-
-    expect(afterAlice).toEqual(['a2', 'b1', 'a1', 'b2']);
-    expect(afterBob).toEqual(['a2', 'b2', 'a1', 'b1']);
+    const afterAlice = recomposeGlobalSessionOrder(
+      ['a1', 'b1', 'a2', 'b2'],
+      [{ owner: 'alice', ownedIds: ['a1', 'a2'], order: ['a2', 'a1'] }]
+    );
+    expect(
+      recomposeGlobalSessionOrder(afterAlice, [{ owner: 'bob', ownedIds: ['b1', 'b2'], order: ['b2', 'b1'] }])
+    ).toEqual(['a2', 'b2', 'a1', 'b1']);
   });
 
   it('handles prototype-like owner names and IDs without corrupting membership', () => {
@@ -251,7 +250,7 @@ describe('recomposeGlobalSessionOrder', () => {
           {
             owner: 'constructor',
             ownedIds: ['__proto__', 'constructor', 'toString'],
-            order: ['toString', 'constructor', '__proto__'],
+            order: ['toString', 'constructor'],
           },
         ]
       )

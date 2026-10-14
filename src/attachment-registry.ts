@@ -10,8 +10,9 @@ import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, extname, isAbsolute, join } from 'node:path';
+import { basename, extname, isAbsolute, join, relative, sep } from 'node:path';
 import { isBlockedAttachmentPath, isUnderTree, loadAttachmentGuardConfig } from './config/attachment-guard.js';
+import { MAX_PASTE_IMAGE_BYTES } from './config/buffer-limits.js';
 import { EDITABLE_EXTENSIONS } from './config/file-editing.js';
 import { validateSessionFilePath } from './web/route-helpers.js';
 import { remoteProbePaths, RemoteFileAccessError, type RemoteProbe } from './remote-files.js';
@@ -75,7 +76,17 @@ const SUPPORTED_ATTACHMENT_EXTENSIONS = new Set([
   ...TEXT_ATTACHMENT_EXTENSIONS,
 ]);
 
-export type AttachmentSource = 'detected' | 'external';
+export const MAX_GENERATED_ARTIFACT_BYTES = 50 * 1024 * 1024;
+
+/**
+ * Cap for an ordinary external reference — a path the user (or a magic link)
+ * pointed at, whose bytes Codeman never admitted through an upload. Deliberately
+ * fixed: raising the upload knob must not widen what an arbitrary registry id
+ * can stream out of the host.
+ */
+export const MAX_EXTERNAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+
+export type AttachmentSource = 'detected' | 'external' | 'upload';
 
 export interface AttachmentRecord {
   attachmentId: string;
@@ -88,6 +99,10 @@ export interface AttachmentRecord {
   mtimeMs: number;
   timestamp: number;
   source: AttachmentSource;
+  /** Server-private canonical root for generated-artifact read-time confinement. */
+  generatedArtifactBoundary?: string;
+  /** Ephemeral canonical root for a Codeman upload through an approved workspace symlink. */
+  trustedUploadBoundary?: string;
 }
 
 export interface AttachmentRegistrationResult extends AttachmentDetectedEvent {
@@ -142,6 +157,19 @@ class AttachmentRegistry {
     return undefined;
   }
 
+  /**
+   * Remove a single record by id (COD-241 unit 3). Used when a Codeman-uploaded
+   * file is deleted via DELETE …/attachments/uploaded, so the in-memory registry
+   * doesn't keep resolving routes to a file that no longer exists. Returns true
+   * when a record was removed. Best-effort — the delete route's ownership gate is
+   * the source of truth and does not depend on this call succeeding.
+   */
+  remove(sessionId: string, attachmentId: string): boolean {
+    const records = this.recordsBySession.get(sessionId);
+    if (!records) return false;
+    return records.delete(attachmentId);
+  }
+
   clearSession(sessionId: string): void {
     this.recordsBySession.delete(sessionId);
   }
@@ -175,16 +203,21 @@ export function getAttachmentType(extension: string): AttachmentDetectedType {
 
 export function buildAttachmentRoutes(
   sessionId: string,
-  attachmentId: string
+  attachmentId: string,
+  extension?: string
 ): {
   rawUrl: string;
   previewUrl: string;
   thumbnailUrl: string;
 } {
   const encodedId = encodeURIComponent(attachmentId);
+  const rawUrl = `/api/sessions/${sessionId}/attachments/${encodedId}/raw`;
   return {
-    rawUrl: `/api/sessions/${sessionId}/attachments/${encodedId}/raw`,
-    previewUrl: `/api/sessions/${sessionId}/attachments/${encodedId}/preview`,
+    rawUrl,
+    previewUrl:
+      extension?.toLowerCase().replace(/^\./, '') === 'xlsx'
+        ? `${rawUrl}?preview=true`
+        : `/api/sessions/${sessionId}/attachments/${encodedId}/preview`,
     thumbnailUrl: `/api/sessions/${sessionId}/attachments/${encodedId}/thumbnail`,
   };
 }
@@ -194,7 +227,7 @@ export function buildFileThumbnailRoute(sessionId: string, relativePath: string)
 }
 
 export function attachmentRecordToEvent(record: AttachmentRecord): AttachmentRegistrationResult {
-  const routes = buildAttachmentRoutes(record.sessionId, record.attachmentId);
+  const routes = buildAttachmentRoutes(record.sessionId, record.attachmentId, record.extension);
   return {
     sessionId: record.sessionId,
     filePath: record.fileName,
@@ -247,6 +280,84 @@ export interface RegisterExternalAttachmentOptions {
    * runs on the same resolved path it would have produced itself.
    */
   remoteProbes?: readonly [RemoteProbe | null, RemoteProbe | null];
+  /** The provenance to stamp on the created record (default `'external'`). */
+  source?: AttachmentSource;
+  /** Canonical root that must continue to contain this generated artifact. */
+  generatedArtifactBoundary?: string;
+  /** Freshly resolved canonical trusted-upload root; never persisted. */
+  trustedUploadBoundary?: string;
+}
+
+function isPathInsideBoundary(filePath: string, boundary: string): boolean {
+  const pathFromBoundary = relative(boundary, filePath);
+  return (
+    pathFromBoundary === '' ||
+    (pathFromBoundary !== '..' && !pathFromBoundary.startsWith(`..${sep}`) && !isAbsolute(pathFromBoundary))
+  );
+}
+
+function resolveAttachmentBoundary(resolvedPath: string, requestedBoundary: string): string {
+  let boundary: string;
+  try {
+    boundary = realpathSync(requestedBoundary);
+  } catch {
+    throw new AttachmentRegistrationError('Access to this file is blocked', 403);
+  }
+  if (boundary !== requestedBoundary || !isPathInsideBoundary(resolvedPath, boundary)) {
+    throw new AttachmentRegistrationError('Access to this file is blocked', 403);
+  }
+  return boundary;
+}
+
+async function resolveBoundaryReadPath(record: AttachmentRecord, boundary: string, maxBytes: number): Promise<string> {
+  let resolvedPath: string;
+  let resolvedBoundary: string;
+  try {
+    resolvedPath = realpathSync(record.filePath);
+    resolvedBoundary = realpathSync(boundary);
+  } catch {
+    throw new AttachmentRegistrationError('Access to this file is blocked', 403);
+  }
+  if (
+    resolvedPath !== record.filePath ||
+    resolvedBoundary !== boundary ||
+    !isPathInsideBoundary(resolvedPath, resolvedBoundary) ||
+    !isSupportedAttachmentExtension(extname(resolvedPath))
+  ) {
+    throw new AttachmentRegistrationError('Access to this file is blocked', 403);
+  }
+  let stat;
+  try {
+    stat = await fs.stat(resolvedPath);
+  } catch {
+    throw new AttachmentRegistrationError('Access to this file is blocked', 403);
+  }
+  if ((typeof stat.isFile === 'function' && !stat.isFile()) || stat.size > maxBytes) {
+    throw new AttachmentRegistrationError(
+      stat.size > maxBytes ? 'Attachment file is too large' : 'Access to this file is blocked',
+      stat.size > maxBytes ? 413 : 403
+    );
+  }
+  return resolvedPath;
+}
+
+export async function resolveGeneratedArtifactReadPath(record: AttachmentRecord): Promise<string | undefined> {
+  if (record.generatedArtifactBoundary && record.trustedUploadBoundary) {
+    throw new AttachmentRegistrationError('Access to this file is blocked', 403);
+  }
+  if (record.generatedArtifactBoundary) {
+    return resolveBoundaryReadPath(record, record.generatedArtifactBoundary, MAX_GENERATED_ARTIFACT_BYTES);
+  }
+  if (record.trustedUploadBoundary) {
+    return resolveBoundaryReadPath(record, record.trustedUploadBoundary, MAX_PASTE_IMAGE_BYTES);
+  }
+  return undefined;
+}
+
+export function maxServableAttachmentBytes(record: AttachmentRecord): number {
+  if (record.generatedArtifactBoundary) return MAX_GENERATED_ARTIFACT_BYTES;
+  if (record.source === 'upload' || record.trustedUploadBoundary) return MAX_PASTE_IMAGE_BYTES;
+  return MAX_EXTERNAL_ATTACHMENT_BYTES;
 }
 
 /**
@@ -349,12 +460,26 @@ export async function registerExternalAttachment(
   const resolved = await (options.remote
     ? resolveRemoteAttachment(requestedPath, options.remote, options.sessionWorkingDir, options.remoteProbes)
     : resolveLocalAttachment(homeRelative ? join(homedir(), requestedPath.slice(2)) : requestedPath));
+  const resolvedPath = resolved.resolvedPath;
+  const stat = { size: resolved.size, mtimeMs: resolved.mtimeMs };
+
+  const generatedArtifactBoundary = options.generatedArtifactBoundary
+    ? resolveAttachmentBoundary(resolvedPath, options.generatedArtifactBoundary)
+    : undefined;
+  const trustedUploadBoundary = options.trustedUploadBoundary
+    ? resolveAttachmentBoundary(resolvedPath, options.trustedUploadBoundary)
+    : undefined;
+  if (generatedArtifactBoundary && trustedUploadBoundary) {
+    throw new AttachmentRegistrationError('Access to this file is blocked', 403);
+  }
 
   // COD-53: enforce the active attachment-guard policy on the symlink-resolved
   // path before doing anything else.
   const guard = await loadAttachmentGuardConfig();
 
-  if (guard.confineToWorkspace || options.forceWorkspaceConfinement) {
+  // A freshly validated trusted boundary is the sole exception to the global
+  // workspace-confinement toggle. Explicit force-confinement always wins.
+  if ((guard.confineToWorkspace && !trustedUploadBoundary) || options.forceWorkspaceConfinement) {
     // Workspace-confined: the file MUST resolve inside the session's workspace.
     // Applies when the global strict mode is on (opt-in, default OFF) OR when
     // the caller forces it for this registration (the magic-link scanner — see
@@ -385,7 +510,6 @@ export async function registerExternalAttachment(
     throw new AttachmentRegistrationError('Access to this file is blocked', 403);
   }
 
-  const resolvedPath = resolved.resolvedPath;
   const extension = resolved.extension;
   if (!isSupportedAttachmentExtension(extension)) {
     throw new AttachmentRegistrationError('Unsupported attachment type');
@@ -394,11 +518,33 @@ export async function registerExternalAttachment(
   if (!resolved.isFile) {
     throw new AttachmentRegistrationError('Attachment path is not a file');
   }
-
-  const stat = { size: resolved.size, mtimeMs: resolved.mtimeMs };
+  if (generatedArtifactBoundary && stat.size > MAX_GENERATED_ARTIFACT_BYTES) {
+    throw new AttachmentRegistrationError('Attachment file is too large', 413);
+  }
+  if (trustedUploadBoundary && stat.size > MAX_PASTE_IMAGE_BYTES) {
+    throw new AttachmentRegistrationError('Attachment file is too large', 413);
+  }
 
   const existing = attachmentRegistry.findByFilePath(sessionId, resolvedPath);
   if (existing) {
+    if (generatedArtifactBoundary && existing.trustedUploadBoundary) {
+      throw new AttachmentRegistrationError('Access to this file is blocked', 403);
+    }
+    if (generatedArtifactBoundary) {
+      if (existing.generatedArtifactBoundary && existing.generatedArtifactBoundary !== generatedArtifactBoundary) {
+        throw new AttachmentRegistrationError('Access to this file is blocked', 403);
+      }
+      existing.generatedArtifactBoundary = generatedArtifactBoundary;
+    }
+    if (trustedUploadBoundary) {
+      if (existing.generatedArtifactBoundary) {
+        throw new AttachmentRegistrationError('Access to this file is blocked', 403);
+      }
+      if (existing.trustedUploadBoundary && existing.trustedUploadBoundary !== trustedUploadBoundary) {
+        throw new AttachmentRegistrationError('Access to this file is blocked', 403);
+      }
+      existing.trustedUploadBoundary = trustedUploadBoundary;
+    }
     existing.size = stat.size;
     existing.mtimeMs = stat.mtimeMs ?? 0;
     existing.timestamp = Date.now();
@@ -415,7 +561,9 @@ export async function registerExternalAttachment(
     size: stat.size,
     mtimeMs: stat.mtimeMs ?? 0,
     timestamp: Date.now(),
-    source: 'external',
+    source: options.source ?? 'external',
+    ...(generatedArtifactBoundary ? { generatedArtifactBoundary } : {}),
+    ...(trustedUploadBoundary ? { trustedUploadBoundary } : {}),
   };
   attachmentRegistry.register(record);
   return attachmentRecordToEvent(record);

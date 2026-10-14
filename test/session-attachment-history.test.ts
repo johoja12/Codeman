@@ -114,6 +114,56 @@ describe('session attachment history', () => {
     expect(persistedHistory?.[0].externalPath).toBe('/mnt/c/private/board-update.pdf');
   });
 
+  it('persists generated-artifact provenance privately without exposing its boundary', () => {
+    const session = new Session({ workingDir: '/tmp/workspace' });
+    session.upsertAttachmentHistory(
+      buildExternalAttachmentHistoryItem({
+        sessionId: session.id,
+        externalPath: '/tmp/workspace/output/mockup.png',
+        fileName: 'mockup.png',
+        extension: 'png',
+        size: 100,
+        timestamp: 100,
+        generatedArtifactBoundary: '/tmp/workspace',
+      })
+    );
+
+    const persistedHistory = session.getAttachmentHistoryForPersist();
+    expect(persistedHistory?.[0].generatedArtifactBoundary).toBe('/tmp/workspace');
+    expect(JSON.stringify(session.toState().attachmentHistory)).not.toContain('generatedArtifactBoundary');
+    expect(JSON.stringify(session.toState().attachmentHistory)).not.toContain('/tmp/workspace');
+  });
+
+  it('persists only the recognized upload provenance marker', () => {
+    const session = new Session({ workingDir: '/tmp' });
+    const item = buildExternalAttachmentHistoryItem({
+      sessionId: session.id,
+      externalPath: '/tmp/upload.pdf',
+      fileName: 'upload.pdf',
+      extension: 'pdf',
+      size: 10,
+      uploadProvenance: 'codeman-upload',
+    });
+    session.upsertAttachmentHistory(item);
+    expect(session.getAttachmentHistoryForPersist()?.[0].uploadProvenance).toBe('codeman-upload');
+
+    session.upsertAttachmentHistory({ ...item, uploadProvenance: 'forged' } as unknown as SessionAttachmentHistoryItem);
+    expect(session.getAttachmentHistoryForPersist()?.[0].uploadProvenance).toBeUndefined();
+  });
+
+  it('attaches remote mux sessions from a local cwd', () => {
+    expect(
+      resolveMuxAttachCwd('/Users/remote/project', {
+        hostId: 'mac-mini',
+        label: 'Mac Mini',
+        host: '192.168.21.109',
+        username: 'saqebakhter',
+        remotePath: '/Users/remote/project',
+      })
+    ).toBe('/tmp');
+    expect(resolveMuxAttachCwd('/opt/projects/Codeman')).toBe('/opt/projects/Codeman');
+  });
+
   it('round-trips persisted history (incl. externalPath) through constructor restore', () => {
     const a = new Session({ workingDir: '/tmp' });
     a.upsertAttachmentHistory(

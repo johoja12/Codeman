@@ -14,24 +14,31 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCookie from '@fastify/cookie';
 import fastifyMultipart from '@fastify/multipart';
-import { dirname, join } from 'node:path';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { registryFilePath, reloadCliRegistry } from '../../src/config/cli-registry/registry.js';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import fs, { mkdtemp, rm, mkdir, writeFile, readFile, readdir, symlink } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { createMockRouteContext, type MockRouteContext } from '../mocks/index.js';
 import { installRouteErrorHandler } from '../../src/web/route-error-handler.js';
 import { ApiErrorCode, httpStatusForErrorCode } from '../../src/types.js';
 import { Session } from '../../src/session.js';
+import { writeHooksConfig } from '../../src/hooks-config.js';
+import type { TabLayout } from '../../src/tab-layout.js';
+import { dataPath } from '../../src/config/instance.js';
+import { CASES_DIR, resolveCasesDir } from '../../src/web/route-helpers.js';
+import { createUser, invalidateUsersCache } from '../../src/user-store.js';
 
 // Mock execFile so the send-key route's `tmux` invocation is observable (not run for real).
-const { execFile } = vi.hoisted(() => ({ execFile: vi.fn() }));
-// The real converter spawns a worker thread (TS worker file — not loadable
-// under vitest); the conversion pipeline itself is covered by
-// test/heic-jpeg-core.test.ts against the real heic-decode WASM.
+const { execFile, spawn } = vi.hoisted(() => ({ execFile: vi.fn(), spawn: vi.fn() }));
+const remoteImageWrite = vi.hoisted(() => vi.fn(async () => {}));
+vi.mock('../../src/remote-file-transfer.js', async (orig) => ({
+  ...(await orig<typeof import('../../src/remote-file-transfer.js')>()),
+  writeRemoteFileBytes: remoteImageWrite,
+}));
 const heicConvert = vi.hoisted(() => vi.fn(async () => Buffer.from('ffd8ffe000104a4649460001', 'hex')));
 vi.mock('node:child_process', async (orig) => {
   const actual = await orig<typeof import('node:child_process')>();
@@ -46,18 +53,112 @@ vi.mock('../../src/config/buffer-limits.js', async (orig) => ({
 
 // In-memory remote store so remote-case tests can inject hosts/cases without real JSON files.
 const remoteStore = vi.hoisted(() => ({
-  hosts: [] as unknown[],
-  cases: [] as unknown[],
+  hosts: [] as Array<{
+    id: string;
+    label: string;
+    host: string;
+    username: string;
+    commands?: Record<string, string>;
+  }>,
+  cases: [] as Array<{
+    name: string;
+    type: 'remote';
+    hostId: string;
+    remotePath: string;
+    commands?: Record<string, string>;
+    codexCommandProfileId?: string;
+    owner?: string;
+  }>,
   tmuxCheck: { ok: true, tmuxPath: '/usr/bin/tmux' } as { ok: boolean; tmuxPath?: string; error?: string },
 }));
+const dockerStore = vi.hoisted(() => ({
+  hosts: [] as Array<{ id: string; label: string; engine: 'docker'; image: string }>,
+  cases: [] as Array<{
+    name: string;
+    type: 'docker';
+    hostId: string;
+    hostWorkspacePath: string;
+    containerWorkdir?: string;
+  }>,
+}));
+const cliAvailability = vi.hoisted(() => ({
+  opencode: true,
+  codex: true,
+  gemini: true,
+  antigravity: true,
+  pi: true,
+}));
+const cliDiagnostics = vi.hoisted(() => ({
+  opencode: 'OpenCode resolver diagnostic',
+  codex: 'Codex resolver diagnostic',
+  gemini: 'Gemini resolver diagnostic',
+  antigravity: 'Antigravity resolver diagnostic',
+  pi: 'Pi resolver diagnostic',
+}));
+vi.mock('node:child_process', async (orig) => {
+  const actual = await orig<typeof import('node:child_process')>();
+  return { ...actual, execFile, spawn };
+});
+vi.mock('heic-convert', () => ({ default: heicConvert }));
 vi.mock('../../src/remote-hosts.js', async (orig) => {
   const actual = await orig<typeof import('../../src/remote-hosts.js')>();
   return {
     ...actual,
     readRemoteHosts: vi.fn(async () => remoteStore.hosts),
     readRemoteCases: vi.fn(async () => remoteStore.cases),
-    // Stub the remote-tmux prereq probe so quick-start never shells out to ssh.
     checkRemoteTmuxAvailable: vi.fn(async () => remoteStore.tmuxCheck),
+  };
+});
+vi.mock('../../src/docker-hosts.js', async (orig) => {
+  const actual = await orig<typeof import('../../src/docker-hosts.js')>();
+  return {
+    ...actual,
+    readDockerHosts: vi.fn(async () => dockerStore.hosts),
+    readDockerCases: vi.fn(async () => dockerStore.cases),
+  };
+});
+vi.mock('../../src/web/heic-jpeg-converter.js', () => ({ convertHeicToJpeg: heicConvert }));
+vi.mock('../../src/utils/opencode-cli-resolver.js', async (orig) => ({
+  ...(await orig<typeof import('../../src/utils/opencode-cli-resolver.js')>()),
+  isOpenCodeAvailable: vi.fn(() => cliAvailability.opencode),
+  getOpenCodeNotFoundMessage: vi.fn(() => 'OpenCode resolver diagnostic'),
+}));
+vi.mock('../../src/utils/codex-cli-resolver.js', async (orig) => ({
+  ...(await orig<typeof import('../../src/utils/codex-cli-resolver.js')>()),
+  isCodexAvailable: vi.fn(() => cliAvailability.codex),
+  getCodexNotFoundMessage: vi.fn(() => 'Codex resolver diagnostic'),
+}));
+vi.mock('../../src/utils/gemini-cli-resolver.js', async (orig) => ({
+  ...(await orig<typeof import('../../src/utils/gemini-cli-resolver.js')>()),
+  isGeminiAvailable: vi.fn(() => cliAvailability.gemini),
+  getGeminiNotFoundMessage: vi.fn(() => 'Gemini resolver diagnostic'),
+}));
+vi.mock('../../src/utils/antigravity-cli-resolver.js', async (orig) => ({
+  ...(await orig<typeof import('../../src/utils/antigravity-cli-resolver.js')>()),
+  isAntigravityAvailable: vi.fn(() => cliAvailability.antigravity),
+  getAntigravityNotFoundMessage: vi.fn(() => 'Antigravity resolver diagnostic'),
+}));
+vi.mock('../../src/utils/pi-cli-resolver.js', async (orig) => ({
+  ...(await orig<typeof import('../../src/utils/pi-cli-resolver.js')>()),
+  isPiAvailable: vi.fn(() => cliAvailability.pi),
+  getPiNotFoundMessage: vi.fn(() => 'Pi resolver diagnostic'),
+}));
+
+// The CLI registry moved the not-found seam: the create/quick-start pre-flights now go
+// through resolveCliLaunchError -> resolveCliBinDir / missingCliMessage instead of each
+// CLI's own isXAvailable/getXNotFoundMessage. Mocking HERE is what keeps the pre-flight
+// tests meaningful and, importantly, environment-independent — reading the real resolver
+// would make them pass or fail depending on which CLIs happen to be installed on the box.
+vi.mock('../../src/utils/cli-resolver.js', async (orig) => {
+  const actual = await orig<typeof import('../../src/utils/cli-resolver.js')>();
+  return {
+    ...actual,
+    resolveCliBinDir: vi.fn((id: string) =>
+      id in cliAvailability && !cliAvailability[id as keyof typeof cliAvailability] ? null : actual.resolveCliBinDir(id)
+    ),
+    missingCliMessage: vi.fn((id: string) =>
+      id in cliDiagnostics ? cliDiagnostics[id as keyof typeof cliDiagnostics] : actual.missingCliMessage(id)
+    ),
   };
 });
 
@@ -88,6 +189,12 @@ import { registerSessionRoutes, _resetPasteRateBuckets } from '../../src/web/rou
 import { RemoteWakeRegistry, REMOTE_WAKE_REQUEST_READY_TIMEOUT_MS } from '../../src/remote-wake.js';
 import { resolveTerminalHistoryConfig } from '../../src/config/terminal-history.js';
 import { describeUnknownPath, probePathKind } from '../../src/utils/bounded-path-probe.js';
+import { checkRemoteTmuxAvailable as checkRemoteTmuxProbe } from '../../src/remote-hosts.js';
+import { isOpenCodeAvailable } from '../../src/utils/opencode-cli-resolver.js';
+import { isCodexAvailable } from '../../src/utils/codex-cli-resolver.js';
+import { isGeminiAvailable } from '../../src/utils/gemini-cli-resolver.js';
+import { isAntigravityAvailable } from '../../src/utils/antigravity-cli-resolver.js';
+import { isPiAvailable } from '../../src/utils/pi-cli-resolver.js';
 
 interface LocalHarness {
   app: FastifyInstance;
@@ -110,13 +217,26 @@ let wakeRegistry: RemoteWakeRegistry;
  * envelopes get the conventional HTTP status from their errorCode.
  */
 async function createEnvelopeHarness(
-  registerFn: (app: FastifyInstance, ctx: MockRouteContext) => void
+  registerFn: (app: FastifyInstance, ctx: MockRouteContext) => void,
+  authUser?: { username: string; role: 'admin' | 'user' }
 ): Promise<LocalHarness> {
   const app = Fastify({ logger: false });
   await app.register(fastifyCookie);
   await app.register(fastifyMultipart, {
-    limits: { fileSize: 10 * 1024 * 1024, files: 1, fields: 4, parts: 5 },
+    limits: {
+      fileSize: 10 * 1024 * 1024,
+      files: 1,
+      fields: 4,
+      parts: 5,
+    },
   });
+
+  if (authUser) {
+    app.addHook('onRequest', (req, _reply, done) => {
+      req.authUser = authUser;
+      done();
+    });
+  }
 
   const ctx = createMockRouteContext();
   registerFn(app, ctx);
@@ -148,6 +268,31 @@ async function createEnvelopeHarness(
 describe('session-routes', () => {
   let harness: LocalHarness;
 
+  const useRegularUserHarness = async (username: string, canBypassPermissions = false) => {
+    const previousMultiuser = process.env.CODEMAN_MULTIUSER;
+    const previousUserSpacesDir = process.env.CODEMAN_USER_SPACES_DIR;
+    const userSpacesDir = await mkdtemp(join(tmpdir(), 'codeman-user-spaces-'));
+    process.env.CODEMAN_MULTIUSER = '1';
+    process.env.CODEMAN_USER_SPACES_DIR = userSpacesDir;
+    await createUser({
+      username,
+      role: 'user',
+      password: 'regularpass123',
+      canBypassPermissions,
+    });
+    invalidateUsersCache();
+    await harness.app.close();
+    harness = await createEnvelopeHarness(registerSessionRoutes, { username, role: 'user' });
+    return async () => {
+      if (previousMultiuser === undefined) delete process.env.CODEMAN_MULTIUSER;
+      else process.env.CODEMAN_MULTIUSER = previousMultiuser;
+      if (previousUserSpacesDir === undefined) delete process.env.CODEMAN_USER_SPACES_DIR;
+      else process.env.CODEMAN_USER_SPACES_DIR = previousUserSpacesDir;
+      invalidateUsersCache();
+      await rm(userSpacesDir, { recursive: true, force: true });
+    };
+  };
+
   beforeEach(async () => {
     wakeProbe.mockReset().mockResolvedValue(true);
     wakeCommandRun.mockReset().mockResolvedValue(true);
@@ -163,16 +308,793 @@ describe('session-routes', () => {
     // Reset remote store so tests start with empty hosts/cases and a passing tmux probe
     remoteStore.hosts = [];
     remoteStore.cases = [];
+    dockerStore.hosts = [];
+    dockerStore.cases = [];
     remoteStore.tmuxCheck = { ok: true, tmuxPath: '/usr/bin/tmux' };
+    Object.assign(cliAvailability, {
+      opencode: true,
+      codex: true,
+      gemini: true,
+      antigravity: true,
+      pi: true,
+    });
   });
 
   afterEach(async () => {
     await harness.app.close();
   });
 
+  const authoritativeTabLayout: TabLayout = {
+    version: 7,
+    groups: [{ id: 'work', name: 'Work', refs: [{ kind: 'session', id: 'created-session' }] }],
+    ungrouped: [],
+    updatedAt: '2026-08-18T12:00:00.000Z',
+  };
+  const authoritativeTabPlacements = [
+    { kind: 'session' as const, id: 'created-session', state: 'manual' as const, parentId: 'parent', canFollow: true },
+  ];
+
+  describe('session creation tab placement', () => {
+    it('returns the authoritative layout for a targeted session creation', async () => {
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', commands: {} }];
+      remoteStore.cases = [{ name: 'nzbdav', type: 'remote', hostId: 'gpu-box', remotePath: '/srv/nzbdav' }];
+      harness.ctx.addSession.mockResolvedValueOnce({
+        layout: authoritativeTabLayout,
+        placements: authoritativeTabPlacements,
+      });
+
+      const response = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { caseName: 'nzbdav', mode: 'shell', tabGroupId: 'work' },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session), {
+        caseName: 'nzbdav',
+        tabGroupId: 'work',
+      });
+      expect(JSON.parse(response.body).data.tabLayout).toEqual(authoritativeTabLayout);
+      expect(JSON.parse(response.body).data.tabPlacements).toEqual(authoritativeTabPlacements);
+    });
+
+    it('returns the authoritative layout when the case default placed a standard session', async () => {
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', commands: {} }];
+      remoteStore.cases = [{ name: 'nzbdav', type: 'remote', hostId: 'gpu-box', remotePath: '/srv/nzbdav' }];
+      harness.ctx.addSession.mockResolvedValueOnce({
+        layout: authoritativeTabLayout,
+        placements: authoritativeTabPlacements,
+        placementSource: 'case-default',
+      });
+
+      const response = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { caseName: 'nzbdav', mode: 'shell' },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session), { caseName: 'nzbdav' });
+      expect(JSON.parse(response.body).data.tabLayout).toEqual(authoritativeTabLayout);
+      expect(JSON.parse(response.body).data.tabPlacements).toEqual(authoritativeTabPlacements);
+    });
+
+    it.each([
+      ['claude', false],
+      ['shell', true],
+    ] as const)(
+      'preserves the regular-user local %s UI case path and applies the case default',
+      async (mode, canBypassPermissions) => {
+        const username = mode === 'shell' ? 'uishell' : 'uiclaude';
+        const cleanup = await useRegularUserHarness(username, canBypassPermissions);
+        const caseName = `ui-${mode}-case`;
+        const workingDir = join(resolveCasesDir({ username, role: 'user' }), caseName);
+        await mkdir(workingDir, { recursive: true });
+        harness.ctx.addSession.mockResolvedValueOnce({
+          layout: authoritativeTabLayout,
+          placements: authoritativeTabPlacements,
+          placementSource: 'case-default',
+        });
+        try {
+          const response = await harness.app.inject({
+            method: 'POST',
+            url: '/api/sessions',
+            payload: {
+              caseName,
+              workingDir,
+              mode,
+              name: `w1-${caseName}`,
+            },
+          });
+
+          expect(response.statusCode).toBe(200);
+          const created = harness.ctx.addSession.mock.calls.at(-1)?.[0] as Session;
+          expect(created.workingDir).toBe(workingDir);
+          expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session), { caseName });
+          expect(JSON.parse(response.body).data.tabLayout).toEqual(authoritativeTabLayout);
+          expect(JSON.parse(response.body).data.tabPlacements).toEqual(authoritativeTabPlacements);
+        } finally {
+          await cleanup();
+        }
+      }
+    );
+
+    it('resolves a regular-user managed caseName-only launch inside the user case root', async () => {
+      const username = 'nameonlyuser';
+      const cleanup = await useRegularUserHarness(username);
+      const caseName = 'name-only-case';
+      const workingDir = join(resolveCasesDir({ username, role: 'user' }), caseName);
+      await mkdir(workingDir, { recursive: true });
+      harness.ctx.addSession.mockResolvedValueOnce({
+        layout: authoritativeTabLayout,
+        placements: authoritativeTabPlacements,
+        placementSource: 'case-default',
+      });
+      try {
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/sessions',
+          payload: { caseName, mode: 'claude', name: `w1-${caseName}` },
+        });
+
+        expect(response.statusCode).toBe(200);
+        const created = harness.ctx.addSession.mock.calls.at(-1)?.[0] as Session;
+        expect(created.workingDir).toBe(workingDir);
+        expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session), { caseName });
+        expect(JSON.parse(response.body).data.tabLayout).toEqual(authoritativeTabLayout);
+        expect(JSON.parse(response.body).data.tabPlacements).toEqual(authoritativeTabPlacements);
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('does not let another owner remote case shadow a regular-user local UI launch', async () => {
+      const username = 'alicecollision';
+      const cleanup = await useRegularUserHarness(username);
+      const caseName = 'shared-name';
+      const workingDir = join(resolveCasesDir({ username, role: 'user' }), caseName);
+      await mkdir(workingDir, { recursive: true });
+      remoteStore.hosts = [{ id: 'bob-host', label: 'Bob host', host: '10.0.0.52', username: 'bob' }];
+      remoteStore.cases = [
+        {
+          name: caseName,
+          type: 'remote',
+          hostId: 'bob-host',
+          remotePath: '/srv/bob/shared-name',
+          owner: 'bob',
+        },
+      ];
+      harness.ctx.addSession.mockResolvedValueOnce({
+        layout: authoritativeTabLayout,
+        placements: authoritativeTabPlacements,
+        placementSource: 'case-default',
+      });
+      try {
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/sessions',
+          payload: { caseName, workingDir, mode: 'claude', name: `w1-${caseName}` },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(checkRemoteTmuxProbe).not.toHaveBeenCalled();
+        const created = harness.ctx.addSession.mock.calls.at(-1)?.[0] as Session;
+        expect(created.workingDir).toBe(workingDir);
+        expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session), { caseName });
+        expect(JSON.parse(response.body).data.tabLayout).toEqual(authoritativeTabLayout);
+        expect(JSON.parse(response.body).data.tabPlacements).toEqual(authoritativeTabPlacements);
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('keeps an ownerless legacy remote case accessible in single-user mode', async () => {
+      remoteStore.hosts = [{ id: 'legacy-host', label: 'Legacy host', host: '10.0.0.53', username: 'legacy' }];
+      remoteStore.cases = [
+        {
+          name: 'legacy-remote',
+          type: 'remote',
+          hostId: 'legacy-host',
+          remotePath: '/srv/legacy/work',
+        },
+      ];
+
+      const response = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { caseName: 'legacy-remote', mode: 'claude' },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(checkRemoteTmuxProbe).toHaveBeenCalledOnce();
+      const created = harness.ctx.addSession.mock.calls.at(-1)?.[0] as Session;
+      expect(created.workingDir).toBe('/srv/legacy/work');
+      expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session), { caseName: 'legacy-remote' });
+    });
+
+    it.each([
+      {
+        selection: 'profile',
+        remoteCase: { codexCommandProfileId: 'personal-codex' },
+        profiles: [{ id: 'personal-codex', name: 'Personal', command: 'exec codex --profile personal' }],
+        expected: 'exec codex --profile personal',
+      },
+      {
+        selection: 'custom',
+        remoteCase: { commands: { codex: 'exec codex --model o3' } },
+        profiles: [],
+        expected: 'exec codex --model o3',
+      },
+      { selection: 'default', remoteCase: {}, profiles: [], expected: 'exec codex --host-default' },
+    ])(
+      'uses the $selection Codex command selection before creating a remote session',
+      async ({ remoteCase, profiles, expected }) => {
+        remoteStore.hosts = [
+          {
+            id: 'gpu-box',
+            label: 'GPU Box',
+            host: '10.0.0.42',
+            username: 'ubuntu',
+            commands: { codex: 'exec codex --host-default' },
+          },
+        ];
+        remoteStore.cases = [
+          { name: 'codex-work', type: 'remote', hostId: 'gpu-box', remotePath: '/srv/codex', ...remoteCase },
+        ];
+        harness.ctx.store.getCodexCommandProfiles.mockReturnValue(profiles);
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/sessions',
+          payload: { caseName: 'codex-work', mode: 'codex' },
+        });
+        expect(response.statusCode).toBe(200);
+        const created = harness.ctx.addSession.mock.calls.at(-1)?.[0] as Session;
+        expect(created.remote?.commands?.codex).toBe(expected);
+      }
+    );
+
+    it('fails a missing selected profile before the remote tmux probe or Session construction', async () => {
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu' }];
+      remoteStore.cases = [
+        {
+          name: 'missing-profile',
+          type: 'remote',
+          hostId: 'gpu-box',
+          remotePath: '/srv/codex',
+          codexCommandProfileId: 'deleted-profile',
+        },
+      ];
+      const response = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { caseName: 'missing-profile', mode: 'codex' },
+      });
+      expect(response.statusCode).toBe(httpStatusForErrorCode(ApiErrorCode.OPERATION_FAILED));
+      expect(JSON.parse(response.body)).toMatchObject({
+        errorCode: ApiErrorCode.OPERATION_FAILED,
+        error: 'Saved Codex command profile is unavailable',
+      });
+      expect(checkRemoteTmuxProbe).not.toHaveBeenCalled();
+      expect(harness.ctx.addSession).not.toHaveBeenCalled();
+    });
+
+    it('fails Quick Start for a missing selected profile before the remote tmux probe or Session construction', async () => {
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu' }];
+      remoteStore.cases = [
+        {
+          name: 'quick-missing-profile',
+          type: 'remote',
+          hostId: 'gpu-box',
+          remotePath: '/srv/codex',
+          codexCommandProfileId: 'deleted-profile',
+        },
+      ];
+
+      const response = await harness.app.inject({
+        method: 'POST',
+        url: '/api/quick-start',
+        payload: { caseName: 'quick-missing-profile', mode: 'codex' },
+      });
+
+      expect(response.statusCode).toBe(httpStatusForErrorCode(ApiErrorCode.OPERATION_FAILED));
+      expect(JSON.parse(response.body)).toMatchObject({
+        errorCode: ApiErrorCode.OPERATION_FAILED,
+        error: 'Saved Codex command profile is unavailable',
+      });
+      expect(checkRemoteTmuxProbe).not.toHaveBeenCalled();
+      expect(harness.ctx.addSession).not.toHaveBeenCalled();
+    });
+
+    it('uses a saved local Codex command as the complete launch command', async () => {
+      const caseName = 'local-codex-command';
+      const workingDir = join(CASES_DIR, caseName);
+      await mkdir(workingDir, { recursive: true });
+      harness.ctx.store.getCaseCodexCommandSelection.mockReturnValue({
+        kind: 'custom',
+        command: 'codex --local-exact',
+      });
+      cliAvailability.codex = false;
+
+      try {
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/sessions',
+          payload: { caseName, mode: 'codex' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        const created = harness.ctx.addSession.mock.calls.at(-1)?.[0] as Session;
+        expect(created.codexConfig?.baseCommand).toBe('codex --local-exact');
+        expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session), { caseName });
+      } finally {
+        await rm(workingDir, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      {
+        selection: { kind: 'profile' as const, profileId: 'cisco' },
+        profiles: [{ id: 'cisco', name: 'Cisco', command: 'exec codx cisco' }],
+      },
+      {
+        selection: { kind: 'custom' as const, command: 'exec codx personal' },
+        profiles: [],
+      },
+    ])('uses the selected local Codex command in Quick Start ($selection.kind)', async ({ selection, profiles }) => {
+      const caseName = 'quick-local-codex-command';
+      const workingDir = join(CASES_DIR, caseName);
+      await mkdir(workingDir, { recursive: true });
+      harness.ctx.store.getCaseCodexCommandSelection.mockReturnValue(selection);
+      harness.ctx.store.getCodexCommandProfiles.mockReturnValue(profiles);
+      cliAvailability.codex = false;
+      const startInteractive = vi.spyOn(Session.prototype, 'startInteractive').mockResolvedValue(undefined);
+
+      try {
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/quick-start',
+          payload: { caseName, mode: 'codex' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        const sessionId = JSON.parse(response.body).data.sessionId as string;
+        expect(harness.ctx.sessions.get(sessionId)?.codexConfig?.baseCommand).toBe(
+          selection.kind === 'profile' ? profiles[0].command : selection.command
+        );
+        expect(harness.ctx.store.getCaseCodexCommandSelection).toHaveBeenCalledWith('@single', caseName);
+      } finally {
+        startInteractive.mockRestore();
+        await rm(workingDir, { recursive: true, force: true });
+      }
+    });
+
+    it('fails Quick Start before creating a local session when its selected profile is missing', async () => {
+      const caseName = 'quick-local-codex-missing';
+      harness.ctx.store.getCaseCodexCommandSelection.mockReturnValue({ kind: 'profile', profileId: 'deleted' });
+      harness.ctx.store.getCodexCommandProfiles.mockReturnValue([]);
+
+      const response = await harness.app.inject({
+        method: 'POST',
+        url: '/api/quick-start',
+        payload: { caseName, mode: 'codex' },
+      });
+
+      expect(response.statusCode).toBe(httpStatusForErrorCode(ApiErrorCode.OPERATION_FAILED));
+      expect(JSON.parse(response.body)).toMatchObject({
+        errorCode: ApiErrorCode.OPERATION_FAILED,
+        error: 'Saved Codex command profile is unavailable',
+      });
+      expect(harness.ctx.addSession).not.toHaveBeenCalled();
+    });
+
+    it('denies Quick Start for a non-granted local Codex command', async () => {
+      const username = 'quicklocalcodexuser';
+      const cleanup = await useRegularUserHarness(username, false);
+      const caseName = 'quick-local-codex-denied';
+      harness.ctx.store.getCaseCodexCommandSelection.mockReturnValue({
+        kind: 'custom',
+        command: 'exec codx cisco',
+      });
+
+      try {
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/quick-start',
+          payload: { caseName, mode: 'codex' },
+        });
+
+        expect(response.statusCode).toBe(httpStatusForErrorCode(ApiErrorCode.FORBIDDEN));
+        expect(harness.ctx.addSession).not.toHaveBeenCalled();
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('fails a missing local Codex profile before Session construction', async () => {
+      const caseName = 'local-codex-missing';
+      const workingDir = join(CASES_DIR, caseName);
+      await mkdir(workingDir, { recursive: true });
+      harness.ctx.store.getCaseCodexCommandSelection.mockReturnValue({
+        kind: 'profile',
+        profileId: 'deleted-profile',
+      });
+      harness.ctx.store.getCodexCommandProfiles.mockReturnValue([]);
+
+      try {
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/sessions',
+          payload: { caseName, mode: 'codex' },
+        });
+
+        expect(response.statusCode).toBe(httpStatusForErrorCode(ApiErrorCode.OPERATION_FAILED));
+        expect(JSON.parse(response.body)).toMatchObject({
+          errorCode: ApiErrorCode.OPERATION_FAILED,
+          error: 'Saved Codex command profile is unavailable',
+        });
+        expect(harness.ctx.addSession).not.toHaveBeenCalled();
+      } finally {
+        await rm(workingDir, { recursive: true, force: true });
+      }
+    });
+
+    it('denies a non-granted multi-user local Codex command at launch', async () => {
+      const username = 'localcodexuser';
+      const cleanup = await useRegularUserHarness(username, false);
+      const caseName = 'local-codex-denied';
+      const workingDir = join(resolveCasesDir({ username, role: 'user' }), caseName);
+      await mkdir(workingDir, { recursive: true });
+      harness.ctx.store.getCaseCodexCommandSelection.mockReturnValue({
+        kind: 'custom',
+        command: 'codex --local-exact',
+      });
+
+      try {
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/sessions',
+          payload: { caseName, mode: 'codex' },
+        });
+
+        expect(response.statusCode).toBe(httpStatusForErrorCode(ApiErrorCode.FORBIDDEN));
+        expect(harness.ctx.addSession).not.toHaveBeenCalled();
+      } finally {
+        await rm(workingDir, { recursive: true, force: true });
+        await cleanup();
+      }
+    });
+
+    it('launches a Bob-owned selected profile when an admin creates a remote session', async () => {
+      vi.stubEnv('CODEMAN_MULTIUSER', '1');
+      await harness.app.close();
+      harness = await createEnvelopeHarness(registerSessionRoutes, { username: 'root', role: 'admin' });
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu' }];
+      remoteStore.cases = [
+        {
+          name: 'bob-profile-session',
+          type: 'remote',
+          owner: 'bob',
+          hostId: 'gpu-box',
+          remotePath: '/srv/bob',
+          codexCommandProfileId: 'bob-profile',
+        },
+      ];
+      harness.ctx.store.getCodexCommandProfiles.mockImplementation((owner: string) =>
+        owner === 'bob' ? [{ id: 'bob-profile', name: 'Bob', command: 'exec codex --profile bob' }] : []
+      );
+
+      try {
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/sessions',
+          payload: { caseName: 'bob-profile-session', mode: 'codex' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        const created = harness.ctx.addSession.mock.calls.at(-1)?.[0] as Session;
+        expect(created.remote?.commands?.codex).toBe('exec codex --profile bob');
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it('launches a Bob-owned selected profile when an admin uses Quick Start', async () => {
+      vi.stubEnv('CODEMAN_MULTIUSER', '1');
+      await harness.app.close();
+      harness = await createEnvelopeHarness(registerSessionRoutes, { username: 'root', role: 'admin' });
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu' }];
+      remoteStore.cases = [
+        {
+          name: 'bob-profile-quick',
+          type: 'remote',
+          owner: 'bob',
+          hostId: 'gpu-box',
+          remotePath: '/srv/bob',
+          codexCommandProfileId: 'bob-profile',
+        },
+      ];
+      harness.ctx.store.getCodexCommandProfiles.mockImplementation((owner: string) =>
+        owner === 'bob' ? [{ id: 'bob-profile', name: 'Bob', command: 'exec codex --profile bob' }] : []
+      );
+      const startInteractive = vi.spyOn(Session.prototype, 'startInteractive').mockResolvedValue(undefined);
+
+      try {
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/quick-start',
+          payload: { caseName: 'bob-profile-quick', mode: 'codex' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        const created = [...harness.ctx.sessions.values()].find((session) => session.remote?.remotePath === '/srv/bob');
+        expect(created?.remote?.commands?.codex).toBe('exec codex --profile bob');
+      } finally {
+        startInteractive.mockRestore();
+        vi.unstubAllEnvs();
+      }
+    });
+
+    it('still resolves a regular users own remote case', async () => {
+      const username = 'aliceownedremote';
+      const cleanup = await useRegularUserHarness(username);
+      const remotePath = join(resolveCasesDir({ username, role: 'user' }), 'remote-compatible-path');
+      remoteStore.hosts = [{ id: 'alice-host', label: 'Alice host', host: '10.0.0.54', username: 'alice' }];
+      remoteStore.cases = [
+        {
+          name: 'alice-remote',
+          type: 'remote',
+          hostId: 'alice-host',
+          remotePath,
+          owner: username,
+        },
+      ];
+      try {
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/sessions',
+          payload: { caseName: 'alice-remote', mode: 'claude' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(checkRemoteTmuxProbe).toHaveBeenCalledOnce();
+        const created = harness.ctx.addSession.mock.calls.at(-1)?.[0] as Session;
+        expect(created.workingDir).toBe(remotePath);
+        expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session), { caseName: 'alice-remote' });
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('infers a managed local case from an exact workingDir-only creation', async () => {
+      const caseName = 'working-dir-managed';
+      const workingDir = join(CASES_DIR, caseName);
+      await mkdir(workingDir, { recursive: true });
+      harness.ctx.addSession.mockResolvedValueOnce({
+        layout: authoritativeTabLayout,
+        placements: authoritativeTabPlacements,
+        placementSource: 'case-default',
+      });
+
+      const response = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { workingDir, mode: 'shell' },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session), { caseName });
+      expect(JSON.parse(response.body).data.tabLayout).toEqual(authoritativeTabLayout);
+      expect(JSON.parse(response.body).data.tabPlacements).toEqual(authoritativeTabPlacements);
+    });
+
+    it('infers an owner-accessible linked local case from an exact workingDir-only creation', async () => {
+      const caseName = 'working-dir-linked';
+      const linkedDir = await mkdtemp(join(tmpdir(), 'codeman-linked-case-'));
+      const linkedCasesFile = dataPath('linked-cases.json');
+      await mkdir(dirname(linkedCasesFile), { recursive: true });
+      await writeFile(linkedCasesFile, JSON.stringify({ [caseName]: linkedDir }));
+      harness.ctx.addSession.mockResolvedValueOnce({
+        layout: authoritativeTabLayout,
+        placements: authoritativeTabPlacements,
+        placementSource: 'case-default',
+      });
+      try {
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/sessions',
+          payload: { workingDir: linkedDir, mode: 'shell' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session), { caseName });
+        expect(JSON.parse(response.body).data.tabLayout).toEqual(authoritativeTabLayout);
+        expect(JSON.parse(response.body).data.tabPlacements).toEqual(authoritativeTabPlacements);
+      } finally {
+        await rm(linkedCasesFile, { force: true });
+        await rm(linkedDir, { recursive: true, force: true });
+      }
+    });
+
+    it('does not infer a case from an arbitrary repository with the same basename', async () => {
+      const caseName = 'basename-only';
+      await mkdir(join(CASES_DIR, caseName), { recursive: true });
+      const arbitraryParent = await mkdtemp(join(tmpdir(), 'codeman-arbitrary-repo-'));
+      const arbitraryRepo = join(arbitraryParent, caseName);
+      await mkdir(arbitraryRepo);
+      try {
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/sessions',
+          payload: { workingDir: arbitraryRepo, mode: 'shell' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session));
+        expect(harness.ctx.addSession.mock.calls.at(-1)).toHaveLength(1);
+        expect(JSON.parse(response.body).data).not.toHaveProperty('tabLayout');
+      } finally {
+        await rm(arbitraryParent, { recursive: true, force: true });
+      }
+    });
+
+    it('does not infer a case from a child directory beneath a managed case', async () => {
+      const childDir = join(CASES_DIR, 'managed-parent', 'child');
+      await mkdir(childDir, { recursive: true });
+
+      const response = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { workingDir: childDir, mode: 'shell' },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session));
+      expect(harness.ctx.addSession.mock.calls.at(-1)).toHaveLength(1);
+      expect(JSON.parse(response.body).data).not.toHaveProperty('tabLayout');
+    });
+
+    it('does not infer a local case from a registered Docker workspace path', async () => {
+      const dockerWorkspace = join(CASES_DIR, 'docker-workspace');
+      await mkdir(dockerWorkspace, { recursive: true });
+      dockerStore.cases = [
+        { name: 'docker-workspace', type: 'docker', hostId: 'docker-local', hostWorkspacePath: dockerWorkspace },
+      ];
+
+      const response = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { workingDir: dockerWorkspace, mode: 'shell' },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session));
+      expect(harness.ctx.addSession.mock.calls.at(-1)).toHaveLength(1);
+      expect(JSON.parse(response.body).data).not.toHaveProperty('tabLayout');
+    });
+
+    it('keeps an ordinary session creation response and addSession call unchanged', async () => {
+      const response = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { mode: 'shell' },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session));
+      expect(harness.ctx.addSession.mock.calls.at(-1)).toHaveLength(1);
+      expect(JSON.parse(response.body).data).not.toHaveProperty('tabLayout');
+      expect(JSON.parse(response.body).data).not.toHaveProperty('tabPlacements');
+    });
+
+    it.each([
+      ['/api/sessions', ''],
+      ['/api/sessions', 'x'.repeat(101)],
+      ['/api/quick-start', ''],
+      ['/api/quick-start', 'x'.repeat(101)],
+    ])('rejects invalid tabGroupId for %s', async (url, tabGroupId) => {
+      const response = await harness.app.inject({
+        method: 'POST',
+        url,
+        payload: { mode: 'shell', tabGroupId },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(JSON.parse(response.body).success).toBe(false);
+      expect(harness.ctx.addSession).not.toHaveBeenCalled();
+    });
+
+    it('returns the authoritative layout for a targeted quick-start', async () => {
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', commands: {} }];
+      remoteStore.cases = [{ name: 'nzbdav', type: 'remote', hostId: 'gpu-box', remotePath: '/srv/nzbdav' }];
+      const startShell = vi.spyOn(Session.prototype, 'startShell').mockResolvedValue(undefined);
+      harness.ctx.addSession.mockResolvedValueOnce({
+        layout: authoritativeTabLayout,
+        placements: authoritativeTabPlacements,
+      });
+      try {
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/quick-start',
+          payload: { caseName: 'nzbdav', mode: 'shell', tabGroupId: 'work' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session), {
+          caseName: 'nzbdav',
+          tabGroupId: 'work',
+        });
+        expect(JSON.parse(response.body).data.tabLayout).toEqual(authoritativeTabLayout);
+        expect(JSON.parse(response.body).data.tabPlacements).toEqual(authoritativeTabPlacements);
+      } finally {
+        startShell.mockRestore();
+      }
+    });
+
+    it('returns the authoritative layout when the case default placed a quick-start session', async () => {
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', commands: {} }];
+      remoteStore.cases = [{ name: 'nzbdav', type: 'remote', hostId: 'gpu-box', remotePath: '/srv/nzbdav' }];
+      const startShell = vi.spyOn(Session.prototype, 'startShell').mockResolvedValue(undefined);
+      harness.ctx.addSession.mockResolvedValueOnce({
+        layout: authoritativeTabLayout,
+        placements: authoritativeTabPlacements,
+        placementSource: 'case-default',
+      });
+      try {
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/quick-start',
+          payload: { caseName: 'nzbdav', mode: 'shell' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session), { caseName: 'nzbdav' });
+        expect(JSON.parse(response.body).data.tabLayout).toEqual(authoritativeTabLayout);
+        expect(JSON.parse(response.body).data.tabPlacements).toEqual(authoritativeTabPlacements);
+      } finally {
+        startShell.mockRestore();
+      }
+    });
+
+    it('keeps an ordinary quick-start response and addSession call unchanged', async () => {
+      const startShell = vi.spyOn(Session.prototype, 'startShell').mockResolvedValue(undefined);
+      try {
+        const response = await harness.app.inject({
+          method: 'POST',
+          url: '/api/quick-start',
+          payload: { mode: 'shell' },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.any(Session), { caseName: 'testcase' });
+        expect(JSON.parse(response.body).data).not.toHaveProperty('tabLayout');
+        expect(JSON.parse(response.body).data).not.toHaveProperty('tabPlacements');
+      } finally {
+        startShell.mockRestore();
+      }
+    });
+  });
+
   // ========== POST /api/sessions/:id/send-key ==========
 
   describe('POST /api/sessions/:id/send-key', () => {
+    it('rejects both input routes before sending keys while assistant handoff owns the session', async () => {
+      harness.ctx._session.assistantInputLocked = true;
+      execFile.mockClear();
+      const key = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions/test-session-1/send-key',
+        payload: { key: 'S-Enter' },
+      });
+      const input = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions/test-session-1/input',
+        payload: { input: 'must not send\r' },
+      });
+      expect(key.statusCode).toBe(409);
+      expect(input.statusCode).toBe(409);
+      expect(execFile).not.toHaveBeenCalled();
+      expect(harness.ctx._session.writeBuffer).toEqual([]);
+    });
     it('routes tmux send-keys through the dedicated Codeman socket (-L)', async () => {
       // Regression guard: bare `tmux` would hit the user's default server and never
       // find a session that lives only on the Codeman socket (#80 regression class).
@@ -276,6 +1198,96 @@ describe('session-routes', () => {
     });
   });
 
+  describe('GET /api/sessions/:id/last-response', () => {
+    it('returns the parsed last COD response from canonical terminal history', async () => {
+      harness.ctx._session.mode = 'codex';
+      harness.ctx._session.terminalBuffer = 'stale local byte history';
+      (harness.ctx.mux as { captureActivePaneBuffer?: unknown }).captureActivePaneBuffer = vi.fn(() =>
+        `
+╭──────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.143.0)                           │
+╰──────────────────────────────────────────────────────╯
+
+› say again
+
+Final polished answer
+With two lines
+
+› Improve documentation in @filename
+
+gpt-5.4 medium · kb · main · Ready · Context 92% left
+`.trim()
+      );
+
+      const res = await harness.app.inject({
+        method: 'GET',
+        url: '/api/sessions/test-session-1/last-response',
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.data.text).toBe('Final polished answer\nWith two lines');
+      expect(body.data.hasContext).toBe(true);
+      expect(harness.ctx.mux.captureActivePaneBuffer).toHaveBeenCalledWith(
+        harness.ctx._session.muxName,
+        expect.objectContaining({
+          fullHistory: true,
+        })
+      );
+    });
+
+    it('returns labeled COD transcript blocks for full context', async () => {
+      harness.ctx._session.mode = 'codex';
+      harness.ctx._session.terminalBuffer = '';
+      (harness.ctx.mux as { captureActivePaneBuffer?: unknown }).captureActivePaneBuffer = vi.fn(() =>
+        `
+› i need to create a naming recommendation for project helix
+
+gpt-5.4 medium · kb · main · Ready · Context 100% left
+
+• Explored
+  └ Read SKILL.md
+
+Subject: Naming Recommendation for Project Helix
+
+The product helps customers move virtual machine workloads between hypervisors while keeping operations
+stable. It improves visibility into application dependencies and reduces
+the risk
+and effort involved in moving workloads.
+`.trim()
+      );
+
+      const res = await harness.app.inject({
+        method: 'GET',
+        url: '/api/sessions/test-session-1/last-response?context=full',
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.data.messages).toEqual([
+        {
+          kind: 'prompt',
+          label: 'Prompt',
+          role: 'user',
+          text: 'i need to create a naming recommendation for project helix',
+        },
+        {
+          kind: 'status',
+          label: 'Status',
+          role: 'assistant',
+          text: 'gpt-5.4 medium · kb · main · Ready · Context 100% left',
+        },
+        { kind: 'tool', label: 'Tool', role: 'assistant', text: '• Explored\n  └ Read SKILL.md' },
+        {
+          kind: 'response',
+          label: 'Response',
+          role: 'assistant',
+          text: 'Subject: Naming Recommendation for Project Helix\n\nThe product helps customers move virtual machine workloads between hypervisors while keeping operations stable. It improves visibility into application dependencies and reduces the risk and effort involved in moving workloads.',
+        },
+      ]);
+    });
+  });
+
   // ========== POST /api/sessions/:id/paste-image ==========
 
   describe('POST /api/sessions/:id/paste-image', () => {
@@ -295,31 +1307,89 @@ describe('session-routes', () => {
       ]);
     }
 
+    function pngUploadBody(boundary: string, imageBytes: Buffer): Buffer {
+      return imageUploadBody(boundary, 'issue.png', 'image/png', imageBytes);
+    }
+
+    function makeSessionRemote(remotePath = '/Users/saqebakhter/repos/projects/moneytrove'): void {
+      harness.ctx._session.workingDir = remotePath;
+      (harness.ctx._session as { remote?: unknown }).remote = {
+        hostId: 'mac-mini',
+        label: 'mac-mini',
+        host: '192.168.21.109',
+        username: 'saqebakhter',
+        remotePath,
+      };
+    }
+
     it('converts HEIC paste images to JPEG attachments when browser-side normalization falls back', async () => {
       const workDir = await mkdtemp(join(tmpdir(), 'codeman-heic-'));
       harness.ctx._session.workingDir = workDir;
       heicConvert.mockClear();
-
       const boundary = 'codeman-test-boundary';
       const heic = Buffer.from('00000034667479706865696300000000', 'hex');
-      const res = await harness.app.inject({
-        method: 'POST',
-        url: `/api/sessions/${harness.ctx._sessionId}/paste-image`,
-        headers: {
-          host: 'codeman.test',
-          origin: 'http://codeman.test',
-          'content-type': `multipart/form-data; boundary=${boundary}`,
-        },
-        payload: imageUploadBody(boundary, 'IMG_4996.HEIC', 'image/heic', heic),
-      });
+      try {
+        const res = await harness.app.inject({
+          method: 'POST',
+          url: `/api/sessions/${harness.ctx._sessionId}/paste-image`,
+          headers: {
+            host: 'codeman.test',
+            origin: 'http://codeman.test',
+            'content-type': `multipart/form-data; boundary=${boundary}`,
+          },
+          payload: imageUploadBody(boundary, 'IMG_4996.HEIC', 'image/heic', heic),
+        });
 
-      await rm(workDir, { recursive: true });
+        expect(res.statusCode).toBe(200);
+        const body = JSON.parse(res.body);
+        expect(body.success).toBe(true);
+        expect(body.data.path).toMatch(/\/\.codeman-uploads\/paste-\d+-[a-f0-9]{8}\.jpg$/);
+        expect((await readFile(body.data.path)).subarray(0, 3)).toEqual(Buffer.from([0xff, 0xd8, 0xff]));
+        expect(heicConvert).toHaveBeenCalledWith(heic);
+      } finally {
+        await rm(workDir, { recursive: true });
+      }
+    });
 
-      expect(res.statusCode).toBe(200);
-      const body = JSON.parse(res.body);
-      expect(body.success).toBe(true);
-      expect(body.data.path).toMatch(/\/\.codeman-uploads\/paste-\d+-[a-f0-9]{8}\.jpg$/);
-      expect(heicConvert).toHaveBeenCalledWith(heic);
+    it('transfers remote images over SSH without creating a local upload directory', async () => {
+      const workDir = await mkdtemp(join(tmpdir(), 'codeman-remote-image-'));
+      makeSessionRemote(workDir);
+      remoteImageWrite.mockClear();
+      try {
+        const res = await upload('shot.jpg', 'image/jpeg', jpeg);
+        expect(res.statusCode).toBe(200);
+        const { path, filename } = JSON.parse(res.body).data;
+        expect(path).toBe(`${workDir}/.claude-images/${filename}`);
+        expect(remoteImageWrite).toHaveBeenCalledWith(
+          harness.ctx._session.remote,
+          expect.objectContaining({
+            dir: `${workDir}/.claude-images`,
+            filePath: path,
+            bytes: jpeg,
+            transferLabel: 'remote image upload',
+          })
+        );
+        expect(await readdir(workDir)).toEqual([]);
+      } finally {
+        await rm(workDir, { recursive: true });
+      }
+    });
+
+    it('surfaces SSH transfer errors without returning a successful attachment path', async () => {
+      makeSessionRemote();
+      remoteImageWrite.mockRejectedValueOnce(new Error('remote image upload failed: Permission denied'));
+      const res = await upload('shot.jpg', 'image/jpeg', jpeg);
+      expect(res.statusCode).toBe(500);
+      expect(JSON.parse(res.body)).toMatchObject({ success: false });
+      expect(JSON.parse(res.body).data).toBeUndefined();
+    });
+
+    it('validates remote image bytes before attempting an SSH transfer', async () => {
+      makeSessionRemote();
+      remoteImageWrite.mockClear();
+      const res = await upload('shot.jpg', 'image/jpeg', Buffer.from('not a valid image'));
+      expect(res.statusCode).toBe(415);
+      expect(remoteImageWrite).not.toHaveBeenCalled();
     });
 
     it('converts mislabeled HEIC (declared image/jpeg, HEIF bytes — the MIUI/Android case) via magic sniff', async () => {
@@ -418,7 +1488,7 @@ describe('session-routes', () => {
       }
     });
 
-    it('refuses an upload for a remote session before touching disk', async () => {
+    it('refuses incomplete remote connection metadata before touching disk', async () => {
       const workDir = await mkdtemp(join(tmpdir(), 'codeman-uploads-'));
       harness.ctx._session.workingDir = workDir;
       // A remote session's workingDir is the REMOTE path: a file written here is unreadable there.
@@ -803,6 +1873,28 @@ describe('session-routes', () => {
     });
   });
 
+  // ========== PUT /api/sessions/:id/name ==========
+
+  describe('PUT /api/sessions/:id/name', () => {
+    it('persists the renamed session immediately so restart restore keeps the custom name', async () => {
+      const res = await harness.app.inject({
+        method: 'PUT',
+        url: `/api/sessions/${harness.ctx._sessionId}/name`,
+        payload: { name: 'Custom restart-safe name' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toMatchObject({ success: true, data: { name: 'Custom restart-safe name' } });
+      expect(harness.ctx._session.name).toBe('Custom restart-safe name');
+      expect(harness.ctx.mux.updateSessionName).toHaveBeenCalledWith(
+        harness.ctx._sessionId,
+        'Custom restart-safe name'
+      );
+      expect(harness.ctx.persistSessionStateNow).toHaveBeenCalledWith(harness.ctx._session);
+      expect(harness.ctx.persistSessionState).not.toHaveBeenCalled();
+    });
+  });
+
   // ========== DELETE /api/sessions/:id ==========
 
   describe('DELETE /api/sessions/:id', () => {
@@ -887,7 +1979,7 @@ describe('session-routes', () => {
       const body = JSON.parse(res.body);
       expect(body.success).toBe(true);
       expect(body.data.name).toBe('new-name');
-      expect(harness.ctx.persistSessionState).toHaveBeenCalled();
+      expect(harness.ctx.persistSessionStateNow).toHaveBeenCalled();
       expect(harness.ctx.broadcast).toHaveBeenCalledWith('session:updated', expect.anything());
     });
 
@@ -991,14 +2083,57 @@ describe('session-routes', () => {
 
   describe('POST /api/sessions/:id/input', () => {
     it('sends input to session', async () => {
+      harness.ctx._session.isCheckpointActive = true;
+      const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+      const session = harness.ctx._session;
+      const write = vi.spyOn(session, 'write');
+      try {
+        const res = await harness.app.inject({
+          method: 'POST',
+          url: `/api/sessions/${harness.ctx._sessionId}/input`,
+          payload: { input: 'hello' },
+        });
+        expect(res.statusCode).toBe(200);
+        const body = JSON.parse(res.body);
+        expect(body.success).toBe(true);
+        expect(session.cancelCheckpoint).toHaveBeenCalledWith('manual-takeover');
+        expect(info).toHaveBeenCalledWith('[Checkpoint] manual takeover', {
+          sessionId: harness.ctx._sessionId,
+          route: 'http',
+          inputClass: 'keyboard',
+        });
+        expect(JSON.stringify(info.mock.calls)).not.toContain('hello');
+        expect(session.cancelCheckpoint.mock.invocationCallOrder[0]).toBeLessThan(write.mock.invocationCallOrder[0]);
+      } finally {
+        write.mockRestore();
+        info.mockRestore();
+      }
+    });
+
+    it.each(['\x1b[O', '\x1b[<64;10;5M', '\x1b[M !!'])('forwards report-only input without takeover', async (input) => {
+      const session = harness.ctx._session;
+      session.isCheckpointActive = true;
       const res = await harness.app.inject({
         method: 'POST',
         url: `/api/sessions/${harness.ctx._sessionId}/input`,
-        payload: { input: 'hello' },
+        payload: { input },
       });
       expect(res.statusCode).toBe(200);
-      const body = JSON.parse(res.body);
-      expect(body.success).toBe(true);
+      expect(session.writeBuffer).toContain(input);
+      expect(session.cancelCheckpoint).not.toHaveBeenCalled();
+    });
+
+    it('cancels for mixed report and keyboard input', async () => {
+      const session = harness.ctx._session;
+      session.isCheckpointActive = true;
+      const input = '\x1b[Ox';
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: `/api/sessions/${harness.ctx._sessionId}/input`,
+        payload: { input },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(session.cancelCheckpoint).toHaveBeenCalledWith('manual-takeover');
     });
 
     it('returns error for unknown session', async () => {
@@ -1034,15 +2169,18 @@ describe('session-routes', () => {
       // First delivery of seq 1 — applied (200, written once).
       const first = await post({ input: 'prompt', seq: 1, clientId: 'cid-1' });
       expect(first.statusCode).toBe(200);
+      session.cancelCheckpoint.mockClear();
 
       // Redelivery of the SAME seq (client never saw the ACK) — still 200, but
       // must NOT write again.
       const dup = await post({ input: 'prompt', seq: 1, clientId: 'cid-1' });
       expect(dup.statusCode).toBe(200);
+      expect(session.cancelCheckpoint).not.toHaveBeenCalled();
 
       // A genuinely new seq — applied.
       const next = await post({ input: '\r', seq: 2, clientId: 'cid-1' });
       expect(next.statusCode).toBe(200);
+      expect(session.cancelCheckpoint).toHaveBeenCalledOnce();
 
       expect(session.writeBuffer).toEqual(['prompt', '\r']);
     });
@@ -1064,7 +2202,9 @@ describe('session-routes', () => {
   // ========== POST /api/sessions/:id/resize ==========
 
   describe('POST /api/sessions/:id/resize', () => {
-    it('resizes session terminal', async () => {
+    it('allows ownerless new-session initialization through the legacy HTTP route', async () => {
+      const resizeIfOwnerless = vi.fn(() => true);
+      Object.assign(harness.ctx._session, { resizeIfNoActiveTerminalViewer: resizeIfOwnerless });
       const res = await harness.app.inject({
         method: 'POST',
         url: `/api/sessions/${harness.ctx._sessionId}/resize`,
@@ -1073,31 +2213,41 @@ describe('session-routes', () => {
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(true);
-      expect(harness.ctx._session.resize).toHaveBeenCalledWith(120, 40, { viewportType: undefined, force: undefined });
+      expect(resizeIfOwnerless).toHaveBeenCalledWith(120, 40);
+      expect(harness.ctx._session.resize).not.toHaveBeenCalled();
     });
 
-    it('passes viewport type through for resize arbitration', async () => {
+    it('rejects a cached-tab HTTP resize while an active viewer owns sizing', async () => {
+      const resizeIfOwnerless = vi.fn(() => false);
+      Object.assign(harness.ctx._session, { resizeIfNoActiveTerminalViewer: resizeIfOwnerless });
       const res = await harness.app.inject({
         method: 'POST',
         url: `/api/sessions/${harness.ctx._sessionId}/resize`,
         payload: { cols: 48, rows: 28, viewportType: 'mobile' },
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(409);
       const body = JSON.parse(res.body);
-      expect(body.success).toBe(true);
-      expect(harness.ctx._session.resize).toHaveBeenCalledWith(48, 28, { viewportType: 'mobile', force: undefined });
+      expect(body.success).toBe(false);
+      expect(body.errorCode).toBe('CONFLICT');
+      expect(body.error).toContain('active terminal viewer');
+      expect(resizeIfOwnerless).toHaveBeenCalledWith(48, 28);
+      expect(harness.ctx._session.resize).not.toHaveBeenCalled();
     });
 
-    it('passes force resize through for redraw requests', async () => {
+    it('keeps cached force flags from bypassing the ownerless admission gate', async () => {
+      const resizeIfOwnerless = vi.fn(() => false);
+      Object.assign(harness.ctx._session, { resizeIfNoActiveTerminalViewer: resizeIfOwnerless });
       const res = await harness.app.inject({
         method: 'POST',
         url: `/api/sessions/${harness.ctx._sessionId}/resize`,
         payload: { cols: 120, rows: 40, force: true },
       });
-      expect(res.statusCode).toBe(200);
+      expect(res.statusCode).toBe(409);
       const body = JSON.parse(res.body);
-      expect(body.success).toBe(true);
-      expect(harness.ctx._session.resize).toHaveBeenCalledWith(120, 40, { viewportType: undefined, force: true });
+      expect(body.success).toBe(false);
+      expect(body.errorCode).toBe('CONFLICT');
+      expect(resizeIfOwnerless).toHaveBeenCalledWith(120, 40);
+      expect(harness.ctx._session.resize).not.toHaveBeenCalled();
     });
 
     it('rejects cols exceeding max (500)', async () => {
@@ -1239,16 +2389,44 @@ describe('session-routes', () => {
       expect(body.data.terminalBuffer).toContain('SHELL_SCROLLBACK_003000');
     });
 
-    it('preserves accumulated history before the live mux pane snapshot for Codex TUI replay', async () => {
-      harness.ctx._session.terminalBuffer = 'hello world\nlater accumulated history';
+    it('does not duplicate the latest Codex prompt tail when full tmux history already contains it', async () => {
+      const duplicateTail =
+        '› Find and fix a bug in @filename\n' + 'gpt-5.5 medium · ~/syncthing/contexts/openshift-base-install';
+      harness.ctx._session.terminalBuffer = `hello world\nlater accumulated history\n${duplicateTail}`;
       harness.ctx._session.mode = 'codex';
       (harness.ctx.mux as { captureActivePaneBuffer?: unknown }).captureActivePaneBuffer = vi.fn(
-        () => 'visible tmux pane only\n› current prompt'
+        () => `tmux full history\n${duplicateTail}`
       );
 
       const res = await harness.app.inject({
         method: 'GET',
         url: `/api/sessions/${harness.ctx._sessionId}/terminal`,
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.data.terminalBuffer).toBe(`tmux full history\n${duplicateTail}`);
+      expect(body.data.terminalBuffer).not.toContain('hello world');
+      expect(body.data.terminalBuffer).not.toContain('\x1b[H\x1b[2J');
+      expect(body.data.terminalBuffer.match(/Find and fix a bug in @filename/g)).toHaveLength(1);
+      expect(harness.ctx.mux.captureActivePaneBuffer).toHaveBeenCalledWith(
+        harness.ctx._session.muxName,
+        expect.objectContaining({
+          fullHistory: true,
+        })
+      );
+    });
+
+    it('preserves accumulated history before the visible mux pane snapshot on tab switch (claude)', async () => {
+      harness.ctx._session.terminalBuffer = 'hello world\nlater accumulated history';
+      harness.ctx._session.mode = 'claude';
+      (harness.ctx.mux as { captureActivePaneBuffer?: unknown }).captureActivePaneBuffer = vi.fn(
+        () => 'visible tmux pane only\n❯ current prompt'
+      );
+
+      const res = await harness.app.inject({
+        method: 'GET',
+        url: `/api/sessions/${harness.ctx._sessionId}/terminal?tail=65536`,
       });
 
       expect(res.statusCode).toBe(200);
@@ -1259,7 +2437,7 @@ describe('session-routes', () => {
       expect(body.data.terminalBuffer.indexOf('hello world')).toBeLessThan(
         body.data.terminalBuffer.indexOf('visible tmux pane only')
       );
-      // No ?full=1 → visible-frame capture (no fullHistory opts).
+      // A tab-switch tail request captures the visible pane.
       expect(harness.ctx.mux.captureActivePaneBuffer).toHaveBeenCalledWith(
         harness.ctx._session.muxName,
         expect.not.objectContaining({ fullHistory: true })
@@ -1287,7 +2465,7 @@ describe('session-routes', () => {
 
       const res = await harness.app.inject({
         method: 'GET',
-        url: `/api/sessions/${harness.ctx._sessionId}/terminal`,
+        url: `/api/sessions/${harness.ctx._sessionId}/terminal?tail=65536`,
       });
 
       const body = JSON.parse(res.body);
@@ -1414,7 +2592,7 @@ describe('session-routes', () => {
     });
 
     // ── COD-47: full tmux scrollback replay on full page reload ──
-    it('full reload (?full=1) requests full tmux history and replays boundary markers', async () => {
+    it('full reload (no tail) requests full tmux history and replays boundary markers', async () => {
       // A realistic scrollback-length capture: ~5000 lines, well past one screen.
       const firstLine = 'SCROLLBACK_FIRST_LINE_0001';
       const lastLine = 'SCROLLBACK_LAST_LINE_5000';
@@ -1434,20 +2612,15 @@ describe('session-routes', () => {
 
       const res = await harness.app.inject({
         method: 'GET',
-        url: `/api/sessions/${harness.ctx._sessionId}/terminal?full=1`,
+        url: `/api/sessions/${harness.ctx._sessionId}/terminal`,
       });
 
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
-      // Full reload asked tmux for the entire scrollback, with the configured
-      // capture bounds (history-line limit + byte cap for exec maxBuffer).
+      // Full reload asked tmux for the entire scrollback.
       expect(captureSpy).toHaveBeenCalledWith(
         harness.ctx._session.muxName,
-        expect.objectContaining({
-          fullHistory: true,
-          historyLimitLines: expect.any(Number),
-          maxCaptureBytes: expect.any(Number),
-        })
+        expect.objectContaining({ fullHistory: true })
       );
       // Both boundary markers survived the capture → route pipeline.
       expect(body.data.terminalBuffer).toContain(firstLine);
@@ -1510,16 +2683,19 @@ describe('session-routes', () => {
       // only afterwards. Absent or malformed, the limit itself, as before.
       const limit = (await harness.ctx.getTerminalHistoryConfig()).tmuxHistoryLimit;
       harness.ctx._session.mode = 'claude';
-      const captureSpy = vi.fn((_name: string, _opts?: { historyLimitLines?: number }) => 'captured frame');
+      const captureSpy = vi.fn(
+        (_name: string, _opts?: { historyLimitLines?: number; lastLines?: number }) => 'captured frame'
+      );
       (harness.ctx.mux as { captureActivePaneBuffer?: unknown }).captureActivePaneBuffer = captureSpy;
       const linesFor = async (query: string) => {
         captureSpy.mockClear();
         await harness.app.inject({ method: 'GET', url: `/api/sessions/${harness.ctx._sessionId}/terminal?${query}` });
-        return captureSpy.mock.calls[0]?.[1]?.historyLimitLines;
+        const options = captureSpy.mock.calls[0]?.[1];
+        return options?.lastLines ?? options?.historyLimitLines;
       };
 
       expect(await linesFor(`full=1&tail=${1024 * 1024}&lines=10040`)).toBe(10040);
-      expect(await linesFor('full=1&lines=1')).toBe(1);
+      expect(await linesFor('full=1&lines=1')).toBe(100);
       expect(await linesFor('full=1')).toBe(limit);
       expect(await linesFor(`full=1&lines=${limit + 5}`)).toBe(limit);
       for (const bad of ['0', '-5', 'abc', '1.5', '', '1e4', '9999999999']) {
@@ -1571,13 +2747,16 @@ describe('session-routes', () => {
 
     it('`lines=` leaves a visible-frame capture (no full=1) exactly as it was', async () => {
       harness.ctx._session.mode = 'shell';
-      const captureSpy = vi.fn(() => 'only the visible frame');
+      const captureSpy = vi.fn(() => 'bounded pane history');
       (harness.ctx.mux as { captureActivePaneBuffer?: unknown }).captureActivePaneBuffer = captureSpy;
       await harness.app.inject({
         method: 'GET',
         url: `/api/sessions/${harness.ctx._sessionId}/terminal?tail=${1024 * 1024}&lines=500`,
       });
-      expect(captureSpy).toHaveBeenCalledWith(harness.ctx._session.muxName, {});
+      expect(captureSpy).toHaveBeenCalledWith(
+        harness.ctx._session.muxName,
+        expect.objectContaining({ fullHistory: true, historyLimitLines: 500 })
+      );
     });
 
     // A shell's tab-select load reads a `lines=` window SMALLER than xterm's
@@ -1903,7 +3082,9 @@ describe('session-routes', () => {
     });
 
     it('tab switch (with tail) uses the visible frame, not full history', async () => {
-      harness.ctx._session.mode = 'codex';
+      // COD-178 moved codex/gemini to full-capture-only replay; the cheap
+      // visible-frame tail capture still applies to shell (and claude) modes.
+      harness.ctx._session.mode = 'shell';
       harness.ctx._session.terminalBuffer = 'accumulated history';
       const captureSpy = vi.fn((_name: string, opts?: { fullHistory?: boolean }) =>
         opts?.fullHistory ? 'FULL_HISTORY_SHOULD_NOT_APPEAR' : 'visible frame only\n› prompt'
@@ -1947,7 +3128,7 @@ describe('session-routes', () => {
 
       const res = await harness.app.inject({
         method: 'GET',
-        url: `/api/sessions/${harness.ctx._sessionId}/terminal?full=1`,
+        url: `/api/sessions/${harness.ctx._sessionId}/terminal`,
       });
 
       expect(res.statusCode).toBe(200);
@@ -1961,11 +3142,13 @@ describe('session-routes', () => {
     });
 
     it('treats stale Codex scrollback config as TUI replay', async () => {
+      // A stale renderMode:'scrollback' in codexConfig must NOT switch codex
+      // back to append-style history replay — capture-only (COD-178) applies.
       harness.ctx._session.terminalBuffer = 'hello world\nlater accumulated history';
       harness.ctx._session.mode = 'codex';
       harness.ctx._session.codexConfig = { renderMode: 'scrollback' } as any;
       (harness.ctx.mux as { captureActivePaneBuffer?: unknown }).captureActivePaneBuffer = vi.fn(
-        () => 'visible tmux pane only\n› current prompt'
+        () => 'full capture scrollback\n› current prompt'
       );
 
       const res = await harness.app.inject({
@@ -1975,28 +3158,31 @@ describe('session-routes', () => {
 
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
-      expect(body.data.terminalBuffer).toContain('hello world');
-      expect(body.data.terminalBuffer).toContain('later accumulated history');
-      expect(body.data.terminalBuffer).toContain('\x1b[H\x1b[2Jvisible tmux pane only');
-      expect(body.data.terminalBuffer.indexOf('hello world')).toBeLessThan(
-        body.data.terminalBuffer.indexOf('visible tmux pane only')
-      );
+      expect(body.data.terminalBuffer).toContain('full capture scrollback');
+      expect(body.data.terminalBuffer).not.toContain('hello world');
+      expect(body.data.terminalBuffer).not.toContain('\x1b[H\x1b[2J');
       expect(harness.ctx.mux.captureActivePaneBuffer).toHaveBeenCalledWith(
         harness.ctx._session.muxName,
-        expect.not.objectContaining({ fullHistory: true })
+        expect.objectContaining({
+          fullHistory: true,
+        })
       );
     });
 
     it('preserves one-time OAuth authorization URLs in Codex TUI replay history', async () => {
+      // Everything codex prints lands in the tmux scrollback, so the full
+      // capture (the only thing codex replay ships since COD-178) carries the
+      // one-time OAuth URL the user still needs to click.
       const authUrl =
         'https://auth.atlassian.com/authorize?response_type=code&client_id=abc&redirect_uri=http%3A%2F%2F127.0.0.1%3A35547%2Fcallback%2Fxyz';
-      harness.ctx._session.terminalBuffer =
-        'Authorize `atlassian` by opening this URL in your browser:\n' +
-        authUrl +
-        '\n(Browser launch failed; please copy the URL above manually.)\n';
+      harness.ctx._session.terminalBuffer = 'stale codex redraw frames';
       harness.ctx._session.mode = 'codex';
       (harness.ctx.mux as { captureActivePaneBuffer?: unknown }).captureActivePaneBuffer = vi.fn(
-        () => 'visible tmux pane only\n› current prompt'
+        () =>
+          'Authorize `atlassian` by opening this URL in your browser:\n' +
+          authUrl +
+          '\n(Browser launch failed; please copy the URL above manually.)\n' +
+          '› current prompt'
       );
 
       const res = await harness.app.inject({
@@ -2007,23 +3193,21 @@ describe('session-routes', () => {
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
       expect(body.data.terminalBuffer).toContain(authUrl);
-      expect(body.data.terminalBuffer).toContain('visible tmux pane only');
-      expect(body.data.terminalBuffer.indexOf(authUrl)).toBeLessThan(
-        body.data.terminalBuffer.indexOf('visible tmux pane only')
-      );
+      expect(body.data.terminalBuffer).toContain('› current prompt');
+      expect(body.data.terminalBuffer).not.toContain('stale codex redraw frames');
     });
 
     it('preserves incidental OAuth URL mentions as ordinary Codex TUI history', async () => {
       const authUrl =
         'https://auth.atlassian.com/authorize?response_type=code&client_id=abc&redirect_uri=http%3A%2F%2F127.0.0.1%3A35547%2Fcallback%2Fxyz';
-      harness.ctx._session.terminalBuffer =
-        'Root cause: URLs like ' +
-        authUrl +
-        ' could be present in history but missing from browser-rendered terminal replay.\n' +
-        "+        'Authorize `atlassian` by opening this URL in your browser:\\n' +\n";
+      harness.ctx._session.terminalBuffer = 'stale codex redraw frames';
       harness.ctx._session.mode = 'codex';
       (harness.ctx.mux as { captureActivePaneBuffer?: unknown }).captureActivePaneBuffer = vi.fn(
-        () => 'visible tmux pane only\n› current prompt'
+        () =>
+          'Root cause: URLs like ' +
+          authUrl +
+          ' could be present in history but missing from browser-rendered terminal replay.\n' +
+          '› current prompt'
       );
 
       const res = await harness.app.inject({
@@ -2034,7 +3218,7 @@ describe('session-routes', () => {
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
       expect(body.data.terminalBuffer).toContain(authUrl);
-      expect(body.data.terminalBuffer).toContain('visible tmux pane only');
+      expect(body.data.terminalBuffer).toContain('› current prompt');
     });
 
     it('preserves accumulated history before a live mux pane snapshot for non-Codex sessions', async () => {
@@ -2060,7 +3244,7 @@ describe('session-routes', () => {
       );
       expect(harness.ctx.mux.captureActivePaneBuffer).toHaveBeenCalledWith(
         harness.ctx._session.muxName,
-        expect.not.objectContaining({ fullHistory: true })
+        expect.objectContaining({ fullHistory: true })
       );
     });
 
@@ -2082,7 +3266,7 @@ describe('session-routes', () => {
       expect(body.data.terminalBuffer).toContain('› current prompt');
       expect(harness.ctx.mux.captureActivePaneBuffer).toHaveBeenCalledWith(
         harness.ctx._session.muxName,
-        expect.not.objectContaining({ fullHistory: true })
+        expect.objectContaining({ fullHistory: true })
       );
     });
 
@@ -2113,7 +3297,7 @@ describe('session-routes', () => {
       expect(buf.indexOf('history-bytes')).toBeLessThan(buf.indexOf('LIVE-PANE-FRAME'));
       expect(harness.ctx.mux.captureActivePaneBuffer).toHaveBeenCalledWith(
         harness.ctx._session.muxName,
-        expect.not.objectContaining({ fullHistory: true })
+        expect.objectContaining({ fullHistory: true })
       );
     });
 
@@ -2317,6 +3501,107 @@ describe('session-routes', () => {
     });
   });
 
+  // ========== POST /api/sessions/:id/park (COD-124) ==========
+
+  describe('POST /api/sessions/:id/park', () => {
+    it('parks an active session', async () => {
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: `/api/sessions/${harness.ctx._sessionId}/park`,
+      });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      expect(harness.ctx._session.park).toHaveBeenCalled();
+      expect(harness.ctx.broadcast).toHaveBeenCalledWith('session:parked', expect.anything());
+      expect(harness.ctx.broadcast).toHaveBeenCalledWith('session:updated', expect.anything());
+    });
+
+    it('returns error for unknown session', async () => {
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions/nonexistent/park',
+      });
+      expect(res.statusCode).toBe(404);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(false);
+    });
+
+    it('is idempotent when the session is already parked', async () => {
+      harness.ctx._session.status = 'parked';
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: `/api/sessions/${harness.ctx._sessionId}/park`,
+      });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      // Already parked — park() should NOT be invoked again.
+      expect(harness.ctx._session.park).not.toHaveBeenCalled();
+    });
+  });
+
+  // ========== POST /api/sessions/:id/resume (COD-124) ==========
+
+  describe('POST /api/sessions/:id/resume', () => {
+    it('resumes a parked session', async () => {
+      harness.ctx._session.status = 'parked';
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: `/api/sessions/${harness.ctx._sessionId}/resume`,
+      });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      // COD-118-style requirement: listener wiring must be re-attached before
+      // startInteractive() is called, since park() detaches listeners via PTY exit.
+      expect(harness.ctx.setupSessionListeners).toHaveBeenCalledWith(harness.ctx._session);
+      expect(harness.ctx._session.startInteractive).toHaveBeenCalled();
+      expect(harness.ctx.broadcast).toHaveBeenCalledWith('session:resumed', expect.anything());
+      expect(harness.ctx.broadcast).toHaveBeenCalledWith('session:updated', expect.anything());
+    });
+
+    it('returns error for unknown session', async () => {
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions/nonexistent/resume',
+      });
+      expect(res.statusCode).toBe(404);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(false);
+    });
+
+    it('rejects resume when the session is not parked', async () => {
+      // Default mock status is 'idle', not 'parked'.
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: `/api/sessions/${harness.ctx._sessionId}/resume`,
+      });
+      expect(res.statusCode).toBe(409);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(false);
+      expect(body.errorCode).toBe(ApiErrorCode.CONFLICT);
+      expect(harness.ctx._session.startInteractive).not.toHaveBeenCalled();
+    });
+
+    // Non-Claude CLIs (codex/opencode/gemini/shell) get a best-effort relaunch
+    // in the same workingDir with NO conversation restore — startInteractive()
+    // is still called (it's the same relaunch path), but no --resume semantics
+    // are claimed or asserted for these modes.
+    it('best-effort relaunches a parked non-claude-mode session (no conversation restore claimed)', async () => {
+      harness.ctx._session.status = 'parked';
+      harness.ctx._session.mode = 'codex';
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: `/api/sessions/${harness.ctx._sessionId}/resume`,
+      });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      expect(harness.ctx._session.startInteractive).toHaveBeenCalled();
+    });
+  });
+
   // ========== GET /api/sessions/:id/output ==========
 
   describe('GET /api/sessions/:id/output', () => {
@@ -2402,6 +3687,27 @@ describe('session-routes', () => {
       const body = JSON.parse(res.body);
       expect(body.data).toHaveProperty('sessions');
       expect(Array.isArray(body.data.sessions)).toBe(true);
+    });
+
+    it('never exposes Claude history from outside the sandboxed test HOME', async () => {
+      // Previously asserted an exactly-empty list, which a `ctx.testMode`
+      // short-circuit in the route guaranteed. That short-circuit is gone: the
+      // history-quality tests below need the scan to actually run, and sibling
+      // tests legitimately write transcripts into the temp HOME, so "empty" is
+      // no longer the invariant. What still must hold — and is the whole point —
+      // is that nothing outside test/setup.ts's per-file temp HOME can appear.
+      const res = await harness.app.inject({
+        method: 'GET',
+        url: '/api/history/sessions',
+      });
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      const home = process.env.HOME as string;
+      expect(home).toBeTruthy();
+      for (const session of body.data.sessions) {
+        expect(session.workingDir.startsWith(home)).toBe(true);
+      }
     });
 
     it('sessions have required fields', async () => {
@@ -2755,46 +4061,258 @@ describe('session-routes', () => {
   // ========== POST /api/sessions (with resumeSessionId) ==========
 
   describe('POST /api/sessions with resumeSessionId', () => {
+    it('fails closed for a new arbitrary local Claude session without verified hooks', async () => {
+      const workingDir = await mkdtemp(join(tmpdir(), 'codeman-route-no-hooks-'));
+      // Create now INSTALLS hooks into any claude workspace (applyWorkspaceHooks),
+      // so the only way to reach a genuinely hook-less workspace — the condition
+      // this fail-closed path exists for — is with the setting off.
+      harness.ctx.getWorkspaceHooksEnabled.mockResolvedValue(false);
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { workingDir, mode: 'claude' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const created = harness.ctx.addSession.mock.calls.at(-1)?.[0] as Session;
+      created.setCheckpoint(true, ['new']);
+      expect(created.requestCheckpoint({ mode: 'new' })).toEqual({
+        triggered: false,
+        reason: 'session-start-hook-unavailable',
+      });
+    });
+
+    it('enables a new local Claude session only after current hooks and authoritative SessionStart identity', async () => {
+      const workingDir = await mkdtemp(join(tmpdir(), 'codeman-route-current-hooks-'));
+      await writeHooksConfig(workingDir);
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { workingDir, mode: 'claude' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const created = harness.ctx.addSession.mock.calls.at(-1)?.[0] as Session;
+      created.setCheckpoint(true, ['new']);
+      expect(created.requestCheckpoint({ mode: 'new' })).toEqual({
+        triggered: false,
+        reason: 'baseline-identity-unavailable',
+      });
+      created.adoptClaudeSessionStartId('route-authoritative-session-id');
+      expect(created.requestCheckpoint({ mode: 'new' })).toEqual({ triggered: true, runId: expect.any(String) });
+      created.cancelCheckpoint('test-cleanup');
+    });
+
+    it('fails closed for a new remote Claude session', async () => {
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', commands: {} }];
+      remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { caseName: 'gpu-work', mode: 'claude' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const created = harness.ctx.addSession.mock.calls.at(-1)?.[0] as Session;
+      created.setCheckpoint(true, ['clear']);
+      expect(created.requestCheckpoint({ mode: 'clear' })).toEqual({
+        triggered: false,
+        reason: 'session-start-hook-unavailable',
+      });
+    });
+
+    it('seeds a standard new session from the server checkpoint default', async () => {
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', commands: {} }];
+      remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
+      harness.ctx.getCheckpointDefaultEnabled.mockResolvedValueOnce(true);
+
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { caseName: 'gpu-work', mode: 'shell' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const created = harness.ctx.addSession.mock.calls.at(-1)?.[0];
+      expect(created?.checkpointEnabled).toBe(true);
+    });
+
+    it.each([
+      ['opencode', 'OpenCode resolver diagnostic'],
+      ['codex', 'Codex resolver diagnostic'],
+      ['gemini', 'Gemini resolver diagnostic'],
+      ['antigravity', 'Antigravity resolver diagnostic'],
+      ['pi', 'Pi resolver diagnostic'],
+    ] as const)('returns the exact %s resolver diagnostic for a local create preflight', async (mode, diagnostic) => {
+      cliAvailability[mode] = false;
+
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { workingDir: process.env.HOME, mode },
+      });
+
+      expect(res.statusCode).toBe(422);
+      expect(JSON.parse(res.body)).toMatchObject({ success: false, error: diagnostic });
+      expect(harness.ctx.addSession).not.toHaveBeenCalled();
+    });
+
+    it('skips local CLI availability preflight for a remote create', async () => {
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', commands: {} }];
+      remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
+      cliAvailability.codex = false;
+
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { caseName: 'gpu-work', mode: 'codex', name: 'Remote Codex' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).data.session).toMatchObject({
+        mode: 'codex',
+        workingDir: '/home/ubuntu/work',
+        remote: expect.objectContaining({ hostId: 'gpu-box' }),
+      });
+    });
+
     it('creates session from a remote case without local stat validation', async () => {
-      // Remote cases go through /api/quick-start which skips local stat() of the workingDir.
-      // /api/sessions always requires workingDir to exist on the local filesystem.
-      const startShell = vi.spyOn(Session.prototype, 'startShell').mockResolvedValue(undefined);
-      try {
-        remoteStore.hosts = [
-          {
-            id: 'gpu-box',
-            label: 'GPU Box',
-            host: '10.0.0.42',
-            username: 'ubuntu',
-            commands: { codex: 'exec codx personal' },
-          },
-        ];
-        remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
+      remoteStore.hosts = [
+        {
+          id: 'gpu-box',
+          label: 'GPU Box',
+          host: '10.0.0.42',
+          username: 'ubuntu',
+          commands: { codex: 'exec codx personal' },
+        },
+      ];
+      remoteStore.cases = [
+        {
+          name: 'gpu-work',
+          type: 'remote',
+          hostId: 'gpu-box',
+          remotePath: '/home/ubuntu/work',
+          commands: { codex: 'exec case-codex' },
+        },
+      ];
+
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { caseName: 'gpu-work', mode: 'shell', name: 'Remote Shell' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.success).toBe(true);
+      expect(body.data.session.workingDir).toBe('/home/ubuntu/work');
+      expect(body.data.session.remote).toMatchObject({
+        hostId: 'gpu-box',
+        host: '10.0.0.42',
+        username: 'ubuntu',
+        remotePath: '/home/ubuntu/work',
+        commands: { codex: 'exec case-codex' },
+      });
+    });
+
+    const externalQuickStartModes = [
+      ['opencode', 'OpenCode resolver diagnostic', isOpenCodeAvailable],
+      ['codex', 'Codex resolver diagnostic', isCodexAvailable],
+      ['gemini', 'Gemini resolver diagnostic', isGeminiAvailable],
+      ['antigravity', 'Antigravity resolver diagnostic', isAntigravityAvailable],
+      ['pi', 'Pi resolver diagnostic', isPiAvailable],
+    ] as const;
+
+    it.each(externalQuickStartModes)(
+      'returns the exact %s resolver diagnostic for a local quick-start preflight',
+      async (mode, diagnostic) => {
+        cliAvailability[mode] = false;
 
         const res = await harness.app.inject({
           method: 'POST',
           url: '/api/quick-start',
-          payload: { caseName: 'gpu-work', mode: 'shell', name: 'Remote Shell' },
+          payload: { caseName: 'missing-local-case', mode },
+        });
+
+        expect(res.statusCode).toBe(422);
+        expect(JSON.parse(res.body)).toMatchObject({ success: false, error: diagnostic });
+        expect(harness.ctx.addSession).not.toHaveBeenCalled();
+      }
+    );
+
+    it.each(
+      externalQuickStartModes.flatMap(([mode, , probe]) => [
+        [mode, 'remote', probe],
+        [mode, 'docker', probe],
+      ])
+    )('skips the local %s resolver probe for a %s quick-start', async (mode, location, probe) => {
+      cliAvailability[mode] = false;
+      const caseName = `${location}-${mode}`;
+      const expectedPath = `/work/${caseName}`;
+      if (location === 'remote') {
+        remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', commands: {} }];
+        remoteStore.cases = [{ name: caseName, type: 'remote', hostId: 'gpu-box', remotePath: expectedPath }];
+      } else {
+        dockerStore.hosts = [
+          { id: 'docker-local', label: 'Docker Local', engine: 'docker', image: 'codeman/agent:base' },
+        ];
+        dockerStore.cases = [
+          {
+            name: caseName,
+            type: 'docker',
+            hostId: 'docker-local',
+            hostWorkspacePath: expectedPath,
+          },
+        ];
+      }
+      const startInteractive = vi.spyOn(Session.prototype, 'startInteractive').mockResolvedValue(undefined);
+
+      try {
+        const res = await harness.app.inject({
+          method: 'POST',
+          url: '/api/quick-start',
+          payload: { caseName, mode },
         });
 
         expect(res.statusCode).toBe(200);
-        const body = JSON.parse(res.body);
-        expect(body.success).toBe(true);
-        expect(body.data.casePath).toBe('/home/ubuntu/work');
-        const session = [...harness.ctx.sessions.values()].find((item) => item.id === body.data.sessionId);
-        expect(session?.toState()).toMatchObject({
-          workingDir: '/home/ubuntu/work',
-          remote: expect.objectContaining({
-            hostId: 'gpu-box',
-            host: '10.0.0.42',
-            username: 'ubuntu',
-            remotePath: '/home/ubuntu/work',
-            commands: { codex: 'exec codx personal' },
-          }),
-        });
+        expect(JSON.parse(res.body).data.casePath).toBe(expectedPath);
+        expect(probe).not.toHaveBeenCalled();
+        expect(startInteractive).toHaveBeenCalledTimes(1);
       } finally {
-        startShell.mockRestore();
+        startInteractive.mockRestore();
       }
+    });
+
+    it('COD-179: passes the creating browser dims through to Session initialDims', async () => {
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', commands: {} }];
+      remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
+
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { caseName: 'gpu-work', mode: 'shell', name: 'Sized', cols: 178, rows: 33 },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const added = (harness.ctx.addSession as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0];
+      expect(added).toBeDefined();
+      expect((added as unknown as { _initialDims?: { cols: number; rows: number } })._initialDims).toEqual({
+        cols: 178,
+        rows: 33,
+      });
+    });
+
+    it('COD-179: rejects out-of-bounds create dims', async () => {
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', commands: {} }];
+      remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
+
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions',
+        payload: { caseName: 'gpu-work', mode: 'shell', cols: 10_000, rows: 33 },
+      });
+
+      expect(JSON.parse(res.body).success).toBe(false);
     });
 
     it('quick-start creates remote case sessions through ssh metadata', async () => {
@@ -2810,6 +4328,7 @@ describe('session-routes', () => {
           },
         ];
         remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
+        harness.ctx.getCheckpointDefaultEnabled.mockResolvedValueOnce(false);
 
         const res = await harness.app.inject({
           method: 'POST',
@@ -2822,6 +4341,7 @@ describe('session-routes', () => {
         expect(body.success).toBe(true);
         expect(body.data.casePath).toBe('/home/ubuntu/work');
         const session = [...harness.ctx.sessions.values()].find((item) => item.id === body.data.sessionId);
+        expect(session?.checkpointEnabled).toBe(false);
         expect(session?.toState()).toMatchObject({
           workingDir: '/home/ubuntu/work',
           remote: expect.objectContaining({

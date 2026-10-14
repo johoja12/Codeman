@@ -10,6 +10,7 @@
 import { vi } from 'vitest';
 import { MockSession, createMockSession } from './mock-session.js';
 import { resolveTerminalHistoryConfig } from '../../src/config/terminal-history.js';
+import type { SessionCreationOptions } from '../../src/web/ports/session-port.js';
 
 /**
  * Creates a mock context that satisfies all port interfaces.
@@ -33,8 +34,15 @@ export function createMockRouteContext(options?: {
   return {
     // -- SessionPort --
     sessions,
-    addSession: vi.fn(async (s: MockSession) => {
+    addSession: vi.fn(async (s: MockSession, _options?: SessionCreationOptions) => {
       sessions.set(s.id, s);
+      const layout = {
+        version: 0,
+        groups: [],
+        ungrouped: [{ kind: 'session' as const, id: s.id }],
+        updatedAt: '1970-01-01T00:00:00.000Z',
+      };
+      return { layout, placements: [] };
     }),
     tabLayouts: {
       get: vi.fn(),
@@ -58,6 +66,9 @@ export function createMockRouteContext(options?: {
       reconcileAfterRestoration: vi.fn(async () => {}),
     },
     cleanupSession: vi.fn(async () => {}),
+    cleanupRecoveryReconnectWrapper: vi.fn(async (id: string) => {
+      sessions.delete(id);
+    }),
     setupSessionListeners: vi.fn(async () => {}),
     persistSessionState: vi.fn(),
     persistSessionStateNow: vi.fn(),
@@ -65,7 +76,48 @@ export function createMockRouteContext(options?: {
     discardPartiallyBuiltSession: vi.fn(async (id: string) => {
       sessions.delete(id);
     }),
-    getSessionStateWithRespawn: vi.fn((s: MockSession) => s.toState()),
+    getSessionStateWithRespawn: vi.fn((s: MockSession) => ({
+      ...s.toState(),
+      activityStatus: s.status,
+      activityStatusSince: null,
+    })),
+
+    // -- AgentActivityPort --
+    // COD-350. Defaults mirror a session with no background agents: every hook
+    // event is presented to the human, and the projection is the session's
+    // `activityProjection` when a test sets one, else its own status (what the
+    // real server returns for a session it has no adapter for). Upstream merges
+    // have dropped this block before (4a5a9d14); the completeness test guards it.
+    agentActivity: {
+      attachSession: vi.fn(),
+      detachSession: vi.fn(),
+      identityChanged: vi.fn(),
+      terminalActivity: vi.fn(),
+      sessionExited: vi.fn(),
+      setTrackingEnabled: vi.fn(),
+      allocateEvent: vi.fn((s: MockSession, kind: string, externalSourceSequence?: number) => ({
+        sessionId: s.id,
+        identityGeneration: 0,
+        trackingGeneration: 0,
+        sequence: 1,
+        kind,
+        ...(externalSourceSequence !== undefined ? { externalSourceSequence } : {}),
+      })),
+      decideEvent: vi.fn(async (_s: MockSession, event: unknown) => ({
+        event,
+        settleEndedEarly: false,
+        presentToHuman: true,
+        autonomyBlocked: false,
+        quarantined: false,
+        ambiguous: false,
+        observation: 'none' as const,
+        liveEvidence: null,
+      })),
+      project: vi.fn(
+        (s: MockSession & { activityProjection?: { activityStatus: string; activityStatusSince: number | null } }) =>
+          s.activityProjection ?? { activityStatus: s.status, activityStatusSince: null }
+      ),
+    },
 
     // -- EventPort --
     broadcast: vi.fn(),
@@ -104,6 +156,17 @@ export function createMockRouteContext(options?: {
       setSessionOrder: vi.fn((order: string[]) => {
         sessionOrder = order;
       }),
+      getCaseDefaultGroup: vi.fn(),
+      setCaseDefaultGroup: vi.fn(),
+      renameCaseDefaultGroup: vi.fn(),
+      deleteCaseDefaultGroup: vi.fn(),
+      getCodexCommandProfiles: vi.fn(() => []),
+      setCodexCommandProfiles: vi.fn(),
+      getCaseCodexCommandSelection: vi.fn(() => undefined),
+      getCaseCodexCommandSelections: vi.fn(() => ({})),
+      setCaseCodexCommandSelection: vi.fn(),
+      renameCaseCodexCommandSelection: vi.fn(),
+      deleteCaseCodexCommandSelection: vi.fn(),
       getAggregateStats: vi.fn(() => ({ totalInputTokens: 0, totalOutputTokens: 0, totalCost: 0 })),
       getGlobalStats: vi.fn(() => ({ sessionsCreated: 0 })),
       getDailyStats: vi.fn(() => []),
@@ -117,7 +180,9 @@ export function createMockRouteContext(options?: {
     getGlobalNiceConfig: vi.fn(async () => undefined),
     getModelConfig: vi.fn(async () => null),
     getClaudeModeConfig: vi.fn(async () => ({})),
-    getTerminalHistoryConfig: vi.fn(async () => resolveTerminalHistoryConfig({})),
+    getTerminalHistoryConfig: vi.fn(async () => resolveTerminalHistoryConfig()),
+    getTruecolorEnabled: vi.fn(async () => false),
+    getCheckpointDefaultEnabled: vi.fn(async () => true),
     // Default OFF mirrors the shipped setting, so existing tests never touch a
     // case's .claude/skills. Overridable per test because the create-time
     // injection call sites are otherwise unreachable from a route test.
@@ -149,10 +214,10 @@ export function createMockRouteContext(options?: {
       listSessions: vi.fn(() => []),
       getStats: vi.fn(() => ({})),
       updateSessionName: vi.fn(() => true),
+      setHistoryLimit: vi.fn(async () => {}),
       getSession: vi.fn(() => null),
       clearRespawnConfig: vi.fn(),
       updateRespawnConfig: vi.fn(),
-      setHistoryLimit: vi.fn(async () => {}),
       startStatsCollection: vi.fn(),
     },
     runSummaryTrackers: new Map(),

@@ -4,19 +4,19 @@
  */
 
 import type { Session } from '../../session.js';
+import type { SessionPlacementHints, TabLayoutSnapshot } from '../../tab-layout-service.js';
+import type { SessionActivityProjection } from '../../types/session.js';
 import type { SessionState } from '../../types.js';
-import type { TabLayout } from '../../tab-layout.js';
-import type { SessionPlacementHint } from '../../tab-layout-service.js';
+
+export type SessionWireState = SessionActivityProjection & Record<string, unknown>;
+
+export type SessionCreationOptions = SessionPlacementHints;
 
 export interface SessionPort {
   readonly sessions: ReadonlyMap<string, Session>;
-  /**
-   * Register a created session with the owner's tab layout. `placement.tabGroupId`
-   * puts it at the end of that group in the same layout write (ignored when the
-   * group is not in the owner's layout). Resolves to the committed layout.
-   */
-  addSession(session: Session, placement?: SessionPlacementHint): Promise<TabLayout>;
+  addSession(session: Session, options?: SessionCreationOptions): Promise<TabLayoutSnapshot>;
   cleanupSession(sessionId: string, killMux?: boolean, reason?: string): Promise<void>;
+  cleanupRecoveryReconnectWrapper(sessionId: string): Promise<void>;
   setupSessionListeners(session: Session): Promise<void>;
   persistSessionState(session: Session): void;
   persistSessionStateNow(session: Session): void;

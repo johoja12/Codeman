@@ -45,6 +45,8 @@ export const PRE_PUSH_CHECKS = [
   ['generate:cli-catalog', '--', '--check'],
   ['check:browser-excludes'],
   ['check:frontend-syntax'],
+  // Downstream: the Bitbucket gate and this fork's ci.yml both run it (upstream's do not).
+  ['check:public-assets'],
   ['format:check'],
   ['lint'],
   ['typecheck'],

@@ -35,6 +35,12 @@ export interface TabLayout {
   groups: TabGroup[];
   ungrouped: TabRef[];
   updatedAt: string;
+  /**
+   * Explicit order for the Focus section, independent of group order. Absent
+   * until a move materializes one; focused refs it omits sort after it in
+   * stored order, so an untouched layout keeps its historical projection.
+   */
+  focusOrder?: TabRef[];
 }
 
 /** Owner and lineage facts supplied by the server or browser integration. */
@@ -49,6 +55,14 @@ export interface TabRefMetadata {
   order: number;
   /** Session-only lineage hint. Ignored for webviews. */
   parentSessionId?: string;
+}
+
+export interface TabPlacementDescription {
+  kind: 'session';
+  id: string;
+  state: 'inherited' | 'manual' | 'dangling' | 'cycle';
+  parentId: string;
+  canFollow: boolean;
 }
 
 export interface TabMoveTarget {
@@ -114,10 +128,30 @@ function parseRef(value: unknown, label: string): TabRef {
   if (value.focus !== undefined && value.focus !== true) {
     throw new TabLayoutValidationError(`${label}.focus must be true when present`);
   }
-  const ref: TabRef = { kind: value.kind, id };
-  if (value.placement === 'manual') ref.placement = 'manual';
-  if (value.focus === true) ref.focus = true;
-  return ref;
+  return {
+    kind: value.kind,
+    id,
+    ...(value.placement === 'manual' ? { placement: 'manual' as const } : {}),
+    ...(value.focus === true ? { focus: true as const } : {}),
+  };
+}
+
+function parseFocusOrder(input: unknown, repairDuplicates: boolean): TabRef[] | undefined {
+  if (input === undefined) return undefined;
+  if (!Array.isArray(input)) throw new TabLayoutValidationError('layout.focusOrder must be an array');
+  const seen = new Set<string>();
+  const result: TabRef[] = [];
+  for (const [index, entry] of input.entries()) {
+    const ref = parseRef(entry, `layout.focusOrder[${index}]`);
+    const key = keyOf(ref);
+    if (seen.has(key)) {
+      if (repairDuplicates) continue;
+      throw new TabLayoutValidationError(`duplicate focusOrder ref: ${ref.kind}:${ref.id}`);
+    }
+    seen.add(key);
+    result.push({ kind: ref.kind, id: ref.id });
+  }
+  return result;
 }
 
 function parseTabLayout(input: unknown, repairDuplicates: boolean): TabLayout {
@@ -160,11 +194,13 @@ function parseTabLayout(input: unknown, repairDuplicates: boolean): TabLayout {
   if (refCount > MAX_TAB_REFS) {
     throw new TabLayoutValidationError(`layout cannot contain more than ${MAX_TAB_REFS} refs`);
   }
+  const focusOrder = parseFocusOrder(input.focusOrder, repairDuplicates);
   return {
     version: input.version as number,
     groups,
     ungrouped: input.ungrouped.map((entry, index) => parseStoredRef(entry, `layout.ungrouped[${index}]`)),
     updatedAt,
+    ...(focusOrder === undefined ? {} : { focusOrder }),
   };
 }
 
@@ -325,7 +361,106 @@ export function normalizeTabLayout(input: TabLayout, metadata: readonly TabRefMe
     if (item.ref.kind === 'session' && parentOf.has(item.ref.id)) continue;
     emitSubtree(item.ref, item.container);
   }
-  return withContainers(working, output);
+  return withPrunedFocusOrder(withContainers(working, output));
+}
+
+/** Drop Focus order entries that are no longer stored or no longer focused. */
+function withPrunedFocusOrder(layout: TabLayout): TabLayout {
+  if (layout.focusOrder === undefined) return layout;
+  const focusedKeys = new Set(
+    locations(layout)
+      .filter((item) => item.ref.focus === true)
+      .map((item) => keyOf(item.ref))
+  );
+  const kept = layout.focusOrder.filter((ref) => focusedKeys.has(keyOf(ref)));
+  if (kept.length === layout.focusOrder.length) return layout;
+  if (kept.length === 0) {
+    const { focusOrder: _dropped, ...rest } = layout;
+    return rest;
+  }
+  return { ...layout, focusOrder: kept };
+}
+
+/**
+ * Focus section order: explicitly ordered refs first, then any focused ref the
+ * stored order has not been asked about, in stored order.
+ */
+export function orderedFocusRefs(input: TabLayout): TabRef[] {
+  const layout = validateTabLayout(input);
+  const focused = locations(layout)
+    .filter((item) => item.ref.focus === true)
+    .map((item) => ({ kind: item.ref.kind, id: item.ref.id }) as TabRef);
+  const byKey = new Map(focused.map((ref) => [keyOf(ref), ref]));
+  const result: TabRef[] = [];
+  const emitted = new Set<string>();
+  for (const ref of layout.focusOrder ?? []) {
+    const key = keyOf(ref);
+    const match = byKey.get(key);
+    if (!match || emitted.has(key)) continue;
+    emitted.add(key);
+    result.push(match);
+  }
+  for (const ref of focused) {
+    const key = keyOf(ref);
+    if (emitted.has(key)) continue;
+    emitted.add(key);
+    result.push(ref);
+  }
+  return result;
+}
+
+/** Server-authoritative presentation facts for lineage-controlled placement. */
+export function describeTabPlacements(
+  input: TabLayout,
+  metadata: readonly TabRefMetadata[]
+): TabPlacementDescription[] {
+  const layout = validateTabLayout(input);
+  const valid = validMetadata(metadata);
+  const represented = new Map(locations(layout).map((item) => [keyOf(item.ref), item.ref]));
+  const sessions = new Map(valid.filter((item) => item.kind === 'session').map((item) => [item.id, item]));
+  const cycleIds = new Set<string>();
+  const state = new Map<string, 'visiting' | 'done'>();
+  const stack: string[] = [];
+  const visit = (id: string): void => {
+    if (state.get(id) === 'done') return;
+    if (state.get(id) === 'visiting') {
+      const start = stack.indexOf(id);
+      for (const cycleId of stack.slice(Math.max(0, start))) cycleIds.add(cycleId);
+      return;
+    }
+    state.set(id, 'visiting');
+    stack.push(id);
+    const parentId = sessions.get(id)?.parentSessionId;
+    if (parentId && sessions.has(parentId) && represented.has(keyOf({ kind: 'session', id: parentId })))
+      visit(parentId);
+    stack.pop();
+    state.set(id, 'done');
+  };
+  for (const item of sessions.values()) if (represented.has(keyOf(item))) visit(item.id);
+
+  const result: TabPlacementDescription[] = [];
+  for (const located of locations(layout)) {
+    if (located.ref.kind !== 'session') continue;
+    const item = sessions.get(located.ref.id);
+    if (!item?.parentSessionId) continue;
+    const parentId = item.parentSessionId;
+    const parentValid = sessions.has(parentId) && represented.has(keyOf({ kind: 'session', id: parentId }));
+    const placementState = !parentValid
+      ? 'dangling'
+      : cycleIds.has(located.ref.id)
+        ? 'cycle'
+        : located.ref.placement === 'manual'
+          ? 'manual'
+          : 'inherited';
+    result.push({
+      kind: 'session',
+      id: located.ref.id,
+      state: placementState,
+      parentId,
+      canFollow: placementState === 'manual',
+    });
+  }
+  return result;
 }
 
 function cloneForEdit(input: TabLayout): TabLayout {
@@ -408,9 +543,33 @@ export function setManualPlacement(input: TabLayout, target: TabRef, manual: boo
   return mapRef(input, target, (ref) => ({ ...ref, placement: 'manual' }));
 }
 
-/** Pin `target` to the Focus section, or unpin it. Moves nothing; idempotent both ways. */
 export function setTabFocus(input: TabLayout, target: TabRef, focused: boolean): TabLayout {
-  return mapRef(input, target, ({ focus: _focus, ...ref }) => (focused ? { ...ref, focus: true } : ref));
+  const mapped = mapRef(input, target, (ref) => {
+    if (focused) return ref.focus === true ? ref : { ...ref, focus: true };
+    if (ref.focus !== true) return ref;
+    const { focus: _focus, ...rest } = ref;
+    return rest;
+  });
+  // A ref leaving Focus leaves the explicit order with it; one entering Focus is
+  // unlisted and therefore sorts after the ordered entries.
+  return withPrunedFocusOrder(mapped);
+}
+
+/** Reorder one Focus entry without disturbing its stored group position. */
+export function moveFocusRef(input: TabLayout, target: TabRef, index: number): TabLayout {
+  const layout = cloneForEdit(input);
+  const targetKey = keyOf(target);
+  if (!locations(layout).some((item) => keyOf(item.ref) === targetKey)) {
+    throw new TabLayoutValidationError(`unknown ref: ${target.kind}:${target.id}`);
+  }
+  const ordered = orderedFocusRefs(layout);
+  const from = ordered.findIndex((ref) => keyOf(ref) === targetKey);
+  if (from < 0) throw new TabLayoutValidationError(`ref is not in Focus: ${target.kind}:${target.id}`);
+  const to = boundedIndex(index, Math.max(0, ordered.length - 1), 'focus');
+  const focusOrder = [...ordered];
+  const [moved] = focusOrder.splice(from, 1);
+  focusOrder.splice(to, 0, moved);
+  return { ...layout, focusOrder };
 }
 
 export function followParent(input: TabLayout, target: TabRef, metadata: readonly TabRefMetadata[]): TabLayout {
@@ -438,8 +597,10 @@ export function followParent(input: TabLayout, target: TabRef, metadata: readonl
     throw new TabLayoutValidationError(`session parent is not represented: ${targetMetadata.parentSessionId}`);
   }
 
-  // Clear the manual placement only: a focused ref stays focused.
-  const cleared = mapRef(normalized, target, ({ placement: _placement, ...ref }) => ref);
+  const cleared = mapRef(normalized, target, (ref) => {
+    const { placement: _placement, ...rest } = ref;
+    return rest;
+  });
   return normalizeTabLayout(cleared, metadata);
 }
 

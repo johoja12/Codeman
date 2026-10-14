@@ -51,11 +51,22 @@ import { SseEvent } from '../sse-events.js';
 import { getInstallInfo, checkForUpdate, startUpdate, getUpdateStatusForApi } from '../self-update.js';
 
 import { getRepositoryStatus } from '../repo-status.js';
-import type { SessionPort, EventPort, ConfigPort, InfraPort, AuthPort, TabLayoutPort } from '../ports/index.js';
+import type {
+  SessionPort,
+  EventPort,
+  ConfigPort,
+  InfraPort,
+  AuthPort,
+  TabLayoutPort,
+  AgentActivityPort,
+} from '../ports/index.js';
 import { AUTH_COOKIE_NAME } from '../middleware/auth.js';
 import { QR_AUTH_FAILURE_MAX } from '../../config/tunnel-config.js';
 import { AUTH_SESSION_TTL_MS } from '../../config/auth-config.js';
 import { resolveTerminalHistoryConfig } from '../../config/terminal-history.js';
+import { getHeadroomConfig } from '../../config/headroom-routing.js';
+import { fetchHeadroomStatus } from '../../config/headroom-status.js';
+import { reconcileCodexHeadroomPatch } from '../../config/codex-headroom-patch.js';
 
 /**
  * Defaults for `POST /api/deepseek/install-profile`.
@@ -79,6 +90,65 @@ const SCREENSHOTS_DIR = dataPath('screenshots');
 
 /** Cached CPU count — doesn't change at runtime */
 const CPU_COUNT = cpus().length;
+
+interface OwnerScopedConfig<T> {
+  _codemanOwnerScoped: 1;
+  owners: Record<string, T>;
+  legacy?: T;
+}
+
+const ownerScopedWriteQueues = new Map<string, Promise<void>>();
+
+function isOwnerScopedConfig<T>(value: unknown): value is OwnerScopedConfig<T> {
+  return !!value && typeof value === 'object' && (value as { _codemanOwnerScoped?: unknown })._codemanOwnerScoped === 1;
+}
+
+async function readOwnerScopedConfig<T>(
+  filePath: string,
+  label: string,
+  fallback: T,
+  username: string,
+  admin: boolean
+): Promise<T> {
+  const stored = await readJsonConfig<unknown>(filePath, label, fallback);
+  if (!isMultiUserMode()) {
+    return isOwnerScopedConfig<T>(stored) ? (stored.legacy ?? stored.owners[username] ?? fallback) : (stored as T);
+  }
+  // Admins have their own persisted view and are the only callers allowed to
+  // consume pre-multi-user legacy state. Ordinary users never receive it.
+  if (!isOwnerScopedConfig<T>(stored)) return admin ? (stored as T) : fallback;
+  return stored.owners[username] ?? (admin && stored.legacy !== undefined ? stored.legacy : fallback);
+}
+
+async function writeOwnerScopedConfig<T>(filePath: string, label: string, value: T, username: string): Promise<void> {
+  const previous = ownerScopedWriteQueues.get(filePath) ?? Promise.resolve();
+  const operation = previous
+    .catch(() => undefined)
+    .then(async () => {
+      let stored: T | OwnerScopedConfig<T> = value;
+      if (isMultiUserMode()) {
+        const prior = await readJsonConfig<unknown>(filePath, label, undefined);
+        const scoped: OwnerScopedConfig<T> = isOwnerScopedConfig<T>(prior)
+          ? prior
+          : {
+              _codemanOwnerScoped: 1,
+              owners: {},
+              ...(prior !== undefined ? { legacy: prior as T } : {}),
+            };
+        scoped.owners[username] = value;
+        stored = scoped;
+      }
+      const dir = dirname(filePath);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      await fs.writeFile(filePath, JSON.stringify(stored, null, 2));
+    });
+  ownerScopedWriteQueues.set(filePath, operation);
+  try {
+    await operation;
+  } finally {
+    if (ownerScopedWriteQueues.get(filePath) === operation) ownerScopedWriteQueues.delete(filePath);
+  }
+}
 
 function parseOptionalNumber(value: string | undefined): number | undefined {
   if (value === undefined || value.trim() === '') return undefined;
@@ -146,7 +216,7 @@ export function resolveSpanUrl(hostHeader: string | undefined, fallbackPort = '3
 
 export function registerSystemRoutes(
   app: FastifyInstance,
-  ctx: SessionPort & EventPort & ConfigPort & InfraPort & AuthPort & TabLayoutPort
+  ctx: SessionPort & EventPort & ConfigPort & InfraPort & AuthPort & TabLayoutPort & AgentActivityPort
 ): void {
   const windowStatesPath = dataPath('subagent-window-states.json');
   const parentMapPath = dataPath('subagent-parents.json');
@@ -159,8 +229,7 @@ export function registerSystemRoutes(
 
   app.get('/api/status', async (req) => ctx.getLightState(req.authUser));
 
-  // ========== Tunnel ==========
-
+  // ========== Tunnel ===
   app.get('/api/tunnel/status', async () => ctx.tunnelManager.getStatus());
 
   app.get('/api/tunnel/info', async () => {
@@ -212,8 +281,7 @@ export function registerSystemRoutes(
   // Authentication (QR auth, session revocation)
   // ═══════════════════════════════════════════════════════════════
 
-  // ========== QR Auth Route ==========
-
+  // ========== QR Auth Route ===
   app.get('/q/:code', async (req, reply) => {
     const shortCode = (req.params as { code: string }).code;
     const multiUser = isMultiUserMode();
@@ -298,15 +366,13 @@ export function registerSystemRoutes(
     return reply.redirect('/');
   });
 
-  // ========== QR Regeneration ==========
-
+  // ========== QR Regeneration ===
   app.post('/api/tunnel/qr/regenerate', async () => {
     ctx.tunnelManager.regenerateQrToken();
     return {};
   });
 
-  // ========== Auth Session Revocation ==========
-
+  // ========== Auth Session Revocation ===
   app.post('/api/auth/revoke', async (req) => {
     const result = RevokeSessionSchema.safeParse(req.body);
     if (result.success && result.data.sessionToken) {
@@ -319,6 +385,7 @@ export function registerSystemRoutes(
   });
 
   // ═══════════════════════════════════════════════════════════════
+  // CLI Integrations (OpenCode, Codex, Gemini)
   // Multi-monitor: span Codeman across all displays
   // ═══════════════════════════════════════════════════════════════
 
@@ -372,11 +439,6 @@ export function registerSystemRoutes(
   // Poll target for update progress — survives the restart the update triggers.
   app.get('/api/system/update/status', async () => getUpdateStatusForApi());
 
-  // Informational companion to the release-tag updater above: what this CHECKOUT
-  // looks like against its own remotes (ahead/behind, incoming commits), which a
-  // release tag cannot answer for a git install tracking a branch.
-  app.get('/api/system/repo-status', async () => getRepositoryStatus());
-
   // Kick off a detached update to the latest release. Returns immediately; the
   // browser then polls /api/system/update/status across the service restart.
   app.post('/api/system/update', async (_req, reply) => {
@@ -399,6 +461,10 @@ export function registerSystemRoutes(
     return reply.code(m.http).send(createErrorResponse(m.api, result.message));
   });
 
+  // Repository status: ahead/behind + incoming-commit summary vs the upstream
+  // and the maintainer's own fork. Informational; does a read-only git fetch.
+  app.get('/api/system/repo-status', async () => getRepositoryStatus());
+
   // ═══════════════════════════════════════════════════════════════
   // CLI Integrations (Claude, OpenCode, Codex, Gemini, Antigravity, Pi, Grok)
   // ═══════════════════════════════════════════════════════════════
@@ -406,48 +472,60 @@ export function registerSystemRoutes(
   // ========== Claude ==========
 
   app.get('/api/claude/status', async () => {
-    const { isClaudeAvailable, findClaudeDir } = await import('../../utils/claude-cli-resolver.js');
+    const { findClaudeDir, getClaudeNotFoundMessage } = await import('../../utils/claude-cli-resolver.js');
+    const path = findClaudeDir();
     return {
-      available: isClaudeAvailable(),
-      path: findClaudeDir(),
+      available: path !== null,
+      path,
+      ...(path === null ? { error: getClaudeNotFoundMessage() } : {}),
     };
   });
 
   // ========== OpenCode ==========
 
   app.get('/api/opencode/status', async () => {
-    const { isOpenCodeAvailable, resolveOpenCodeDir } = await import('../../utils/opencode-cli-resolver.js');
+    const { resolveOpenCodeDir, getOpenCodeNotFoundMessage } = await import('../../utils/opencode-cli-resolver.js');
+    const path = resolveOpenCodeDir();
     return {
-      available: isOpenCodeAvailable(),
-      path: resolveOpenCodeDir(),
+      available: path !== null,
+      path,
+      ...(path === null ? { error: getOpenCodeNotFoundMessage() } : {}),
     };
   });
 
+  // ========== Codex ===
   app.get('/api/codex/status', async () => {
-    const { isCodexAvailable, resolveCodexDir } = await import('../../utils/codex-cli-resolver.js');
+    const { resolveCodexDir, getCodexNotFoundMessage } = await import('../../utils/codex-cli-resolver.js');
+    const path = resolveCodexDir();
     return {
-      available: isCodexAvailable(),
-      path: resolveCodexDir(),
+      available: path !== null,
+      path,
+      ...(path === null ? { error: getCodexNotFoundMessage() } : {}),
     };
   });
 
   // ========== Gemini ==========
 
   app.get('/api/gemini/status', async () => {
-    const { isGeminiAvailable, resolveGeminiDir } = await import('../../utils/gemini-cli-resolver.js');
+    const { resolveGeminiDir, getGeminiNotFoundMessage } = await import('../../utils/gemini-cli-resolver.js');
+    const path = resolveGeminiDir();
     return {
-      available: isGeminiAvailable(),
-      path: resolveGeminiDir(),
+      available: path !== null,
+      path,
+      ...(path === null ? { error: getGeminiNotFoundMessage() } : {}),
     };
   });
 
   // ========== Antigravity ==========
 
   app.get('/api/antigravity/status', async () => {
-    const { isAntigravityAvailable, resolveAntigravityDir } = await import('../../utils/antigravity-cli-resolver.js');
+    const { resolveAntigravityDir, getAntigravityNotFoundMessage } =
+      await import('../../utils/antigravity-cli-resolver.js');
+    const path = resolveAntigravityDir();
     return {
-      available: isAntigravityAvailable(),
-      path: resolveAntigravityDir(),
+      available: path !== null,
+      path,
+      ...(path === null ? { error: getAntigravityNotFoundMessage() } : {}),
     };
   });
 
@@ -458,11 +536,45 @@ export function registerSystemRoutes(
   // is not the coding agent. Surfacing path + version makes a misresolution
   // diagnosable from the UI instead of presenting as "the mode just doesn't work".
   app.get('/api/pi/status', async () => {
-    const { isPiAvailable, resolvePiDir, getPiCliVersion } = await import('../../utils/pi-cli-resolver.js');
+    const { resolvePiDir, getPiCliVersion, getPiNotFoundMessage } = await import('../../utils/pi-cli-resolver.js');
+    const path = resolvePiDir();
     return {
-      available: isPiAvailable(),
-      path: resolvePiDir(),
-      version: getPiCliVersion(),
+      available: path !== null,
+      path,
+      version: path === null ? null : getPiCliVersion(),
+      ...(path === null ? { error: getPiNotFoundMessage() } : {}),
+    };
+  });
+
+  // Legacy alias kept so an older cached frontend keeps working after the
+  // agy -> antigravity rename (session-ui.js still probes /api/agy/status).
+  app.get('/api/agy/status', async () => {
+    const { resolveAntigravityDir, getAntigravityNotFoundMessage } =
+      await import('../../utils/antigravity-cli-resolver.js');
+    const path = resolveAntigravityDir();
+    return {
+      available: path !== null,
+      path,
+      ...(path === null ? { error: getAntigravityNotFoundMessage() } : {}),
+    };
+  });
+
+  // ========== Headroom ==========
+  app.get('/api/headroom/status', async () => {
+    const cfg = getHeadroomConfig();
+    const status = await fetchHeadroomStatus(cfg.proxyUrl);
+    const routedSessions = [...ctx.sessions.values()].map((s) => ({
+      name: s.name,
+      mode: s.mode,
+      routed: s.headroomRouted ?? null,
+      routedAt: s.headroomRoutedAt ?? null,
+    }));
+    return {
+      enabled: cfg.proxyUrl !== '',
+      proxyUrl: cfg.proxyUrl,
+      settings: { routeClaude: cfg.routeClaude, routeCodex: cfg.routeCodex },
+      ...status,
+      routedSessions,
     };
   });
 
@@ -716,12 +828,11 @@ export function registerSystemRoutes(
   // State & Lifecycle (cleanup, lifecycle log, stats)
   // ═══════════════════════════════════════════════════════════════
 
-  // ========== State & Lifecycle ==========
-
+  // ========== State & Lifecycle ===
   app.post('/api/cleanup-state', async () => {
     const activeSessionIds = new Set(ctx.sessions.keys());
-    const result = await ctx.tabLayouts.runStaleSessionCleanup(activeSessionIds, (ids) =>
-      ctx.store.cleanupSessionsByIds(ids)
+    const result = await ctx.tabLayouts.runStaleSessionCleanup(activeSessionIds, (confirmedIds) =>
+      ctx.store.cleanupSessionsByIds(confirmedIds)
     );
     const lifecycleLog = getLifecycleLog();
     for (const s of result.cleaned) {
@@ -747,8 +858,7 @@ export function registerSystemRoutes(
     return { entries };
   });
 
-  // ========== Stats ==========
-
+  // ========== Stats ===
   function collectActiveTokens(): Record<string, { inputTokens?: number; outputTokens?: number; totalCost?: number }> {
     const tokens: Record<string, { inputTokens?: number; outputTokens?: number; totalCost?: number }> = {};
     for (const [sessionId, session] of ctx.sessions) {
@@ -860,8 +970,7 @@ export function registerSystemRoutes(
   // Configuration & Settings (config, settings, model config, CPU priority)
   // ═══════════════════════════════════════════════════════════════
 
-  // ========== Config ==========
-
+  // ========== Config ===
   app.get('/api/config', async () => {
     return { config: ctx.store.getConfig() };
   });
@@ -872,8 +981,7 @@ export function registerSystemRoutes(
     return { config: ctx.store.getConfig() };
   });
 
-  // ========== Debug/Memory ==========
-
+  // ========== Debug/Memory ===
   app.get('/api/debug/memory', async () => {
     const mem = process.memoryUsage();
     const subagentStats = subagentWatcher.getStats();
@@ -927,14 +1035,12 @@ export function registerSystemRoutes(
     };
   });
 
-  // ========== System Stats ==========
-
+  // ========== System Stats ===
   app.get('/api/system/stats', async () => {
     return getSystemStats();
   });
 
-  // ========== Settings ==========
-
+  // ========== Settings ===
   app.get('/api/settings', async () => {
     // A plain read. This route must NEVER write settings.json: readJsonConfig()
     // answers `{}` for ANY read failure (a parse error, EACCES, EMFILE, a read
@@ -1022,7 +1128,9 @@ export function registerSystemRoutes(
       // services to the effective stored settings instead, which also self-heals
       // drift. Same convention as the tmuxHistoryLimit block above.
       // Handle subagent tracking toggle dynamically
-      toggleService((merged.subagentTrackingEnabled as boolean) ?? true, subagentWatcher, 'Subagent watcher');
+      const subagentTrackingEnabled = (merged.subagentTrackingEnabled as boolean) ?? true;
+      if ('subagentTrackingEnabled' in settings) ctx.agentActivity.setTrackingEnabled(subagentTrackingEnabled);
+      toggleService(subagentTrackingEnabled, subagentWatcher, 'Subagent watcher');
 
       // Handle ultracode/workflow run watcher toggle dynamically (default OFF).
       // Either the docked panel OR the floating windows keep the watcher running.
@@ -1076,14 +1184,21 @@ export function registerSystemRoutes(
         }
       }
 
+      // COD-102: codex routing is global host state (the ~/.codex/config.toml patch),
+      // so apply a toggle/URL change immediately. Claude routing is per-session and is
+      // read fresh at the next spawn, so it needs nothing here. Non-fatal (reconcile
+      // swallows its own errors).
+      if ('headroomRouteCodex' in settings || 'headroomProxyUrl' in settings) {
+        await reconcileCodexHeadroomPatch();
+      }
+
       return {};
     } catch (err) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
     }
   });
 
-  // ========== Model Configuration ==========
-
+  // ========== Model Configuration ===
   app.get('/api/execution/model-config', async () => {
     const settings = await readJsonConfig<Record<string, unknown>>(SETTINGS_PATH, 'model config', {});
     return { success: true, data: settings.modelConfig || {} };
@@ -1115,8 +1230,7 @@ export function registerSystemRoutes(
     }
   });
 
-  // ========== CPU Priority ==========
-
+  // ========== CPU Priority ===
   app.get('/api/sessions/:id/cpu-limit', async (req) => {
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id, req);
@@ -1145,40 +1259,40 @@ export function registerSystemRoutes(
   // Subagent Management (window states, parents, monitoring, transcripts)
   // ═══════════════════════════════════════════════════════════════
 
-  // ========== Subagent Window State Persistence ==========
-
-  app.get('/api/subagent-window-states', async () => {
-    return readJsonConfig(windowStatesPath, 'subagent window states', { minimized: {}, open: [] });
+  // ========== Subagent Window State Persistence ===
+  app.get('/api/subagent-window-states', async (req) => {
+    const user = getAuthUser(req);
+    return readOwnerScopedConfig(
+      windowStatesPath,
+      'subagent window states',
+      { minimized: {}, open: [] },
+      user.username,
+      user.role === 'admin'
+    );
   });
 
   app.put('/api/subagent-window-states', async (req) => {
     const states = parseBody(SubagentWindowStatesSchema, req.body, 'Invalid window states') as Record<string, unknown>;
     try {
-      const dir = dirname(windowStatesPath);
-      if (!existsSync(dir)) {
-        mkdirSync(dir, { recursive: true });
-      }
-      await fs.writeFile(windowStatesPath, JSON.stringify(states, null, 2));
+      const user = getAuthUser(req);
+      await writeOwnerScopedConfig(windowStatesPath, 'subagent window states', states, user.username);
       return {};
     } catch (err) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
     }
   });
 
-  // ========== Subagent Parent Associations ==========
-
-  app.get('/api/subagent-parents', async () => {
-    return readJsonConfig(parentMapPath, 'subagent parent map', {});
+  // ========== Subagent Parent Associations ===
+  app.get('/api/subagent-parents', async (req) => {
+    const user = getAuthUser(req);
+    return readOwnerScopedConfig(parentMapPath, 'subagent parent map', {}, user.username, user.role === 'admin');
   });
 
   app.put('/api/subagent-parents', async (req) => {
     const parentMap = parseBody(SubagentParentMapSchema, req.body, 'Invalid parent map');
     try {
-      const dir = dirname(parentMapPath);
-      if (!existsSync(dir)) {
-        mkdirSync(dir, { recursive: true });
-      }
-      await fs.writeFile(parentMapPath, JSON.stringify(parentMap, null, 2));
+      const user = getAuthUser(req);
+      await writeOwnerScopedConfig(parentMapPath, 'subagent parent map', parentMap, user.username);
       return {};
     } catch (err) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
@@ -1227,7 +1341,8 @@ export function registerSystemRoutes(
   app.get('/api/sessions/:id/subagents', async (req) => {
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id, req);
-    const subagents = subagentWatcher.getSubagentsForSession(session.workingDir);
+    const claudeSessionId = session.claudeSessionId ?? session.id;
+    const subagents = subagentWatcher.getSubagentsForConversation(session.workingDir, claudeSessionId);
     return { success: true, data: subagents };
   });
 
@@ -1235,7 +1350,11 @@ export function registerSystemRoutes(
     // Multi-user stopgap: cross-user subagent metadata is admin-only (no-op single-user).
     if (isMultiUserMode() && !requireAdmin(req, reply)) return;
     const { agentId } = req.params as { agentId: string };
-    const info = subagentWatcher.getSubagent(agentId);
+    const resolved = subagentWatcher.resolveSubagentReference(agentId);
+    if (resolved.status === 'ambiguous') {
+      return createErrorResponse(ApiErrorCode.CONFLICT, `Subagent ID ${agentId} is ambiguous; use its agentKey`);
+    }
+    const info = resolved.status === 'found' ? resolved.info : subagentWatcher.getSubagent(agentId);
     if (!info) {
       return createErrorResponse(ApiErrorCode.NOT_FOUND, `Subagent ${agentId} not found`);
     }
@@ -1249,7 +1368,12 @@ export function registerSystemRoutes(
     const { agentId } = req.params as { agentId: string };
     const { limit, format } = req.query as { limit?: string; format?: 'raw' | 'formatted' };
     const limitNum = limit ? parseInt(limit, 10) : undefined;
-    const transcript = await subagentWatcher.getTranscript(agentId, limitNum);
+    const resolved = subagentWatcher.resolveSubagentReference(agentId);
+    if (resolved.status === 'ambiguous') {
+      return createErrorResponse(ApiErrorCode.CONFLICT, `Subagent ID ${agentId} is ambiguous; use its agentKey`);
+    }
+    const exactReference = resolved.status === 'found' ? resolved.info.agentKey : agentId;
+    const transcript = await subagentWatcher.getTranscript(exactReference, limitNum);
 
     if (format === 'formatted') {
       const formatted = subagentWatcher.formatTranscript(transcript);
@@ -1264,16 +1388,32 @@ export function registerSystemRoutes(
     // (no-op allow-all in single-user mode).
     if (isMultiUserMode() && !requireAdmin(req, reply)) return;
     const { agentId } = req.params as { agentId: string };
-    const info = subagentWatcher.getSubagent(agentId);
+    const resolved = subagentWatcher.resolveSubagentReference(agentId);
+    if (resolved.status === 'ambiguous') {
+      return createErrorResponse(ApiErrorCode.CONFLICT, `Subagent ID ${agentId} is ambiguous; use its agentKey`);
+    }
+    const info = resolved.status === 'found' ? resolved.info : subagentWatcher.getSubagent(agentId);
     if (!info) {
       return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Subagent not found');
     }
 
-    const killed = await subagentWatcher.killSubagent(agentId);
-    if (killed) {
-      return { success: true, data: { agentId, status: 'killed' } };
+    const exactReference = resolved.status === 'found' ? resolved.info.agentKey : agentId;
+    const result = await subagentWatcher.killSubagent(exactReference);
+    if (result.status === 'killed') {
+      return {
+        success: true,
+        data: { agentKey: info.agentKey, agentId: info.agentId, status: 'killed' },
+      };
     }
-    return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Subagent not found or already completed');
+    const messages: Record<typeof result.status, string> = {
+      not_found: 'Subagent not found',
+      already_completed: 'Subagent already completed',
+      atomic_termination_unavailable: 'Atomic exact subagent termination is unavailable for this Claude runtime',
+      unverifiable: 'Exact subagent process identity could not be verified',
+      stale_process: 'The exact subagent process changed before termination',
+      signal_failed: 'The verified subagent process could not be terminated',
+    };
+    return { ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, messages[result.status]), reason: result.status };
   });
 
   app.post('/api/subagents/cleanup', async (req, reply) => {
@@ -1287,7 +1427,7 @@ export function registerSystemRoutes(
     // Multi-user stopgap: clearing ALL users' subagents is a cross-user write → admin-only (no-op single-user).
     if (isMultiUserMode() && !requireAdmin(req, reply)) return;
     const cleared = subagentWatcher.clearAll();
-    return { success: true, data: { cleared } };
+    return { success: true, data: { cleared, remaining: subagentWatcher.getSubagents() } };
   });
 
   // ═══════════════════════════════════════════════════════════════

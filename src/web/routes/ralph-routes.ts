@@ -24,7 +24,7 @@ import {
   parseBody,
 } from '../route-helpers.js';
 import { resolveClaudeModeForUsername } from '../../user-store.js';
-import { writeHooksConfig, stripCaseEnvKeys } from '../../hooks-config.js';
+import { writeHooksConfig, stripCaseEnvKeys, verifyClaudeSessionStartHookCapability } from '../../hooks-config.js';
 import { generateClaudeMd } from '../../templates/claude-md.js';
 import { buildRalphLoopPrompt } from '../../prompts/index.js';
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
@@ -53,7 +53,14 @@ export function registerRalphRoutes(
       };
     const session = findSessionOrFail(ctx, id, req);
 
-    // Ralph tracker is not supported for external-CLI sessions (opencode/codex)
+    // Ralph tracker is not supported for external CLI sessions.
+    //
+    // COD-416/Q23: this was a hardcoded `opencode|codex|gemini` list — the external set from
+    // before antigravity was added, let alone pi/grok/deepseek/omp. The comment already said
+    // "external CLI", so the LIST was the bug. Ralph parses Claude's own todo/completion
+    // output, which no external CLI emits.
+    // ⚠️ NOT `capabilities.ralph`: shell is `ralph: false` there but is not external, and
+    // shell ralph config is accepted today.
     if (isExternalCliMode(session.mode)) {
       return createErrorResponse(
         ApiErrorCode.INVALID_INPUT,
@@ -333,6 +340,7 @@ export function registerRalphRoutes(
     const rlModelConfig = await ctx.getModelConfig();
     const rlClaudeModeConfig = await ctx.getClaudeModeConfig();
     const rlClaudeMode = await resolveClaudeModeForUsername(rlClaudeModeConfig.claudeMode, rlOwner);
+    const claudeSessionStartHookReady = await verifyClaudeSessionStartHookCapability('claude', casePath, false);
     const session = new Session({
       workingDir: casePath,
       mux: ctx.mux,
@@ -346,6 +354,8 @@ export function registerRalphRoutes(
       effort,
       advisorModel,
       owner: rlOwner,
+      checkpointEnabled: await ctx.getCheckpointDefaultEnabled(),
+      claudeSessionStartHookReady,
     });
 
     // Configure Ralph tracker

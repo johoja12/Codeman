@@ -57,7 +57,7 @@ afterAll(async () => {
   await server?.stop();
 }, 30_000);
 
-describe('OpenCode session initial resize', () => {
+describe(`${targetPrefix} OpenCode session initial resize`, () => {
   let context: BrowserContext;
   let page: Page;
 
@@ -111,31 +111,24 @@ describe('OpenCode session initial resize', () => {
     ({ context, page } = await freshPage());
     await navigateAndWait(page);
 
-    // Intercept resize API calls to track when they happen
-    const resizeCalls: Array<{ url: string; cols: number; rows: number }> = [];
-    // While the WebSocket is connected, resizes go out as {t:'z',c,r} frames
-    // instead of POST /resize, so record both transports.
-    page.on('websocket', (ws) => {
-      ws.on('framesent', (frame) => {
+    // COD-370 (`8bb9c972`) fenced the HTTP resize fallback off: viewer geometry
+    // is ownership-sensitive and only the sizing token on the terminal socket may
+    // resize the shared PTY, so `POST /api/sessions/:id/resize` is no longer on
+    // this path at all. Watch the socket frame (`{t:'z',c,r}`) instead — routing
+    // the retired endpoint made this assertion unsatisfiable, not merely stale.
+    await page.addInitScript(() => {
+      (window as any).__resizeFrames = [];
+      const send = WebSocket.prototype.send;
+      WebSocket.prototype.send = function (payload: any) {
         try {
-          const msg = JSON.parse(String(frame.payload));
-          if (msg.t === 'z') resizeCalls.push({ url: ws.url(), cols: msg.c, rows: msg.r });
-        } catch {
-          /* not JSON */
-        }
-      });
+          const msg = JSON.parse(payload);
+          if (msg?.t === 'z') (window as any).__resizeFrames.push({ url: this.url, cols: msg.c, rows: msg.r });
+        } catch {}
+        return send.call(this, payload);
+      };
     });
-    await page.route('**/api/sessions/*/resize', async (route) => {
-      const request = route.request();
-      const body = request.postDataJSON();
-      resizeCalls.push({
-        url: request.url(),
-        cols: body.cols,
-        rows: body.rows,
-      });
-      // Let the request through to the server
-      await route.continue();
-    });
+    await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => document.body.classList.contains('app-loaded'), { timeout: 5000 });
 
     // Create a session via API (simulating what quick-start does)
     const sessionId = await page.evaluate(async () => {
@@ -151,6 +144,12 @@ describe('OpenCode session initial resize', () => {
 
     expect(sessionId).toBeTruthy();
 
+    // Only frames caused by the SELECTION count. The window-resize handler and
+    // the pending-frame flush both put `t:'z'` on the same socket, so without
+    // this reset the assertion passes even with sendResize stubbed out — which
+    // is exactly what a mutation check caught.
+    await page.evaluate(() => ((window as any).__resizeFrames.length = 0));
+
     // Call selectSession (which is what runOpenCode does after fix)
     await page.evaluate(async (sid: string) => {
       const app = (window as unknown as { app: { selectSession: (id: string) => Promise<void> } }).app;
@@ -158,9 +157,12 @@ describe('OpenCode session initial resize', () => {
     }, sessionId);
 
     // Wait for the resize to be sent (it's fire-and-forget in selectSession)
-    await page.waitForTimeout(500);
+    await page.waitForFunction(() => ((window as any).__resizeFrames?.length ?? 0) >= 1, { timeout: 10_000 });
 
-    // Verify resize was called with reasonable dimensions (not 120x40 default)
+    // Verify resize was sent with reasonable dimensions (not the 120x40 default)
+    const resizeCalls: Array<{ url: string; cols: number; rows: number }> = await page.evaluate(
+      () => (window as any).__resizeFrames
+    );
     expect(resizeCalls.length).toBeGreaterThanOrEqual(1);
     const lastResize = resizeCalls[resizeCalls.length - 1];
     expect(lastResize.url).toContain(sessionId);
@@ -170,8 +172,18 @@ describe('OpenCode session initial resize', () => {
     // 1280x800 viewport, we should get something reasonable (>= 40 cols).
     expect(lastResize.cols).toBeGreaterThanOrEqual(40);
     expect(lastResize.rows).toBeGreaterThanOrEqual(10);
-
-    console.log(`[opencode-resize] resize sent: ${lastResize.cols}x${lastResize.rows}`);
+    // "Not stuck at 120x40" really means the frame carries what this xterm
+    // actually measured, so pin it to the live dimensions rather than to a
+    // floor that the 120x40 default would clear anyway.
+    // Read xterm directly, not getTerminalDimensions(): the frame is built from
+    // the same helper, so comparing against it would move both sides together
+    // and assert nothing.
+    expect(
+      await page.evaluate(() => ({ cols: (window as any).app.terminal.cols, rows: (window as any).app.terminal.rows }))
+    ).toEqual({
+      cols: lastResize.cols,
+      rows: lastResize.rows,
+    });
 
     // Cleanup
     await page.evaluate(async (sid: string) => {
@@ -225,17 +237,15 @@ describe('OpenCode session initial resize', () => {
     }, sessionId);
   });
 
-  it('needsRefresh handler includes sendResize call', async () => {
-    // The needsRefresh handler is registered inside a closure (connectSSE),
-    // so we can't directly invoke it from tests. Instead, verify that the
-    // handler source code dispatched to the EventSource includes sendResize.
-    // This is a structural test — if the handler code changes, this test
-    // ensures the resize call is preserved.
+  it('needsRefresh handler updates terminal resize state', async () => {
+    // The needsRefresh handler is registered via connectSSE. For active sessions,
+    // WS-backed sessions skip SSE refresh, so force the SSE fallback state in this
+    // test before invoking _onSSENeedsRefresh.
     ({ context, page } = await freshPage());
     await navigateAndWait(page);
 
-    // Dispatch a needsRefresh event on the EventSource and intercept
-    // the resulting resize API call
+    // Force the SSE fallback path and then validate the needs-refresh + resize
+    // state transition end-to-end.
     const sessionId = await page.evaluate(async () => {
       const res = await fetch('/api/sessions', {
         method: 'POST',
@@ -273,42 +283,153 @@ describe('OpenCode session initial resize', () => {
       }
     }, sessionId);
 
-    // Intercept resize calls
-    const resizeCalls: Array<{ url: string }> = [];
-    await page.route('**/api/sessions/*/resize', async (route) => {
-      resizeCalls.push({ url: route.request().url() });
-      await route.continue();
-    });
-
-    // Exercise the SSE fallback path. While WebSocket owns terminal I/O these
-    // duplicate SSE terminal events are intentionally ignored.
-    await page.evaluate((sid: string) => {
-      const app = (window as unknown as { app: { eventSource: EventSource; _disconnectWs: () => void } }).app;
-      app._disconnectWs();
-      if (app.eventSource) {
-        const event = new MessageEvent('session:needsRefresh', {
-          data: JSON.stringify({ id: sid }),
-        });
-        app.eventSource.dispatchEvent(event);
-      }
+    const stateBefore = await page.evaluate((sid) => {
+      const app = (
+        window as unknown as {
+          app: {
+            activeSessionId: string | null;
+            _wsReady: boolean;
+            _wsSessionId: string | null;
+            _isLoadingBuffer: boolean;
+            terminal: unknown;
+            fitAddon: unknown;
+            _lastResizeDims: { cols: number; rows: number } | null;
+            getTerminalDimensions: () => { cols: number; rows: number } | null;
+            sessions?: Map<string, { mode?: string }>;
+          };
+        }
+      ).app;
+      return {
+        activeSessionId: app.activeSessionId,
+        wsReady: app._wsReady,
+        wsSessionId: app._wsSessionId,
+        isLoadingBuffer: app._isLoadingBuffer,
+        liveMirrorEnabled: (app as { _liveMirrorEnabled?: boolean })._liveMirrorEnabled,
+        sessionMode: app.sessions?.get(sid as unknown as never)?.mode,
+        hasTerminal: Boolean(app.terminal),
+        hasFitAddon: Boolean(app.fitAddon),
+        lastResizeDims: app._lastResizeDims,
+        dims: app.getTerminalDimensions(),
+      };
     }, sessionId);
 
-    // Wait for the async handler (fetches /terminal buffer + sends resize)
-    await page.waitForTimeout(1500);
+    // Intercept terminal fetches so the refresh path has deterministic content.
+    // Trailing `*` matters: `6866a617` made the recovery fetch ask for
+    // `?full=1` (and fall back to `?tail=`), and a glob without it stops
+    // matching the query string, so the route silently never fired and the
+    // refresh saw the real server's empty buffer instead of the fixture.
+    const terminalRoute = '**/api/sessions/*/terminal*';
 
-    // Verify resize was called
-    expect(resizeCalls.length).toBeGreaterThanOrEqual(1);
-    console.log(`[opencode-resize] needsRefresh triggered ${resizeCalls.length} resize call(s)`);
+    await page.route(terminalRoute, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          data: {
+            terminalBuffer: 'mock-buffer-after-needs-refresh',
+          },
+        }),
+      });
+    });
+
+    // Confirm SSE wiring is present, then invoke the SSE path in fallback mode.
+    const handlerBound = await page.evaluate(() => {
+      const app = (
+        window as unknown as {
+          app: {
+            _sseHandlerWrappers?: Map<string, (event: { data: string }) => void>;
+            _onSSENeedsRefresh: (data: { id?: string }) => Promise<void>;
+          };
+        }
+      ).app;
+      return Boolean(app._sseHandlerWrappers?.has('session:needsRefresh'));
+    });
+
+    expect(handlerBound).toBe(true);
+
+    await page.evaluate(async (sid) => {
+      const app = (
+        window as unknown as {
+          app: {
+            _needsRefreshResizeCallCount: number;
+            _lastResizeDims: { cols: number; rows: number } | null;
+            sendResize: (sessionId: string) => Promise<unknown>;
+            _wsReady: boolean;
+            _wsSessionId: string | null;
+            _isLoadingBuffer: boolean;
+            sessions: Map<string, { mode?: string }>;
+            _liveMirrorEnabled: boolean;
+            selectSession?: (sessionId: string) => Promise<unknown>;
+            _onSSENeedsRefresh: (data: { id?: string }) => Promise<void>;
+          };
+        }
+      ).app;
+
+      // Reset to make resize tracking a stable assertion signal for this test.
+      app._lastResizeDims = null;
+      app._needsRefreshResizeCallCount = 0;
+      const originalSendResize = app.sendResize;
+      app.sendResize = async function (sessionId: string) {
+        app._needsRefreshResizeCallCount += 1;
+        return originalSendResize.call(app, sessionId);
+      };
+      app._wsReady = false;
+      app._wsSessionId = null;
+      app._isLoadingBuffer = false;
+      app._liveMirrorEnabled = false;
+      const session = app.sessions.get(sid);
+      if (session) {
+        session.mode = 'shell';
+      }
+      await app._onSSENeedsRefresh({ id: sid });
+    }, sessionId);
+
+    // Wait for the async refresh pipeline to complete.
+    await page.waitForFunction(() => {
+      const app = (window as unknown as { app: { _needsRefreshResizeCallCount?: number } }).app;
+      return (app._needsRefreshResizeCallCount ?? 0) > 0;
+    });
+
+    const stateAfter = await page.evaluate(() => {
+      const app = (
+        window as unknown as {
+          app: {
+            activeSessionId: string | null;
+            _wsReady: boolean;
+            _wsSessionId: string | null;
+            _isLoadingBuffer: boolean;
+            terminal: { buffer?: unknown } | null;
+            _lastResizeDims: { cols: number; rows: number } | null;
+          };
+        }
+      ).app;
+      return {
+        activeSessionId: app.activeSessionId,
+        wsReady: app._wsReady,
+        wsSessionId: app._wsSessionId,
+        isLoadingBuffer: app._isLoadingBuffer,
+        lastResizeDims: app._lastResizeDims,
+      };
+    });
+
+    expect(stateAfter.lastResizeDims).toEqual(
+      expect.objectContaining({
+        cols: expect.any(Number),
+        rows: expect.any(Number),
+      })
+    );
+    expect(stateAfter.lastResizeDims?.cols).toBeGreaterThanOrEqual(40);
+    expect(stateAfter.lastResizeDims?.rows).toBeGreaterThanOrEqual(10);
 
     // Cleanup
-    await page.route('**/api/sessions/*/resize', (route) => route.continue());
+    await page.unroute(terminalRoute);
     await page.evaluate(async (sid: string) => {
       await fetch(`/api/sessions/${sid}`, { method: 'DELETE' });
     }, sessionId);
   });
 });
 
-describe('OpenCode close modal text', () => {
+describe(`${targetPrefix} OpenCode close modal text`, () => {
   let context: BrowserContext;
   let page: Page;
 
@@ -320,12 +441,14 @@ describe('OpenCode close modal text', () => {
     ({ context, page } = await freshPage());
     await navigateAndWait(page);
 
-    // Create a session and mark it as opencode mode
+    // Create a session and mark it as opencode mode in the frontend state.
+    // The close-modal copy depends only on app.sessions mode, not an installed
+    // OpenCode CLI.
     const sessionId = await page.evaluate(async () => {
       const res = await fetch('/api/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workingDir: '/tmp', name: 'oc-close-test', mode: 'opencode' }),
+        body: JSON.stringify({ workingDir: '/tmp', name: 'oc-close-test' }),
       });
       const data = await res.json();
       // POST /api/sessions answers in the { success, data: { session } } envelope.
@@ -334,8 +457,16 @@ describe('OpenCode close modal text', () => {
 
     expect(sessionId).toBeTruthy();
 
-    // Wait for SSE to propagate the session
-    await page.waitForTimeout(500);
+    await page.evaluate(async (sid: string) => {
+      const app = (
+        window as unknown as {
+          app: { selectSession: (id: string) => Promise<void>; sessions: Map<string, { mode?: string }> };
+        }
+      ).app;
+      await app.selectSession(sid);
+      const session = app.sessions.get(sid);
+      if (session) session.mode = 'opencode';
+    }, sessionId);
 
     // Open the close confirmation modal
     await page.evaluate((sid: string) => {

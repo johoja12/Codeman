@@ -11,6 +11,18 @@ function handleOutput(session: Session, data: string): void {
 }
 
 describe('Codex terminal output filtering', () => {
+  it('uses configured terminal buffer limits for session stats and trimming', () => {
+    const session = new Session({
+      workingDir: '/tmp',
+      mode: 'codex',
+      terminalBufferConfig: { maxBytes: 20, trimBytes: 10 },
+    });
+
+    handleOutput(session, '1234567890abcdefghijk');
+
+    expect(session.terminalBuffer).toBe('bcdefghijk');
+    expect(session.toLightDetailedState().bufferStats.maxTerminalBuffer).toBe(20);
+  });
   it('keeps browser scrollback guards but skips Codeman row repair in hybrid render mode', () => {
     const session = new Session({ workingDir: '/tmp', mode: 'codex', codexConfig: { renderMode: 'hybrid' } });
     (session as unknown as SessionInternals)._ptyRows = 63;

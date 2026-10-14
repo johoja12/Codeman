@@ -16,6 +16,7 @@ import { resolve } from 'node:path';
 const publicDir = resolve(import.meta.dirname, '../src/web/public');
 const html = readFileSync(resolve(publicDir, 'index.html'), 'utf8');
 const settingsUi = readFileSync(resolve(publicDir, 'settings-ui.js'), 'utf8');
+const sessionUi = readFileSync(resolve(publicDir, 'session-ui.js'), 'utf8');
 
 /** The App Settings modal markup, so assertions can't be satisfied elsewhere. */
 function settingsModal(): string {
@@ -33,7 +34,7 @@ function settingsModal(): string {
  */
 function referencedIds(): string[] {
   const ids = new Set<string>();
-  for (const fn of ['openAppSettings()', 'async saveAppSettings()']) {
+  for (const fn of ['async openAppSettings()', 'async saveAppSettings()']) {
     const start = settingsUi.indexOf(`\n  ${fn} {`);
     expect(start, `${fn} not found in settings-ui.js`).toBeGreaterThan(-1);
     const body = settingsUi.slice(start, settingsUi.indexOf('\n  },', start));
@@ -213,5 +214,42 @@ describe('App Settings modal structure', () => {
     const adminUi = readFileSync(resolve(publicDir, 'admin-ui.js'), 'utf8');
     expect(adminUi).toContain('.set-rail-items');
     expect(adminUi).toContain('.set-doc');
+  });
+});
+
+describe('Case Management default group structure', () => {
+  it('keeps one accessible default-group control in the Edit Case surface', () => {
+    expect(html).toContain('id="caseEditDefaultGroupRow"');
+    expect(html).toContain('for="caseEditDefaultGroup"');
+    expect(html).toContain('id="caseEditDefaultGroup"');
+    expect(html).toContain('<option value="">Ungrouped</option>');
+    expect(html).toContain('Place future sessions for this case in this group');
+    expect(html).not.toContain('id="caseDefaultGroup"');
+    expect(html).not.toContain('id="caseDefaultGroupMobile"');
+  });
+
+  it('loads the Edit Case control from the server and saves it through the case update', () => {
+    expect(sessionUi).toContain('async loadCaseEditDefaultGroup(caseName)');
+    expect(sessionUi).toContain('this.loadCaseEditDefaultGroup(name)');
+    expect(sessionUi).toContain('const defaultGroupId = this._caseEditDefaultGroupId()');
+    expect(sessionUi).toContain('updatePayload = { ...updatePayload, defaultGroupId }');
+    expect(sessionUi).not.toContain('async onCaseDefaultGroupChanged(isMobile)');
+  });
+
+  it('opens Docker cases in the Docker Edit Case panel before loading the shared control', () => {
+    expect(sessionUi).toContain("this.caseEditOriginalLocation === 'docker'");
+    expect(sessionUi).toContain("this.switchCaseModalTab('case-docker')");
+    expect(sessionUi).toContain("originalLocation === 'docker'");
+  });
+});
+
+describe('COD-351 remote Codex command profile structure', () => {
+  it('replaces the raw override with an accessible saved-profile selection surface', () => {
+    expect(html).toContain('id="remoteCaseCodexProfile"');
+    expect(html).toContain('id="manageCodexCommandProfiles"');
+    expect(html).toContain('id="remoteCaseCodexProfilePreview"');
+    expect(html).toContain('id="remoteCaseCodexCommandCustom"');
+    expect(html).toContain('id="codexCommandProfileManager"');
+    expect(html).not.toContain('id="remoteCaseCodexCommand"');
   });
 });

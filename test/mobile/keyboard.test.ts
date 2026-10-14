@@ -237,14 +237,22 @@ describe('Virtual Keyboard', () => {
           toolbarTransform: toolbar?.style.transform ?? '',
           accessoryTransform: (accessory as HTMLElement | null)?.style.transform ?? '',
           toolbarTop: toolbarRect?.top ?? 0,
+          toolbarBottom: toolbarRect?.bottom ?? 0,
           accessoryTop: accessoryRect?.top ?? 0,
+          accessoryBottom: accessoryRect?.bottom ?? 0,
           terminalBottom: terminalRect?.bottom ?? 0,
+          mainPaddingBottom: parseFloat(
+            (document.querySelector('.main') as HTMLElement | null)?.style.paddingBottom || '0'
+          ),
         };
       });
-      expect(layout.toolbarTransform).toBe('');
-      expect(layout.accessoryTransform).toBe('');
+      expect(layout.toolbarTransform === '' || layout.toolbarTransform.startsWith('translateY(')).toBe(true);
+      expect(layout.accessoryTransform === '' || layout.accessoryTransform.startsWith('translateY(')).toBe(true);
       expect(layout.accessoryTop).toBeGreaterThanOrEqual(layout.terminalBottom - 4);
-      expect(layout.toolbarTop).toBeGreaterThan(layout.accessoryTop);
+      expect(layout.toolbarTop).toBeGreaterThanOrEqual(layout.accessoryBottom - 4);
+      expect(layout.mainPaddingBottom).toBeGreaterThanOrEqual(
+        layout.toolbarBottom - layout.toolbarTop + layout.accessoryBottom - layout.accessoryTop - 4
+      );
     });
 
     it('accessory bar gets .visible class', async () => {
@@ -751,7 +759,14 @@ describe('Virtual Keyboard', () => {
       expect(result.afterScroll).toContain('xterm-helper-textarea');
     });
 
-    it('routes CJK textarea typing through local echo on Enter', async () => {
+    // `70742d40` removed CJK local-echo buffering deliberately: accumulating
+    // characters until Enter was itself the bug, because a composed CJK word has
+    // to reach the PTY as it is committed. Every keystroke is now flushed and the
+    // textarea reset to its zero-width-space sentinel, so NEITHER the overlay nor
+    // the textarea holds text between keys — the terminal's own echo is the
+    // feedback. This used to assert the accumulate-then-flush contract; it now
+    // pins the immediate-send one, so re-introducing buffering fails here.
+    it('sends CJK textarea typing straight through without local-echo buffering', async () => {
       await page.evaluate(() => {
         window.__sentInputs = [];
         const sessionId = 'mobile-cjk-local-echo-test';
@@ -790,18 +805,21 @@ describe('Virtual Keyboard', () => {
         pendingText: app._localEchoOverlay.pendingText,
         sentInputs: window.__sentInputs,
       }));
-      expect(beforeEnter.visibleText).toBe('hello');
+      // Nothing is held back: the textarea is flushed and reset per keystroke,
+      // and the local-echo overlay is bypassed entirely\u2026
+      expect(beforeEnter.visibleText).toBe('');
       expect(beforeEnter.pendingText).toBe('');
-      expect(beforeEnter.sentInputs).toEqual([]);
+      // \u2026and the characters are already on the wire, not held back until Enter.
+      expect(beforeEnter.sentInputs.join('')).toBe('hello');
 
       await page.keyboard.press('Enter');
-      await page.waitForFunction(() => window.__sentInputs?.length === 2);
+      await page.waitForFunction(() => window.__sentInputs?.some((input) => input.includes('\r')));
       const afterEnter = await page.evaluate(() => ({
         pendingText: app._localEchoOverlay.pendingText,
         sentInputs: window.__sentInputs,
       }));
       expect(afterEnter.pendingText).toBe('');
-      expect(afterEnter.sentInputs).toEqual(['hello', '\r']);
+      expect(afterEnter.sentInputs.join('')).toBe('hello\r');
     });
 
     it('shows the CJK textarea on mobile for server override only inside an active session', async () => {
@@ -980,6 +998,11 @@ describe('Virtual Keyboard', () => {
           id: 'mobile-readback-tap-test',
           mode: 'codex',
           status: 'running',
+          // `fa7e7008` narrowed tap classification from a mode check to the live
+          // `cliMouseTracking` flag the server publishes as it strips the CLI's
+          // mouse DECSETs. A real pane running this TUI has tracking on; without
+          // the flag every tap classifies as 'input' and the row is never content.
+          cliMouseTracking: true,
         });
         app._sendInputAsync = (_sessionId: string, input: string) => {
           window.__sentInputs.push(input);
@@ -1026,6 +1049,7 @@ describe('Virtual Keyboard', () => {
           mode: 'claude',
           cliVersion: '2.1.220',
           status: 'working',
+          cliMouseTracking: true, // see fa7e7008 note above
         });
         app._sendInputAsync = (_sessionId: string, input: string) => {
           window.__sentInputs.push(input);
@@ -1043,6 +1067,11 @@ describe('Virtual Keyboard', () => {
           )
         );
         app.terminal.focus();
+        // COD-467: "keyboard up" is focus AND a visible keyboard. Headless Chromium
+        // has no on-screen keyboard, so say so explicitly; focus alone is now the
+        // stale-focus case (keyboard gone, textarea still focused), where a tap
+        // must REOPEN the keyboard rather than run this close toggle.
+        KeyboardHandler.keyboardVisible = true;
 
         const screen = app.terminal.element?.querySelector('.xterm-screen');
         const cell = app.terminal._core?._renderService?.dimensions?.css?.cell;
@@ -1072,8 +1101,76 @@ describe('Virtual Keyboard', () => {
       // one on an inert row — the case that now closes the keyboard. Previously
       // it re-focused, which left the accessory bar's chevron as the only way to
       // dismiss. The prompt row is unaffected and still positions the caret.
-      const activeClass = await page.evaluate(() => document.activeElement?.className);
+      const activeClass = await page.evaluate(() => {
+        const cls = document.activeElement?.className;
+        KeyboardHandler.keyboardVisible = false; // never leak into the next test
+        return cls;
+      });
       expect(activeClass).not.toContain('xterm-helper-textarea');
+    });
+
+    // COD-467 (iPhone, Chrome = WebKit): iOS hides the keyboard on an app/tab
+    // switch while the hidden textarea KEEPS focus. WebKit ignores focus() on the
+    // already-focused element, so a tap used to do nothing (prompt row) or run the
+    // close toggle (transcript row) until a session switch blurred it. A tap in
+    // that state must produce a REAL focus change (blur then focus) and end
+    // focused. Headless Chromium cannot show the iOS keyboard, so the events on
+    // the textarea are the observable.
+    it('reopens the keyboard from stale focus: a tap is a real blur+focus, on the prompt and the transcript', async () => {
+      const setup = await page.evaluate(async () => {
+        app.activeSessionId = 'mobile-claude-stale-focus-test';
+        app.sessions.set('mobile-claude-stale-focus-test', {
+          id: 'mobile-claude-stale-focus-test',
+          mode: 'claude',
+          cliVersion: '2.1.220',
+          status: 'idle',
+          cliMouseTracking: true,
+        });
+        app._sendInputAsync = () => {};
+        app.hideWelcome();
+        const settings = app.loadAppSettingsFromStorage();
+        settings.cjkInputEnabled = false;
+        app.saveAppSettingsToStorage(settings);
+        app._updateCjkInputState();
+        app.terminal.reset();
+        await new Promise<void>((resolve) =>
+          app.terminal.write(
+            'Transcript row one\r\nTranscript row two\r\nTranscript row three\r\nTranscript row four\r\nTranscript row five\r\nTranscript row six\r\n\r\n❯ ',
+            resolve
+          )
+        );
+        const screen = app.terminal.element?.querySelector('.xterm-screen');
+        const cell = app.terminal._core?._renderService?.dimensions?.css?.cell;
+        const rect = screen?.getBoundingClientRect();
+        if (!screen || !rect || !cell?.width || !cell?.height) return null;
+        const cursorRow = app.terminal.buffer.active.cursorY;
+        const at = (row: number) => ({ x: rect.left + cell.width * 2, y: rect.top + cell.height * (row + 0.5) });
+        const textarea = app.terminal.textarea;
+        window.__focusEvents = [];
+        textarea.addEventListener('blur', () => window.__focusEvents.push('blur'));
+        textarea.addEventListener('focus', () => window.__focusEvents.push('focus'));
+        return { prompt: at(cursorRow), transcript: at(1) };
+      });
+      expect(setup).not.toBeNull();
+
+      for (const target of ['prompt', 'transcript'] as const) {
+        await page.evaluate(() => {
+          // Stale focus: textarea focused, keyboard NOT up.
+          app.terminal.focus();
+          KeyboardHandler.keyboardVisible = false;
+          window.__focusEvents = [];
+        });
+        await page.touchscreen.tap(setup![target].x, setup![target].y);
+        const after = await page.evaluate(() => ({
+          events: window.__focusEvents.slice(),
+          active: document.activeElement?.className || '',
+        }));
+        expect(after.active, target).toContain('xterm-helper-textarea');
+        // A focus event AFTER a blur = a real focus change inside the tap.
+        const lastFocus = after.events.lastIndexOf('focus');
+        expect(lastFocus, `${target}: ${after.events.join(',')}`).toBeGreaterThan(after.events.indexOf('blur'));
+        expect(after.events.indexOf('blur'), target).toBeGreaterThan(-1);
+      }
     });
 
     it('prevents Claude subagent status taps from opening the hidden keyboard input', async () => {
@@ -1085,6 +1182,7 @@ describe('Virtual Keyboard', () => {
           mode: 'claude',
           cliVersion: '2.1.220',
           status: 'working',
+          cliMouseTracking: true, // see fa7e7008 note above
         });
         app._sendInputAsync = (_sessionId: string, input: string) => {
           window.__sentInputs.push(input);
@@ -1262,7 +1360,7 @@ describe('Virtual Keyboard', () => {
         app.activeSessionId = 'mobile-touch-scroll-test';
         app.sessions.set('mobile-touch-scroll-test', {
           id: 'mobile-touch-scroll-test',
-          mode: 'codex',
+          mode: 'claude',
           status: 'running',
         });
         app.hideWelcome();
@@ -1285,15 +1383,24 @@ describe('Virtual Keyboard', () => {
           cjkVisible: document.body.classList.contains('cjk-input-visible'),
         };
 
+        // COD-187 routes a mirror tab's drag into _handleUserScrollIntent, which
+        // runs at scrollback 0 and therefore never reaches terminal.scrollLines.
+        // Spy on the funnel itself — that is what "the drag reached the terminal"
+        // means for these modes now. Both are recorded so either route counts.
         const originalScrollLines = app.terminal.scrollLines.bind(app.terminal);
         const scrollCalls: number[] = [];
         app.terminal.scrollLines = (lines: number) => {
           scrollCalls.push(lines);
           return originalScrollLines(lines);
         };
+        const originalScrollIntent = app._handleUserScrollIntent.bind(app);
+        app._handleUserScrollIntent = (lines: number) => {
+          scrollCalls.push(lines);
+          return originalScrollIntent(lines);
+        };
+
         const sentToCli: string[] = [];
         app._sendInputEphemeral = (_id: string, data: string) => sentToCli.push(data);
-
         const target =
           document.querySelector('#terminalContainer .xterm-screen') ?? document.getElementById('terminalContainer');
         if (!target) return { before, scrollCalls, sentToCli, viewportAfter: -1 };
@@ -1358,6 +1465,92 @@ describe('Virtual Keyboard', () => {
       expect(result.sentToCli).toEqual([]);
     });
 
+    it('consumes terminal touch drag while keyboard is visible so Safari does not pan the viewport', async () => {
+      await showKeyboard(page, KEYBOARD.TYPICAL_IOS_HEIGHT);
+      await page.waitForTimeout(WAIT.KEYBOARD_ANIMATION);
+
+      const state = await page.evaluate(async () => {
+        app.activeSessionId = 'mobile-keyboard-touch-scroll-test';
+        app.sessions.set('mobile-keyboard-touch-scroll-test', {
+          id: 'mobile-keyboard-touch-scroll-test',
+          mode: 'codex',
+          status: 'running',
+        });
+        app.hideWelcome();
+        app._updateCjkInputState();
+
+        // COD-187 routes a mirror tab's drag into _handleUserScrollIntent, which
+        // runs at scrollback 0 and therefore never reaches terminal.scrollLines.
+        // Spy on the funnel itself — that is what "the drag reached the terminal"
+        // means for these modes now. Both are recorded so either route counts.
+        const originalScrollLines = app.terminal.scrollLines.bind(app.terminal);
+        const scrollCalls: number[] = [];
+        app.terminal.scrollLines = (lines: number) => {
+          scrollCalls.push(lines);
+          return originalScrollLines(lines);
+        };
+        const originalScrollIntent = app._handleUserScrollIntent.bind(app);
+        app._handleUserScrollIntent = (lines: number) => {
+          scrollCalls.push(lines);
+          return originalScrollIntent(lines);
+        };
+
+        const target = document.getElementById('terminalContainer');
+        if (!target) return { scrollCalls, moveAllowedDefault: true, moveDefaultPrevented: false };
+        const rect = target.getBoundingClientRect();
+        const x = rect.left + rect.width / 2;
+        const startY = rect.top + Math.min(160, rect.height - 20);
+        const endY = startY - 120;
+
+        function createTouch(y: number) {
+          return new Touch({
+            identifier: 1,
+            target,
+            clientX: x,
+            clientY: y,
+            pageX: x,
+            pageY: y,
+          });
+        }
+
+        const start = new TouchEvent('touchstart', {
+          touches: [createTouch(startY)],
+          changedTouches: [createTouch(startY)],
+          bubbles: true,
+          cancelable: true,
+        });
+        target.dispatchEvent(start);
+
+        const move = new TouchEvent('touchmove', {
+          touches: [createTouch(endY)],
+          changedTouches: [createTouch(endY)],
+          bubbles: true,
+          cancelable: true,
+        });
+        const moveAllowedDefault = target.dispatchEvent(move);
+
+        target.dispatchEvent(
+          new TouchEvent('touchend', {
+            touches: [],
+            changedTouches: [createTouch(endY)],
+            bubbles: true,
+            cancelable: true,
+          })
+        );
+        await new Promise((resolve) => setTimeout(resolve, 50));
+
+        return {
+          scrollCalls,
+          moveAllowedDefault,
+          moveDefaultPrevented: move.defaultPrevented,
+        };
+      });
+
+      expect(state.scrollCalls.some((lines) => lines !== 0)).toBe(true);
+      expect(state.moveAllowedDefault).toBe(false);
+      expect(state.moveDefaultPrevented).toBe(true);
+    });
+
     it('keeps typed phone text in the terminal local echo path', async () => {
       await page.evaluate(() => {
         window.__sentInputs = [];
@@ -1403,6 +1596,39 @@ describe('Virtual Keyboard', () => {
       }));
       expect(afterEnter.pendingText).toBe('');
       expect(afterEnter.sentInputs.join('')).toBe('find bug\r');
+    });
+
+    it('sends Codex skill picker trigger immediately despite local echo', async () => {
+      await page.evaluate(() => {
+        window.__sentInputs = [];
+        app.activeSessionId = 'mobile-codex-skill-trigger-test';
+        app.sessions.set('mobile-codex-skill-trigger-test', {
+          id: 'mobile-codex-skill-trigger-test',
+          mode: 'codex',
+          status: 'running',
+        });
+        app.hideWelcome();
+        app._sendInputAsync = (_sessionId: string, input: string) => {
+          window.__sentInputs.push(input);
+        };
+        const settings = app.loadAppSettingsFromStorage();
+        settings.cjkInputEnabled = false;
+        settings.localEchoEnabled = true;
+        app.saveAppSettingsToStorage(settings);
+        app._updateCjkInputState();
+        app._updateLocalEchoState();
+        app.terminal.focus();
+      });
+
+      await page.keyboard.type('$');
+      await page.waitForFunction(() => window.__sentInputs?.length === 1);
+
+      const state = await page.evaluate(() => ({
+        pendingText: app._localEchoOverlay?.pendingText,
+        sentInputs: window.__sentInputs,
+      }));
+      expect(state.pendingText).toBe('');
+      expect(state.sentInputs).toEqual(['$']);
     });
 
     it('shows terminal local echo at the cursor when no prompt marker is visible', async () => {

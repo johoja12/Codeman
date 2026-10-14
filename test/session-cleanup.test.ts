@@ -1,11 +1,124 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
-import { WebServer } from '../src/web/server.js';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { WebServer, subagentConversationIdForCleanup } from '../src/web/server.js';
+import { Session } from '../src/session.js';
+import { workingFramePollCoordinator } from '../src/working-frame-poll-coordinator.js';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { safeRmHomeTree } from './mocks/index.js';
 
 const CASES_DIR = join(homedir(), 'codeman-cases');
+
+describe('subagent cleanup identity', () => {
+  it('uses Claude conversation identity rather than the Codeman session id', () => {
+    const session = new Session({ id: 'codeman-id', workingDir: '/tmp', mode: 'claude' });
+    session.adoptClaudeSessionId('claude-conversation-id');
+
+    expect(subagentConversationIdForCleanup(session)).toBe('claude-conversation-id');
+    expect(subagentConversationIdForCleanup({ id: 'codeman-only', claudeSessionId: undefined })).toBeUndefined();
+  });
+});
+
+describe('working-frame poll cleanup', () => {
+  it('unregisters the session from the shared coordinator on stop', async () => {
+    const session = new Session({ id: 'cleanup-poller', workingDir: '/tmp', mode: 'codex' });
+    const internals = session as unknown as {
+      _mux: unknown;
+      _muxSession: unknown;
+      _startWorkingFramePoller(): void;
+    };
+    internals._mux = { capturePaneTextAsync: async () => null };
+    internals._muxSession = { muxName: 'codeman-cleanup' };
+    internals._startWorkingFramePoller();
+
+    expect(workingFramePollCoordinator.has('cleanup-poller')).toBe(true);
+    await session.stop(false);
+    expect(workingFramePollCoordinator.has('cleanup-poller')).toBe(false);
+  });
+});
+
+describe('session stop SIGKILL cleanup', () => {
+  function setPty(session: Session, pid: number) {
+    (session as unknown as { ptyProcess: { pid: number; kill: () => void } }).ptyProcess = {
+      pid,
+      kill: vi.fn(),
+    };
+  }
+
+  function esrch() {
+    return Object.assign(new Error('no such process'), { code: 'ESRCH' });
+  }
+
+  it('does not warn when the direct SIGKILL target has already exited', async () => {
+    const pid = 45_001;
+    const session = new Session({ id: 'direct-esrch', workingDir: '/tmp', mode: 'shell' });
+    setPty(session, pid);
+    const kill = vi.spyOn(process, 'kill').mockImplementation(((target: number) => {
+      if (target === pid) throw esrch();
+      return true;
+    }) as typeof process.kill);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    try {
+      await session.stop();
+
+      expect(kill).toHaveBeenCalledWith(pid, 'SIGKILL');
+      expect(kill).toHaveBeenCalledWith(-pid, 'SIGKILL');
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      kill.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it('does not warn when the SIGKILL process group has already exited', async () => {
+    const pid = 45_002;
+    const session = new Session({ id: 'group-esrch', workingDir: '/tmp', mode: 'shell' });
+    setPty(session, pid);
+    const kill = vi.spyOn(process, 'kill').mockImplementation(((target: number) => {
+      if (target === -pid) throw esrch();
+      return true;
+    }) as typeof process.kill);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    try {
+      await session.stop();
+
+      expect(kill).toHaveBeenCalledWith(pid, 'SIGKILL');
+      expect(kill).toHaveBeenCalledWith(-pid, 'SIGKILL');
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      kill.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it.each([
+    ['process', 45_003],
+    ['process group', -45_004],
+  ])('keeps warnings for other SIGKILL failures from the %s', async (_targetLabel, failingTarget) => {
+    const pid = Math.abs(failingTarget);
+    const session = new Session({ id: `kill-error-${pid}`, workingDir: '/tmp', mode: 'shell' });
+    setPty(session, pid);
+    const error = Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+    const kill = vi.spyOn(process, 'kill').mockImplementation(((target: number) => {
+      if (target === failingTarget) throw error;
+      return true;
+    }) as typeof process.kill);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    try {
+      await session.stop();
+
+      expect(kill).toHaveBeenCalledWith(pid, 'SIGKILL');
+      expect(kill).toHaveBeenCalledWith(-pid, 'SIGKILL');
+      expect(warn).toHaveBeenCalledWith(expect.any(String), error);
+    } finally {
+      kill.mockRestore();
+      warn.mockRestore();
+    }
+  });
+});
 
 /**
  * Session Cleanup Tests
@@ -15,9 +128,10 @@ const CASES_DIR = join(homedir(), 'codeman-cases');
 describe('Session Cleanup', () => {
   let server: WebServer;
   let baseUrl: string;
-  let testWorkingDir: string;
   const createdCases: string[] = [];
   const createdSessions: string[] = [];
+  // Own, isolated working-directory fixture instead of the shared /tmp (COD-44).
+  let testWorkingDir: string;
 
   beforeAll(async () => {
     testWorkingDir = mkdtempSync(join(tmpdir(), 'codeman-cleanup-test-'));
@@ -57,18 +171,17 @@ describe('Session Cleanup', () => {
       const internals = server as unknown as {
         tabLayouts: { runSessionDeletion: (...args: unknown[]) => Promise<unknown> };
       };
-      const deletionSpy = vi
-        .spyOn(internals.tabLayouts, 'runSessionDeletion')
-        .mockRejectedValueOnce(new Error('layout prune unavailable'));
-      try {
-        const deleteRes = await fetch(`${baseUrl}/api/sessions/${id}`, { method: 'DELETE' });
-        const getRes = await fetch(`${baseUrl}/api/sessions/${id}`);
+      const original = internals.tabLayouts.runSessionDeletion;
+      internals.tabLayouts.runSessionDeletion = vi.fn(async () => {
+        throw new Error('layout prune unavailable');
+      });
 
-        expect(deleteRes.status).toBe(500);
-        expect(getRes.status).toBe(200);
-      } finally {
-        deletionSpy.mockRestore();
-      }
+      const deleteRes = await fetch(`${baseUrl}/api/sessions/${id}`, { method: 'DELETE' });
+      const getRes = await fetch(`${baseUrl}/api/sessions/${id}`);
+
+      expect(deleteRes.status).toBe(500);
+      expect(getRes.status).toBe(200);
+      internals.tabLayouts.runSessionDeletion = original;
     });
 
     it('should properly stop and cleanup interactive session', async () => {
@@ -148,7 +261,7 @@ describe('Session Cleanup', () => {
       const sessionRes = await fetch(`${baseUrl}/api/sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workingDir: '/tmp' }),
+        body: JSON.stringify({ workingDir: testWorkingDir }),
       });
       const sessionData = await sessionRes.json();
       expect(sessionData.success).toBe(true);
@@ -189,7 +302,7 @@ describe('Session Cleanup', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           prompt: 'test cleanup',
-          workingDir: '/tmp',
+          workingDir: testWorkingDir,
           durationMinutes: 1,
         }),
       });

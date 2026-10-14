@@ -101,12 +101,21 @@ Object.assign(CodemanApp.prototype, {
       if (!this.activeSessionId) return;
       if (!e.dataTransfer || !e.dataTransfer.files.length) return;
 
-      const mediaFiles = Array.from(e.dataTransfer.files).filter((f) => this._promptAttachKind(f));
-      if (mediaFiles.length === 0) {
-        this.showToast('Only image or video files are supported', 'error');
+      // Unified drop split (COD-241 unit 3): a single drop handler on the
+      // terminal container routes images → the image flow and allowlisted
+      // documents → the document flow, so the two never fight over the same
+      // drop event (a second competing listener would double-toast a doc-only
+      // drop as "Only image files are supported"). _isAllowedDocumentFile is
+      // defined in document-input.js (also mixed onto CodemanApp.prototype).
+      const all = Array.from(e.dataTransfer.files);
+      const imageFiles = all.filter((f) => this._promptAttachKind(f));
+      const docFiles = all.filter((f) => !this._promptAttachKind(f) && this._isAllowedDocumentFile(f));
+      if (imageFiles.length === 0 && docFiles.length === 0) {
+        this.showToast('Unsupported file type', 'error');
         return;
       }
-      this._uploadAndInsertImages(mediaFiles);
+      if (imageFiles.length > 0) this._uploadAndInsertImages(imageFiles);
+      if (docFiles.length > 0) this._uploadAndInsertDocuments(docFiles);
     });
   },
 

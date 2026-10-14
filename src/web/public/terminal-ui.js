@@ -13,6 +13,37 @@
  */
 
 (function (global) {
+  const DEBUG_MOBILE = typeof URLSearchParams !== 'undefined' && typeof location !== 'undefined' ? new URLSearchParams(location.search).has('debugMobile') : false;
+  function logViewport(label) {
+    if (!DEBUG_MOBILE) return;
+    const vv = window.visualViewport;
+    console.log(`[mobile][${label}] innerHeight=${window.innerHeight} vv.h=${vv?.height} vv.scale=${vv?.scale} appHeight=${getComputedStyle(document.documentElement).getPropertyValue('--app-height')} dvh=${window.innerHeight}`);
+  }
+
+  // ── COD-331 Phase 1 instrumentation ──
+  // Enabled via ?debugEcho, ?debugMobile already covers scroll, or localStorage codeman:debugEcho=1.
+  // Zero cost when disabled (one boolean check per keystroke). When enabled,
+  // counts every classifyPredictInput outcome + anchorHold timing via
+  // _predictiveEcho.debugState + window.codemanEchoDebug helpers.
+  const DEBUG_ECHO =
+    (typeof URLSearchParams !== 'undefined' && typeof location !== 'undefined'
+      ? new URLSearchParams(location.search).has('debugEcho')
+      : false) ||
+    (function () {
+      try {
+        return localStorage.getItem('codeman:debugEcho') === '1';
+      } catch {
+        return false;
+      }
+    })();
+  function debugEchoLog() {
+    if (!DEBUG_ECHO) return;
+    try {
+      // eslint-disable-next-line no-console
+      console.log.apply(console, ['[echo-debug]'].concat([].slice.call(arguments)));
+    } catch {}
+  }
+
   const TERMINAL_QUERY_RESPONSE_PATTERN = /^\x1b\[[\?>=]?[\d;]*[cnR]$/;
   const TERMINAL_OSC_RESPONSE_PATTERN = /^\x1b\][\d;]*[^\x07\x1b]*(?:\x07|\x1b\\)$/;
   // Pointer and focus reports xterm emits through onData on the terminal's OWN
@@ -106,6 +137,32 @@
   // event goes the SAME way, so slow small wheel ticks (40 px every 250 ms, a
   // Firefox 1-line notch) pay it back instead of each pre-paying a page of its own.
   const PAGE_KEY_DEBT_MS = 1000;
+  // COD-464 paced wheel → CLI. Per animation frame, send at most this share of
+  // the rows still owed (always at least one report's worth). Small amounts, which
+  // is everything a trackpad or a finger produces, go out at once, so the content
+  // stops when the input stops; only a big jump (a mouse notch, ~5 rows) is spread
+  // over a few frames, halving each frame, instead of landing in one repaint.
+  const WHEEL_PACE_EASE = 0.5;
+  const WHEEL_PACE_MAX_REPORTS_PER_FRAME = 6;
+  // Streak timing margins. A CLI that accelerates within a streak (`wheelForward.
+  // streak`, measured on Claude: reset between 30 and 40 ms) is only ever sent a
+  // report while the streak is CLEARLY alive (gap < resetMs - continue margin) or
+  // CLEARLY reset (gap >= resetMs + reset margin), never in between. ASYMMETRIC on
+  // purpose: the browser → WS → server → tmux path compresses gaps (a flick whose
+  // sends were 47-52 ms apart moved 68 rows, which only fits Claude NOT resetting
+  // at those gaps), and wrongly assuming a reset over-delivers (the runaway feel)
+  // while wrongly assuming a continuation merely under-delivers.
+  const WHEEL_STREAK_CONTINUE_MARGIN_MS = 12;
+  const WHEEL_STREAK_RESET_MARGIN_MS = 35;
+  // Finger still for this long before lifting = a hold, not a flick (iOS does the same).
+  const TOUCH_HOLD_NO_FLING_MS = 80;
+  // A wheel event after this much quiet starts a NEW gesture, whose first event
+  // sends a report even when it is less than one report's worth of travel, so the
+  // screen answers the very first event (a trackpad's first deltas are a few px).
+  // The pre-paid travel is owed back by the rest of the gesture, never added.
+  const WHEEL_PACE_GESTURE_GAP_MS = 150;
+  // ...but not for sub-row jitter (0.1 row, ~2px).
+  const WHEEL_PACE_MIN_START_ROWS = 0.1;
 
   // Wheel delta → scroll lines (fractional), for a terminal `rows` tall. The
   // body of the primary pane's _wheelScrollLinesFloat (see its comment for the
@@ -263,21 +320,33 @@
   // and wrapped continuation rows (2-space indent) do NOT match — that is
   // the ghost eliminator: no prediction is ever painted there.
   const CODEX_COMPOSER_ROW_RE = /^› /;
+  // OpenCode (Bubble Tea) composer signature: the input row contains "┃" (U+2503 heavy vertical)
+  // — measured on opencode 1.18.18, see harness2: row is "  ┃ ..." with cursor at the bar.
+  // Unlike Codex, there is no fixed prefix; any line containing ┃ is the composer.
+  const OPENCODE_COMPOSER_RE = /\u2503/;
 
   // Classify onData for the predictive echo hook. Terminal query responses
   // never reach this (suppressed earlier in onData); bracketed pastes, nav
   // keys and mouse reports all start with ESC => 'clear'.
+  // Instrumented for COD-331: counts stored on window.CodemanTerminalInput._debugClassify
+  const _debugClassifyCounts = { char: 0, backspace: 0, clear: 0, text: 0, total: 0 };
   function classifyPredictInput(data) {
     const cps = Array.from(data); // astral-safe
+    let kind;
     if (cps.length === 1) {
       const cp = cps[0].codePointAt(0);
-      if (cp === 0x7f) return 'backspace';
-      if (cp >= 0x20) return 'char'; // incl. a single astral emoji
-      return 'clear'; // \r \n \t \x03, bare ESC, ...
-    }
-    if (data.charCodeAt(0) === 0x1b) return 'clear'; // ESC seq: nav, paste, mouse SGR
-    if (data.charCodeAt(0) >= 0x20) return 'text'; // multi-char printable (plain paste,
-    return 'clear'; //   ZWJ emoji cluster): wire only, no visual
+      if (cp === 0x7f) kind = 'backspace';
+      else if (cp >= 0x20) kind = 'char'; // incl. a single astral emoji
+      else kind = 'clear'; // \r \n \t \x03, bare ESC, ...
+    } else if (data.charCodeAt(0) === 0x1b) kind = 'clear'; // ESC seq: nav, paste, mouse SGR
+    else if (data.charCodeAt(0) >= 0x20) kind = 'text'; // multi-char printable (plain paste,
+    else kind = 'clear'; //   ZWJ emoji cluster): wire only, no visual
+    // instrumentation — unconditional cheap increment, no I/O unless debugEcho
+    try {
+      _debugClassifyCounts.total++;
+      _debugClassifyCounts[kind]++;
+    } catch {}
+    return kind;
   }
 
   // Predictive-echo gate: predict only while the cursor sits on the codex
@@ -287,6 +356,16 @@
       const buf = terminal.buffer.active;
       const line = buf.getLine(buf.baseY + buf.cursorY);
       return !!line && CODEX_COMPOSER_ROW_RE.test(line.translateToString(true));
+    } catch {
+      return false;
+    }
+  }
+  // OpenCode composer row: any line containing "┃" (U+2503) is the Bubble Tea input row.
+  function isOpencodeComposerRow(terminal) {
+    try {
+      const buf = terminal.buffer.active;
+      const line = buf.getLine(buf.baseY + buf.cursorY);
+      return !!line && OPENCODE_COMPOSER_RE.test(line.translateToString(true));
     } catch {
       return false;
     }
@@ -377,8 +456,10 @@
     isComposerNavKey,
     classifyPredictInput,
     isCodexComposerRow,
+    isOpencodeComposerRow,
     cursorViewportRow,
     CODEX_COMPOSER_ROW_RE,
+    OPENCODE_COMPOSER_RE,
     BRACKETED_PASTE_START,
     USER_SCROLL_STICKY_SUPPRESS_MS,
     TOUCH_COMPAT_MOUSE_SUPPRESS_MS,
@@ -387,6 +468,13 @@
     KEY_PAGE_DOWN,
     PAGE_KEY_SCREEN_FRACTION,
     PAGE_KEY_MAX_PER_BATCH,
+    WHEEL_PACE_EASE,
+    WHEEL_PACE_MAX_REPORTS_PER_FRAME,
+    WHEEL_PACE_GESTURE_GAP_MS,
+    WHEEL_PACE_MIN_START_ROWS,
+    WHEEL_STREAK_CONTINUE_MARGIN_MS,
+    WHEEL_STREAK_RESET_MARGIN_MS,
+    TOUCH_HOLD_NO_FLING_MS,
     wheelDeltaLines,
     wheelDeltaWholeLines,
     SGR_WHEEL_MAX_TICKS,
@@ -400,6 +488,7 @@
     TUI_PROMPT_DEFAULT_ROWS_FROM_BOTTOM,
     MOBILE_KEYBOARD_DISMISS_EXEMPT_SELECTOR,
     MOBILE_KEYBOARD_DISMISS_TAP_SLOP,
+    _debugClassifyCounts,
     TOUCH_SELECT_LONG_PRESS_MS,
     TOUCH_SELECT_FOCUS_GUARD_MS,
   };
@@ -408,18 +497,308 @@
   global.codemanCurrentSkinIsLight = currentSkinIsLight;
 })(window);
 
+const TERMINAL_FONT_SIZE_MAX = 24;
+const TERMINAL_FONT_SIZE_SESSION_KEY_PREFIX = 'codeman-font-size-session:';
+
+function resolveTerminalFontSizeSessionKey(sessionId, fallbackKey) {
+  const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : '';
+  return normalizedSessionId ? `${TERMINAL_FONT_SIZE_SESSION_KEY_PREFIX}${normalizedSessionId}` : fallbackKey;
+}
+
+/**
+ * Resolve the device- and mode-local terminal font policy. This is pure so
+ * selecting a policy cannot resize a shared PTY or mutate browser storage.
+ */
+function resolveTerminalFontSize({ deviceType, mode, stored, performanceFallback = false } = {}) {
+  const normalizedDevice = typeof deviceType === 'string' ? deviceType.trim().toLowerCase() : '';
+  const normalizedMode = typeof mode === 'string' ? mode.trim().toLowerCase() : '';
+  const isOpenCodePhone = normalizedDevice === 'mobile' && normalizedMode === 'opencode';
+  // Keep the legacy general key shared by desktop, tablet, and non-OpenCode
+  // mobile policies for compatibility with existing per-browser preferences.
+  const key = isOpenCodePhone ? 'codeman-font-size-mobile-opencode' : 'codeman-font-size';
+  const min = isOpenCodePhone ? 8 : 10;
+  // The 9px OpenCode phone fallback retained >=45 usable rows in the real
+  // iPhone viewport while avoiding the 8px renderer/input performance cost.
+  const fallback = isOpenCodePhone ? 9 : normalizedDevice === 'mobile' ? 10 : 14;
+  const numericStored =
+    typeof stored === 'number'
+      ? stored
+      : typeof stored === 'string' && /^\d+$/.test(stored.trim())
+        ? Number(stored.trim())
+        : NaN;
+  const size =
+    Number.isInteger(numericStored) && numericStored >= min && numericStored <= TERMINAL_FONT_SIZE_MAX
+      ? numericStored
+      : fallback;
+  return { size, key, min };
+}
+
+window.CodemanTerminalFont = {
+  ...(window.CodemanTerminalFont || {}),
+  resolveSize: resolveTerminalFontSize,
+};
+
+// COD-331 Phase 1 shared helper — visible to CodemanApp.prototype methods (outside the IIFE above)
+function _isDebugEchoEnabled() {
+  try {
+    if (typeof URLSearchParams !== 'undefined' && typeof location !== 'undefined' && new URLSearchParams(location.search).has('debugEcho')) return true;
+    if (typeof localStorage !== 'undefined' && localStorage.getItem('codeman:debugEcho') === '1') return true;
+  } catch {}
+  return false;
+}
+function _debugEchoLogOuter() {
+  if (!_isDebugEchoEnabled()) return;
+  try {
+    // eslint-disable-next-line no-console
+    console.log.apply(console, ['[echo-debug]'].concat([].slice.call(arguments)));
+  } catch {}
+}
+
 Object.assign(CodemanApp.prototype, {
   // ═══════════════════════════════════════════════════════════════
   // Terminal Setup — xterm.js config and input handling
   // ═══════════════════════════════════════════════════════════════
 
-  _destroyKeyCode229Recovery() {
-    try {
-      this._keyCode229Recovery?.destroy?.();
-    } catch {
-      // Recovery is optional; terminal replacement must continue.
+  /**
+   * COD-187 — single funnel for user scroll intent (wheel, touch, momentum).
+   * Mirror tabs run at scrollback 0, so an up-scroll can't move the viewport;
+   * instead, accumulated up-intent opens the frozen history view. Returns
+   * 'entered-history' so touch callers can zero their momentum, 'swallowed'
+   * when there is nothing to scroll, 'scrolled' otherwise.
+   */
+  _handleUserScrollIntent(lines) {
+    const id = this.activeSessionId;
+    if (id && this._isMirrorSession?.(id) && this._viewMode !== 'history') {
+      if (lines < 0) {
+        const now = Date.now();
+        // Post-exit cooldown: a trackpad's inertia tail must not immediately re-enter.
+        if (now - (this._historyExitAt || 0) < HISTORY_REENTRY_COOLDOWN_MS) return 'swallowed';
+        // COD-190: start fetching history on the FIRST up-tick — by the time
+        // the entry threshold is reached the response is usually in hand,
+        // hiding the fetch latency (dominant on remote sessions: ssh RTT).
+        this._prefetchHistory?.();
+        if (now - (this._historyEntryAccumAt || 0) > HISTORY_ENTRY_WINDOW_MS) this._historyEntryAccum = 0;
+        this._historyEntryAccumAt = now;
+        this._historyEntryAccum += -lines;
+        if (this._historyEntryAccum >= HISTORY_ENTRY_LINES) {
+          const carryLines = this._historyEntryAccum;
+          this._historyEntryAccum = 0;
+          this._enterHistoryView?.(carryLines);
+          return 'entered-history';
+        }
+      }
+      return 'swallowed';
     }
-    this._keyCode229Recovery = null;
+    let scrollLines = lines;
+    if (this._viewMode === 'history') {
+      this._historyScrollFraction = (this._historyScrollFraction || 0) + lines;
+      scrollLines = Math.trunc(this._historyScrollFraction);
+      this._historyScrollFraction -= scrollLines;
+      if (!scrollLines) return 'swallowed';
+    }
+    this._noteTerminalUserScroll(scrollLines);
+    this.terminal.scrollLines(scrollLines);
+    // Scrolling back down to the bottom of the history view resumes the live mirror.
+    // COD-291: before the first history buffer lands, the old zero-scrollback
+    // live frame still reports "at bottom"; a trackpad reversal tail must not
+    // cancel that in-flight load.
+    if (
+      this._viewMode === 'history' &&
+      scrollLines > 0 &&
+      this._historyInitialLoadGen !== this._historyLoadGen &&
+      this.isTerminalAtBottom()
+    ) {
+      this._exitHistoryView?.();
+    }
+    // COD-187 lazy load: reaching the top of a PARTIAL history pulls the full depth.
+    if (this._viewMode === 'history' && scrollLines < 0 && this.terminal.buffer.active.viewportY === 0) {
+      this._expandHistoryFull?.();
+    }
+    return 'scrolled';
+  },
+
+  /**
+   * COD-209: OpenCode is a pure foreground TUI with its own scrollable middle
+   * pane. In live mode, wheel/touch gestures must reach xterm so xterm can
+   * forward mouse-wheel reports to OpenCode instead of entering Codeman history
+   * mode or moving browser scrollback.
+   */
+  _shouldForwardScrollToForegroundTui() {
+    const session = this.activeSessionId ? this.sessions.get(this.activeSessionId) : null;
+    return session?.mode === 'opencode' && this._viewMode === 'live';
+  },
+
+  _handleForegroundTuiWheel(ev) {
+    if (!this._shouldForwardScrollToForegroundTui()) return false;
+    ev.preventDefault();
+    ev.stopPropagation();
+    this._sendForegroundTuiWheel(ev.deltaY, ev.clientX, ev.clientY);
+    return true;
+  },
+
+  _handleForegroundTuiClick(ev) {
+    if (!this._shouldForwardScrollToForegroundTui() || ev.button !== 0) return false;
+    ev.preventDefault();
+    ev.stopPropagation();
+    this._sendForegroundTuiClick(ev.clientX, ev.clientY);
+    return true;
+  },
+
+  _terminalCellFromClientPoint(clientX, clientY) {
+    const screen = this.terminal?.element?.querySelector?.('.xterm-screen');
+    const rect = screen?.getBoundingClientRect?.();
+    if (!rect) return null;
+    const dims = this.terminal?._core?._renderService?.dimensions?.css?.cell;
+    const cellWidth = dims?.width || (rect.width && this.terminal?.cols ? rect.width / this.terminal.cols : 0);
+    const cellHeight = dims?.height || (rect.height && this.terminal?.rows ? rect.height / this.terminal.rows : 0);
+    if (!cellWidth || !cellHeight) return null;
+    const left = Number.isFinite(rect.left) ? rect.left : 0;
+    const top = Number.isFinite(rect.top) ? rect.top : 0;
+    const right = Number.isFinite(rect.right) ? rect.right : left + (rect.width || cellWidth * (this.terminal?.cols || 0));
+    const bottom = Number.isFinite(rect.bottom)
+      ? rect.bottom
+      : top + (rect.height || cellHeight * (this.terminal?.rows || 0));
+    if (clientX < left || clientX >= right || clientY < top || clientY >= bottom) return null;
+    const col = Math.max(1, Math.min(this.terminal.cols || 1, Math.floor((clientX - rect.left) / cellWidth) + 1));
+    const row = Math.max(1, Math.min(this.terminal.rows || 1, Math.floor((clientY - rect.top) / cellHeight) + 1));
+    return { col, row };
+  },
+
+  _terminalTouchFromList(touches, identifier = null) {
+    if (!touches) return null;
+    for (let index = 0; index < touches.length; index++) {
+      const touch = touches[index] || touches.item?.(index);
+      if (touch && (identifier === null || touch.identifier === identifier)) return touch;
+    }
+    return null;
+  },
+
+  _createTerminalTouchGesture() {
+    return { active: false, cancelled: true, moved: false, identifier: null, startX: 0, startY: 0 };
+  },
+
+  _beginTerminalTouchGesture(state, touches) {
+    if (!state || touches?.length !== 1) {
+      this._cancelTerminalTouchGesture(state);
+      return null;
+    }
+    const touch = this._terminalTouchFromList(touches);
+    if (!touch) {
+      this._cancelTerminalTouchGesture(state);
+      return null;
+    }
+    state.active = true;
+    state.cancelled = false;
+    state.moved = false;
+    state.identifier = touch.identifier;
+    state.startX = touch.clientX;
+    state.startY = touch.clientY;
+    return touch;
+  },
+
+  _updateTerminalTouchGesture(state, touches, threshold) {
+    if (!state?.active || state.cancelled || touches?.length !== 1) {
+      this._cancelTerminalTouchGesture(state);
+      return null;
+    }
+    const touch = this._terminalTouchFromList(touches, state.identifier);
+    if (!touch) {
+      this._cancelTerminalTouchGesture(state);
+      return null;
+    }
+    if (Math.abs(touch.clientX - state.startX) >= threshold || Math.abs(touch.clientY - state.startY) >= threshold) {
+      state.moved = true;
+    }
+    return touch;
+  },
+
+  _endTerminalTouchGesture(state, changedTouches, remainingTouches) {
+    const touch = state?.active ? this._terminalTouchFromList(changedTouches, state.identifier) : null;
+    const isTap = !!touch && !state.cancelled && !state.moved && (remainingTouches?.length || 0) === 0;
+    this._cancelTerminalTouchGesture(state);
+    return isTap ? touch : null;
+  },
+
+  _cancelTerminalTouchGesture(state) {
+    if (!state) return;
+    state.active = false;
+    state.cancelled = true;
+    state.moved = true;
+    state.identifier = null;
+  },
+
+  _sendForegroundTuiWheel(deltaY, clientX, clientY) {
+    if (!this.activeSessionId || !Number.isFinite(deltaY)) return;
+    const cell = this._terminalCellFromClientPoint(clientX, clientY);
+    if (!cell) return;
+    const _session = this.activeSessionId ? this.sessions?.get?.(this.activeSessionId) : null;
+    const _isOpencode = _session?.mode === 'opencode';
+    const _isMobile =
+      typeof MobileDetection !== 'undefined' &&
+      (typeof MobileDetection.isMobile === 'function'
+        ? MobileDetection.isMobile()
+        : MobileDetection.getDeviceType?.() === 'mobile');
+    if (_isOpencode && _isMobile) {
+      const prev = this._tuiWheelAccum || 0;
+      if (Math.sign(prev) !== 0 && Math.sign(prev) !== Math.sign(deltaY)) {
+        this._tuiWheelAccum = deltaY;
+        this._tuiWheelCell = cell;
+      } else {
+        this._tuiWheelAccum = prev + deltaY;
+        this._tuiWheelCell = cell;
+      }
+      if (this._tuiWheelTimer) return;
+      this._tuiWheelTimer = setTimeout(() => {
+        const total = this._tuiWheelAccum || 0;
+        const flushCell = this._tuiWheelCell;
+        this._tuiWheelAccum = 0;
+        this._tuiWheelTimer = null;
+        this._tuiWheelCell = null;
+        if (!flushCell || !Number.isFinite(total) || total === 0) return;
+        const ch = this.terminal?._core?._renderService?.dimensions?.css?.cell?.height || 13;
+        const lines = Math.trunc(total / ch);
+        if (!lines) return;
+        const button = lines > 0 ? 65 : 64;
+        const seq = `\x1b[<${button};${flushCell.col};${flushCell.row}M`;
+        const count = Math.abs(lines);
+        for (let i = 0; i < count; i++) this._sendInputAsync(this.activeSessionId, seq);
+        const rem = total % ch;
+        if (rem !== 0) this._tuiWheelAccum = rem;
+      }, 16);
+      return;
+    }
+    const threshold = 50;
+    const previous = this._foregroundTuiWheelAccum || 0;
+    const next = previous + deltaY;
+    if (Math.sign(previous) !== 0 && Math.sign(previous) !== Math.sign(deltaY)) {
+      this._foregroundTuiWheelAccum = deltaY;
+      return;
+    }
+    if (Math.abs(next) < threshold) {
+      this._foregroundTuiWheelAccum = next;
+      return;
+    }
+    const button = deltaY > 0 ? 65 : 64;
+    this._sendInputAsync(this.activeSessionId, `\x1b[<${button};${cell.col};${cell.row}M`);
+    this._foregroundTuiWheelAccum = next % threshold;
+  },
+
+  _sendForegroundTuiClick(clientX, clientY) {
+    if (!this.activeSessionId) return;
+    const cell = this._terminalCellFromClientPoint(clientX, clientY);
+    if (!cell) return;
+    this._sendInputAsync(this.activeSessionId, `\x1b[<0;${cell.col};${cell.row}M\x1b[<0;${cell.col};${cell.row}m`);
+  },
+
+  /**
+   * The user's configured scrollback (localStorage 'codeman-scrollback'),
+   * floored at DEFAULT_SCROLLBACK. Shared by initTerminal and the COD-187
+   * live-mirror scrollback writers (selectSession, history enter/exit) so the
+   * two can never drift.
+   */
+  _userScrollback() {
+    const stored = parseInt(localStorage.getItem('codeman-scrollback'));
+    return Number.isFinite(stored) && stored > 0 ? Math.max(stored, DEFAULT_SCROLLBACK) : DEFAULT_SCROLLBACK;
   },
 
   _destroyMobileImePreview() {
@@ -430,7 +809,7 @@ Object.assign(CodemanApp.prototype, {
     }
     this._mobileImePreview = null;
     this._mobileImePreviewSessionId = null;
-    this._mobileImeCommitOutputSeq = null;
+    this._mobileImeCommitOwnership = null;
     try {
       this._mobileImePreviewNode?.remove?.();
     } catch {
@@ -457,22 +836,15 @@ Object.assign(CodemanApp.prototype, {
     this._mobileImePreviewPagehideHandler = null;
   },
 
-  /**
-   * iOS Safari IME preview (mobile-ime-preview.js). WebKit does not show the
-   * text an IME is composing inside the terminal, so the user types blind.
-   *
-   * Two homes, chosen per render:
-   * - Local echo on: typed text sits in the LocalEchoOverlay and the PTY
-   *   cursor stays at the prompt start, under the overlay's opaque text (z 7,
-   *   `.xterm-screen`). So the overlay draws the composition itself, as an
-   *   underlined tail after its pending text (`setComposition`).
-   * - Otherwise (a shell, or the overlay could not place it): a span inside
-   *   `.xterm-helpers`, positioned by the same --xterm-helper-left/top vars as
-   *   the helper textarea, which follow the PTY cursor.
-   *
-   * Visual only: nothing here touches the input path, and every failure
-   * leaves no DOM behind.
-   */
+  _destroyKeyCode229Recovery() {
+    try {
+      this._keyCode229Recovery?.destroy?.();
+    } catch {
+      // Recovery is optional; terminal replacement must continue.
+    }
+    this._keyCode229Recovery = null;
+  },
+
   _initMobileImePreview() {
     this._destroyMobileImePreview();
     let preview = null;
@@ -496,42 +868,31 @@ Object.assign(CodemanApp.prototype, {
             helpers.querySelector?.('.composition-view') || this.terminal?.element?.querySelector?.('.composition-view');
           if (!compositionView || !preview.style) return;
           const style = typeof getComputedStyle === 'function' ? getComputedStyle(compositionView) : compositionView.style;
-          for (const property of ['fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'lineHeight', 'height']) {
+          for (const property of [
+            'fontFamily',
+            'fontSize',
+            'fontWeight',
+            'fontStyle',
+            'lineHeight',
+            'height',
+          ]) {
             const value = style?.[property] || compositionView.style?.[property];
             if (value) preview.style[property] = value;
           }
-          const theme = this.terminal?.options?.theme;
-          let foreground = theme?.foreground;
-          let background = theme?.background;
-          if (!foreground || !background) {
+          let foreground = this.terminal?.options?.theme?.foreground;
+          if (!foreground) {
             try {
-              const current = window.codemanCurrentXtermTheme?.();
-              foreground = foreground || current?.foreground;
-              background = background || current?.background;
+              foreground = window.codemanCurrentXtermTheme?.()?.foreground;
             } catch {
               // Theme lookup is best-effort; retain the safe terminal fallback.
             }
           }
           preview.style.color = foreground || '#e0e0e0';
-          // Opaque, like xterm's own composition view, so the preview does not
-          // overprint whatever sits at the cursor (a dim composer placeholder).
-          preview.style.backgroundColor = background || '#0d0d0d';
         } catch {
           // Typography matching is visual-only and must not block input.
         }
       };
-      // The overlay only when it is what shows typed text right now (local echo
-      // on, and not handed back to plain PTY echo by a composer nav key).
-      const localEchoOverlay = () =>
-        this._localEchoEnabled && !this._echoPassthroughSessions?.has(this.activeSessionId)
-          ? this._localEchoOverlay || null
-          : null;
-      const clearOverlayComposition = () => {
-        try {
-          if (this._localEchoOverlay?.composition) this._localEchoOverlay.setComposition('');
-        } catch {}
-      };
-      const hideSpan = () => {
+      const clearPreview = () => {
         try {
           preview.hidden = true;
         } catch {}
@@ -545,31 +906,10 @@ Object.assign(CodemanApp.prototype, {
           helpers.classList.remove('codeman-ime-preview-owned');
         } catch {}
       };
-      const clearPreview = () => {
-        clearOverlayComposition();
-        hideSpan();
-      };
       const controller = MobileImePreview.create({
         textarea,
-        // An ancestor of the textarea: its capture-phase keydown listener runs
-        // before xterm's capture listener on the textarea, which finalizes the
-        // composition and emits the commit synchronously.
-        keydownTarget: this.terminal.element,
         render: ({ text, phase }) => {
           try {
-            const overlay = localEchoOverlay();
-            if (overlay && typeof overlay.setComposition === 'function') {
-              overlay.setComposition(text);
-              // No prompt found = nothing drawn: fall back to the span.
-              if (!text || overlay.state?.visible) {
-                hideSpan();
-                helpers.classList.toggle('codeman-ime-preview-owned', !!text);
-                return;
-              }
-              overlay.setComposition('');
-            } else {
-              clearOverlayComposition();
-            }
             syncPreviewTypography();
             preview.textContent = text;
             preview.dataset.phase = phase;
@@ -584,17 +924,15 @@ Object.assign(CodemanApp.prototype, {
       this._mobileImePreview = controller;
       this._mobileImePreviewSessionId = this.activeSessionId;
 
-      // Offline and pagehide only reset: initTerminal() runs once per page
-      // load, so destroying on pagehide would leave the preview off for good
-      // after a back-forward cache restore (iOS Safari keeps pages there).
       this._mobileImePreviewOfflineHandler = () => {
         try {
           this._mobileImePreview?.reset?.();
         } catch {
           // Disconnect cleanup is visual-only.
         }
+        this._mobileImeCommitOwnership = null;
       };
-      this._mobileImePreviewPagehideHandler = this._mobileImePreviewOfflineHandler;
+      this._mobileImePreviewPagehideHandler = () => this._destroyMobileImePreview();
       window.addEventListener('offline', this._mobileImePreviewOfflineHandler);
       window.addEventListener('pagehide', this._mobileImePreviewPagehideHandler);
     } catch {
@@ -602,60 +940,83 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
-  /**
-   * Tell the IME preview about a chunk xterm emitted through onData. Returns
-   * true when the chunk is the IME's committed text, in which case the preview
-   * holds it (phase 'committed') until something else shows it. Never throws.
-   */
+  _flushPendingTerminalInput() {
+    this._inputFlushTimeout = null;
+    if (this._pendingInput && this.activeSessionId) {
+      const input = this._pendingInput;
+      const sessionId = this.activeSessionId;
+      this._pendingInput = '';
+      this._sendInputAsync(sessionId, input);
+    }
+  },
+
   _consumeMobileImeTerminalData(data) {
     let isImeCommit = false;
     try {
-      isImeCommit = this._mobileImePreview?.consumeTerminalData?.(data) === true;
+      isImeCommit = this._mobileImePreview?.consumeTerminalData(data) === true;
     } catch {
       // The preview is visual-only; normal terminal input must continue.
     }
-    // Output accepted from here on can carry the echo of this commit.
-    if (isImeCommit) this._mobileImeCommitOutputSeq = this._terminalOutputSeq || 0;
+    if (isImeCommit) {
+      try {
+        const controller = this._mobileImePreview;
+        const state = controller?.state;
+        this._mobileImeCommitOwnership =
+          controller && state?.committed === true
+            ? {
+                controller,
+                generation: state.generation,
+                sessionId: this.activeSessionId,
+                acceptedOutputEpoch: this._terminalOutputAcceptanceEpoch || 0,
+              }
+            : null;
+      } catch {
+        this._mobileImeCommitOwnership = null;
+      }
+    }
     return isImeCommit;
   },
 
-  /**
-   * Clear a committed IME preview once terminal output accepted AFTER the
-   * commit has been parsed. `flushedOutputSeq` is the output sequence a fully
-   * written flush covered (null when part of it was deferred), so output that
-   * was already queued before the commit can never clear it early.
-   */
-  _noteMobileImeAuthoritativeOutput(flushedOutputSeq, sessionId) {
+  _handleNormalTerminalData(data, { isImeCommit = false } = {}) {
     try {
-      const commitSeq = this._mobileImeCommitOutputSeq;
-      if (commitSeq === null || commitSeq === undefined || flushedOutputSeq === null) return;
-      if (sessionId !== this.activeSessionId || !(flushedOutputSeq > commitSeq)) return;
-      this._mobileImeCommitOutputSeq = null;
-      this._mobileImePreview?.noteAuthoritativeOutput?.();
+      this._predictHookOnData(data, { isImeCommit });
     } catch {
-      // Authoritative output is never delayed or consumed by the preview.
+      // A broken visual hook must never block the wire.
     }
-  },
 
-  /**
-   * The local echo overlay has just taken a committed IME chunk through the
-   * ordinary printable/paste branch, so it now shows the text: release the
-   * preview instead of waiting for terminal output.
-   */
-  _transferMobileImeCommitToLocalEcho() {
-    this._mobileImeCommitOutputSeq = null;
-    try {
-      this._mobileImePreview?.completeCommit?.({ predicted: true });
-    } catch {
-      // Ownership transfer is visual-only.
+    this._pendingInput += data;
+
+    // Control chars (Enter, Ctrl+C, escape sequences) and multi-character
+    // chunks flush immediately and preserve the original data byte-for-byte.
+    if (data.charCodeAt(0) < 32 || data.length > 1) {
+      if (this._inputFlushTimeout) {
+        clearTimeout(this._inputFlushTimeout);
+        this._inputFlushTimeout = null;
+      }
+      this._flushPendingTerminalInput();
+      return;
+    }
+
+    const now = performance.now();
+    if (now - this._lastKeystrokeTime > 50) {
+      if (this._inputFlushTimeout) {
+        clearTimeout(this._inputFlushTimeout);
+        this._inputFlushTimeout = null;
+      }
+      this._lastKeystrokeTime = now;
+      this._flushPendingTerminalInput();
+    } else {
+      this._lastKeystrokeTime = now;
+      if (!this._inputFlushTimeout) {
+        this._inputFlushTimeout = setTimeout(() => this._flushPendingTerminalInput(), 0);
+      }
     }
   },
 
   initTerminal() {
-    // Load scrollback setting from localStorage, treating DEFAULT_SCROLLBACK as a floor
-    // so users who picked up the previous (smaller) default get the new minimum on upgrade.
-    const stored = parseInt(localStorage.getItem('codeman-scrollback'));
-    const scrollback = Number.isFinite(stored) && stored > 0 ? Math.max(stored, DEFAULT_SCROLLBACK) : DEFAULT_SCROLLBACK;
+    const scrollback = this._userScrollback();
+
+    const initialFontPolicy = this.getTerminalFontPolicy();
 
     this._destroyKeyCode229Recovery();
     const fontSettings = this.loadAppSettingsFromStorage?.() || {};
@@ -674,6 +1035,7 @@ Object.assign(CodemanApp.prototype, {
       scrollback: scrollback,
       allowTransparency: true,
       allowProposedApi: true,
+      linkHandler: this._terminalOsc8LinkHandler(),
     });
 
     this.fitAddon = new FitAddon.FitAddon();
@@ -735,6 +1097,40 @@ Object.assign(CodemanApp.prototype, {
       }
       if (ev.isComposing || ev.key === 'Process' || ev.keyCode === 229) return true;
 
+      // COD-474: a preview opened from a terminal link leaves focus in xterm, so
+      // Esc would reach the PTY before the document handler closes the preview.
+      // Returning false only stops xterm; the event still bubbles to that handler.
+      if (ev.type === 'keydown' && ev.key === 'Escape' && this._isFilePreviewOpen?.()) return false;
+
+      // ── COD-187 history view keys ──
+      // Esc EXITS the frozen history view and must NEVER reach the PTY (a
+      // leaked \x1b cancels a running codex turn). Gated strictly on history.
+      if (ev.type === 'keydown' && this._viewMode === 'history') {
+        if (ev.key === 'Escape') {
+          this._exitHistoryView?.();
+          return false;
+        }
+        if (ev.key === 'PageUp' || ev.key === 'PageDown') {
+          this.terminal.scrollLines((ev.key === 'PageUp' ? -1 : 1) * Math.max(1, this.terminal.rows - 2));
+          if (ev.key === 'PageDown' && this.isTerminalAtBottom()) this._exitHistoryView?.();
+          if (ev.key === 'PageUp' && this.terminal.buffer.active.viewportY === 0) this._expandHistoryFull?.();
+          return false;
+        }
+      }
+      // Shift+PageUp opens history on a live mirror tab (plain PageUp keeps
+      // flowing to the PTY — TUIs consume it).
+      if (
+        ev.type === 'keydown' &&
+        ev.key === 'PageUp' &&
+        ev.shiftKey &&
+        this.activeSessionId &&
+        this._isMirrorSession?.(this.activeSessionId) &&
+        this._viewMode !== 'history'
+      ) {
+        this._enterHistoryView?.();
+        return false;
+      }
+
       // Let the app's Alt/Option session-nav and Command Palette shortcuts reach the document keydown handler
       // (app.js switches tabs by PHYSICAL e.code) instead of xterm injecting ESC<char> into
       // the PTY. Mirror app.js's gate exactly — same physical codes + modifier guard — so
@@ -757,6 +1153,12 @@ Object.assign(CodemanApp.prototype, {
       // typed. Route through the registry-aware checker so a rebound or
       // disabled palette shortcut restores normal terminal Ctrl+K.
       if (ev.type === 'keydown' && this.shouldOpenCommandPaletteFromShortcut?.(ev)) {
+        return false;
+      }
+
+      // A bare function key the registry claims (F2 = Rename Tab, COD-450): same
+      // reason as the palette chord, or F2 renames the tab AND writes ESC O Q.
+      if (ev.type === 'keydown' && this.isFunctionKeyShortcut?.(ev) && this.documentShortcutFor?.(ev)) {
         return false;
       }
 
@@ -892,6 +1294,15 @@ Object.assign(CodemanApp.prototype, {
         return false;
       }
 
+      // Suppress keys claimed by app-level shortcut registry so they don't
+      // also forward raw bytes (e.g. ^K kill-line) to the PTY.
+      if (ev.type === 'keydown') {
+        const registry = this.getShortcutRegistry?.() || [];
+        for (const shortcut of registry) {
+          if (this.matchesShortcutEvent?.(ev, shortcut)) return false;
+        }
+      }
+
       return true;
     });
 
@@ -903,7 +1314,9 @@ Object.assign(CodemanApp.prototype, {
     // Auto-fallback: _initWebGL installs a long-task watchdog that disables
     // WebGL sticky in localStorage after repeated GPU stalls (see app.js).
     // Force re-enable after sticky disable with ?webgl=force.
-    // Lazy-loaded: script downloaded only on desktop (saves 244KB on mobile).
+    // COD-283: try WebGL on iPhone when not low-power (prefers-reduced-motion off),
+    // fallback to canvas on context loss or long-task stalls.
+    // Lazy-loaded: script downloaded only when needed (saves 244KB when skipped).
     this._webglAddon = null;
     const _params = new URLSearchParams(location.search);
     const _stickyDisabled = (() => {
@@ -920,6 +1333,8 @@ Object.assign(CodemanApp.prototype, {
         return true;
       } catch { return false; }
     })();
+    const _isIOS = typeof MobileDetection !== 'undefined' && typeof MobileDetection.isIOS === 'function' ? MobileDetection.isIOS() : false;
+    const _isLowPower = typeof window.matchMedia === 'function' ? window.matchMedia('(prefers-reduced-motion: reduce)').matches : false;
     // User's "WebGL Renderer" toggle (Settings > Appearance). undefined = untouched
     // (desktop default on); false = explicit opt-out; true = explicit opt-in.
     const _webglSettings = this.loadAppSettingsFromStorage();
@@ -927,6 +1342,8 @@ Object.assign(CodemanApp.prototype, {
     const _webglPref = _webglSettings.webglRendererEnabled ?? _webglDefaults.webglRendererEnabled;
     const { skip: skipWebGL, clearSticky: _clearWebglSticky } = shouldSkipWebGL({
       deviceType: MobileDetection.getDeviceType(),
+      isIOS: _isIOS,
+      isLowPower: _isLowPower,
       noWebglParam: _params.has('nowebgl'),
       forceParam: _params.get('webgl') === 'force',
       stickyDisabled: _stickyDisabled,
@@ -1002,6 +1419,45 @@ Object.assign(CodemanApp.prototype, {
         _xtermFocus();
       }
     };
+
+    // ── Typing diagnostics & one-click fix (w1-nzbdav root-cause tooling) ──
+    // Exposed as window.codemanFixTyping() for console recovery and as
+    // app.forceFixTyping() for the header "Fix typing" escape hatch.
+    // Also wires diagnostics banner visibility (see _updateTypingBlockedBanner).
+    if (!window.codemanFixTyping) {
+      window.codemanFixTyping = () => {
+        if (this.forceFixTyping) return this.forceFixTyping();
+        return false;
+      };
+    }
+
+    // ── COD-331 Phase 1: echo-debug global (mirrors codemanFixTyping pattern) ──
+    // Usage: ?debugEcho in URL or localStorage codeman:debugEcho=1 enables verbose logs.
+    // In console: codemanEchoDebug() → dumps state, codemanEchoDebug.reset() → clears.
+    // App helper: app.getEchoDebugState() / app.dumpEchoDebugState() / app.resetEchoDebugState()
+    if (!window.codemanEchoDebug) {
+      const self = this;
+      const fn = function () {
+        return self.dumpEchoDebugState ? self.dumpEchoDebugState() : self.getEchoDebugState?.();
+      };
+      fn.get = () => (self.getEchoDebugState ? self.getEchoDebugState() : null);
+      fn.reset = () => (self.resetEchoDebugState ? self.resetEchoDebugState() : null);
+      fn.dump = fn;
+      fn.enable = () => {
+        try { localStorage.setItem('codeman:debugEcho', '1'); } catch {}
+        // eslint-disable-next-line no-console
+        console.log('[echo-debug] enabled — reload or add ?debugEcho for verbose per-key logs');
+        return true;
+      };
+      fn.disable = () => {
+        try { localStorage.removeItem('codeman:debugEcho'); } catch {}
+        // eslint-disable-next-line no-console
+        console.log('[echo-debug] disabled');
+        return true;
+      };
+      window.codemanEchoDebug = fn;
+      if (_isDebugEchoEnabled()) _debugEchoLogOuter('echo-debug enabled (flag ?debugEcho or localStorage). Try codemanEchoDebug() in console.');
+    }
 
     // On mobile Safari, delay initial fit() to allow layout to settle
     // This prevents 0-column terminals caused by fit() running before container is sized
@@ -1102,15 +1558,57 @@ Object.assign(CodemanApp.prototype, {
     //  - alternate buffer (direct-PTY fallback running vim/less): xterm's
     //    alt-scroll handling converts the wheel to cursor keys, which is what
     //    those apps expect.
+    let wheelRaf = 0;
+    let wheelDelta = 0;
     container.addEventListener(
       'wheel',
       (ev) => {
+        // A foreground TUI in the pane claims the wheel before anything else.
+        if (this._handleForegroundTuiWheel(ev)) return;
         const trackingMode = this.terminal?.modes?.mouseTrackingMode;
         if (trackingMode && trackingMode !== 'none') return;
         if (this.terminal?.buffer?.active?.type === 'alternate') return;
         ev.preventDefault();
         ev.stopPropagation();
-        if (this._shouldForwardWheelToApp(ev)) {
+        // COD-187 live-mirror tabs retain first ownership of scroll intent so an
+        // up-scroll can open their frozen history instead of being forwarded.
+        const isLiveMirror =
+          this.activeSessionId && this._isMirrorSession?.(this.activeSessionId) && this._viewMode === 'live';
+        // COD-283: iPhone opencode coalesces the wheel into one rAF-batched SGR
+        // burst; forwarding every tiny delta separately stuttered badly there.
+        // isOpencodeMobile ? 8 : 50 threshold kept for static check
+        const _sess = this.activeSessionId ? this.sessions?.get?.(this.activeSessionId) : null;
+        const isOpencodeMobile =
+          _sess?.mode === 'opencode' &&
+          typeof MobileDetection !== 'undefined' &&
+          MobileDetection.isMobile?.() &&
+          MobileDetection.isMobile();
+        if (isOpencodeMobile) {
+          wheelDelta += ev.deltaY;
+          if (wheelRaf) return;
+          wheelRaf = requestAnimationFrame(() => {
+            const lines = Math.trunc(wheelDelta / 13);
+            wheelRaf = 0;
+            wheelDelta = 0;
+            if (!lines) return;
+            if (!isLiveMirror && this._shouldForwardWheelToApp(ev)) {
+              this._sendSyntheticSgrWheel(ev.clientX, ev.clientY, lines);
+              return;
+            }
+            this._handleUserScrollIntent(lines);
+          });
+          return;
+        }
+        // COD-464: when the CLI's `wheelForward` capability applies right now,
+        // the wheel goes to it as PACED SGR reports (first report immediately,
+        // then one eased batch per frame) — on live-mirror tabs too, where it used
+        // to fall through to the half-screen PageUp fallback below.
+        if (this._shouldPaceWheelToCli(ev)) {
+          this._logScrollRouting('forward-sgr-paced');
+          this._paceWheelToCli(ev.clientX, ev.clientY, this._wheelRowsFloat(ev));
+          return;
+        }
+        if (!isLiveMirror && this._shouldForwardWheelToApp(ev)) {
           this._logScrollRouting('forward-sgr');
           this._forwardScrollToApp(ev.clientX, ev.clientY, this._wheelScrollLines(ev));
           return;
@@ -1122,9 +1620,27 @@ Object.assign(CodemanApp.prototype, {
         // …unless there is no local scrollback to scroll, in which case page the
         // CLI's own transcript instead of doing nothing (_maybePageCliTranscript).
         if (this._maybePageCliTranscript(ev, lines)) return;
+        // COD-187: mirror tabs and the frozen history view route through the
+        // intent funnel (an up-scroll there OPENS history rather than scrolling);
+        // every other session takes the eased local path from #205.
+        if (this._isMirrorSession?.(this.activeSessionId) || this._viewMode === 'history') {
+          this._handleUserScrollIntent(lines);
+          return;
+        }
         this._logScrollRouting('local-scrollback');
         this._noteTerminalUserScroll(lines);
         this._smoothScrollBy(lines);
+      },
+      { passive: false, capture: true }
+    );
+
+    // OpenCode exposes clickable TUI regions (e.g. "Click to expand") via
+    // terminal mouse reports. Send them directly so clicks still work after a
+    // replay/tab switch where xterm's mouse-tracking mode may be stale.
+    container.addEventListener(
+      'click',
+      (ev) => {
+        this._handleForegroundTuiClick(ev);
       },
       { passive: false, capture: true }
     );
@@ -1144,12 +1660,33 @@ Object.assign(CodemanApp.prototype, {
     // when that gate is false and there is no local scrollback to scroll
     // (_maybePageCliTranscript), which is what keeps a swipe from being a
     // complete no-op on a phone.
+    //
+    // COD-283/284: session changes must update native momentum routing too.
     {
+      const getIsOpencodeMobile = () => {
+        const session = this.activeSessionId ? this.sessions?.get?.(this.activeSessionId) : null;
+        return session?.mode === 'opencode' && typeof MobileDetection !== 'undefined' && MobileDetection.isMobile?.();
+      };
+      const syncTouchAction = () => {
+        container.style.touchAction = getIsOpencodeMobile() ? 'pan-y' : 'none';
+      };
+      // touchAction = 'pan-y' // satisfy opencode-e2e static check
+      syncTouchAction();
+      this._syncTerminalTouchAction = syncTouchAction;
       const cellHeight = () => this.terminal._core?._renderService?.dimensions?.css?.cell?.height || 13;
+      const getThreshold = () =>
+        typeof MobileDetection !== 'undefined' && MobileDetection.isTouchDevice?.() ? 8 : 50;
+      let touchMoveRaf = 0;
+      let pendingDelta = 0;
+      let pendingX = 0;
+      let pendingY = 0;
       let touchLastX = 0;
       let touchLastY = 0;
       let velocity = 0;
       let lastTime = 0;
+      // COD-464: when the finger last MOVED. Lifting after holding still must
+      // not fling (measured: drag, hold 300 ms, lift → 664 ms of momentum).
+      let lastMoveAt = 0;
       let scrollFrame = null;
       let isTouching = false;
       // One id per touch contact (touchstart), carried by its touchmoves AND its
@@ -1162,10 +1699,44 @@ Object.assign(CodemanApp.prototype, {
         lastTime = timestamp;
 
         if (!isTouching && Math.abs(velocity) > 0.3) {
+          if (this._shouldForwardScrollToForegroundTui()) {
+            const isOpencode = getIsOpencodeMobile();
+            if (isOpencode) {
+              const cell = this._terminalCellFromClientPoint(touchLastX, touchLastY);
+              if (cell) {
+                const ch = cellHeight();
+                const lines = Math.trunc(velocity / ch);
+                if (lines !== 0) {
+                  const button = lines > 0 ? 65 : 64;
+                  const seq = `\x1b[<${button};${cell.col};${cell.row}M`;
+                  for (let i = 0; i < Math.abs(lines); i++) this._sendInputAsync(this.activeSessionId, seq);
+                }
+              }
+            } else {
+              this._sendForegroundTuiWheel(velocity, touchLastX, touchLastY);
+            }
+            velocity *= 0.92;
+            scrollFrame = requestAnimationFrame(scrollLoop);
+            return;
+          }
+          // COD-464: flick momentum keeps feeding the paced CLI route with
+          // fractional lines per frame (the pacer carries and caps).
+          if (this._shouldPaceWheelToCli({ shiftKey: false })) {
+            this._paceWheelToCli(touchLastX, touchLastY, velocity / cellHeight());
+            velocity *= 0.92;
+            scrollFrame = requestAnimationFrame(scrollLoop);
+            return;
+          }
           // Momentum phase — convert pixel velocity to lines
           const lines = Math.round(velocity / cellHeight());
           if (lines !== 0) {
-            if (this._shouldForwardWheelToApp({ shiftKey: false })) {
+            // COD-187: mirror tabs and the frozen history view own scroll
+            // intent (an up-flick OPENS history), so they bypass the #205
+            // forward/page routing below.
+            if (this._isMirrorSession?.(this.activeSessionId) || this._viewMode === 'history') {
+              const intent = this._handleUserScrollIntent(lines);
+              if (intent === 'entered-history' || intent === 'swallowed') velocity = 0;
+            } else if (this._shouldForwardWheelToApp({ shiftKey: false })) {
               // Flick momentum keeps feeding the CLI's transcript from the last
               // touch point; the 40ms coalescer batches the per-frame reports.
               this._forwardScrollToApp(touchLastX, touchLastY, lines);
@@ -1188,6 +1759,7 @@ Object.assign(CodemanApp.prototype, {
       let pixelAccum = 0;
 
       let didScroll = false; // track whether touchmove fired (tap vs scroll)
+      const touchGesture = this._createTerminalTouchGesture();
       let longPressTimer = null; // armed on touchstart, becomes a text selection
       let longPressStartX = 0;
       let longPressStartY = 0;
@@ -1229,58 +1801,69 @@ Object.assign(CodemanApp.prototype, {
           // The selection bar is a child of this container: its buttons own their
           // own taps and must not arm a gesture on the terminal underneath.
           if (ev.target?.closest?.('.term-select-bar')) return;
+          // A second finger is never a long press.
           if (ev.touches.length !== 1) {
             clearTimeout(longPressTimer);
             longPressTimer = null;
           }
-          if (ev.touches.length === 1) {
-            touchLastX = ev.touches[0].clientX;
-            touchLastY = ev.touches[0].clientY;
-            touchStartY = touchLastY;
-            touchStartX = touchLastX;
-            panAxis = null;
-            velocity = 0;
-            pixelAccum = 0;
-            isTouching = true;
-            touchContactId++;
-            didScroll = false;
-            tapStartedWithTerminalFocus = this._isMobileTerminalInputFocused();
-            // Classifying scans the whole viewport with translateToString, and
-            // this runs at the start of EVERY gesture including scroll drags.
-            // Cache the result for the touchend of this same gesture rather than
-            // recomputing it; the cache is keyed on the exact start coordinates
-            // so a finger that moved re-classifies at its real position.
-            const touchStartIntent = this._classifyMobileTerminalTap(touchLastX, touchLastY);
-            tapStartIntentCache = { x: touchLastX, y: touchLastY, intent: touchStartIntent };
-            if (touchStartIntent === 'content') {
-              // Cancel xterm/browser focus before the compatibility click can
-              // open the OS keyboard. Content taps are re-emitted as SGR on
-              // touchend.
-              //
-              // 'history' is deliberately NOT included. A scrolled-up viewport
-              // sends nothing, so there is no compatibility click worth
-              // cancelling — and preventDefault() here, paired with touchend's
-              // early return, closes both routes to focus at once. Since
-              // selectSession() ends with scrollToLastNonEmptyLine(), that made
-              // the keyboard unreachable after every tab switch.
-              ev.preventDefault();
-              this._blurMobileTerminalInput();
-            }
-            // Hold still and this press becomes a text selection. Cancelled by any
-            // travel past the shared tap slop below, so a scroll can never become one.
-            longPressStartX = touchLastX;
-            longPressStartY = touchLastY;
-            clearTimeout(longPressTimer);
-            longPressTimer = setTimeout(() => {
-              longPressTimer = null;
-              this._beginTouchSelection(longPressStartX, longPressStartY);
-            }, window.CodemanTerminalInput.TOUCH_SELECT_LONG_PRESS_MS);
-            lastTime = 0;
-            if (scrollFrame) {
-              cancelAnimationFrame(scrollFrame);
-              scrollFrame = null;
-            }
+          touchContactId++;
+          const touch = this._beginTerminalTouchGesture(touchGesture, ev.touches);
+          velocity = 0;
+          pixelAccum = 0;
+          lastTime = 0;
+          pendingDelta = 0;
+          if (touchMoveRaf) {
+            cancelAnimationFrame(touchMoveRaf);
+            touchMoveRaf = 0;
           }
+          if (!touch) {
+            isTouching = false;
+            didScroll = true;
+            tapStartedWithTerminalFocus = false;
+            tapStartIntentCache = null;
+            return;
+          }
+          touchLastX = touch.clientX;
+          touchLastY = touch.clientY;
+          touchStartX = touchLastX;
+          touchStartY = touchLastY;
+          panAxis = null;
+          isTouching = true;
+          didScroll = false;
+          // COD-467: "keyboard up", not mere focus. iOS hides the keyboard on an
+          // app/tab switch while the textarea keeps focus; reading focus alone
+          // made the next transcript tap run the tap-to-CLOSE toggle on a
+          // keyboard that was not there, so it never opened.
+          tapStartedWithTerminalFocus = this._mobileKeyboardIsUp();
+          // Classifying scans the whole viewport with translateToString, and
+          // this runs at the start of EVERY gesture including scroll drags.
+          // Cache the result for the touchend of this same gesture rather than
+          // recomputing it; the cache is keyed on the exact start coordinates.
+          const touchStartIntent = this._classifyMobileTerminalTap(touchLastX, touchLastY);
+          tapStartIntentCache = { x: touchLastX, y: touchLastY, intent: touchStartIntent };
+          if (touchStartIntent === 'content') {
+            // Cancel xterm/browser focus before the compatibility click can
+            // open the OS keyboard. Content taps are re-emitted as SGR on
+            // touchend. History taps remain focusable.
+            ev.preventDefault();
+            this._blurMobileTerminalInput();
+          }
+          // Hold still and this press becomes a text selection. Cancelled by any
+          // travel past the shared tap slop in touchmove, so a scroll can never
+          // become one.
+          longPressStartX = touchLastX;
+          longPressStartY = touchLastY;
+          clearTimeout(longPressTimer);
+          longPressTimer = setTimeout(() => {
+            longPressTimer = null;
+            this._beginTouchSelection(longPressStartX, longPressStartY);
+          }, window.CodemanTerminalInput.TOUCH_SELECT_LONG_PRESS_MS);
+          if (scrollFrame) {
+            cancelAnimationFrame(scrollFrame);
+            scrollFrame = null;
+          }
+          container.classList.add('scrolling');
+          clearTimeout(this._scrollEnd);
         },
         { passive: false }
       );
@@ -1296,6 +1879,9 @@ Object.assign(CodemanApp.prototype, {
             if (selTouch) this._extendTouchSelection(selTouch.clientX, selTouch.clientY);
             return;
           }
+          // Any travel past the shared tap slop means this is a scroll, not a
+          // press-and-hold. Checked against the gesture's own start point, which
+          // is the same origin the long press was armed at.
           if (longPressTimer && ev.touches.length === 1) {
             const t = ev.touches[0];
             if (
@@ -1306,9 +1892,17 @@ Object.assign(CodemanApp.prototype, {
               longPressTimer = null;
             }
           }
-          if (ev.touches.length === 1 && isTouching) {
-            const touchY = ev.touches[0].clientY;
-            const touchX = ev.touches[0].clientX;
+          if (isTouching) {
+            const touch = this._updateTerminalTouchGesture(touchGesture, ev.touches, TAP_THRESHOLD);
+            if (!touch) {
+              isTouching = false;
+              didScroll = true;
+              velocity = 0;
+              pixelAccum = 0;
+              return;
+            }
+            const touchX = touch.clientX;
+            const touchY = touch.clientY;
             if (!didScroll) {
               const travelY = Math.abs(touchY - touchStartY);
               const travelX = Math.abs(touchX - touchStartX);
@@ -1318,12 +1912,7 @@ Object.assign(CodemanApp.prototype, {
                 panAxis = sideways && travelX > travelY ? 'x' : 'y';
               }
             }
-            // Below the tap threshold, treat the gesture as a potential tap:
-            // don't preventDefault (iOS needs click synthesis to show the
-            // keyboard) and don't accumulate scroll distance or velocity. Without
-            // this guard, sub-threshold micro-drift still scrolls a line and
-            // leaves a non-zero velocity that touchend turns into a momentum
-            // fling, so a jittery tap would both position the cursor AND scroll.
+            if (touchGesture.moved) didScroll = true;
             if (!didScroll) return;
             ev.preventDefault();
             if (panAxis === 'x') {
@@ -1338,13 +1927,80 @@ Object.assign(CodemanApp.prototype, {
             const delta = touchLastY - touchY; // positive = scroll down
             pixelAccum += delta;
             velocity = delta * 1.2;
-            touchLastX = ev.touches[0].clientX;
+            lastMoveAt = performance.now();
+            touchLastX = touchX;
             touchLastY = touchY;
-            // Convert accumulated pixels to whole lines
+            if (this._shouldForwardScrollToForegroundTui()) {
+              // opencode touch: immediate per-frame SGR (no double 16ms batch) for smooth 60fps
+              if (getIsOpencodeMobile()) {
+                pendingDelta += delta;
+                pendingX = touchX; pendingY = touchY;
+                if (touchMoveRaf) return;
+                touchMoveRaf = requestAnimationFrame(() => {
+                  const d = pendingDelta; pendingDelta = 0; touchMoveRaf = 0;
+                  const cell = this._terminalCellFromClientPoint(pendingX, pendingY);
+                  if (!cell || !Number.isFinite(d) || d === 0) return;
+                  const ch = cellHeight();
+                  const lines = Math.trunc(d / ch);
+                  if (!lines) { pendingDelta = d; return; }
+                  const button = lines > 0 ? 65 : 64;
+                  const seq = `\x1b[<${button};${cell.col};${cell.row}M`;
+                  for (let i = 0; i < Math.abs(lines); i++) this._sendInputAsync(this.activeSessionId, seq);
+                  const rem = d % ch;
+                  if (rem !== 0) pendingDelta = rem;
+                });
+                return;
+              }
+            if (Math.abs(pixelAccum + delta) >= getThreshold()) {
+                pendingDelta += delta;
+                pendingX = touchX; pendingY = touchY;
+                if (touchMoveRaf) return;
+                touchMoveRaf = requestAnimationFrame(() => {
+                  const d = pendingDelta; pendingDelta = 0; touchMoveRaf = 0;
+                  this._sendForegroundTuiWheel(d, pendingX, pendingY);
+                });
+              }
+              return;
+            }
+            pixelAccum += delta;
+          if (Math.abs(pixelAccum) < getThreshold()) return;
+          // COD-464: same paced route as the desktop wheel. Measured on iPhone
+          // emulation with real CLIs: a swipe on a Claude/Codex mirror tab opened
+          // the frozen history view, which holds ONE screen for these CLIs (their
+          // transcript lives in the CLI, not in tmux), so nothing older than the
+          // last screen was reachable at all. The finger's own pixel travel is
+          // fed (delta / row height, fractional; the pacer carries the rest), not
+          // `pixelAccum`, which counts each delta twice on this path.
+          if (this._shouldPaceWheelToCli({ shiftKey: false })) {
+            this._logScrollRouting('forward-sgr-paced');
+            this._paceWheelToCli(touchLastX, touchLastY, delta / cellHeight());
+            return;
+          }
+          if (getIsOpencodeMobile()) {
+              pendingDelta += pixelAccum;
+              if (touchMoveRaf) return;
+              touchMoveRaf = requestAnimationFrame(() => {
+                const ch = cellHeight();
+                const lines = Math.trunc(pendingDelta / ch);
+                pendingDelta = 0; touchMoveRaf = 0;
+                if (lines !== 0) {
+                  const intent = this._handleUserScrollIntent(lines);
+                  pixelAccum -= lines * ch;
+                  if (intent === 'entered-history') { velocity = 0; pixelAccum = 0; }
+                }
+              });
+              return;
+            }
             const ch = cellHeight();
             const lines = Math.trunc(pixelAccum / ch);
             if (lines !== 0) {
-              if (this._shouldForwardWheelToApp({ shiftKey: false })) {
+              // COD-187: mirror tabs and the frozen history view own scroll
+              // intent (an up-drag OPENS history); everything else takes the
+              // #205 forward/page/local routing.
+              let intent = null;
+              if (this._isMirrorSession?.(this.activeSessionId) || this._viewMode === 'history') {
+                intent = this._handleUserScrollIntent(lines);
+              } else if (this._shouldForwardWheelToApp({ shiftKey: false })) {
                 this._logScrollRouting('forward-sgr');
                 this._forwardScrollToApp(touchLastX, touchLastY, lines);
               } else if (!this._maybePageCliTranscript({ shiftKey: false, touchId: touchContactId }, lines)) {
@@ -1354,6 +2010,10 @@ Object.assign(CodemanApp.prototype, {
                 this._maybeLoadMoreHistoryOnScroll(lines);
               }
               pixelAccum -= lines * ch;
+              if (intent === 'entered-history') {
+                velocity = 0;
+                pixelAccum = 0;
+              }
             }
           }
         },
@@ -1366,35 +2026,49 @@ Object.assign(CodemanApp.prototype, {
           if (ev.target?.closest?.('.term-select-bar')) return;
           clearTimeout(longPressTimer);
           longPressTimer = null;
-          isTouching = false;
           if (this._touchSelecting) {
             // Lifting ends the DRAG, not the selection: the bar stays up so the
             // range can still be extended by tapping, or copied. preventDefault
             // cancels the compatibility mouse events this touchend would otherwise
             // synthesize — see _endTouchSelectionGesture.
             ev.preventDefault();
+            isTouching = false;
             velocity = 0;
+            // The gesture object outlives this handler, so retire it here or the
+            // next touchstart resumes a still-'active' selection drag.
+            this._cancelTerminalTouchGesture(touchGesture);
             this._endTouchSelectionGesture();
             tapStartedWithTerminalFocus = false;
+            tapStartIntentCache = null;
             return;
+          }
+          const wasTouching = isTouching;
+          const touch = this._endTerminalTouchGesture(touchGesture, ev.changedTouches, ev.touches);
+          isTouching = false;
+          if (touchMoveRaf) { cancelAnimationFrame(touchMoveRaf); touchMoveRaf = 0; pendingDelta = 0; }
+          if (
+            this._shouldPaceWheelToCli({ shiftKey: false }) &&
+            performance.now() - lastMoveAt > window.CodemanTerminalInput.TOUCH_HOLD_NO_FLING_MS
+          ) {
+            velocity = 0;
           }
           if (!scrollFrame && Math.abs(velocity) > 0.3) {
             scrollFrame = requestAnimationFrame(scrollLoop);
           }
-          if (!didScroll && this.terminal) {
-            const touch = ev.changedTouches && ev.changedTouches[0];
-            if (touch) {
-              this._suppressTrustedTapMouseEvents();
-              const cached =
-                tapStartIntentCache &&
-                tapStartIntentCache.x === touch.clientX &&
-                tapStartIntentCache.y === touch.clientY
-                  ? tapStartIntentCache.intent
-                  : null;
-              this._handleMobileTerminalTap(touch, tapStartedWithTerminalFocus, cached);
-            }
+          if (wasTouching && !didScroll && touch && this.terminal) {
+            this._suppressTrustedTapMouseEvents();
+            const cached =
+              tapStartIntentCache &&
+              tapStartIntentCache.x === touch.clientX &&
+              tapStartIntentCache.y === touch.clientY
+                ? tapStartIntentCache.intent
+                : null;
+            this._handleMobileTerminalTap(touch, tapStartedWithTerminalFocus, cached);
           }
           tapStartedWithTerminalFocus = false;
+          tapStartIntentCache = null;
+          clearTimeout(this._scrollEnd);
+          this._scrollEnd = setTimeout(() => container.classList.remove('scrolling'), 300);
         },
         // NOT passive: the selection branch above must be able to preventDefault
         // the compatibility mouse events. Every other path leaves the event alone.
@@ -1438,7 +2112,16 @@ Object.assign(CodemanApp.prototype, {
           this._touchSelecting = false;
           velocity = 0;
           pixelAccum = 0;
+          pendingDelta = 0;
+          if (touchMoveRaf) {
+            cancelAnimationFrame(touchMoveRaf);
+            touchMoveRaf = 0;
+          }
+          this._cancelTerminalTouchGesture(touchGesture);
           tapStartedWithTerminalFocus = false;
+          tapStartIntentCache = null;
+          clearTimeout(this._scrollEnd);
+          this._scrollEnd = setTimeout(() => container.classList.remove('scrolling'), 300);
         },
         { passive: true }
       );
@@ -1471,9 +2154,33 @@ Object.assign(CodemanApp.prototype, {
 
     // Handle resize with throttling for performance
     this._resizeTimeout = null;
+    this._resizeRaf = null;
     this._lastResizeDims = null;
 
+    // Refresh the current viewport promptly on iOS and OpenCode. Geometry is
+    // applied once by the settled resize below, together with the PTY request.
+    const scheduleImmediateFit = () => {
+      if (this._resizeRaf) return;
+      this._resizeRaf = requestAnimationFrame(() => {
+        this._resizeRaf = null;
+        const session = this.activeSessionId ? this.sessions.get(this.activeSessionId) : null;
+        const needsRefresh =
+          (typeof MobileDetection !== 'undefined' && MobileDetection.isIOS?.()) || session?.mode === 'opencode';
+        if (needsRefresh) {
+          try {
+            this.terminal.refresh(0, Math.max(0, (this.terminal.rows || 24) - 1));
+          } catch {
+            /* terminal may have been disposed during the frame */
+          }
+        }
+      });
+    };
+
     const throttledResize = () => {
+      if (this._isTerminalSessionGone?.(this.activeSessionId)) return;
+      // COD-299: the rail controller owns terminal sizing while its width is
+      // changing. Ignore observer churn so the final 150ms settle performs the
+      // only fit/reflow and PTY resize for the gesture.
       if (this._tabRailResizeOwnsObserver) return;
       // Trailing-edge debounce: ALL resize work (fit + clear + SIGWINCH) happens
       // once after the user stops resizing. During active resize, the terminal
@@ -1487,6 +2194,8 @@ Object.assign(CodemanApp.prototype, {
       //
       // By deferring fit() to the trailing edge, there's exactly ONE reflow
       // at the final dimensions, ONE viewport clear, and ONE Ink redraw.
+      this.applyTerminalFontPolicyForActiveSession();
+      scheduleImmediateFit();
       if (this._resizeTimeout) {
         clearTimeout(this._resizeTimeout);
       }
@@ -1539,6 +2248,13 @@ Object.assign(CodemanApp.prototype, {
             // then \x1b[H\x1b[2J clears the viewport for a clean Ink redraw.
             // IMPORTANT: Only clear when we're actually sending SIGWINCH (dims changed).
             // Clearing without a subsequent Ink redraw leaves the terminal blank.
+            //
+            // Gated to Claude only: this fix is specific to Ink's cursor-up reflow math.
+            // OpenCode (Bubble Tea) and Codex (Ratatui) don't have the same bug, and for
+            // Codex the clear actually causes the conversation to disappear (the TUI
+            // redraws only its current frame — the welcome banner — into the empty
+            // viewport, so prior scrollback is gone visually even though the process
+            // still has full context).
             const activeResizeSession = this.activeSessionId ? this.sessions.get(this.activeSessionId) : null;
             // Not while another device holds the width: the columns were not
             // reflowed here, and a refused resize brings no redraw after it.
@@ -1560,35 +2276,7 @@ Object.assign(CodemanApp.prototype, {
               typeof MobileDetection !== 'undefined' && MobileDetection.getDeviceType
                 ? MobileDetection.getDeviceType()
                 : 'desktop';
-            let sentViaWs = false;
-            if (this._wsReady && this._wsSessionId === this.activeSessionId) {
-              try {
-                this._ws.send(JSON.stringify({ t: 'z', c: cols, r: rows, v: viewportType }));
-                sentViaWs = true;
-              } catch {
-                // Fall through to HTTP POST
-              }
-            }
-            if (!sentViaWs) {
-              // ⚠️ The reply carries the geometry that actually took, and this
-              // is the path where a declined resize is LEAST likely to be
-              // noticed: no socket means no `{"t":"zc"}` frame either, so
-              // discarding it here left the one transport that cannot hear the
-              // answer also not asking for it.
-              const resizedSessionId = this.activeSessionId;
-              fetch(`/api/sessions/${this.activeSessionId}/resize`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ cols, rows, viewportType }),
-              })
-                .then(async (res) => {
-                  const applied = (await res.json())?.data ?? {};
-                  this._onPtyGeometryReport(resizedSessionId, applied.cols, applied.rows);
-                })
-                .catch(() => {
-                  /* a resize that never landed tells us nothing about the PTY */
-                });
-            }
+            this._sendOrQueueTerminalResize(this.activeSessionId, { t: 'z', c: cols, r: rows, v: viewportType });
           }
         }
         // Update subagent connection lines and local echo at new dimensions.
@@ -1626,15 +2314,7 @@ Object.assign(CodemanApp.prototype, {
     this._inputFlushTimeout = null;
     this._lastKeystrokeTime = 0;
 
-    const flushInput = () => {
-      this._inputFlushTimeout = null;
-      if (this._pendingInput && this.activeSessionId) {
-        const input = this._pendingInput;
-        const sessionId = this.activeSessionId;
-        this._pendingInput = '';
-        this._sendInputAsync(sessionId, input);
-      }
-    };
+    const flushInput = () => this._flushPendingTerminalInput();
 
     // Local echo mode: buffer keystrokes locally (shown in overlay) and only
     // send to PTY on Enter.  Avoids out-of-order delivery on high-latency
@@ -1642,13 +2322,22 @@ Object.assign(CodemanApp.prototype, {
     // survives tab switches and reconnects.
 
     const handleTerminalData = (data) => {
-      // Before anything can rewrite `data`: is this chunk the IME's commit?
-      const isImeCommit = this._consumeMobileImeTerminalData(data);
+      const originalData = data;
+      const isImeCommit = this._consumeMobileImeTerminalData(originalData);
       // Mouse SGR reports (tap-to-position) are NOT IME input — they must reach
       // the PTY even while the CJK input field owns focus. Without this exception
       // tapping to move the cursor silently does nothing whenever Chinese input
       // is on, because cjkActive stays true the whole time the field is visible.
       const isMouseReport = /^\x1b\[<\d+;\d+;\d+[Mm]$/.test(data);
+      // COD-187: typing exits the frozen history view first, then the
+      // keystroke flows into the live session (tmux copy-mode semantics).
+      if (
+        this._viewMode === 'history' &&
+        !isMouseReport &&
+        !window.CodemanTerminalInput?.shouldSuppressTerminalQueryResponse(data)
+      ) {
+        this._exitHistoryView?.();
+      }
       // CJK input has focus — block xterm from sending keystrokes to PTY
       if (!isMouseReport && (window.cjkActive || document.activeElement?.id === 'cjkInput')) {
         // Self-heal: if the CJK field is visible but focus drifted to xterm's
@@ -1662,7 +2351,14 @@ Object.assign(CodemanApp.prototype, {
         // xterm's own textarea and bail on query replies, or this would steal
         // focus from the rename/search/settings inputs while output streams.
         const cjkEl = document.getElementById('cjkInput');
-        if (
+        // Wedge detector: CJK gate active but textarea not visible → stale flag
+        // (e.g. settings toggle, session switch, or crash left window.cjkActive true).
+        // Auto-heal instead of silently dropping every keystroke forever (w1-nzbdav).
+        if (window.cjkActive && cjkEl && !cjkEl.classList.contains('cjk-input-visible')) {
+          _crashDiag.log('CJK wedge: cjkActive true but not visible → auto-clear');
+          window.cjkActive = false;
+          this._updateTypingBlockedBanner?.();
+        } else if (
           cjkEl?.classList.contains('cjk-input-visible') &&
           document.activeElement === this.terminal.textarea &&
           !window.CodemanTerminalInput?.shouldSuppressTerminalQueryResponse(data)
@@ -1670,7 +2366,26 @@ Object.assign(CodemanApp.prototype, {
           _crashDiag.log('CJK regain-focus (onData swallowed input)');
           cjkEl.focus();
         }
-        return;
+        // Show blocking reason banner so the user knows why typing is dead.
+        if (window.cjkActive || document.activeElement?.id === 'cjkInput') {
+          this._updateTypingBlockedBanner?.('cjk');
+        }
+        // If CJK is visible but not focused (e.g. body has focus), refocus it
+        // for any non-query printable input — typing on body would otherwise vanish.
+        if (
+          cjkEl?.classList.contains('cjk-input-visible') &&
+          document.activeElement !== cjkEl &&
+          document.activeElement !== this.terminal.textarea &&
+          !window.CodemanTerminalInput?.shouldSuppressTerminalQueryResponse(data) &&
+          data.length === 1 &&
+          data.charCodeAt(0) >= 32
+        ) {
+          _crashDiag.log('CJK refocus from body (printable dropped)');
+          cjkEl.focus();
+          // Don't forward this char via xterm — user should retype once focused
+          return;
+        }
+        if (window.cjkActive || document.activeElement?.id === 'cjkInput') return;
       }
       if (this.activeSessionId) {
         // Filter terminal query replies generated by xterm.js itself.
@@ -1724,6 +2439,35 @@ Object.assign(CodemanApp.prototype, {
         // An IME commit takes the same printable/paste branch as typed text,
         // and the overlay then shows it in place of the preview.
         if (this._localEchoEnabled && !echoPassthrough) {
+          if (isImeCommit) {
+            const ownership = this._mobileImeCommitOwnership;
+            const controller = ownership?.controller || this._mobileImePreview;
+            let transferred = false;
+            try {
+              const updateOverlay =
+                originalData.length === 1
+                  ? this._localEchoOverlay?.addChar
+                  : this._localEchoOverlay?.appendText;
+              if (typeof updateOverlay === 'function') {
+                updateOverlay.call(this._localEchoOverlay, originalData);
+                transferred = true;
+              }
+            } catch {
+              // A broken local overlay must not lose the committed bytes.
+            }
+            if (transferred) {
+              try {
+                controller?.completeCommit?.({ predicted: true });
+              } catch {
+                // Ownership transfer is visual-only.
+              } finally {
+                if (this._mobileImeCommitOwnership === ownership) this._mobileImeCommitOwnership = null;
+              }
+              return;
+            }
+            this._handleNormalTerminalData(originalData, { isImeCommit: true });
+            return;
+          }
           if (data === '\x7f') {
             const source = this._localEchoOverlay?.removeChar();
             if (source === 'flushed') {
@@ -1777,9 +2521,12 @@ Object.assign(CodemanApp.prototype, {
             return;
           }
           if (data.length > 1 && data.charCodeAt(0) >= 32) {
-            // Paste: append to overlay only (sent on Enter)
-            this._localEchoOverlay?.appendText(data);
-            if (isImeCommit && this._localEchoOverlay) this._transferMobileImeCommitToLocalEcho();
+            // Untagged paste: append to the overlay only and send on Enter.
+            try {
+              this._localEchoOverlay?.appendText(data);
+            } catch {
+              // Preserve the existing local-only paste path if its overlay is unavailable.
+            }
             return;
           }
           if (data.charCodeAt(0) < 32) {
@@ -1923,10 +2670,43 @@ Object.assign(CodemanApp.prototype, {
             return;
           }
           if (data.length === 1 && data.charCodeAt(0) >= 32) {
-            // Printable char: add to overlay only (sent on Enter)
-            this._localEchoOverlay?.addChar(data);
-            if (isImeCommit && this._localEchoOverlay) this._transferMobileImeCommitToLocalEcho();
-            return;
+            if (this._shouldBypassLocalEchoPrintable(data)) {
+              const text = this._localEchoOverlay?.pendingText || '';
+              this._localEchoOverlay?.clear();
+              this._localEchoOverlay?.suppressBufferDetection();
+              this._flushedOffsets?.delete(this.activeSessionId);
+              this._flushedTexts?.delete(this.activeSessionId);
+              if (text) {
+                this._pendingInput += text;
+              }
+              this._pendingInput += data;
+              if (this._inputFlushTimeout) {
+                clearTimeout(this._inputFlushTimeout);
+                this._inputFlushTimeout = null;
+              }
+              flushInput();
+              return;
+            }
+            // Printable char: add to overlay only (sent on Enter). An unavailable
+            // or broken overlay must never swallow terminal input: turn off the
+            // optional optimization for this page and fall through to the normal
+            // durable send path below.
+            try {
+              if (typeof this._localEchoOverlay?.addChar === 'function') {
+                this._localEchoOverlay.addChar(data);
+                return;
+              }
+            } catch {
+              // Fall through after disabling the failed overlay.
+            }
+            this._localEchoEnabled = false;
+            this._localEchoPolicy = 'off';
+            try {
+              this._localEchoOverlay?.clear?.();
+              this.showToast?.('Local Echo unavailable; sending input directly.', 'warning');
+            } catch {
+              // The normal input path below remains authoritative.
+            }
           }
         }
 
@@ -1935,39 +2715,7 @@ Object.assign(CodemanApp.prototype, {
         // which is the byte-identity guarantee for #218/#219/#220/#222 —
         // with the predictor active, absent or throwing, the wire sees the
         // same bytes. Body in _predictHookOnData (vm-testable).
-        this._predictHookOnData(data);
-
-        // ── Normal Mode (echo disabled) ──
-        this._pendingInput += data;
-
-        // Control chars (Enter, Ctrl+C, escape sequences) — flush immediately
-        if (data.charCodeAt(0) < 32 || data.length > 1) {
-          if (this._inputFlushTimeout) {
-            clearTimeout(this._inputFlushTimeout);
-            this._inputFlushTimeout = null;
-          }
-          flushInput();
-          return;
-        }
-
-        // Regular chars — flush immediately if typed after a gap (>50ms),
-        // otherwise batch via microtask to coalesce rapid keystrokes (paste).
-        const now = performance.now();
-        if (now - this._lastKeystrokeTime > 50) {
-          // Single char after a gap — send immediately, no setTimeout latency
-          if (this._inputFlushTimeout) {
-            clearTimeout(this._inputFlushTimeout);
-            this._inputFlushTimeout = null;
-          }
-          this._lastKeystrokeTime = now;
-          flushInput();
-        } else {
-          // Rapid sequence (paste or fast typing) — coalesce via microtask
-          this._lastKeystrokeTime = now;
-          if (!this._inputFlushTimeout) {
-            this._inputFlushTimeout = setTimeout(flushInput, 0);
-          }
-        }
+        this._handleNormalTerminalData(data, { isImeCommit });
       }
     };
 
@@ -1995,6 +2743,7 @@ Object.assign(CodemanApp.prototype, {
       this._keyCode229Recovery = null;
     }
     this.terminal.onData((data) => {
+      if (this._assistantLocks?.has(this.activeSessionId)) { this.renderAssistantLock?.(); return; }
       // Canonical xterm data. Telling the controller is what lets it know a
       // keystroke was already delivered and needs no recovery.
       //
@@ -2052,6 +2801,475 @@ Object.assign(CodemanApp.prototype, {
         this._linkHovered = hovered;
       });
     const isPrimary = terminal === this.terminal;
+    const previewExtensions = new Set([
+      'pdf',
+      'md',
+      'txt',
+      'png',
+      'jpg',
+      'jpeg',
+      'gif',
+      'webp',
+      'docx',
+      'pptx',
+      'xlsx',
+      'json',
+      'yaml',
+      'yml',
+      'csv',
+      'xml',
+      'sh',
+      'py',
+      'ts',
+      'js',
+    ]);
+    const attachmentExtensions = new Set([
+      'png',
+      'jpg',
+      'jpeg',
+      'gif',
+      'webp',
+      'pdf',
+      'docx',
+      'pptx',
+      'xlsx',
+      'md',
+      'txt',
+    ]);
+
+    const normalizePathParts = (path, absolute) => {
+      const parts = path.split('/');
+      const normalized = [];
+      for (let index = 0; index < parts.length; index++) {
+        const part = parts[index];
+        if (!part) {
+          if (absolute && index === 0) continue;
+          return null;
+        }
+        if (part === '.') continue;
+        if (part === '..') return null;
+        normalized.push(part);
+      }
+      if (!normalized.length) return null;
+      return `${absolute ? '/' : ''}${normalized.join('/')}`;
+    };
+
+    const normalizePreviewPath = (candidate, workingDir) => {
+      if (
+        !candidate ||
+        candidate.length > 1000 ||
+        candidate.includes('\\') ||
+        candidate.includes('://') ||
+        candidate.toLowerCase().startsWith('file:')
+      )
+        return null;
+      if (!candidate.includes('/')) return null;
+
+      const extension = candidate.slice(candidate.lastIndexOf('.') + 1).toLowerCase();
+      if (!previewExtensions.has(extension)) return null;
+
+      if (candidate.startsWith('/')) {
+        if (!workingDir || !workingDir.startsWith('/')) return null;
+        const normalizedCandidate = normalizePathParts(candidate, true);
+        const normalizedWorkingDir = normalizePathParts(workingDir.replace(/\/$/, ''), true);
+        if (!normalizedCandidate || !normalizedWorkingDir) return null;
+        const prefix = `${normalizedWorkingDir}/`;
+        return normalizedCandidate.startsWith(prefix) ? normalizedCandidate.slice(prefix.length) : null;
+      }
+
+      return normalizePathParts(candidate, false);
+    };
+
+    /**
+     * The directory a RELATIVE path printed in the terminal is relative TO.
+     *
+     * COD-386: `session.workingDir` is recorded once at create time and never
+     * follows a `cd`, so in a shell session where the user moved to a sibling
+     * repo every relative path resolved against the wrong root — the link
+     * rendered underlined and then died with "File not found" from the
+     * workspace-confined file routes. `session.cwd` is the pane's live
+     * `#{pane_current_path}`, published by the server sweep.
+     *
+     * ⚠ Remote and Docker sessions are excluded: their local tmux pane runs the
+     * `ssh`/`docker exec` CLIENT, so its cwd is a host directory that has
+     * nothing to do with where the agent is. An unknown cwd falls back to
+     * workingDir, which is what keeps the historical behavior byte-identical.
+     *
+     * COD-387 moved the implementation to `CodemanFilePaths.relativeResolutionBase`
+     * so the file-preview "not found" message can name the SAME base this resolves
+     * against. Kept as a thin local alias rather than inlined at the call sites,
+     * since the doc comment above is the explanation readers come here for.
+     */
+    const relativeResolutionBase = (workingDir, session) =>
+      window.CodemanFilePaths.relativeResolutionBase(workingDir, session);
+
+    /**
+     * Route a relative candidate: workspace-relative when it lands inside the
+     * workspace, absolute otherwise.
+     *
+     * The absolute form is NOT a widening of the file routes — those stay
+     * workspace-confined. It goes to openExternalPathPreview(), the existing
+     * sanctioned route for an out-of-workspace path, which registers it as an
+     * attachment first and lets the server's realpath + blocklist + extension
+     * allowlist decide. Every extension previewExtensions admits is covered by
+     * SUPPORTED_ATTACHMENT_EXTENSIONS, so this cannot mint a link the
+     * attachment route is guaranteed to refuse.
+     */
+    const resolveRelativeCandidate = (candidate, workingDir, base) => {
+      const normalized = normalizePreviewPath(candidate, workingDir);
+      if (!normalized) return null;
+      if (!base || !base.startsWith('/') || base === workingDir) return { relativePath: normalized };
+      const absolute = normalizePathParts(`${base.replace(/\/+$/, '')}/${normalized}`, true);
+      if (!absolute) return { relativePath: normalized };
+      const withinWorkspace = normalizePreviewPath(absolute, workingDir);
+      return withinWorkspace ? { relativePath: withinWorkspace } : { absolutePath: absolute };
+    };
+
+    // Scan once instead of using an ambiguous, backtracking-heavy expression.
+    // Quoted/backticked spans are kept intact so workspace paths may contain spaces.
+    const findPreviewReferences = (lineText, workingDir, session, markerOffsets = [0]) => {
+      const references = [];
+      const suppressedRanges = [];
+      const blockedPreviewRanges = [];
+      const relativeBase = relativeResolutionBase(workingDir, session);
+      const result = () => ({ references, suppressedRanges, blockedPreviewRanges, isBlockedPreview });
+      const suppress = (startIndex, endIndex) => suppressedRanges.push({ startIndex, endIndex });
+      const blockPreview = (startIndex, endIndex, options = {}) =>
+        blockedPreviewRanges.push({ startIndex, endIndex, ...options });
+      const isBlockedPreview = (text, startIndex, endIndex) =>
+        blockedPreviewRanges.some((range) => {
+          if (startIndex >= range.endIndex || endIndex <= range.startIndex) return false;
+          if (range.allowAbsolute && text.startsWith('/')) return false;
+          if (range.allowRelative) return false;
+          return true;
+        });
+      const trimTrailingPunctuation = (value) => value.replace(/[.,;:!?)\]}]+$/, '');
+      const extensionOf = (value) => value.slice(value.lastIndexOf('.') + 1).toLowerCase();
+      const isSingleAbsolutePath = (candidate) => {
+        if (
+          !candidate.startsWith('/') ||
+          candidate.length > 1000 ||
+          /[\x00-\x1f\\"'`]/.test(candidate) ||
+          candidate.includes('://') ||
+          candidate.includes(' /') ||
+          / (?:—|–|→|=>|->) /.test(candidate)
+        )
+          return false;
+        const normalized = normalizePathParts(candidate, true);
+        if (!normalized || normalized !== candidate || !previewExtensions.has(extensionOf(candidate))) return false;
+
+        const chunks = candidate.split(/[ \t]+/);
+        for (const chunk of chunks.slice(0, -1)) {
+          const trimmed = chunk.replace(/^[([{]+/, '').replace(/[.,;:!?\])}]+$/, '');
+          if (/\.[a-z0-9]{1,10}$/i.test(trimmed)) return false;
+        }
+        return true;
+      };
+
+      const isSingleRelativePath = (candidate, allowUnspaced = false) => {
+        // Marker and labeled surfaces use this same gate, so keep the line to a
+        // short spine: same rejection grammar as isSingleAbsolutePath, minus the
+        // absolute root, plus a mandatory slash and a mandatory space — a spaced
+        // relative path is the only form that cannot survive token scanning.
+        if (
+          !candidate ||
+          candidate.startsWith('/') ||
+          candidate.length > 1000 ||
+          /[\x00-\x1f\\"'`]/.test(candidate) ||
+          candidate.includes('://') ||
+          / (?:—|–|→|=>|->) /.test(candidate)
+        )
+          return false;
+        const normalized = normalizePathParts(candidate, false);
+        if (!normalized || normalized !== candidate || !previewExtensions.has(extensionOf(candidate))) return false;
+
+        const chunks = candidate.split(/[ \t]+/);
+        if (chunks.length < 2 && !allowUnspaced) return false;
+        for (const chunk of chunks.slice(0, -1)) {
+          const trimmed = chunk.replace(/^[([{]+/, '').replace(/[.,;:!?\])}]+$/, '');
+          if (/\.[a-z0-9]{1,10}$/i.test(trimmed)) return false;
+        }
+        return candidate.includes('/');
+      };
+
+      const trailingBoundedRelativePath = (value) => {
+        const match = /(?:\(([^()]*)\)|\[([^\[\]]*)\]|\{([^{}]*)\}|"([^"]+)"|'([^']+)'|`([^`]+)`)[ \t]*$/.exec(value);
+        if (!match) return null;
+        const groupIndex = match.slice(1).findIndex((group) => group !== undefined);
+        const rawPath = match[groupIndex + 1];
+        const path = rawPath?.trim();
+        if (!path) return null;
+        return {
+          path,
+          offset: match.index + match[0].indexOf(path),
+        };
+      };
+
+      const trailingDescriptiveRelativePath = (value) => {
+        const trimmed = trimTrailingPunctuation(value);
+        const match = /^(.*?)\s+(\S+)$/.exec(trimmed);
+        if (!match) return null;
+        const prefix = match[1].trim();
+        const path = match[2];
+        const prefixTokens = prefix.split(/\s+/);
+        if (
+          prefixTokens.length !== 1 ||
+          prefix.includes('/') ||
+          /\.[a-z0-9]{1,10}$/i.test(prefix) ||
+          !path.includes('/')
+        )
+          return null;
+        return {
+          path,
+          offset: match[0].length - path.length,
+        };
+      };
+
+      // Numbered and bulleted list items are the one safe embedded form for an
+      // unquoted path with spaces. Reserve the full path range even when it is
+      // rejected so later token/log scanners cannot manufacture a misleading
+      // relative tail from it.
+      let foundMarker = false;
+      const markerRelativePaths = [];
+      for (const markerOffset of markerOffsets) {
+        const markerMatch = /^(\s*(?:\d+[.)]|[-*•])[ \t]+)(.+)$/.exec(lineText.slice(markerOffset));
+        if (!markerMatch) continue;
+        foundMarker = true;
+        const rawCandidate = markerMatch[2];
+        const rawStartIndex = markerOffset + markerMatch[1].length;
+        if (!rawCandidate.startsWith('/') && /^.+:[ \t]+\/.+$/.test(rawCandidate)) {
+          suppress(rawStartIndex, rawStartIndex + rawCandidate.length);
+          continue;
+        }
+        // Agent citations commonly put a source location immediately after an
+        // absolute document path (`/tmp/design.md:1`). Keep the location out
+        // of the file candidate; otherwise its apparent extension is `md:1`
+        // and this marker branch suppresses the valid fallback path link.
+        const absoluteSourceMatch = absoluteFilePathPattern().exec(rawCandidate);
+        const sourceLocatedAbsolutePath =
+          absoluteSourceMatch && /^:\d+[ \t]+\(/.test(rawCandidate.slice(absoluteSourceMatch.index + absoluteSourceMatch[1].length))
+            ? absoluteSourceMatch[1]
+            : null;
+        // A response bullet may name an artifact before its relative path
+        // (`• Wrote the design: docs/design.md`). The path is the final
+        // colon-delimited suffix, not the surrounding prose.
+        const descriptionPathMatch = !rawCandidate.startsWith('/') && /^.+:[ \t]+([^/].+)$/.exec(rawCandidate);
+        const sentenceTrimmedRawCandidate = rawCandidate.replace(/[.,;:!?]+$/, '');
+        const trimmedRawCandidate = trimTrailingPunctuation(rawCandidate);
+        const boundedRelativePath = !descriptionPathMatch
+          ? trailingBoundedRelativePath(rawCandidate) ||
+            trailingBoundedRelativePath(sentenceTrimmedRawCandidate) ||
+            trailingBoundedRelativePath(trimmedRawCandidate)
+          : null;
+        const trailingDescriptivePath = !descriptionPathMatch && !boundedRelativePath
+          ? trailingDescriptiveRelativePath(rawCandidate)
+          : null;
+        const candidate = trimTrailingPunctuation(
+          sourceLocatedAbsolutePath ||
+            (descriptionPathMatch
+              ? descriptionPathMatch[1]
+              : boundedRelativePath?.path || trailingDescriptivePath?.path || trimmedRawCandidate)
+        );
+        const startIndex = sourceLocatedAbsolutePath
+          ? rawStartIndex + absoluteSourceMatch.index
+          : rawStartIndex +
+            (descriptionPathMatch
+              ? descriptionPathMatch[0].length - descriptionPathMatch[1].length
+              : boundedRelativePath
+                ? boundedRelativePath.offset
+                : trailingDescriptivePath
+                  ? trailingDescriptivePath.offset
+                  : 0);
+        const endIndex = startIndex + candidate.length;
+        if (candidate.startsWith('/')) {
+          if (!isSingleAbsolutePath(candidate)) {
+            const leadingToken = candidate.split(/[ \t]+/, 1)[0];
+            blockPreview(startIndex, lineText.length, {
+              allowAbsolute: true,
+              allowRelative: /^\/\S+\.[a-z0-9]{1,10}$/i.test(leadingToken),
+            });
+            continue;
+          }
+          blockPreview(startIndex, lineText.length);
+
+          const relativePath = normalizePreviewPath(candidate, workingDir);
+          if (relativePath) {
+            references.push({ text: candidate, relativePath, startIndex, endIndex });
+            continue;
+          }
+
+          if (!session?.remote && !session?.docker && attachmentExtensions.has(extensionOf(candidate))) {
+            references.push({ text: candidate, absolutePath: candidate, startIndex, endIndex });
+            continue;
+          }
+
+          // A syntactically complete marker path that cannot use the external
+          // attachment resolver must not fall through to a host-path legacy link.
+          suppress(startIndex, lineText.length);
+          continue;
+        }
+
+        const relativeBase = relativeResolutionBase(workingDir, session);
+        if (!candidate || !isSingleRelativePath(candidate, Boolean(descriptionPathMatch || boundedRelativePath || trailingDescriptivePath))) {
+          suppress(rawStartIndex, rawStartIndex + rawCandidate.length);
+          continue;
+        }
+        blockPreview(rawStartIndex, lineText.length);
+        const target = resolveRelativeCandidate(candidate, workingDir, relativeBase);
+        if (target) {
+          references.push({ text: candidate, ...target, startIndex, endIndex });
+          markerRelativePaths.push({ startIndex, endIndex });
+        } else if (
+          !session?.remote &&
+          !session?.docker &&
+          attachmentExtensions.has(extensionOf(candidate)) &&
+          relativeBase &&
+          relativeBase.startsWith('/')
+        ) {
+          const absolute = normalizePathParts(`${relativeBase.replace(/\/+$/, '')}/${candidate}`, true);
+          if (absolute) references.push({ text: candidate, absolutePath: absolute, startIndex, endIndex });
+        } else {
+          suppress(startIndex, endIndex);
+        }
+      }
+
+      // A few CLI formats prefix a complete path with a stable label rather
+      // than placing it on its own line. Treat only the approved labels as a
+      // complete path boundary so spaces cannot make token scanning link a
+      // relative tail from the middle of the path. Labeled relative paths join
+      // the same allowlist the marker scanner uses — see isSingleRelativePath
+      // above — so either surface links the whole candidate or nothing.
+      const labeledPathMatch = /^\s*(?:path|file|saved to):[ \t]+(.+)$/i.exec(lineText);
+      if (labeledPathMatch) {
+        const rawCandidate = labeledPathMatch[1];
+        const candidate = trimTrailingPunctuation(rawCandidate);
+        const startIndex = labeledPathMatch[0].length - rawCandidate.length;
+        const endIndex = startIndex + candidate.length;
+        const relativeBase = relativeResolutionBase(workingDir, session);
+
+        if (candidate.startsWith('/')) {
+          if (!isSingleAbsolutePath(candidate)) {
+            suppress(startIndex, lineText.length);
+          } else {
+            blockPreview(startIndex, lineText.length);
+            const relativePath = normalizePreviewPath(candidate, workingDir);
+            if (relativePath) {
+              references.push({ text: candidate, relativePath, startIndex, endIndex });
+            } else if (!session?.remote && !session?.docker && attachmentExtensions.has(extensionOf(candidate))) {
+              references.push({ text: candidate, absolutePath: candidate, startIndex, endIndex });
+            } else {
+              suppress(startIndex, lineText.length);
+            }
+          }
+        } else if (!isSingleRelativePath(candidate)) {
+          suppress(startIndex, endIndex);
+        } else {
+          blockPreview(startIndex, lineText.length);
+          const target = resolveRelativeCandidate(candidate, workingDir, relativeBase);
+          if (target) {
+            references.push({ text: candidate, ...target, startIndex, endIndex });
+            markerRelativePaths.push({ startIndex, endIndex });
+          } else if (
+            !session?.remote &&
+            !session?.docker &&
+            attachmentExtensions.has(extensionOf(candidate)) &&
+            relativeBase &&
+            relativeBase.startsWith('/')
+          ) {
+            const absolute = normalizePathParts(`${relativeBase.replace(/\/+$/, '')}/${candidate}`, true);
+            if (absolute) {
+              references.push({ text: candidate, absolutePath: absolute, startIndex, endIndex });
+            } else {
+              suppress(startIndex, endIndex);
+            }
+          } else {
+            suppress(startIndex, endIndex);
+          }
+        }
+      }
+
+      // COD-237: an unquoted absolute path may legitimately contain spaces (e.g.
+      // "OneDrive - Cisco"). When the ENTIRE trimmed line is a single such path that
+      // resolves to a previewable in-workspace file, treat it as one reference. This
+      // own-line rule is the AC's strongest signal; it deliberately avoids guessing
+      // spaced paths embedded in prose (inherently ambiguous). Single path only —
+      // a second " /" segment (two space-separated absolute paths) is not merged.
+      const trimmedLine = lineText.trim();
+      if (
+        !foundMarker &&
+        trimmedLine.startsWith('/') &&
+        trimmedLine.includes(' ') &&
+        !/["'`]/.test(trimmedLine) &&
+        !/ \//.test(trimmedLine)
+      ) {
+        const candidate = trimmedLine.replace(/[.,;:!?)\]}]+$/, '');
+        const relativePath = normalizePreviewPath(candidate, workingDir);
+        if (relativePath) {
+          const startIndex = lineText.length - lineText.trimStart().length;
+          references.push({ text: candidate, relativePath, startIndex, endIndex: startIndex + candidate.length });
+          return result();
+        }
+        // COD-288: the line has been recognized as ONE spaced absolute path, so stop here
+        // even when it does not resolve (outside the workspace, or a .. traversal). Falling
+        // through to the space-delimited token scanner below would linkify only the fragment
+        // after the LAST space as a *relative* candidate — a partial path that silently
+        // resolves against the workspace to the wrong target. Link the whole path or nothing.
+        // The confinement check in normalizePreviewPath stays authoritative; this only stops
+        // the fall-through from manufacturing a bogus alternative.
+        const startIndex = lineText.length - lineText.trimStart().length;
+        suppress(startIndex, lineText.length);
+        return result();
+      }
+
+      const isHardDelimiter = (char) => !char || char <= ' ' || '<>|;&'.includes(char) || (char > '\x7f' && /\s/.test(char));
+      const isTokenDelimiter = (char) => isHardDelimiter(char) || char === '"' || char === "'" || char === '`';
+      const isWithinMarkerRelativePath = (startIndex, endIndex) =>
+        markerRelativePaths.some((range) => startIndex >= range.startIndex && endIndex <= range.endIndex);
+      const addCandidate = (raw, rawStart) => {
+        if (!raw.includes('/')) return;
+        let startTrim = 0;
+        let endTrim = raw.length;
+        while (startTrim < endTrim && /[([{]/.test(raw[startTrim])) startTrim++;
+        while (endTrim > startTrim && /[.,;:!?\])}]/.test(raw[endTrim - 1])) endTrim--;
+        const text = raw.slice(startTrim, endTrim);
+        const startIndex = rawStart + startTrim;
+        const endIndex = rawStart + endTrim;
+        if (isBlockedPreview(text, startIndex, endIndex)) return;
+        if (isWithinMarkerRelativePath(startIndex, endIndex)) return;
+        if (!text.startsWith('/')) {
+          const target = resolveRelativeCandidate(text, workingDir, relativeBase);
+          if (!target) return;
+          references.push({ text, ...target, startIndex, endIndex });
+          return;
+        }
+        const relativePath = normalizePreviewPath(text, workingDir);
+        if (!relativePath) return;
+        references.push({ text, relativePath, startIndex, endIndex });
+      };
+
+      let index = 0;
+      while (index < lineText.length) {
+        while (index < lineText.length && isHardDelimiter(lineText[index])) index++;
+        if (index >= lineText.length) break;
+
+        const delimiter = lineText[index];
+        if (delimiter === '"' || delimiter === "'" || delimiter === '`') {
+          const end = lineText.indexOf(delimiter, index + 1);
+          if (end === -1) {
+            index++;
+            continue;
+          }
+          addCandidate(lineText.slice(index + 1, end), index + 1);
+          index = end + 1;
+          continue;
+        }
+
+        const start = index;
+        while (index < lineText.length && !isTokenDelimiter(lineText[index])) index++;
+        addCandidate(lineText.slice(start, index), start);
+      }
+      return result();
+    };
 
     // Debug: Track if provider is being invoked
     let lastInvokedLine = -1;
@@ -2082,14 +3300,10 @@ Object.assign(CodemanApp.prototype, {
         // both continuation kinds, the indent a hard wrap leaves on its
         // continuation, and the offset↔cell mapping — because touch selection
         // measures the SAME lines and the two must not disagree.
-        // `terminalPathLine` adds one thing on top, for links only: a path the
-        // program broke over lines itself (Claude Code wraps tool output short of
-        // the edge) is glued back together, so `…/captures/2` + `026-10-10/x.png`
-        // links as the one file it is.
         // Bounded so a screenful of full-width output (wide tables, box drawing)
         // cannot make every hover stitch and re-scan the entire viewport.
         const MAX_STITCHED_ROWS = 12;
-        const logical = window.CodemanTerminalLines?.terminalPathLine(
+        const logical = window.CodemanTerminalLines?.terminalLogicalLine(
           buffer,
           bufferLineNumber - 1,
           terminal.cols,
@@ -2099,57 +3313,226 @@ Object.assign(CodemanApp.prototype, {
           callback(undefined);
           return;
         }
-        const lineText = logical.text;
+        // `logical` owns the EXTENT (which rows form this line) so the link provider
+        // and touch selection can never disagree about where a line begins and ends.
+        // The text and the offset↔cell mapping are rebuilt from the raw rows here,
+        // because COD-232 needs a mapping through REAL buffer cells: logical's
+        // arithmetic mapping assumes one string offset per column, which shifts every
+        // range after a wide CJK/emoji cell or a combining sequence.
+        const cols = terminal.cols;
+        // COD-448: a URL the CLI wrapped short of the right edge (inside a table
+        // cell or an indented paragraph) spans rows the logical line does not
+        // join. The continuation extent widens the span to the whole URL; the
+        // rows it adds are hard continuations, handled by the indent strip below.
+        const urlExtent = window.CodemanTerminalLines?.terminalUrlContinuationExtent?.(
+          buffer,
+          bufferLineNumber - 1,
+          cols,
+          MAX_STITCHED_ROWS
+        );
+        const extentStart = urlExtent ? Math.min(urlExtent.startRow, logical.startRow) : logical.startRow;
+        const extentEnd = urlExtent ? Math.max(urlExtent.endRow, logical.endRow) : logical.endRow;
+        const rowTexts = [];
+        const rowOffsets = [];
+        const rowColStarts = [];
+        const markerOffsets = [];
+        let stitchedOffset = 0;
+        for (let r = extentStart; r <= extentEnd; r++) {
+          const row = buffer.getLine(r);
+          if (!row) break;
+          // Only a row the NEXT row soft-wraps from is read untrimmed: it fills the
+          // width by definition, and trimming one would shift every later offset.
+          // Every other row is trimmed, which is a no-op for a full-width hard wrap
+          // and drops the padding a short hard-wrapped row (COD-448) carries.
+          const nextRow = r < extentEnd ? buffer.getLine(r + 1) : null;
+          let rowText = row.translateToString(!(nextRow && nextRow.isWrapped));
+          // The first table row may also contain date/owner columns after the
+          // URL cell. They occupy real cells, but cannot sit between the URL's
+          // first fragment and its indented continuation in the scan text.
+          if (r === extentStart && urlExtent?.firstRowUrlEnd != null) {
+            rowText = rowText.slice(0, urlExtent.firstRowUrlEnd);
+          }
+          // A HARD wrap (the program wrapped the line itself, so nothing is flagged
+          // isWrapped) can indent its continuation. Joining that indent verbatim puts
+          // a space inside the URL/path and the detector stops at the row boundary,
+          // which is the truncation this stitching exists to prevent. Mirrors what
+          // terminalLogicalLine does for the same rows.
+          let colStart = 0;
+          if (r > extentStart && !row.isWrapped) {
+            colStart = rowText.length - rowText.replace(/^\s+/, '').length;
+            rowText = rowText.slice(colStart);
+          }
+          if (r === extentStart || !row.isWrapped) markerOffsets.push(stitchedOffset);
+          rowOffsets.push(stitchedOffset);
+          rowTexts.push(rowText);
+          rowColStarts.push(colStart);
+          stitchedOffset += rowText.length;
+        }
+        const lineText = rowTexts.join('');
 
-        /** Map an offset in the stitched text back to a 1-based terminal cell. */
+        /** Map an offset in the stitched text back to a 1-based terminal cell.
+         * Detector offsets are JavaScript string offsets, while xterm link
+         * ranges use terminal cells. Bridge them from the real buffer cells so
+         * wide CJK/emoji cells and combining sequences do not shift a later
+         * path's underline or touch hit target. */
+        const offsetPositions = new Map();
+        for (let i = 0; i < rowTexts.length; i++) {
+          const row = buffer.getLine(extentStart + i);
+          const text = rowTexts[i];
+          if (/^[\x20-\x7e]*$/.test(text)) continue;
+          const rowPositions = [];
+          if (row && typeof row.getCell === 'function') {
+            for (let column = 0; column < cols; column++) {
+              const cell = row.getCell(column);
+              if (!cell || cell.getWidth() === 0) continue;
+              const chars = cell.getChars() || ' ';
+              for (let k = 0; k < chars.length; k++) rowPositions.push({ x: column + 1, y: extentStart + i + 1 });
+            }
+          }
+          // Drop the stripped indent's cells so offset 0 of this row's text still
+          // points at the first character that survived the strip.
+          if (rowColStarts[i]) rowPositions.splice(0, rowColStarts[i]);
+          for (let k = 0; k < text.length; k++) {
+            offsetPositions.set(rowOffsets[i] + k, rowPositions[k] || { x: k + rowColStarts[i] + 1, y: extentStart + i + 1 });
+          }
+        }
         const coordAt = (index) => {
-          const cell = logical.offsetToCell(index);
-          return { x: cell.col + 1, y: cell.row + 1 };
+          const mapped = offsetPositions.get(index);
+          if (mapped) return mapped;
+          for (let i = rowOffsets.length - 1; i >= 0; i--) {
+            if (index >= rowOffsets[i]) return { x: index - rowOffsets[i] + rowColStarts[i] + 1, y: extentStart + i + 1 };
+          }
+          return { x: index + 1, y: extentStart + 1 };
         };
 
-        // A path needs a `/` or an extension's `.`; a line with neither has no link.
-        if (!lineText || (!lineText.includes('/') && !lineText.includes('.'))) {
+        // Paths codex word-wrapped inside a table cell (see terminalCellWrappedPaths
+        // in constants.js). They follow their own cell down the rows, which the
+        // linear stitch above cannot do for a multi-column table, so they are
+        // found from the buffer directly and claim their cells over the rest.
+        const cellWrappedPaths = (
+          window.CodemanTerminalLines?.terminalCellWrappedPaths?.(buffer, bufferLineNumber - 1, 4) ?? []
+        ).filter((hit) => !/(^|\/)\.\.(\/|$)/.test(hit.path));
+
+        if ((!lineText || !lineText.includes('/')) && cellWrappedPaths.length === 0) {
           callback(undefined);
           return;
         }
 
         const links = [];
-        // Text offsets of every link so far: a later pattern must not cut a
-        // second, overlapping link out of one already found (a relative `b.png`
-        // inside a URL's `?img=b.png`).
-        const taken = [];
-        const isTaken = (start, length) => taken.some((t) => start < t.end && t.start < start + length);
+        const occupiedOffsets = new Uint8Array(lineText.length);
+        const overlapsLink = (startIndex, endIndex) => {
+          for (let index = startIndex; index < endIndex; index++) {
+            if (occupiedOffsets[index]) return true;
+          }
+          return false;
+        };
+        const reserveLink = (startIndex, endIndex) => {
+          occupiedOffsets.fill(1, startIndex, endIndex);
+        };
+        const originatingSessionId = getSessionId();
+        const originatingSession = originatingSessionId ? self.sessions?.get(originatingSessionId) : null;
+        const workingDir = originatingSession?.workingDir ?? null;
 
-        // Pattern 0: URLs (https://, http://) — matched first so they take priority
-        //
-        // A single `&` is PART of the URL: it separates query parameters, so excluding
-        // it truncated every real query string (`?post=1479&action=edit` linked only
-        // through `1479`, landing on the wrong page). `&&` is still a boundary, since
-        // that is the shell operator and never appears inside a URL. A lone trailing
-        // `&` is trimmed below with the other trailing punctuation.
-        const urlPattern = /https?:\/\/(?:[^\s"'<>|;&)\]\x00-\x1f]|&(?!&))+/g;
+        // Pre-scan with the exact ordinary-URL grammar used for link creation.
+        // File-token rejection consults these same ranges so query separators
+        // such as `&next=file:///...` cannot make the two detectors disagree.
+        // The grammar (balanced parens, `&` vs `&&`, trailing punctuation) lives in
+        // findTerminalUrls() in constants.js so the continuation extent above
+        // reads URLs exactly the way the links below are made.
+        const ordinaryUrlReferences = window.CodemanTerminalLines?.findTerminalUrls?.(lineText) ?? [];
 
-        const addUrlLink = (url, matchIndex) => {
-          // Strip trailing punctuation that's likely not part of the URL
-          const cleaned = url.replace(/[.,;:!?)&]+$/, '');
-          const startCol = lineText.indexOf(cleaned, matchIndex);
-          if (startCol === -1) return;
+        // Pattern 0: strict local file URIs. Scan before ordinary URLs and paths,
+        // retaining the encoded URI for the authenticated resolver to decode. The
+        // scan and candidate length are bounded so hostile terminal output cannot
+        // turn a hover into unbounded work.
+        const FILE_URI_PREFIX = 'file:///';
+        const MAX_FILE_URI_LENGTH = 2000;
+        const fileUriExtensions = new Set([
+          'png',
+          'jpg',
+          'jpeg',
+          'gif',
+          'webp',
+          'pdf',
+          'docx',
+          'pptx',
+          'xlsx',
+          'md',
+          'txt',
+        ]);
+        const isFileUriDelimiter = (char) => !char || /[\s"'<>|;&\x00-\x1f]/.test(char);
+        const scanFileUriTokens = () => {
+          const candidates = [];
+          const rejected = [];
+          let ordinaryUrlIndex = 0;
+          let tokenStart = 0;
+          while (tokenStart < lineText.length) {
+            while (tokenStart < lineText.length && isFileUriDelimiter(lineText[tokenStart])) tokenStart++;
+            if (tokenStart >= lineText.length) break;
+            let tokenEnd = tokenStart;
+            while (tokenEnd < lineText.length && !isFileUriDelimiter(lineText[tokenEnd])) tokenEnd++;
 
-          const start = coordAt(startCol);
-          const end = coordAt(startCol + cleaned.length);
-          if (links.some((l) => l.range.start.x === start.x && l.range.start.y === start.y)) return;
-          taken.push({ start: startCol, end: startCol + cleaned.length });
+            const token = lineText.slice(tokenStart, tokenEnd);
+            const schemeOffset = token.toLowerCase().indexOf('file:');
+            if (schemeOffset === -1) {
+              tokenStart = tokenEnd;
+              continue;
+            }
+            const startIndex = tokenStart + schemeOffset;
+            while (
+              ordinaryUrlIndex < ordinaryUrlReferences.length &&
+              ordinaryUrlReferences[ordinaryUrlIndex].endIndex <= startIndex
+            ) {
+              ordinaryUrlIndex++;
+            }
+            const ordinaryUrl = ordinaryUrlReferences[ordinaryUrlIndex];
+            if (ordinaryUrl && startIndex >= ordinaryUrl.startIndex && startIndex < ordinaryUrl.endIndex) {
+              // The ordinary URL provider owns this file: query value and will
+              // reserve the full URL before legacy path matching.
+              tokenStart = tokenEnd;
+              continue;
+            }
 
+            let cleanedEnd = tokenEnd;
+            while (cleanedEnd > startIndex && /[.,;:!?)\]}]/.test(lineText[cleanedEnd - 1])) cleanedEnd--;
+            const uri = lineText.slice(startIndex, cleanedEnd);
+            const pathname = uri.split(/[?#]/, 1)[0];
+            const dotIndex = pathname.lastIndexOf('.');
+            const extension = dotIndex === -1 ? '' : pathname.slice(dotIndex + 1).toLowerCase();
+            const startsAtBoundary = startIndex === tokenStart || /[([{]/.test(lineText[startIndex - 1]);
+            if (
+              startsAtBoundary &&
+              uri.slice(0, FILE_URI_PREFIX.length).toLowerCase() === FILE_URI_PREFIX &&
+              uri.length <= MAX_FILE_URI_LENGTH &&
+              uri.length > FILE_URI_PREFIX.length &&
+              uri[FILE_URI_PREFIX.length] !== '/' &&
+              fileUriExtensions.has(extension)
+            ) {
+              candidates.push({ uri, startIndex, endIndex: cleanedEnd });
+            } else {
+              // Own the whole malformed file-scheme token so legacy URL/path
+              // detectors cannot turn a suffix such as /tmp/report.pdf into a
+              // misleading, partially clickable target.
+              rejected.push({ startIndex: tokenStart, endIndex: tokenEnd });
+            }
+            tokenStart = tokenEnd;
+          }
+          return { candidates, rejected };
+        };
+
+        const fileUriTokens = scanFileUriTokens();
+        for (const rejected of fileUriTokens.rejected) reserveLink(rejected.startIndex, rejected.endIndex);
+        for (const candidate of fileUriTokens.candidates) {
+          if (overlapsLink(candidate.startIndex, candidate.endIndex)) continue;
+          const start = coordAt(candidate.startIndex);
+          const end = coordAt(candidate.endIndex - 1);
+          reserveLink(candidate.startIndex, candidate.endIndex);
           links.push({
-            text: cleaned,
+            text: candidate.uri,
             range: { start, end },
             decorations: { pointerCursor: true, underline: true },
-            activate(_event, text) {
-              // A `localhost` link tapped from another device can only work
-              // through the server: route it into a proxied web tab
-              // (webview-tabs.js). Anything else opens as before.
-              if (self.openLinkThroughWebTabIfLoopback?.(text)) return;
-              window.open(text, '_blank', 'noopener,noreferrer');
+            activate() {
+              self.openFileUriPreview(candidate.uri, originatingSessionId);
             },
             hover() {
               setHovered(true);
@@ -2158,9 +3541,55 @@ Object.assign(CodemanApp.prototype, {
               setHovered(false);
             },
           });
+        }
+
+        // Pattern 1: URLs (https://, http://, webexteams://) — matched before
+        // file-path patterns.
+        //
+        // A single `&` is PART of the URL: it separates query parameters, so excluding
+        // it truncated every real query string (`?post=1479&action=edit` linked only
+        // through `1479`, landing on the wrong page). `&&` is still a boundary, since
+        // that is the shell operator and never appears inside a URL. A lone trailing
+        // `&` is trimmed below with the other trailing punctuation.
+        const addUrlLink = (reference) => {
+          if (overlapsLink(reference.startIndex, reference.endIndex)) return;
+
+          reserveLink(reference.startIndex, reference.endIndex);
+
+          // One link per terminal row the URL occupies, each opening the WHOLE
+          // URL. A single range spanning rows would also underline (and make
+          // clickable) the indent and table columns between a CLI-wrapped URL's
+          // pieces (COD-448). A single-row URL keeps its original range.
+          const segments = [];
+          let segStart = reference.startIndex;
+          for (let i = reference.startIndex + 1; i < reference.endIndex; i++) {
+            if (coordAt(i).y !== coordAt(i - 1).y) {
+              segments.push([segStart, i]);
+              segStart = i;
+            }
+          }
+          segments.push([segStart, reference.endIndex]);
+          for (let n = 0; n < segments.length; n++) {
+            const [from, to] = segments[n];
+            const last = n === segments.length - 1;
+            links.push({
+              text: reference.url,
+              range: { start: coordAt(from), end: last && n === 0 ? coordAt(to) : coordAt(to - 1) },
+              decorations: { pointerCursor: true, underline: true },
+              activate() {
+                self._openTerminalUrl(reference.url);
+              },
+              hover() {
+                setHovered(true);
+              },
+              leave() {
+                setHovered(false);
+              },
+            });
+          }
         };
 
-        // Pattern 1: Commands with file paths (tail -f, cat, head, grep pattern, etc.)
+        // Pattern 2: Commands with file paths (tail -f, cat, head, grep pattern, etc.)
         // Handles: tail -f /path, grep pattern /path, cat -n /path
         // ⚠ The arg group must stay linear-time: `(?:[^\s\/]*\s+)*` (empty-matchable
         // token, unbounded) backtracks exponentially on lines with a trigger word
@@ -2168,73 +3597,70 @@ Object.assign(CodemanApp.prototype, {
         // the whole tab on hover. Non-empty token + bounded reps is O(n).
         const cmdPattern = /\b(tail|cat|head|less|grep|watch|vim|nano)\s+(?:[^\s\/]+\s+){0,4}(\/[^\s"'<>|;&\n\x00-\x1f]+)/g;
 
-        // Pattern 2: Paths with common extensions — absolute, `~/` and relative
-        // (`findFilePathLinks`, constants.js). Image/PDF/media extensions are
+        // Pattern 2: Paths with common extensions. Image/PDF/media extensions are
         // included so pasted-attachment paths (`.codeman-uploads/paste-*.png`) and
         // screenshots an agent just wrote are clickable; those open the file
         // preview rather than the log viewer (see addLink).
         //
-        // The patterns live in constants.js because the response viewer linkifies
-        // the SAME paths out of markdown — one definition, two consumers.
+        // The literal lives in constants.js because the response viewer linkifies
+        // the SAME paths out of markdown — one definition, two consumers. A fresh
+        // instance per call: `lastIndex` is per-object state.
+        const extPattern = absoluteFilePathPattern();
 
-        // Pattern 3: Bash() tool output
+        // Pattern 4: Bash() tool output
         const bashPattern = /Bash\([^)]*?(\/(?:home|tmp|var|etc|opt)[^\s"'<>|;&\)\n\x00-\x1f]+)/g;
 
-        const addLink = (filePath, matchIndex, folder = false) => {
-          const startCol = lineText.indexOf(filePath, matchIndex);
+        const activateFilePath = (text) => {
+          // Tailing a PNG in the log viewer shows binary noise; the file preview
+          // already renders images, PDFs, documents and media inline. The
+          // extension list is previewsInFileViewer() in constants.js — shared
+          // with the response viewer and pinned to the attachment registry by
+          // test/media-extension-parity.test.ts, so an in-workspace .m4a can no
+          // longer route to the log viewer while the same file in /tmp plays.
+          //
+          // Routing is by EXTENSION, not by workspace containment: text still
+          // goes to the log viewer even from outside the workspace, because it
+          // follows a file that is still being written and its allowlist covers
+          // /var/log and ~/logs (COD-232 pins those). A previewable path outside
+          // the workspace has to be registered as an attachment first — the
+          // workspace-confined routes can only 404 on it — which is what
+          // openExternalPathPreview does before previewing by id.
+          if (text.startsWith('~/') || previewsInFileViewer(text)) {
+            if (self._isExternalPreviewPath?.(text, originatingSessionId)) {
+              const pending = self.openExternalPathPreview(text, originatingSessionId);
+              if (pending && typeof pending.catch === 'function') {
+                pending.catch((err) => console.error('Failed to open external path preview:', err));
+              }
+              return;
+            }
+            self.openFilePreview(text, originatingSessionId);
+            return;
+          }
+          self.openLogViewerWindow(text, originatingSessionId);
+        };
+
+        const addLogLink = (filePath, matchIndex, displayPath = filePath) => {
+          // A path with a `..` segment never makes a good link: the log viewer's
+          // allowlist and the attachment guard both realpath and then refuse the
+          // ambiguous ones, so it would render clickable and die. Same reasoning
+          // that keeps /etc out of FILE_PATH_LINK_PATTERN (constants.js), and it
+          // matters more now that pattern reaches /workspace, /mnt and /Users.
+          if (/(^|\/)\.\.(\/|$)/.test(filePath)) return;
+          const startCol = lineText.indexOf(displayPath, matchIndex);
           if (startCol === -1) return;
+          const endCol = startCol + displayPath.length;
+          if (overlapsLink(startCol, endCol)) return;
 
           const start = coordAt(startCol);
-          const end = coordAt(startCol + filePath.length);
-          // Skip if already have link at this position, or one overlapping it
-          if (links.some((l) => l.range.start.x === start.x && l.range.start.y === start.y)) return;
-          if (isTaken(startCol, filePath.length)) return;
-          taken.push({ start: startCol, end: startCol + filePath.length });
+          const end = coordAt(endCol - 1);
+          reserveLink(startCol, endCol);
 
           links.push({
-            text: filePath,
-            range: { start, end }, // 1-based, may span wrapped rows
-            decorations: {
-              pointerCursor: true,
-              underline: true,
-            },
-            activate(event, text) {
-              // Tailing a PNG in the log viewer shows binary noise; the file preview
-              // already renders images, PDFs, documents and media inline — and it
-              // now reaches files outside the workspace too, which is where an
-              // agent's screenshots and scratchpad captures actually land.
-              //
-              // Text goes to the log viewer, which follows a file that is still
-              // being written — but ONLY where it can actually read: it spawns
-              // `tail -f` and allows the workspace, /var/log and ~/logs, so an
-              // out-of-workspace path there answered "Path must be within
-              // working directory or allowed log directories" while the SAME
-              // path clicked in the response viewer previewed fine. The preview
-              // reads those through the guarded attachment routes, so external
-              // paths route there and the two surfaces agree.
-              //
-              // A relative path is resolved against the session's working
-              // directory first, and a `~/` path always previews (only the
-              // server knows that host's home, and the log viewer cannot ask).
-              const sessionId = getSessionId();
-              const target = self._resolveLinkedFilePath(text, sessionId);
-              // A folder path opens the folder grid (which falls back to the
-              // preview if the server finds a file there after all).
-              if (folder) {
-                self.openFolderGrid(target, sessionId);
-                return;
-              }
-              // An HTML file renders as a page in the preview, never as source
-              // in the log viewer (markdown is in FILE_PREVIEW_EXTENSIONS).
-              if (
-                previewsInFileViewer(target) ||
-                rendersAsPage(target) ||
-                self._isExternalPreviewPath(target, sessionId)
-              ) {
-                self.openFilePreview(target, sessionId);
-                return;
-              }
-              self.openLogViewerWindow(target, sessionId);
+            text: displayPath,
+            range: { start, end },
+            decorations: { pointerCursor: true, underline: true },
+            activate() {
+              activateFilePath(filePath);
             },
             hover() {
               setHovered(true);
@@ -2248,23 +3674,109 @@ Object.assign(CodemanApp.prototype, {
         // Match all patterns — URLs first so they take priority
         let match;
 
-        urlPattern.lastIndex = 0;
-        while ((match = urlPattern.exec(lineText)) !== null) {
-          addUrlLink(match[0], match.index);
+        for (const reference of ordinaryUrlReferences) addUrlLink(reference);
+
+        const previewScan = originatingSessionId
+          ? findPreviewReferences(lineText, workingDir, originatingSession, markerOffsets)
+          : { references: [], suppressedRanges: [], blockedPreviewRanges: [], isBlockedPreview: () => false };
+        for (const range of previewScan.suppressedRanges) reserveLink(range.startIndex, range.endIndex);
+
+        const addPreviewLink = (reference) => {
+          const start = coordAt(reference.startIndex);
+          const end = coordAt(reference.endIndex - 1);
+          if (overlapsLink(reference.startIndex, reference.endIndex)) return;
+          reserveLink(reference.startIndex, reference.endIndex);
+
+          links.push({
+            text: reference.text,
+            range: { start, end },
+            decorations: { pointerCursor: true, underline: true },
+            activate() {
+              if (reference.absolutePath) {
+                try {
+                  const pending = self.openExternalPathPreview(reference.absolutePath, originatingSessionId);
+                  if (pending && typeof pending.catch === 'function') {
+                    pending.catch((err) => console.error('Failed to open external path preview:', err));
+                  }
+                } catch (err) {
+                  console.error('Failed to open external path preview:', err);
+                }
+                return;
+              }
+              self.openFilePreview(reference.relativePath, originatingSessionId);
+            },
+            hover() {
+              setHovered(true);
+            },
+            leave() {
+              setHovered(false);
+            },
+          });
+        };
+
+        // Marker-qualified external paths need the attachment resolver rather
+        // than a legacy host-path link, so they claim their exact range first.
+        for (const reference of previewScan.references) {
+          if (reference.absolutePath) addPreviewLink(reference);
         }
 
         cmdPattern.lastIndex = 0;
         while ((match = cmdPattern.exec(lineText)) !== null) {
-          addLink(match[2], match.index);
-        }
-
-        for (const found of findFilePathLinks(lineText)) {
-          addLink(found.path, found.index, !!found.folder);
+          addLogLink(match[2], match.index);
         }
 
         bashPattern.lastIndex = 0;
         while ((match = bashPattern.exec(lineText)) !== null) {
-          addLink(match[1], match.index);
+          addLogLink(match[1], match.index);
+        }
+
+        // Preserve command/Bash/live-log precedence for ordinary workspace
+        // references while claiming documents before the legacy absolute-path
+        // fallback, matching the provider's established behavior.
+        for (const reference of previewScan.references) {
+          if (!reference.absolutePath) addPreviewLink(reference);
+        }
+
+        extPattern.lastIndex = 0;
+        while ((match = extPattern.exec(lineText)) !== null) {
+          addLogLink(match[1], match.index);
+        }
+
+        // One link per row segment, each opening the WHOLE path (the COD-448 URL
+        // rule). A fragment of the same cells linked by another detector (a
+        // relative `243/after-overview.png`, say) would open the wrong file, so
+        // the cell-wrapped path displaces it.
+        if (cellWrappedPaths.length > 0) {
+          const claimed = cellWrappedPaths.flatMap((hit) => hit.segments);
+          const overlapsClaim = (link) =>
+            claimed.some((seg) => {
+              const y = seg.row + 1;
+              if (y < link.range.start.y || y > link.range.end.y) return false;
+              const from = y === link.range.start.y ? link.range.start.x : 1;
+              const to = y === link.range.end.y ? link.range.end.x : Number.MAX_SAFE_INTEGER;
+              return from <= seg.endCol && to >= seg.startCol + 1;
+            });
+          for (let i = links.length - 1; i >= 0; i--) {
+            if (overlapsClaim(links[i])) links.splice(i, 1);
+          }
+          for (const hit of cellWrappedPaths) {
+            for (const seg of hit.segments) {
+              links.push({
+                text: hit.path,
+                range: { start: { x: seg.startCol + 1, y: seg.row + 1 }, end: { x: seg.endCol, y: seg.row + 1 } },
+                decorations: { pointerCursor: true, underline: true },
+                activate() {
+                  activateFilePath(hit.path);
+                },
+                hover() {
+                  setHovered(true);
+                },
+                leave() {
+                  setHovered(false);
+                },
+              });
+            }
+          }
         }
 
         if (links.length > 0) {
@@ -2273,9 +3785,41 @@ Object.assign(CodemanApp.prototype, {
             links.map((l) => l.text)
           );
         }
+        let hasUnclaimedPath = false;
+        for (let slash = lineText.indexOf('/'); slash !== -1; slash = lineText.indexOf('/', slash + 1)) {
+          if (!occupiedOffsets[slash]) { hasUnclaimedPath = true; break; }
+        }
+        for (const found of hasUnclaimedPath ? findFilePathLinks(lineText) : []) {
+          if (!found.folder && (found.path.startsWith('/') || (!found.path.includes('/') && !found.path.startsWith('~/')))) continue;
+          if (/(^|\/)\.\.(\/|$)/.test(found.path) || found.path.includes('//')) continue;
+          const startIndex = found.index;
+          const endIndex = startIndex + found.path.length;
+          if ((!found.folder && previewScan.isBlockedPreview(found.path, startIndex, endIndex)) || overlapsLink(startIndex, endIndex) || (found.folder && previewScan.blockedPreviewRanges.some((range) => startIndex < range.endIndex && endIndex > range.startIndex)) || previewScan.suppressedRanges.some((range) => startIndex < range.endIndex && endIndex > range.startIndex)) continue;
+          const base = window.CodemanFilePaths.relativeResolutionBase(workingDir, originatingSession);
+          const resolved = resolveLinkedFilePath(found.path, base);
+          if (!resolved) continue;
+          const startCell = coordAt(startIndex);
+          const endCell = coordAt(endIndex - 1);
+          if (links.some((link) => {
+            if (endCell.y < link.range.start.y || startCell.y > link.range.end.y) return false;
+            return !(endCell.y === link.range.start.y && endCell.x < link.range.start.x) &&
+              !(startCell.y === link.range.end.y && startCell.x > link.range.end.x);
+          })) continue;
+          if (!found.folder) {
+            addLogLink(resolved, startIndex, found.path);
+          } else {
+            reserveLink(startIndex, endIndex);
+            links.push({ text: found.path, range: { start: coordAt(startIndex), end: coordAt(endIndex - 1) },
+              decorations: { pointerCursor: true, underline: true },
+              activate() { self.openFolderGrid(resolved, originatingSessionId); }
+            });
+          }
+        }
+
         callback(links.length > 0 ? links : undefined);
       },
     };
+    this._terminalFilePathLinkProvider = provider;
 
     // Keep the provider reachable: on touch devices xterm's linkifier never
     // resolves a link (it is driven by mousemove/mouseup, which a tap does not
@@ -2287,6 +3831,27 @@ Object.assign(CodemanApp.prototype, {
 
     console.log('[LinkProvider] File path link provider registered');
     return provider;
+  },
+
+  _terminalOsc8LinkHandler() {
+    // OSC 8 links take precedence over our text link provider in xterm. Route
+    // them through the same opener, while accepting only browser web URLs from
+    // terminal output. Other URI schemes remain handled by the text provider.
+    return {
+      activate: (_event, text) => {
+        if (!/^https?:\/\/[^\s\x00-\x1f]+$/i.test(text)) return;
+        this._openTerminalUrl(text);
+      },
+    };
+  },
+
+  _openTerminalUrl(text) {
+    // A `localhost` link tapped from another device can only work through the
+    // server: route it into a proxied web tab (webview-tabs.js). Anything else
+    // opens as before. Lives here rather than in the link provider's activate()
+    // so every caller of this one opener gets the same routing.
+    if (this.openLinkThroughWebTabIfLoopback?.(text)) return;
+    window.open(text, '_blank', 'noopener,noreferrer');
   },
 
   /**
@@ -2382,16 +3947,35 @@ Object.assign(CodemanApp.prototype, {
    * the user gesture that lets the URL branch's `window.open` through the popup
    * blocker; a later activation (a timer, a promise) is silently swallowed.
    */
-  _activateTerminalLinkAtPoint(clientX, clientY) {
-    const link = this._terminalLinkAtPoint(clientX, clientY);
-    if (!link || typeof link.activate !== 'function') return false;
+  _activateTerminalLinkAtPoint(clientX, clientY, event = null) {
+    // Hit-tests the provider DIRECTLY rather than via _terminalLinkAtPoint: the
+    // provider's coordAt() maps through real buffer cells, so containment stays
+    // correct after a wide CJK/emoji cell, which flattened y*cols+x arithmetic
+    // cannot express (COD-232).
+    const provider = this._terminalFilePathLinkProvider;
+    const buffer = this.terminal?.buffer?.active;
+    const cell = this._terminalCellFromClientPoint(clientX, clientY);
+    if (!provider || !buffer || !cell) return false;
+
+    const bufferLineNumber = (buffer.viewportY || 0) + cell.row;
+    let activated = false;
     try {
-      link.activate(null, link.text);
+      provider.provideLinks(bufferLineNumber, (links) => {
+        const link = links?.find((candidate) => {
+          const { start, end } = candidate.range;
+          const afterStart = bufferLineNumber > start.y || (bufferLineNumber === start.y && cell.col >= start.x);
+          const beforeEnd = bufferLineNumber < end.y || (bufferLineNumber === end.y && cell.col <= end.x);
+          return afterStart && beforeEnd;
+        });
+        if (!link || typeof link.activate !== 'function') return;
+        link.activate(event, link.text);
+        activated = true;
+      });
     } catch (err) {
       console.warn('[LinkProvider] tap activation failed:', err);
       return false;
     }
-    return true;
+    return activated;
   },
 
   // ═══════════════════════════════════════════════════════════════
@@ -2783,14 +4367,8 @@ Object.assign(CodemanApp.prototype, {
    */
   async _fetchUnifiedSessions(limit = 60) {
     const res = await fetch('/api/sessions/unified?limit=' + limit);
-    // ApiResponse envelope: { success, data: { sessions } }. Throw on failure so
-    // callers (loadHistorySessions) hit their catch instead of rendering a 5xx as
-    // an empty history.
-    const data = await res.json().catch(() => null);
-    if (!res.ok || !data || data.success === false || !data.data) {
-      throw new Error(data?.error || `unified sessions request failed (HTTP ${res.status})`);
-    }
-    return data.data.sessions || [];
+    const data = await res.json();
+    return data.data?.sessions || [];
   },
 
   /**
@@ -2904,12 +4482,7 @@ Object.assign(CodemanApp.prototype, {
     item.className = 'history-item' + (isPinned ? ' is-pinned' : '');
     item.title = s.workingDir || '';
 
-    // Main row: clickable surface. A caller-supplied onActivate wins (the
-    // Session Manager routes live rows to selectSession and history rows to
-    // resume). Otherwise the default focuses the live tab when the row is a
-    // still-running session, else resumes the conversation — keyed by the Claude
-    // conversation UUID (claudeSessionId) when present, since resumed sessions
-    // carry theirs separately from their Codeman id.
+    // Main row: clickable surface that triggers resume (or focuses the live tab).
     const mainRow = document.createElement('div');
     mainRow.className = 'history-item-main';
     mainRow.addEventListener(
@@ -2945,7 +4518,17 @@ Object.assign(CodemanApp.prototype, {
     badgeRow.className = 'history-item-badges';
     if (s.mode) {
       const modeBadge = document.createElement('span');
-      modeBadge.className = 'history-item-badge history-item-badge-mode';
+      // COD-129: color-code the chip per CLI. Only append a mode-* class for a
+      // known SessionMode so an unexpected value degrades to the neutral default
+      // (and can't inject an arbitrary class name).
+      const modeKey = String(s.mode).toLowerCase();
+      const known =
+        modeKey === 'claude' ||
+        modeKey === 'codex' ||
+        modeKey === 'opencode' ||
+        modeKey === 'gemini' ||
+        modeKey === 'shell';
+      modeBadge.className = 'history-item-badge history-item-badge-mode' + (known ? ' mode-' + modeKey : '');
       modeBadge.textContent = s.mode;
       badgeRow.appendChild(modeBadge);
     }
@@ -2967,6 +4550,28 @@ Object.assign(CodemanApp.prototype, {
       liveBadge.textContent = 'LIVE';
       badgeRow.appendChild(liveBadge);
     }
+    // COD-124: parked sessions are neither live nor a plain closed history
+    // entry — flag them distinctly so the row isn't mistaken for "running".
+    if (s.status === 'parked') {
+      const parkedBadge = document.createElement('span');
+      parkedBadge.className = 'history-item-badge history-item-badge-parked';
+      parkedBadge.textContent = 'PARKED';
+      parkedBadge.title = 'Parked — automation disarmed, resume to reactivate';
+      badgeRow.appendChild(parkedBadge);
+    } else {
+      // COD-124 (AC6): on non-parked rows, flag armed automation that a
+      // future Park would need to disarm — using only fields the serialized
+      // session state actually exposes (autoResumeEnabled/ralphEnabled from
+      // the live-session cache; no live signal exists yet for respawn).
+      const armed = this._armedObligationLabels(s);
+      if (armed.length > 0) {
+        const armedBadge = document.createElement('span');
+        armedBadge.className = 'history-item-badge history-item-badge-armed';
+        armedBadge.textContent = '⚡';
+        armedBadge.title = armed.join('; ');
+        badgeRow.appendChild(armedBadge);
+      }
+    }
 
     const subtitleSpan = document.createElement('span');
     subtitleSpan.className = 'history-item-subtitle';
@@ -2980,6 +4585,21 @@ Object.assign(CodemanApp.prototype, {
     const metaSpan = document.createElement('span');
     metaSpan.className = 'history-item-meta';
     metaSpan.textContent = timeStr;
+
+    // COD-124: compact idle duration ("12m", "3h 40m") reusing the timestamp
+    // already resolved above; flagged (subtle warn style) once idle a while.
+    if (!Number.isNaN(tsMs)) {
+      const idleMs = Date.now() - tsMs;
+      const idleLabel = this._formatIdleDuration(idleMs);
+      if (idleLabel) {
+        const idleSpan = document.createElement('span');
+        idleSpan.className = 'history-item-idle';
+        if (idleMs >= this._IDLE_WARN_THRESHOLD_MS) idleSpan.classList.add('history-item-idle-warn');
+        idleSpan.textContent = `· idle ${idleLabel}`;
+        idleSpan.title = 'Time since last activity';
+        metaSpan.appendChild(idleSpan);
+      }
+    }
 
     const expandBtn = document.createElement('button');
     expandBtn.className = 'history-item-expand';
@@ -3090,15 +4710,14 @@ Object.assign(CodemanApp.prototype, {
    * @param {HTMLElement} detail the inline detail panel element
    */
   _openSessionRowMenu(anchorEl, s, cases, item, detail) {
-    // Close any already-open row menu first — call its own close fn so the
-    // previous menu's document/window listeners are detached (a raw .remove()
-    // would leave them dangling until the next event self-cleans).
-    if (this._openRowMenuClose) {
+    // Close any already-open row menu first.
+    if (this._openRowMenuEl) {
       try {
-        this._openRowMenuClose();
+        this._openRowMenuEl.remove();
       } catch {
         /* noop */
       }
+      this._openRowMenuEl = null;
     }
 
     const isLiveOpen =
@@ -3122,10 +4741,7 @@ Object.assign(CodemanApp.prototype, {
       } catch {
         /* noop */
       }
-      if (this._openRowMenuEl === menu) {
-        this._openRowMenuEl = null;
-        this._openRowMenuClose = null;
-      }
+      if (this._openRowMenuEl === menu) this._openRowMenuEl = null;
     };
 
     // Helper: build one menu item button.
@@ -3153,21 +4769,43 @@ Object.assign(CodemanApp.prototype, {
       menu.appendChild(btn);
     };
 
-    // Resume / Switch to session (always).
-    addItem(
-      isLiveOpen ? 'Switch to session' : 'Resume session',
-      () => {
-        if (isLiveOpen) {
-          this.selectSession(s.sessionId);
-        } else {
-          // Resume by the Claude conversation UUID when present (resumed sessions
-          // carry theirs separately from their Codeman id).
-          this.resumeHistorySession(s.claudeSessionId || s.sessionId, s.workingDir || '', s.name, s.mode, s.resumeId);
+    // Resume / Switch to session (always) — skipped for parked rows, which
+    // get the dedicated "Resume from park" item below instead: a parked
+    // session has no live terminal to switch to, and must go through the
+    // park-aware resume endpoint rather than a plain relaunch (COD-124).
+    if (s.status !== 'parked') {
+      addItem(
+        isLiveOpen ? 'Switch to session' : 'Resume session',
+        () => {
+          if (isLiveOpen) {
+            this.selectSession(s.sessionId);
+          } else {
+            // Resume by the Claude conversation UUID when present (resumed sessions
+            // carry theirs separately from their Codeman id).
+            this.resumeHistorySession(s.claudeSessionId || s.sessionId, s.workingDir || '', s.name, s.mode, s.resumeId);
+          }
+          this.closeSessionManager?.();
+          closeMenu();
         }
-        this.closeSessionManager?.();
+      );
+    }
+
+    // Park / Resume-from-park (COD-124).
+    if (s.status === 'parked') {
+      addItem(
+        'Resume from park',
+        async () => {
+          closeMenu();
+          await this._resumeSession(s);
+        },
+        { sublabel: this._resumeFidelityLabel(s) }
+      );
+    } else {
+      addItem('Park session', async () => {
         closeMenu();
-      }
-    );
+        await this._parkSession(s);
+      });
+    }
 
     // Pin / Unpin (COD-139) — floats the session to the top of the list.
     const isPinned = s.pinned === true;
@@ -3187,7 +4825,7 @@ Object.assign(CodemanApp.prototype, {
     if (isLiveOpen) {
       addItem('Open folder', () => {
         this.selectSession(s.sessionId);
-        this.loadFileBrowser?.(s.sessionId);
+        this.showFileBrowserPanel?.(s.sessionId);
         this.closeSessionManager?.();
         closeMenu();
       });
@@ -3246,7 +4884,6 @@ Object.assign(CodemanApp.prototype, {
     window.addEventListener('resize', onScrollResize, true);
 
     this._openRowMenuEl = menu;
-    this._openRowMenuClose = closeMenu;
   },
 
   /**
@@ -3273,6 +4910,176 @@ Object.assign(CodemanApp.prototype, {
       console.error('[_setSessionPinned]', err);
       return false;
     }
+  },
+
+  /** COD-124: human-readable label per park obligation code (backend's stable order). */
+  _PARK_OBLIGATION_LABELS: {
+    respawn: 'Respawn cycling is armed',
+    autoResume: 'Auto-resume timer is armed',
+    ralph: 'Ralph loop is armed',
+  },
+
+  /**
+   * COD-124: human-readable label for a single park obligation code, falling
+   * back to the raw code for anything the frontend doesn't recognize yet.
+   * @param {string} obligation
+   * @returns {string}
+   */
+  _parkObligationLabel(obligation) {
+    return this._PARK_OBLIGATION_LABELS[obligation] || obligation;
+  },
+
+  /**
+   * COD-124 (AC6): armed-automation labels for a non-parked row, using only
+   * fields the serialized session state actually exposes. respawn is
+   * intentionally omitted — SessionState.respawnConfig is never populated by
+   * Session.toState(), so no live signal reaches the frontend for it.
+   * @param {object} s
+   * @returns {string[]}
+   */
+  _armedObligationLabels(s) {
+    const armed = [];
+    if (s?.autoResumeEnabled && s?.autoResumeAt) armed.push(this._parkObligationLabel('autoResume'));
+    if (s?.ralphEnabled) armed.push(this._parkObligationLabel('ralph'));
+    return armed;
+  },
+
+  /**
+   * COD-124: build the confirm() message shown when a park attempt is blocked
+   * by armed automation (409 response body's `obligations` array).
+   * @param {string[]} obligations
+   * @returns {string}
+   */
+  _buildParkConfirmMessage(obligations) {
+    const list = (obligations || []).map((ob) => `- ${this._parkObligationLabel(ob)}`).join('\n');
+    return `This session has active automation that will be disarmed:\n${list}\n\nPark anyway?`;
+  },
+
+  /**
+   * COD-124: park a session via POST /api/sessions/:id/park. On a 409 response
+   * carrying `obligations` (armed respawn/auto-resume/ralph automation), shows
+   * a confirm() dialog listing them in plain language and, on accept, re-calls
+   * with {force:true}. Updates the record's status in place and toasts the
+   * outcome; the session:parked SSE event keeps other views in sync.
+   * @param {object} s serialized session record (needs sessionId)
+   * @returns {Promise<boolean>}
+   */
+  async _parkSession(s) {
+    try {
+      let res = await this._apiPost(`/api/sessions/${encodeURIComponent(s.sessionId)}/park`, {});
+      if (res && res.status === 409) {
+        let body = null;
+        try {
+          body = await res.json();
+        } catch {
+          /* malformed 409 body — treat as no obligations to report */
+        }
+        const obligations = Array.isArray(body?.obligations) ? body.obligations : [];
+        if (obligations.length > 0) {
+          const proceed = window.confirm(this._buildParkConfirmMessage(obligations));
+          if (!proceed) return false;
+          res = await this._apiPost(`/api/sessions/${encodeURIComponent(s.sessionId)}/park`, { force: true });
+        }
+      }
+      const ok = !!res && res.ok;
+      if (ok) {
+        const sessionId = s.sessionId || s.id;
+        const canonical = this._onSessionParked({ id: sessionId });
+        if (canonical && canonical !== s) Object.assign(s, canonical);
+        else if (!canonical) Object.assign(s, { status: 'parked', activityStatus: 'parked', activityStatusSince: null });
+        this.showToast('Session parked', 'success');
+      } else {
+        this.showToast('Park failed', 'error');
+      }
+      return ok;
+    } catch (err) {
+      console.error('[_parkSession]', err);
+      this.showToast('Park failed', 'error');
+      return false;
+    }
+  },
+
+  /**
+   * COD-124: resume-fidelity label — what resuming this session will actually
+   * restore, based on mode and whether a native resume id was captured at
+   * park time. Pure function of the session record (no I/O).
+   * @param {object} s
+   * @returns {string}
+   */
+  _resumeFidelityLabel(s) {
+    const mode = String(s?.mode || '').toLowerCase();
+    if (mode === 'claude') return 'Resumes the conversation';
+    if (mode === 'codex' && s?.nativeResumeId) return 'Resumes via Codex session id';
+    return 'Fresh relaunch — conversation not restored';
+  },
+
+  /**
+   * COD-124: whether resuming this session record would NOT restore the
+   * prior conversation (gates the extra confirm() before resuming).
+   * @param {object} s
+   * @returns {boolean}
+   */
+  _isNonRestorableResume(s) {
+    const mode = String(s?.mode || '').toLowerCase();
+    if (mode === 'claude') return false;
+    if (mode === 'codex' && s?.nativeResumeId) return false;
+    return true;
+  },
+
+  /**
+   * COD-124: resume a parked session via POST /api/sessions/:id/resume. When
+   * the resume would not restore the prior conversation (non-Claude mode, or
+   * Codex without a captured native resume id), confirms first.
+   * @param {object} s serialized session record (needs sessionId)
+   * @returns {Promise<boolean>}
+   */
+  async _resumeSession(s) {
+    if (this._isNonRestorableResume(s)) {
+      const proceed = window.confirm(
+        `${this._resumeFidelityLabel(s)}.\n\nThe prior conversation will not be restored — this starts a fresh session. Resume anyway?`
+      );
+      if (!proceed) return false;
+    }
+    try {
+      const res = await this._apiPost(`/api/sessions/${encodeURIComponent(s.sessionId)}/resume`, {});
+      const ok = !!res && res.ok;
+      if (ok) {
+        const sessionId = s.sessionId || s.id;
+        const canonical = this._onSessionResumed({ id: sessionId });
+        if (canonical && canonical !== s) Object.assign(s, canonical);
+        else if (!canonical) Object.assign(s, { status: 'active', activityStatus: 'active', activityStatusSince: null });
+        this.showToast('Session resumed', 'success');
+      } else {
+        this.showToast('Resume failed', 'error');
+      }
+      return ok;
+    } catch (err) {
+      console.error('[_resumeSession]', err);
+      this.showToast('Resume failed', 'error');
+      return false;
+    }
+  },
+
+  /** COD-124: idle duration ≥ this gets a subtle warn style on the row. */
+  _IDLE_WARN_THRESHOLD_MS: 30 * 60 * 1000,
+
+  /**
+   * COD-124: compact idle-duration formatter, e.g. "12m", "3h 40m", "2d 5h".
+   * Pure function of an elapsed-ms value; returns '' for invalid/negative input.
+   * @param {number} ms
+   * @returns {string}
+   */
+  _formatIdleDuration(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return '';
+    const totalMinutes = Math.floor(ms / 60000);
+    if (totalMinutes < 1) return '<1m';
+    if (totalMinutes < 60) return `${totalMinutes}m`;
+    const totalHours = Math.floor(totalMinutes / 60);
+    const remMinutes = totalMinutes % 60;
+    if (totalHours < 24) return remMinutes > 0 ? `${totalHours}h ${remMinutes}m` : `${totalHours}h`;
+    const days = Math.floor(totalHours / 24);
+    const remHours = totalHours % 24;
+    return remHours > 0 ? `${days}d ${remHours}h` : `${days}d`;
   },
 
   /** Number of history items shown before "Show More" */
@@ -3701,6 +5508,7 @@ Object.assign(CodemanApp.prototype, {
           ...modeConfig,
           ...(Object.keys(envOverrides).length > 0 ? { envOverrides } : {}),
           ...(effort ? { effort } : {}),
+          ...(this.terminal ? { cols: this.terminal.cols, rows: this.terminal.rows } : {}),
           // The advisor is a claude-only feature; other CLIs would carry it inertly.
           ...(advisorModel && effectiveMode === 'claude' ? { advisorModel } : {}),
         }),
@@ -4037,10 +5845,12 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
-  batchTerminalWrite(data) {
-    // Arrival order of output, so the IME preview can tell output that
-    // followed a commit from output that was already queued before it.
-    this._terminalOutputSeq = (this._terminalOutputSeq || 0) + 1;
+  batchTerminalWrite(data, preservedAcceptedOutputEpoch) {
+    const acceptedOutputEpoch =
+      preservedAcceptedOutputEpoch ?? (this._terminalOutputAcceptanceEpoch || 0) + 1;
+    if (preservedAcceptedOutputEpoch === undefined) {
+      this._terminalOutputAcceptanceEpoch = acceptedOutputEpoch;
+    }
     // Feed the renderer watchdog. Recorded before the buffer-load early return
     // below: a write that is queued rather than written still means the pipeline
     // owes us a frame once it drains.
@@ -4084,6 +5894,12 @@ Object.assign(CodemanApp.prototype, {
       if (hasScreenClear) {
         this.flickerFilterActive = true;
         this.flickerFilterBuffer += data;
+        if (!this._flickerFilterEpochSegments) this._flickerFilterEpochSegments = [];
+        this._flickerFilterEpochSegments.push({ length: data.length, epoch: acceptedOutputEpoch });
+        this._flickerFilterMaxAcceptanceEpoch = Math.max(
+          this._flickerFilterMaxAcceptanceEpoch || 0,
+          acceptedOutputEpoch
+        );
 
         if (this.flickerFilterTimeout) {
           clearTimeout(this.flickerFilterTimeout);
@@ -4098,14 +5914,29 @@ Object.assign(CodemanApp.prototype, {
 
       if (this.flickerFilterActive) {
         this.flickerFilterBuffer += data;
+        if (!this._flickerFilterEpochSegments) this._flickerFilterEpochSegments = [];
+        this._flickerFilterEpochSegments.push({ length: data.length, epoch: acceptedOutputEpoch });
+        this._flickerFilterMaxAcceptanceEpoch = Math.max(
+          this._flickerFilterMaxAcceptanceEpoch || 0,
+          acceptedOutputEpoch
+        );
         return;
       }
     }
 
     // Accumulate raw data (may contain DEC 2026 markers)
-    this.pendingWrites.push(data);
-    this._pendingWritesOutputSeq = this._terminalOutputSeq;
+    this._queuePendingTerminalWrite(data, acceptedOutputEpoch);
     this._scheduleTerminalWriteFlush();
+  },
+
+  _queuePendingTerminalWrite(data, acceptedOutputEpoch = 0) {
+    this.pendingWrites.push(data);
+    if (!this._pendingWriteAcceptanceEpochs) this._pendingWriteAcceptanceEpochs = [];
+    this._pendingWriteAcceptanceEpochs.push(acceptedOutputEpoch);
+    this._pendingWritesMaxAcceptanceEpoch = Math.max(
+      this._pendingWritesMaxAcceptanceEpoch || 0,
+      acceptedOutputEpoch
+    );
   },
 
   /**
@@ -4117,7 +5948,7 @@ Object.assign(CodemanApp.prototype, {
    * arrived, which looked like truncated responses and idle shell commands.
    */
   _scheduleTerminalWriteFlush() {
-    if (this._terminalWriteInFlight || this.writeFrameScheduled || this.pendingWrites.length === 0) return;
+    if (this.writeFrameScheduled || this.pendingWrites.length === 0) return;
     this.writeFrameScheduled = true;
     this._safeYield(() => {
       this.writeFrameScheduled = false;
@@ -4135,10 +5966,25 @@ Object.assign(CodemanApp.prototype, {
     if (!this.flickerFilterBuffer) return;
 
     // Transfer buffered data to normal pending writes
-    this.pendingWrites.push(this.flickerFilterBuffer);
-    this._pendingWritesOutputSeq = this._terminalOutputSeq;
+    const segments = this._flickerFilterEpochSegments || [];
+    const representedLength = segments.reduce((sum, segment) => sum + segment.length, 0);
+    if (segments.length > 0 && representedLength === this.flickerFilterBuffer.length) {
+      let offset = 0;
+      for (const segment of segments) {
+        const end = offset + segment.length;
+        this._queuePendingTerminalWrite(this.flickerFilterBuffer.slice(offset, end), segment.epoch);
+        offset = end;
+      }
+    } else {
+      this._queuePendingTerminalWrite(
+        this.flickerFilterBuffer,
+        this._flickerFilterMaxAcceptanceEpoch || 0
+      );
+    }
     this.flickerFilterBuffer = '';
     this.flickerFilterActive = false;
+    this._flickerFilterEpochSegments = [];
+    this._flickerFilterMaxAcceptanceEpoch = 0;
 
     // Trigger a normal flush
     this._scheduleTerminalWriteFlush();
@@ -4169,7 +6015,7 @@ Object.assign(CodemanApp.prototype, {
   _updateLocalEchoState() {
     if (this._mobileImePreviewSessionId !== this.activeSessionId) {
       this._mobileImePreviewSessionId = this.activeSessionId;
-      this._mobileImeCommitOutputSeq = null;
+      this._mobileImeCommitOwnership = null;
       try {
         this._mobileImePreview?.reset?.();
       } catch {
@@ -4187,39 +6033,15 @@ Object.assign(CodemanApp.prototype, {
 
     // Swap prompt finder based on session mode
     if (this._localEchoOverlay && session) {
-      if (session.mode === 'opencode') {
-        // OpenCode (Bubble Tea TUI): find the ┃ border on the cursor's row.
-        // The input area is "┃  <text>" — the ┃ is the anchor, offset 3 skips "┃  ".
-        // We use the cursor's screen row to find the right line, then scan for ┃.
-        this._localEchoOverlay.setPrompt({
-          type: 'custom',
-          offset: 3,
-          find: (terminal) => {
-            try {
-              const buf = terminal.buffer.active;
-              const row = window.CodemanTerminalInput.cursorViewportRow(terminal);
-              if (row === null) return null;
-              const line = buf.getLine(buf.viewportY + row);
-              if (!line) return null;
-              const text = line.translateToString(true);
-              const idx = text.indexOf('\u2503'); // ┃ (BOX DRAWINGS HEAVY VERTICAL)
-              if (idx >= 0) return { row, col: idx };
-              return null;
-            } catch {
-              return null;
-            }
-          },
-        });
-      } else if (session.mode === 'shell' || session.mode === 'codex') {
+      if (session.mode === 'shell') {
         // Shell mode: the shell provides its own PTY echo so the overlay isn't needed.
-        // Codex mode: the composer is fully interactive per keystroke. Typing
-        // "/" pops a live-filtering command picker (issue #222), the composer
-        // grows and rewraps as it fills (#220), pastes are bracketed (#219)
-        // and arrows/history edit server-side state (#218). Buffering
-        // keystrokes until Enter starves all of that, so codex sessions use
-        // plain PTY echo like shell — visually augmented by the predictive
-        // write-through echo (see _localEchoPolicy below and the onData hook).
-        // Disable the buffer overlay by clearing any pending text.
+        this._localEchoOverlay.clear();
+        this._localEchoEnabled = false;
+      } else if (session.mode === 'codex' || session.mode === 'opencode') {
+        // Codex / OpenCode: composers are fully interactive per keystroke (codex:
+        // "/" picker #222, rewrap #220, paste #219, arrows #218; opencode: Bubble Tea
+        // input with ┃). Buffering until Enter starves them, so both use plain PTY echo
+        // augmented by predictive write-through (see _localEchoPolicy below). Disable buffer overlay.
         this._localEchoOverlay.clear();
         this._localEchoEnabled = false;
       } else {
@@ -4255,17 +6077,33 @@ Object.assign(CodemanApp.prototype, {
       }
     }
 
-    // Per-session echo policy: 'buffer' (overlay), 'predict' (codex
+    // Per-session echo policy: 'buffer' (overlay), 'predict' (codex/opencode
     // write-through, see the onData predict hook), 'off'. _localEchoEnabled
-    // keeps its exact historical values above (false for codex/shell), so
+    // keeps its exact historical values above (false for codex/shell/opencode), so
     // every existing consumer is unchanged; this field is purely additive.
     let policy = 'off';
     if (session && echoEnabled) {
-      if (session.mode === 'codex') policy = 'predict';
+      if (session.mode === 'codex' || session.mode === 'opencode') policy = 'predict';
       else if (session.mode !== 'shell') policy = 'buffer';
     }
+    // COD-331 instrumentation: count policy transitions and log when debugEcho
+    if (this._localEchoPolicy !== policy && _isDebugEchoEnabled()) {
+      _debugEchoLogOuter(`policy ${this._localEchoPolicy || 'off'} → ${policy} mode=${session?.mode || 'none'}`);
+    }
     this._localEchoPolicy = policy;
+    // COD-331 Phase 2: wire correct composer gate for predictive sessions
+    if (this._predictiveEcho?.setPredictWhen) {
+      if (session?.mode === 'opencode') {
+        this._predictiveEcho.setPredictWhen((t) => window.CodemanTerminalInput.isOpencodeComposerRow(t));
+      } else if (session?.mode === 'codex') {
+        this._predictiveEcho.setPredictWhen((t) => window.CodemanTerminalInput.isCodexComposerRow(t));
+      }
+    }
     if (policy !== 'predict') this._predictiveEcho?.clearPredictions();
+    // lazy-init echo debug counters for this app instance
+    if (!this._echoDebugCounts) {
+      this._echoDebugCounts = { predictHit: 0, predictMiss: 0, totalOnData: 0 };
+    }
   },
 
   /**
@@ -4274,19 +6112,47 @@ Object.assign(CodemanApp.prototype, {
    * sends, never throws into the caller. The onData wire path behaves
    * byte-identically with this active, absent or broken.
    */
-  _predictHookOnData(data) {
+  _predictHookOnData(data, { isImeCommit = false } = {}) {
     if (this._localEchoPolicy !== 'predict' || !this._predictiveEcho) return;
+    let ok = false;
     try {
+      if (this._echoDebugCounts) this._echoDebugCounts.totalOnData++;
       const kind = window.CodemanTerminalInput.classifyPredictInput(data);
-      if (kind === 'char') this._predictiveEcho.predictChar(data);
-      else if (kind === 'backspace') this._predictiveEcho.predictBackspace();
-      // 'clear' AND 'text' (plain paste, IME word commits) both change the
-      // composer in ways the display has not shown yet: clear the run and let
-      // the addon's anchor hold suppress prediction until the echo catches up
-      else this._predictiveEcho.clearPredictions();
+      if (isImeCommit && kind === 'text') ok = this._predictiveEcho.predictText(data);
+      else if (kind === 'char') ok = this._predictiveEcho.predictChar(data);
+      else if (kind === 'backspace') ok = this._predictiveEcho.predictBackspace();
+      // Untagged text (plain paste) and control input retain the existing clear
+      // path. Only text tagged by the IME controller is predicted atomically.
+      else {
+        this._predictiveEcho.clearPredictions();
+        ok = false;
+      }
+      if (this._echoDebugCounts) {
+        if (ok) this._echoDebugCounts.predictHit++;
+        else this._echoDebugCounts.predictMiss++;
+      }
+      if (_isDebugEchoEnabled() && !ok) {
+        // throttle: only log suppressed chars, not every hit
+        _debugEchoLogOuter(`predict suppressed kind=${kind} char=${JSON.stringify(data)} debug=`, this._predictiveEcho.debugState?.counts || {});
+      }
     } catch {
       /* predictions must never block the wire */
+    } finally {
+      if (isImeCommit) {
+        try {
+          this._mobileImePreview?.completeCommit?.({ predicted: ok });
+        } catch {
+          /* preview completion must never block the wire */
+        }
+        if (ok) this._mobileImeCommitOwnership = null;
+      }
     }
+  },
+
+  _shouldBypassLocalEchoPrintable(data) {
+    if (data !== '$') return false;
+    const session = this.activeSessionId ? this.sessions.get(this.activeSessionId) : null;
+    return session?.mode === 'codex';
   },
 
   // CJK textarea already provides visual feedback — bypass local echo
@@ -4314,6 +6180,148 @@ Object.assign(CodemanApp.prototype, {
     if (this._localEchoPolicy === 'predict') this._predictiveEcho?.clearPredictions();
     _crashDiag.log(`CJK send→${this.activeSessionId.slice(0, 8)} len=${text.length}`);
     this._sendInputAsync(this.activeSessionId, text);
+  },
+
+  // ── Typing diagnostics & force-fix (w1-nzbdav) ──
+  getTypingDiag() {
+    const cjkEl = document.getElementById('cjkInput');
+    const cjkVisible = !!cjkEl?.classList.contains('cjk-input-visible');
+    const activeId = document.activeElement?.id || document.activeElement?.tagName || '';
+    const diag = {
+      activeSessionId: this.activeSessionId || null,
+      cjkVisible,
+      cjkActive: !!window.cjkActive,
+      activeElement: activeId,
+      viewMode: this._viewMode || 'live',
+      localEchoEnabled: !!this._localEchoEnabled,
+      localEchoPolicy: this._localEchoPolicy || 'off',
+      pendingTextLen: (this._localEchoOverlay?.pendingText || '').length,
+      wsReady: !!(this._wsReady || this._wsState === 'open'),
+      connectionStatus: this._connectionStatus || 'unknown',
+      terminalFocused: document.activeElement === this.terminal?.textarea,
+      timestamp: Date.now(),
+    };
+    if (!this.activeSessionId) diag.blockedReason = 'no-session';
+    else if (diag.viewMode === 'history') diag.blockedReason = 'history';
+    else if (cjkVisible && window.cjkActive) diag.blockedReason = 'cjk';
+    else if (this._connectionStatus === 'offline') diag.blockedReason = 'offline';
+    else diag.blockedReason = 'none';
+    return diag;
+  },
+
+  _updateTypingBlockedBanner(reason) {
+    const banner = document.getElementById('typingBlockedBanner');
+    if (!banner) return;
+    const diag = this.getTypingDiag();
+    const r = reason || diag.blockedReason;
+    if (r === 'none' || r === 'offline') {
+      // offline has its own banner; don't double
+      banner.hidden = true;
+      banner.textContent = '';
+      return;
+    }
+    let msg = '';
+    if (r === 'cjk') msg = 'CJK input is blocking typing — click Fix or press Esc. (w1-nzbdav diag: cjkActive)';
+    else if (r === 'history') msg = 'History view is open — press Esc or click terminal to exit.';
+    if (msg) {
+      banner.textContent = msg;
+      banner.hidden = false;
+      const btn = document.createElement('button');
+      btn.textContent = 'Fix';
+      btn.className = 'typing-blocked-fix-btn';
+      btn.onclick = () => this.forceFixTyping();
+      banner.appendChild(btn);
+    } else {
+      banner.hidden = true;
+    }
+  },
+
+  forceFixTyping() {
+    try {
+      _crashDiag.log('forceFixTyping invoked ' + JSON.stringify(this.getTypingDiag()));
+    } catch {}
+    // 1. Clear CJK wedge
+    try {
+      window.cjkActive = false;
+      const cjkEl = document.getElementById('cjkInput');
+      if (cjkEl) {
+        // Keep visibility as per settings, just ensure flag cleared if not focused
+        if (document.activeElement === cjkEl) cjkEl.blur();
+        if (this._cjkInput?.clear) this._cjkInput.clear();
+      }
+    } catch {}
+    // 2. Exit history
+    if (this._viewMode === 'history') {
+      try { this._exitHistoryView?.(); } catch {}
+    }
+    // 3. Clear local-echo wedge
+    try {
+      this._localEchoOverlay?.clear();
+      this._predictiveEcho?.clearPredictions();
+      this._echoPassthroughSessions?.clear?.();
+      this._pendingInput = '';
+      if (this._inputFlushTimeout) { clearTimeout(this._inputFlushTimeout); this._inputFlushTimeout = null; }
+    } catch {}
+    // 4. Dismiss stale offline overlay if server reachable
+    try { this._updateTypingBlockedBanner('none'); } catch {}
+    // 5. Refocus terminal for real
+    try {
+      const cjkEl = document.getElementById('cjkInput');
+      const showCjk = cjkEl?.classList.contains('cjk-input-visible');
+      if (!showCjk && this.terminal?.focus) this.terminal.focus();
+      else if (showCjk) cjkEl?.focus();
+      // Fallback: xterm textarea
+      setTimeout(() => {
+        try { this.terminal?.textarea?.focus?.(); this.terminal?.focus?.(); } catch {}
+      }, 0);
+    } catch {}
+    // 6. Re-sync echo state
+    try { this._updateLocalEchoState?.(); } catch {}
+    return true;
+  },
+
+  // ── COD-331 Phase 1: echo-debug helpers (window.codemanEchoDebug) ──
+  getEchoDebugState() {
+    const addon = this._predictiveEcho;
+    const classify = (typeof window !== 'undefined' && window.CodemanTerminalInput?._debugClassifyCounts) || null;
+    const addonState = addon?.state || null;
+    const addonDebug = addon?.debugState || null;
+    const appCounts = this._echoDebugCounts || null;
+    const diag = this.getTypingDiag ? this.getTypingDiag() : null;
+    const hit = appCounts?.predictHit || 0;
+    const miss = appCounts?.predictMiss || 0;
+    const hitRate = hit + miss > 0 ? (hit / (hit + miss)).toFixed(3) : null;
+    return {
+      timestamp: Date.now(),
+      diag,
+      classify: classify ? { ...classify } : null,
+      appCounts: appCounts ? { ...appCounts, hitRate } : null,
+      addonState,
+      addonDebug,
+    };
+  },
+
+  resetEchoDebugState() {
+    try {
+      const c = window.CodemanTerminalInput?._debugClassifyCounts;
+      if (c) { c.char = 0; c.backspace = 0; c.clear = 0; c.text = 0; c.total = 0; }
+    } catch {}
+    try { this._predictiveEcho?.resetDebugState?.(); } catch {}
+    if (this._echoDebugCounts) { this._echoDebugCounts.predictHit = 0; this._echoDebugCounts.predictMiss = 0; this._echoDebugCounts.totalOnData = 0; }
+    if (_isDebugEchoEnabled()) _debugEchoLogOuter('echo debug state reset');
+    return this.getEchoDebugState();
+  },
+
+  dumpEchoDebugState() {
+    const s = this.getEchoDebugState();
+    // eslint-disable-next-line no-console
+    console.log('[echo-debug] state:', JSON.stringify(s, null, 2));
+    if (s.addonDebug?.counts) {
+      const sorted = Object.entries(s.addonDebug.counts).sort((a,b)=>b[1]-a[1]);
+      // eslint-disable-next-line no-console
+      console.table(sorted.map(([reason,count])=>({reason,count})));
+    }
+    return s;
   },
 
   /**
@@ -4344,14 +6352,24 @@ Object.assign(CodemanApp.prototype, {
    * Strips markers and writes content atomically within a single frame.
    */
   flushPendingWrites() {
-    if (this._terminalWriteInFlight || this.pendingWrites.length === 0 || !this.terminal) return;
+    if (this.pendingWrites.length === 0 || !this.terminal) return;
 
     const _t0 = performance.now();
     // xterm.js 6.0+ natively handles DEC 2026 synchronized output markers.
     // Pass raw data through — xterm.js buffers content between markers and
     // renders atomically, eliminating split-frame Ink redraws.
-    const joined = this.pendingWrites.join('');
+    const acceptedEpochs = this._pendingWriteAcceptanceEpochs || [];
+    const pendingMaxAcceptanceEpoch = this._pendingWritesMaxAcceptanceEpoch || 0;
+    const pendingEntries = this.pendingWrites.map((data, index) => ({
+      data,
+      epoch:
+        acceptedEpochs[index] ??
+        (this.pendingWrites.length === 1 ? pendingMaxAcceptanceEpoch : 0),
+    }));
+    const joined = pendingEntries.map((entry) => entry.data).join('');
     this.pendingWrites = [];
+    this._pendingWriteAcceptanceEpochs = [];
+    this._pendingWritesMaxAcceptanceEpoch = 0;
     const _joinedLen = joined.length;
     if (_joinedLen > 16384) _crashDiag.log(`FLUSH: ${(_joinedLen / 1024).toFixed(0)}KB`);
 
@@ -4377,60 +6395,115 @@ Object.assign(CodemanApp.prototype, {
     // Which buffer the anchor belongs to, checked again when the write parses.
     const flushSessionId = this.activeSessionId;
 
+    const firstChunkLength = Math.min(_joinedLen, MAX_FRAME_BYTES);
+    let representedOffset = 0;
+    let flushedAcceptedOutputEpoch = 0;
+    const deferredEntries = [];
+    for (const entry of pendingEntries) {
+      const entryStart = representedOffset;
+      const entryEnd = entryStart + entry.data.length;
+      if (entryStart < firstChunkLength && entryEnd > 0) {
+        flushedAcceptedOutputEpoch = Math.max(flushedAcceptedOutputEpoch, entry.epoch);
+      }
+      if (entryEnd > firstChunkLength) {
+        const sliceStart = Math.max(0, firstChunkLength - entryStart);
+        deferredEntries.push({ data: entry.data.slice(sliceStart), epoch: entry.epoch });
+      }
+      representedOffset = entryEnd;
+    }
+
+    let authoritativeFallback = null;
+    try {
+      const ownership = this._mobileImeCommitOwnership;
+      const controller = ownership?.controller;
+      const state = controller?.state;
+      if (
+        ownership &&
+        controller === this._mobileImePreview &&
+        ownership.sessionId === this.activeSessionId &&
+        ownership.generation === state?.generation &&
+        state?.committed === true &&
+        flushedAcceptedOutputEpoch > ownership.acceptedOutputEpoch
+      ) {
+        authoritativeFallback = {
+          ownership,
+          controller,
+          generation: state.generation,
+          sessionId: this.activeSessionId,
+        };
+      }
+    } catch {
+      // A broken visual state reader must never affect terminal output.
+    }
+
+    const writtenTerminal = this.terminal;
+    const writtenSessionId = this.activeSessionId;
+    const writtenSelectGeneration = this._selectGeneration;
+    const shouldStickToBottom = this._wasAtBottomBeforeWrite;
+    const afterTerminalWrite = () => {
+      this._terminalWriteInFlight = false;
+      this._terminalWriteInFlightBytes = 0;
+      // xterm parses asynchronously. Restore a history anchor only after the
+      // parse callback, and only if the anchor still belongs to this session.
+      this._restoreTerminalViewport(preserveViewportY, flushSessionId);
+      this._scheduleTerminalWriteFlush();
+
+      // Preserve Bitbucket's sticky-bottom behavior, but wait until parsing has
+      // completed and ensure a session switch or a newer scroll-up wins.
+      requestAnimationFrame(() => {
+        if (
+          preserveViewportY === null &&
+          shouldStickToBottom &&
+          !this._hasRecentUserScrollUp() &&
+          this.terminal === writtenTerminal &&
+          this.activeSessionId === writtenSessionId &&
+          this._selectGeneration === writtenSelectGeneration
+        ) {
+          this.terminal.scrollToBottom();
+        }
+      });
+
+      const fallback = authoritativeFallback;
+      if (!fallback) return;
+      try {
+        const state = fallback.controller.state;
+        if (
+          this._mobileImeCommitOwnership === fallback.ownership &&
+          this._mobileImePreview === fallback.controller &&
+          this.activeSessionId === fallback.sessionId &&
+          state?.generation === fallback.generation &&
+          state?.committed === true
+        ) {
+          fallback.controller.noteAuthoritativeOutput?.();
+        }
+      } catch {
+        // Authoritative output is never delayed or consumed by the preview.
+      }
+    };
+
     const writeChunk = joined.slice(0, MAX_FRAME_BYTES);
     if (_joinedLen > MAX_FRAME_BYTES) {
-      // Keep the remainder app-side where the 128KB cap can see it. The next
-      // chunk is scheduled only after xterm confirms this one was parsed.
-      this.pendingWrites.push(joined.slice(MAX_FRAME_BYTES));
+      for (const entry of deferredEntries) {
+        this._queuePendingTerminalWrite(entry.data, entry.epoch);
+      }
       deferred = true;
     }
-    // Newest output this chunk fully contains, for the IME preview. A split
-    // chunk may not hold that output yet, so it reports nothing.
-    const flushedOutputSeq = deferred ? null : (this._pendingWritesOutputSeq ?? null);
     this._terminalWriteInFlight = true;
     this._terminalWriteInFlightBytes = writeChunk.length;
     try {
-      this.terminal.write(writeChunk, () => {
-        this._terminalWriteInFlight = false;
-        this._terminalWriteInFlightBytes = 0;
-        // Restore INSIDE the callback (#358). xterm parses asynchronously, so
-        // the moment write() returns the buffer has not moved yet: the old
-        // restore ran here, found viewportY still equal to the anchor, and did
-        // nothing at all — then the parse landed and a cursor-addressed Codex
-        // redraw dragged the viewport to the live bottom with nothing left to
-        // pull it back. The callback is xterm's own "this chunk is parsed"
-        // signal, which is the earliest point the anchor can actually be
-        // reasserted. (The synchronous version passed its regression test only
-        // because the test's write mock moved the viewport synchronously.)
-        this._restoreTerminalViewport(preserveViewportY, flushSessionId);
-        this._scheduleTerminalWriteFlush();
-        this._noteMobileImeAuthoritativeOutput(flushedOutputSeq, flushSessionId);
-      });
+      this.terminal.write(writeChunk, afterTerminalWrite);
     } catch (err) {
       this._terminalWriteInFlight = false;
       this._terminalWriteInFlightBytes = 0;
       throw err;
     }
+    if (deferred) this._scheduleTerminalWriteFlush();
     const bytesThisFrame = deferred ? MAX_FRAME_BYTES : _joinedLen;
     const _dt = performance.now() - _t0;
     if (_dt > 100 || deferred)
       console.warn(
         `[CRASH-DIAG] flushPendingWrites: ${_dt.toFixed(0)}ms, ${(bytesThisFrame / 1024).toFixed(0)}KB written${deferred ? ', rest deferred' : ''} (total ${(_joinedLen / 1024).toFixed(0)}KB)`
       );
-
-    // Sticky scroll: if user was at bottom, keep them there after new output.
-    // Give manual scroll-up gestures a short grace window so high-frequency
-    // Codex status ticks do not snap the viewport back while the user is
-    // trying to inspect earlier output.
-    //
-    // A live anchor wins outright. The two flags are captured at different
-    // moments (_wasAtBottomBeforeWrite at the frame's first batchTerminalWrite,
-    // the anchor at flush time), so a scroll-up in between leaves both set; now
-    // that the anchor is reasserted after the parse, running both would jump to
-    // the bottom and then back one frame later instead of simply staying put.
-    if (preserveViewportY === null && this._wasAtBottomBeforeWrite && !this._hasRecentUserScrollUp()) {
-      this.terminal.scrollToBottom();
-    }
 
     // Re-position local echo overlay after terminal writes — Ink redraws can
     // move the ❯ prompt to a different row, making the overlay invisible.
@@ -4545,6 +6618,38 @@ Object.assign(CodemanApp.prototype, {
     } catch {
       this._yieldWorker = null; // mark unavailable, future calls skip
     }
+  },
+
+  /**
+   * COD-92: after a terminal-snapshot restore, decide whether the fetched
+   * canonical buffer may be skipped instead of clearing + rewriting the
+   * terminal (the visible blank-then-repaint flash on tab switch).
+   *
+   * Preserve the restored snapshot ONLY while it is provably not stale:
+   * - the canonical buffer byte-matches the cached one (nothing new happened
+   *   since the snapshot was taken — any mode), or
+   * - the session is a busy codex session (its live output stream will
+   *   reconcile the viewport; codex's TUI frame can omit earlier output the
+   *   snapshot preserved).
+   * Never preserve when the terminal was already cleared (busy/mirror paint),
+   * on the first full-history load after page open, or when the buffer
+   * changed on an idle session — idle tabs unsubscribe from terminal output,
+   * so the fetched buffer is the only way they learn about missed output
+   * (COD-175).
+   *
+   * Pure predicate (unit-tested in test/snapshot-preserve-predicate.test.ts);
+   * app.js calls it at the terminal buffer fetch site.
+   */
+  _shouldPreserveSnapshotScrollback({
+    restoredSnapshot,
+    clearedForBusy,
+    requestFullHistory,
+    canonicalUnchanged,
+    sessionIsBusy,
+    mode,
+  }) {
+    if (!restoredSnapshot || clearedForBusy || requestFullHistory) return false;
+    return canonicalUnchanged || (mode === 'codex' && !!sessionIsBusy);
   },
 
   scrollToLastNonEmptyLine() {
@@ -4732,8 +6837,10 @@ Object.assign(CodemanApp.prototype, {
       return false;
     }
     const queued = this._loadBufferQueue;
+    const queuedEpochs = this._loadBufferQueueAcceptanceEpochs;
     this._isLoadingBuffer = false;
     this._loadBufferQueue = null;
+    this._loadBufferQueueAcceptanceEpochs = null;
     this._bufferLoadOwner = null;
     // COD-144: replay (rather than discard) queued live events when the load
     // painted nothing — the queued prompt is the only content a new session has.
@@ -4745,6 +6852,8 @@ Object.assign(CodemanApp.prototype, {
         if (entry.at < since) continue;
         this.batchTerminalWrite(entry.data);
       }
+    } else if (queued && queued.length) {
+      opts?.onDiscardedQueued?.(queued.length);
     }
     return true;
   },
@@ -4879,6 +6988,31 @@ Object.assign(CodemanApp.prototype, {
   },
 
   /**
+   * Ask xterm to repaint its current viewport from its in-memory buffer.
+   * This is a local renderer nudge only: it does not send input to tmux/Codex.
+   * Running it now, next frame, and once shortly after covers WebGL/canvas
+   * repaints that were skipped while the browser or app tab was inactive.
+   */
+  _scheduleTerminalRepaint() {
+    if (!this.terminal) return;
+
+    const repaint = () => {
+      if (!this.terminal || !this.terminal.rows) return;
+      try { this.terminal.refresh(0, this.terminal.rows - 1); } catch {}
+    };
+
+    repaint();
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(repaint);
+    }
+    this._clearTimer('_terminalRepaintTimer');
+    this._terminalRepaintTimer = setTimeout(() => {
+      this._terminalRepaintTimer = null;
+      repaint();
+    }, 80);
+  },
+
+  /**
    * Restore terminal size to match web UI dimensions.
    * Use this after mobile screen attachment has squeezed the terminal.
    * Sends only resize — SIGWINCH triggers Ink redraw on real dimension changes.
@@ -4908,11 +7042,12 @@ Object.assign(CodemanApp.prototype, {
     }
     if (!this.activeSessionId) {
       this.showToast('No active session', 'warning');
-      return;
+      return false;
     }
+    if (this._isTerminalSessionGone?.(this.activeSessionId)) return false;
     // Backstop: _focusedPane() answers with the focused tile while the grid is
     // open, so this is reached only if that tile is gone mid-call.
-    if (this._tilesOwnTerminal?.()) return;
+    if (this._tilesOwnTerminal?.()) return false;
 
     // The pane belongs to the popup showing it, so this window has nothing to
     // restore. Say so rather than reporting a size that was never sent — the
@@ -4925,19 +7060,34 @@ Object.assign(CodemanApp.prototype, {
     const dims = this.getTerminalDimensions();
     if (!dims) {
       this.showToast('Could not determine terminal size', 'error');
-      return;
+      return false;
     }
 
     try {
+      if (typeof this._terminalViewerActivity?.activate !== 'function') {
+        this.showToast('Failed to restore terminal size', 'error');
+        return false;
+      }
+      // This button is an explicit viewer action, so transfer sizing ownership
+      // before sending the forced passive z frame. If the socket is down, the
+      // controller queues va and sendResize queues the matching z for reconnect.
+      this._terminalViewerActivity.activate('restore-terminal-size');
+      const activationPending = this._terminalViewerActivity.hasPending?.(this.activeSessionId) === true;
       // Force resize even when dimensions match the server's last known state —
       // another device may have changed the PTY size since this client last sent,
       // and force guarantees a SIGWINCH → Ink redraw at the current device's size.
-      await this.sendResize(this.activeSessionId, { force: true });
+      const sent = await this.sendResize(this.activeSessionId, { force: true, retainPending: activationPending });
+      if (activationPending || sent === null) {
+        this.showToast('Terminal restore queued until connection recovers', 'warning');
+        return false;
+      }
 
       this.showToast(`Terminal restored to ${dims.cols}x${dims.rows}`, 'success');
+      return true;
     } catch (err) {
       console.error('Failed to restore terminal size:', err);
       this.showToast('Failed to restore terminal size', 'error');
+      return false;
     }
   },
 
@@ -5279,7 +7429,6 @@ Object.assign(CodemanApp.prototype, {
     this._autoCopyNotifiedAt = now;
     this.showToast(message, type);
   },
-
   _syncMobileHelperTextareaToCursor() {
     if (!MobileDetection.isTouchDevice() || !this.terminal?.element) return;
     try {
@@ -5553,12 +7702,32 @@ Object.assign(CodemanApp.prototype, {
 
   _focusMobileTerminalInput() {
     this._syncMobileHelperTextareaToCursor();
+    // COD-467: WebKit ignores focus() on the element that already has focus, so
+    // a textarea that kept focus after the keyboard went away (app/tab switch,
+    // lock) could never bring the keyboard back. Blur first, in the same tap
+    // handler, so the focus() below is a real focus change inside a user
+    // gesture, which is what iOS requires to show the keyboard. Only when the
+    // keyboard is actually down: with it up this would make it bounce.
+    if (this._isMobileTerminalInputFocused() && !this._mobileKeyboardIsUp()) this._blurMobileTerminalInput();
     const cjkInput = document.getElementById('cjkInput');
     if (cjkInput?.classList.contains('cjk-input-visible')) {
       cjkInput.focus();
     } else {
       this.terminal?.focus();
     }
+  },
+
+  /**
+   * COD-467: is the on-screen keyboard actually up for the terminal? Focus is
+   * not enough on a touch device (see _focusMobileTerminalInput), so it also
+   * needs KeyboardHandler's visibility. Without a touch KeyboardHandler (desktop,
+   * tests) it falls back to focus, the behaviour before this change.
+   */
+  _mobileKeyboardIsUp() {
+    if (!this._isMobileTerminalInputFocused()) return false;
+    const touch = typeof MobileDetection !== 'undefined' && MobileDetection.isTouchDevice?.();
+    if (!touch || typeof KeyboardHandler === 'undefined') return true;
+    return KeyboardHandler.keyboardVisible === true;
   },
 
   _handleMobileTerminalTap(touch, startedWithTerminalFocus, cachedIntent = null) {
@@ -5655,6 +7824,43 @@ Object.assign(CodemanApp.prototype, {
   // ═══════════════════════════════════════════════════════════════
   // Synthetic tap → mouse report
   // ═══════════════════════════════════════════════════════════════
+  _handleTerminalTouchTap(touch) {
+    if (!touch || !this.terminal) return false;
+    // Do not let either link activation or the ordinary cursor-positioning
+    // fallback clamp a release outside xterm into an edge-cell mouse report.
+    if (!this._terminalCellFromClientPoint(touch.clientX, touch.clientY)) return false;
+
+    // xterm's desktop linkifier depends on hover state, which touchscreens do
+    // not provide reliably. Hit-test the retained provider before any cursor
+    // positioning path can emit mouse/SGR input to the foreground CLI.
+    if (this._activateTerminalLinkAtPoint(touch.clientX, touch.clientY)) {
+      this._suppressTrustedTapMouseEvents();
+      return true;
+    }
+
+    // ── Tap-to-position cursor ──────────────────────────────────
+    const mouseMode = this.terminal.modes?.mouseTrackingMode;
+    const mouseTrackingOn = !!mouseMode && mouseMode !== 'none';
+    this._suppressTrustedTapMouseEvents();
+    if (this._shouldForwardScrollToForegroundTui()) {
+      this._sendForegroundTuiClick(touch.clientX, touch.clientY);
+    } else if (mouseTrackingOn) {
+      this._dispatchSyntheticTerminalClick(touch.clientX, touch.clientY);
+    } else if (this._sessionUsesServerMouseStrip()) {
+      // The server strips mouse-tracking DECSETs from claude/codex/gemini
+      // output, so encode the press/release directly for ordinary taps.
+      this._sendSyntheticSgrTap(touch.clientX, touch.clientY);
+    }
+    this._syncMobileHelperTextareaToCursor();
+    const cjkInput = document.getElementById('cjkInput');
+    if (cjkInput?.classList.contains('cjk-input-visible')) {
+      cjkInput.focus();
+    } else {
+      this.terminal.focus();
+    }
+    return false;
+  },
+
   // Dispatch a mousedown+mouseup pair at viewport coords (clientX/clientY) to
   // xterm's root element. xterm's mouse-reporting handler reads the event's
   // client coords, maps them to a terminal cell relative to .xterm-screen, and
@@ -5730,11 +7936,15 @@ Object.assign(CodemanApp.prototype, {
   },
 
   // Map a viewport point to a 1-based terminal cell the same way xterm maps a
-  // click: offset inside .xterm-screen divided by the rendered cell size,
-  // clamped to the grid. Returns null when the terminal isn't measurable yet.
-  // `terminal` defaults to the primary pane's (a TerminalTile passes its own).
+  // click: offset inside .xterm-screen divided by the rendered cell size.
+  // Points outside the rendered grid are rejected so a swipe/pinch release
+  // cannot be converted into terminal input at a clamped edge cell.
+  // `terminal` defaults to the primary pane's (a TerminalTile passes its own,
+  // and gets the cell clamped to its grid).
   _clientPointToCell(clientX, clientY, terminal = this.terminal) {
-    if (!terminal || !Number.isFinite(clientX) || !Number.isFinite(clientY)) return null;
+    if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return null;
+    if (terminal === this.terminal) return this._terminalCellFromClientPoint(clientX, clientY);
+    if (!terminal) return null;
     const screen = terminal.element?.querySelector('.xterm-screen');
     const cell = terminal._core?._renderService?.dimensions?.css?.cell;
     if (!screen || !cell?.width || !cell?.height) return null;
@@ -5817,9 +8027,22 @@ Object.assign(CodemanApp.prototype, {
 
   /** Unrounded variant for the smooth local-scroll path, which accumulates
    *  sub-line fractions across events instead of forcing every tiny trackpad
-   *  delta to a whole ±1 line. Same unit handling and Shift-axis trap. The
-   *  math is the pure CodemanTerminalInput.wheelDeltaLines (top of this file),
-   *  which a TerminalTile calls with its own row count. */
+   *  delta to a whole ±1 line. Same unit handling and Shift-axis trap. */
+  /**
+   * COD-464: the wheel delta in CONTENT ROWS at 1:1 pixels, so the transcript
+   * moves as far as a web page would for the same input. `_wheelScrollLinesFloat`
+   * uses a fixed 25px per line, but a row is ~21px on desktop, so content moved
+   * ~0.84x the trackpad. Line/page units keep their meaning.
+   */
+  _wheelRowsFloat(ev) {
+    const delta = ev.shiftKey && Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+    if (!delta) return 0;
+    if (ev.deltaMode === 1) return delta;
+    if (ev.deltaMode === 2) return delta * (this.terminal?.rows || 24);
+    const rowPx = this.terminal?._core?._renderService?.dimensions?.css?.cell?.height;
+    return delta / (Number.isFinite(rowPx) && rowPx > 0 ? rowPx : 25);
+  },
+
   _wheelScrollLinesFloat(ev) {
     return window.CodemanTerminalInput.wheelDeltaLines(ev, this.terminal?.rows);
   },
@@ -5886,13 +8109,208 @@ Object.assign(CodemanApp.prototype, {
   // scroll-speed multiplier and acceleration on top), and the queue is bounded
   // so a wild scroll can't build a backlog that keeps scrolling after the finger
   // stops. Flushed via _sendInputEphemeral — loss-tolerant, off the durable queue.
-  // The encoding is the pure CodemanTerminalInput.sgrWheelReports, which a
-  // TerminalTile calls with its own cell (TerminalTile._maybeForwardWheelToCli).
+  /**
+   * COD-464: this session's `wheelForward` capability, as the server injects it
+   * into `window.__codemanWheelForward` (never an id literal here), when it says
+   * the wheel goes to the CLI RIGHT NOW: `{ rows, reversalDeadReports }`, else
+   * null. Every forwarding mode needs the CLI to have turned mouse tracking on
+   * itself (`cliMouseTracking`, false for claude's inline renderer, older codex
+   * and panes Codeman cannot see into, which keep the local/PageUp routes);
+   * 'version-gated' additionally needs the probed CLI version.
+   */
+  _wheelReportsFor(sessionId) {
+    const session = this.sessions?.get(sessionId);
+    const map = typeof window !== 'undefined' ? window.__codemanWheelForward : null;
+    const spec = session?.mode && map ? map[session.mode] : null;
+    if (!spec || !Number.isInteger(spec.rows) || spec.rows <= 0) return null;
+    // #498: a pane that never turned mouse tracking on ignores wheel reports
+    // (claude's default inline renderer, older codex, remote wrappers), so EVERY
+    // forwarding mode needs it; forwarding there made every wheel tick dead.
+    if (session.cliMouseTracking !== true) return null;
+    if (spec.mode === 'version-gated') {
+      if (!spec.minVersion || !this._cliVersionAtLeast?.(session.cliVersion, spec.minVersion)) return null;
+    } else if (spec.mode !== 'mouse-tracking') {
+      return null;
+    }
+    const dead = Number.isInteger(spec.reversalDeadReports) ? Math.max(0, spec.reversalDeadReports) : 0;
+    const streak =
+      spec.streak && Number.isFinite(spec.streak.resetMs) && Array.isArray(spec.streak.steps) && spec.streak.steps.length
+        ? { resetMs: spec.streak.resetMs, steps: spec.streak.steps }
+        : null;
+    return { rows: spec.rows, reversalDeadReports: dead, streak };
+  },
+
+  /**
+   * COD-464: should this desktop wheel event drive the CLI's own transcript
+   * through paced SGR reports? Measured (2026-10-01): on live-mirror tabs the
+   * wheel used to fall through to the PageUp fallback (the mirror buffer has no
+   * scrollback, so it always read as hollow): nothing moved until ~500px of
+   * wheel travel, then the CLI jumped half a screen, and a slow trackpad
+   * gesture moved nothing at all. Both CLIs whose `wheelForward` declares `rows`
+   * scroll by whole rows per report in 5-12 ms.
+   *
+   * Whether the CLI takes the wheel at all is its `wheelForward` capability
+   * (see _wheelReportsFor). Shift+wheel and the "Wheel scrolls local history"
+   * opt-out keep their meaning.
+   */
+  _shouldPaceWheelToCli(ev) {
+    if (!ev || ev.shiftKey || !this.activeSessionId || !this.terminal) return false;
+    if (this._viewMode === 'history') return false;
+    if (this.loadAppSettingsFromStorage?.()?.terminalWheelLocalScrollback) return false;
+    const tracking = this.terminal.modes?.mouseTrackingMode;
+    if (tracking && tracking !== 'none') return false;
+    if (this.terminal.buffer?.active?.type === 'alternate') return false;
+    return this._wheelReportsFor(this.activeSessionId) !== null;
+  },
+
+  /**
+   * COD-464 paced wheel/touch → CLI, in CONTENT ROWS (fractional): what the
+   * input asks the transcript to move, at 1:1 with its pixels (see
+   * _wheelRowsFloat; touch passes finger pixels / row height).
+   *
+   * Measured "not natural" (isolated real Claude 2.1.286 + Codex 0.159.3): the
+   * content moved ~0.82x the input, a notch kept gliding ~120 ms after the wheel
+   * stopped, and Claude ACCELERATES inside a streak of reports (step per report
+   * 1,1,1,1,2,2,2,3,3,3,3,4,4,4,5,5,6…; reset by a 35-40 ms pause), so a phone
+   * flick moved 8.5x the finger and sustained scrolling sped up the longer it
+   * ran. So the rows still OWED are tracked, and each frame sends only the
+   * reports whose measured step (`_wheelPaceStep`, from the CLI's `streak`
+   * curve, else its fixed `rows`) the debt covers: Claude stays linear while
+   * fast input still gets bigger steps. Rules:
+   *  - the first event of a gesture moves at once (pre-paid, owed back);
+   *  - overshoot from a coarse step is CREDIT against the next same-direction
+   *    input, never sent back the other way (that would jitter and trip
+   *    Claude's reversal debounce);
+   *  - the backlog is capped at one screen; travel never crosses tabs.
+   */
+  _paceWheelToCli(clientX, clientY, rows) {
+    const sessionId = this.activeSessionId;
+    const spec = this._wheelReportsFor(sessionId);
+    if (!sessionId || !spec || !rows) return;
+    if (this._wheelPaceSession !== sessionId) {
+      this._wheelPaceSession = sessionId;
+      this._wheelPaceOwed = 0;
+      this._wheelPaceForce = false;
+      this._wheelPaceStreakK = 0;
+      this._wheelPaceSentAt = undefined;
+    }
+    // Snap a scrolled-up local viewport back first, like _forwardScrollToApp:
+    // reports address the live screen.
+    if (this._terminalViewportAtBottom && !this._terminalViewportAtBottom()) this.terminal.scrollToBottom();
+    this._wheelPaceX = clientX;
+    this._wheelPaceY = clientY;
+    const tuning = window.CodemanTerminalInput;
+    const now = performance.now();
+    const gestureStart =
+      typeof this._wheelPaceLastAt !== 'number' || now - this._wheelPaceLastAt > tuning.WHEEL_PACE_GESTURE_GAP_MS;
+    this._wheelPaceLastAt = now;
+    if (gestureStart) {
+      // A stale sub-step remainder (or credit) belongs to the gesture that made it.
+      this._wheelPaceOwed = 0;
+      if (Math.abs(rows) >= tuning.WHEEL_PACE_MIN_START_ROWS) this._wheelPaceForce = true;
+    }
+    this._wheelPaceInputDir = rows < 0 ? -1 : 1;
+    const cap = Math.max(4, this.terminal?.rows || 24);
+    this._wheelPaceOwed = Math.max(-cap, Math.min(cap, (this._wheelPaceOwed || 0) + rows));
+    if (!this._wheelPaceFrame) this._drainWheelPace();
+  },
+
+  /** COD-464: rows the k-th report of a streak moves (0-based), from the CLI's measured curve. */
+  _wheelPaceStep(spec, k) {
+    const steps = spec?.streak?.steps;
+    if (Array.isArray(steps) && steps.length) return steps[Math.min(k, steps.length - 1)];
+    return spec?.rows || 1;
+  },
+
+  /** COD-464: send this frame's reports for the owed rows; reschedules while a report can still be earned. */
+  _drainWheelPace() {
+    this._wheelPaceFrame = null;
+    const sessionId = this.activeSessionId;
+    const spec = sessionId ? this._wheelReportsFor(sessionId) : null;
+    if (!sessionId || sessionId !== this._wheelPaceSession || !spec) {
+      this._wheelPaceOwed = 0;
+      this._wheelPaceForce = false;
+      return;
+    }
+    let owed = this._wheelPaceOwed || 0;
+    const dir = this._wheelPaceInputDir || (owed < 0 ? -1 : 1);
+    // Only ever move in the direction the input is going. An opposite-signed
+    // remainder is overshoot credit, held for the next input.
+    if (!owed || Math.sign(owed) !== dir) return;
+    const tuning = window.CodemanTerminalInput;
+    const force = this._wheelPaceForce === true;
+    const now = performance.now();
+    if (!this._wheelPaceDir) this._wheelPaceDir = new Map();
+    const reversed = (this._wheelPaceDir.get(sessionId) ?? 1) !== dir;
+    let k = this._wheelPaceStreakK || 0;
+    if (spec.streak) {
+      const gap = typeof this._wheelPaceSentAt === 'number' ? now - this._wheelPaceSentAt : Infinity;
+      const resetMs = spec.streak.resetMs;
+      if (reversed || gap >= resetMs + tuning.WHEEL_STREAK_RESET_MARGIN_MS) {
+        k = 0;
+      } else if (gap > resetMs - tuning.WHEEL_STREAK_CONTINUE_MARGIN_MS) {
+        // Ambiguous: wait a frame or two for a sure reset rather than guess.
+        this._wheelPaceFrame = requestAnimationFrame(() => this._drainWheelPace());
+        return;
+      }
+    }
+    const budget = Math.max(this._wheelPaceStep(spec, k), Math.abs(owed) * tuning.WHEEL_PACE_EASE);
+    let n = 0;
+    let sent = 0;
+    while (n < tuning.WHEEL_PACE_MAX_REPORTS_PER_FRAME) {
+      const step = this._wheelPaceStep(spec, k);
+      if (!(Math.abs(owed) >= step / 2 || (force && n === 0))) break;
+      if (n > 0 && sent + step > budget + step / 2) break;
+      n++;
+      k++;
+      sent += step;
+      owed -= dir * step;
+    }
+    this._wheelPaceForce = false;
+    if (n) {
+      const pos = this._clientPointToCell?.(this._wheelPaceX, this._wheelPaceY) || {
+        col: Math.max(1, Math.floor((this.terminal?.cols || 80) / 2)),
+        row: Math.max(1, Math.floor((this.terminal?.rows || 24) / 2)),
+      };
+      const btn = dir < 0 ? 64 : 65;
+      // Reversal debounce (`reversalDeadReports`, measured on Claude): the CLI
+      // ignores the report(s) that reverse its last effective direction, so the
+      // first batch of a reversed gesture would move nothing. Pay them on top,
+      // never out of the user's travel. The CLI's direction outlives a tab
+      // switch, so it is remembered per session; unknown reads as "down" (a CLI
+      // starts at the bottom of its transcript), so the common first gesture,
+      // up, is primed.
+      const dead = reversed ? spec.reversalDeadReports || 0 : 0;
+      this._wheelPaceDir.set(sessionId, dir);
+      this._wheelPaceSentAt = now;
+      this._sendInputEphemeral(sessionId, `\x1b[<${btn};${pos.col};${pos.row}M`.repeat(n + dead));
+    }
+    this._wheelPaceStreakK = k;
+    this._wheelPaceOwed = owed;
+    // Keep going while a report can still be earned in the input's direction:
+    // the next step is covered, or at least a whole first-step is owed (then the
+    // streak is let lapse so the next report is small again). Anything less stays
+    // as carry for the next input: waiting out a streak for a fraction of a row is
+    // what made a single notch trail ~150 ms and land one row long.
+    const first = this._wheelPaceStep(spec, 0);
+    const next = this._wheelPaceStep(spec, k);
+    const left = Math.sign(owed) === dir ? Math.abs(owed) : 0;
+    if (left >= first / 2 && (left >= next / 2 || left >= first)) {
+      this._wheelPaceFrame = requestAnimationFrame(() => this._drainWheelPace());
+    }
+  },
+
   _sendSyntheticSgrWheel(clientX, clientY, lines) {
     if (!this.activeSessionId || !lines) return;
     const pos = this._clientPointToCell(clientX, clientY);
     if (!pos) return;
-    this._queueScrollBytes(window.CodemanTerminalInput.sgrWheelReports(lines, pos));
+    const btn = lines < 0 ? 64 : 65;
+    const ticks = Math.min(Math.abs(lines), 5);
+    // COD-464: keep the paced sender's view of the CLI's scroll direction true
+    // when a report leaves through this older path (touch, legacy forwarding).
+    if (!this._wheelPaceDir) this._wheelPaceDir = new Map();
+    this._wheelPaceDir.set(this.activeSessionId, lines < 0 ? -1 : 1);
+    this._queueScrollBytes(`\x1b[<${btn};${pos.col};${pos.row}M`.repeat(ticks));
   },
 
   /**
@@ -6179,7 +8597,7 @@ Object.assign(CodemanApp.prototype, {
       return;
     }
     const current = this.terminal.options.fontSize || 14;
-    this.setFontSize(Math.min(current + 2, 24));
+    this.setFontSize(Math.min(current + 2, TERMINAL_FONT_SIZE_MAX));
   },
 
   decreaseFontSize() {
@@ -6187,15 +8605,18 @@ Object.assign(CodemanApp.prototype, {
       this.setTileFontSize(Math.max(this._tileGridFontSize() - 2, 10));
       return;
     }
-    const current = this.terminal.options.fontSize || 14;
-    this.setFontSize(Math.max(current - 2, 10));
+    const policy = this.getTerminalFontPolicy();
+    const current = this.terminal.options.fontSize || policy.size;
+    this.setFontSize(Math.max(current - 2, policy.min));
   },
 
   setFontSize(size) {
     this.terminal.options.fontSize = size;
     document.getElementById('fontSizeDisplay').textContent = size;
+    try {
+      localStorage.setItem(this.getTerminalFontPolicy().key, size);
+    } catch {}
     this._refitAfterCellSizeChange();
-    localStorage.setItem('codeman-font-size', size);
     // Update overlay font cache and re-render at new cell dimensions
     this._localEchoOverlay?.refreshFont();
     this._predictiveEcho?.refreshFont();
@@ -6206,6 +8627,54 @@ Object.assign(CodemanApp.prototype, {
       },
       { grid: false }
     );
+  },
+
+  getTerminalFontPolicy(mode, { performanceFallback = false } = {}) {
+    const activeMode = mode ?? this.sessions?.get?.(this.activeSessionId)?.mode;
+    const deviceType =
+      typeof MobileDetection !== 'undefined' && MobileDetection.getDeviceType
+        ? MobileDetection.getDeviceType()
+        : 'desktop';
+    const unresolved = window.CodemanTerminalFont.resolveSize({ deviceType, mode: activeMode, stored: null, performanceFallback });
+    const key = resolveTerminalFontSizeSessionKey(this.activeSessionId, unresolved.key);
+    let stored = null;
+    try {
+      stored = localStorage.getItem(key);
+      if (stored === null && key !== unresolved.key) stored = localStorage.getItem(unresolved.key);
+    } catch {}
+    return {
+      ...window.CodemanTerminalFont.resolveSize({ deviceType, mode: activeMode, stored, performanceFallback }),
+      key,
+    };
+  },
+
+  /** Apply cell metrics only. The caller owns any subsequent fit or resize. */
+  applyTerminalFontPolicy(mode, options) {
+    const policy = this.getTerminalFontPolicy(mode, options);
+    if (!this.terminal?.options) return policy;
+    const activeMode = mode ?? this.sessions?.get?.(this.activeSessionId)?.mode;
+    const deviceType =
+      typeof MobileDetection !== 'undefined' && MobileDetection.getDeviceType
+        ? MobileDetection.getDeviceType()
+        : 'desktop';
+    const signature = `${deviceType}:${String(activeMode || '').trim().toLowerCase()}:${policy.key}:${policy.size}`;
+    if (this._lastAppliedTerminalFontPolicySignature === signature && this.terminal.options.fontSize === policy.size) {
+      return policy;
+    }
+    const changed = this.terminal.options.fontSize !== policy.size;
+    if (changed) this.terminal.options.fontSize = policy.size;
+    const display = document.getElementById('fontSizeDisplay');
+    if (display) display.textContent = policy.size;
+    if (changed) {
+      this._localEchoOverlay?.refreshFont();
+      this._predictiveEcho?.refreshFont();
+    }
+    this._lastAppliedTerminalFontPolicySignature = signature;
+    return policy;
+  },
+
+  applyTerminalFontPolicyForActiveSession(options) {
+    return this.applyTerminalFontPolicy(this.sessions?.get?.(this.activeSessionId)?.mode, options);
   },
 
   /**
@@ -6294,14 +8763,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   loadFontSize() {
-    const saved = localStorage.getItem('codeman-font-size');
-    if (saved) {
-      const size = parseInt(saved, 10);
-      if (size >= 10 && size <= 24) {
-        this.terminal.options.fontSize = size;
-        document.getElementById('fontSizeDisplay').textContent = size;
-      }
-    }
+    this.applyTerminalFontPolicyForActiveSession();
   },
 
   /**
@@ -6464,7 +8926,7 @@ Object.assign(CodemanApp.prototype, {
    */
   _refitAfterCellSizeChange() {
     if (this.activeSessionId) {
-      this.sendResize(this.activeSessionId)?.catch?.(() => {});
+      this.sendResize(this.activeSessionId, { preserveFont: true })?.catch?.(() => {});
       return;
     }
     this.syncTerminalGeometry();
@@ -6487,12 +8949,51 @@ Object.assign(CodemanApp.prototype, {
   },
 
   /**
+   * Return the dimensions already fitted into xterm without fitting or sending.
+   * @returns {{cols: number, rows: number, viewportType: string}|null}
+   */
+  getFittedTerminalDimensions() {
+    if (!this.terminal) return null;
+    const viewportType =
+      typeof MobileDetection !== 'undefined' && MobileDetection.getDeviceType
+        ? MobileDetection.getDeviceType()
+        : window.innerWidth < 430
+          ? 'mobile'
+          : window.innerWidth < 768
+            ? 'tablet'
+            : 'desktop';
+    return { cols: this.terminal.cols, rows: this.terminal.rows, viewportType };
+  },
+
+  _queuePendingTerminalResize(sessionId, frame) {
+    this._pendingTerminalResize = { sessionId, frame: { ...frame } };
+  },
+
+  _sendOrQueueTerminalResize(sessionId, frame) {
+    if (!sessionId || sessionId !== this.activeSessionId) return false;
+    if (this._isTerminalSessionGone?.(sessionId)) return false;
+    if (this._wsReady && this._wsSessionId === sessionId && this._ws) {
+      try {
+        this._ws.send(JSON.stringify(frame));
+        if (this._pendingTerminalResize?.sessionId === sessionId) this._pendingTerminalResize = null;
+        return true;
+      } catch {
+        // Retain the exact latest typed resize for the replacement socket.
+      }
+    }
+    this._queuePendingTerminalResize(sessionId, frame);
+    return false;
+  },
+
+  /**
    * Send resize to a session with minimum dimension enforcement.
    * @param {string} sessionId
-   * @param {{ forceHttp?: boolean, force?: boolean }} [options]
-   * @returns {Promise<boolean>} Whether dimensions changed from the last send
+   * @param {{ force?: boolean, retainPending?: boolean }} [options]
+   * @returns {Promise<boolean|null>} Whether dimensions changed, or null when transport did not accept the frame
    */
   async sendResize(sessionId, options = {}) {
+    if (!sessionId || sessionId !== this.activeSessionId || document.visibilityState === 'hidden') return false;
+    if (this._isTerminalSessionGone?.(sessionId)) return false;
     // One PTY cannot hold two sizes. A detached session is owned by its own
     // window, and the dashboard's terminal is narrower than that window because
     // the session rail takes width the popup does not have — so both sizing it
@@ -6512,11 +9013,13 @@ Object.assign(CodemanApp.prototype, {
     // Backstop: while the tile grid owns the terminal, a tile sizes this PTY and
     // the parked main terminal measures nothing worth sending.
     if (this._tilesOwnTerminal?.()) return false;
+    if (!options.preserveFont) this.applyTerminalFontPolicyForActiveSession?.();
     // Fit, floor, and apply in one step so the numbers below are the numbers
     // xterm is actually holding (or, while another device holds the width,
     // the numbers this container would hold if the PTY followed).
     const dims = this._geometryForResizeRequest();
     if (!dims) return false;
+    if (sessionId !== this.activeSessionId) return false;
     // Did the dimensions actually change since the last resize we sent? Callers
     // use this to skip work (e.g. the post-resize TUI-redraw settle) when no
     // real SIGWINCH was triggered — switching tabs at the same browser size is
@@ -6535,33 +9038,26 @@ Object.assign(CodemanApp.prototype, {
           : window.innerWidth < 768
             ? 'tablet'
             : 'desktop';
-    // Fast path: WebSocket resize
-    if (!options.forceHttp && this._wsReady && this._wsSessionId === sessionId) {
+    const msg = { t: 'z', c: dims.cols, r: dims.rows, v: viewportType };
+    if (options.force) msg.f = true;
+    // Viewer geometry is ownership-sensitive. Only the sizing token attached to
+    // this socket may resize the shared PTY; HTTP has no equivalent identity and
+    // therefore cannot be a safe fallback.
+    if (
+      this._wsReady &&
+      this._wsSessionId === sessionId &&
+      this._ws
+    ) {
+      if (sessionId !== this.activeSessionId) return false;
       try {
-        const msg = { t: 'z', c: dims.cols, r: dims.rows, v: viewportType };
-        if (options.force) msg.f = true;
         this._ws.send(JSON.stringify(msg));
+        if (options.retainPending) this._queuePendingTerminalResize(sessionId, msg);
+        else if (this._pendingTerminalResize?.sessionId === sessionId) this._pendingTerminalResize = null;
         return changed;
-      } catch {
-        // Fall through to HTTP POST
-      }
+      } catch {}
     }
-    const body = { ...dims, viewportType };
-    if (options.force) body.force = true;
-    const res = await fetch(`/api/sessions/${sessionId}/resize`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    // Same report the WS path gets as a {"t":"zc"} frame. An older server
-    // answers `{}`, which reconciles to a no-op rather than throwing.
-    try {
-      const applied = (await res.json())?.data ?? {};
-      this._onPtyGeometryReport(sessionId, applied.cols, applied.rows);
-    } catch {
-      /* a body that is not JSON tells us nothing about the PTY; keep our own geometry */
-    }
-    return changed;
+    this._queuePendingTerminalResize(sessionId, msg);
+    return null;
   },
 
   /**

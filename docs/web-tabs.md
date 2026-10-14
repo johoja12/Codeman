@@ -29,11 +29,11 @@ Past six live frames the least-recently-viewed one is dropped to bound memory
 A plain `<iframe src="http://your-box:4000">` does not work in the setup Codeman
 actually ships in, for three separate reasons:
 
-| Blocker             | What happens                                                                                   |
-| ------------------- | ---------------------------------------------------------------------------------------------- |
+| Blocker             | What happens                                                                                                                                                 |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **Mixed content**   | Production serves HTTPS (behind `tailscale serve`). Browsers hard-block `http://` iframes on an HTTPS page, with no override, and none at all on iOS Safari. |
-| **Framing refusal** | Grafana, Portainer, Home Assistant and many others send `X-Frame-Options: DENY` or `frame-ancestors 'none'`. |
-| **Codeman's CSP**   | `default-src 'self'` means `frame-src` falls back to `'self'`, so a cross-origin iframe is blocked before it starts. |
+| **Framing refusal** | Grafana, Portainer, Home Assistant and many others send `X-Frame-Options: DENY` or `frame-ancestors 'none'`.                                                 |
+| **Codeman's CSP**   | `default-src 'self'` means `frame-src` falls back to `'self'`, so a cross-origin iframe is blocked before it starts.                                         |
 
 Serving the dashboard **through Codeman's own origin** dissolves all three. So by
 default a web tab loads `/webview/<capability>/` on Codeman, and Codeman relays to
@@ -86,7 +86,7 @@ On the box itself (a browser on `localhost`) every link opens directly.
 ## The sandbox, and when to turn it off
 
 Because a proxied dashboard is served from Codeman's own address, it is
-*same-origin with Codeman* as far as the browser is concerned. Left unchecked, its
+_same-origin with Codeman_ as far as the browser is concerned. Left unchecked, its
 JavaScript could read the Codeman page and call the API that spawns agents.
 
 So the iframe is sandboxed **without** `allow-same-origin` by default. The page runs
@@ -126,15 +126,15 @@ capability (tabs re-mint transparently on next click).
 
 ## Limits and env vars
 
-| Variable                             | Default | Meaning                                    |
-| ------------------------------------ | ------- | ------------------------------------------ |
-| `CODEMAN_MAX_WEBVIEWS`               | 50      | Saved dashboards per owner                 |
-| `CODEMAN_MAX_LIVE_WEBVIEW_FRAMES`    | 6       | Iframes kept mounted at once               |
-| `CODEMAN_WEBVIEW_CAPABILITY_TTL_MS`  | 12h     | Rolling capability lifetime                |
-| `CODEMAN_WEBVIEW_TIMEOUT_MS`         | 30000   | Upstream request timeout                   |
-| `CODEMAN_WEBVIEW_PROBE_TIMEOUT_MS`   | 8000    | Timeout for the Test button                |
-| `CODEMAN_MAX_WEBVIEW_HTML_BYTES`     | 8MB     | Largest HTML document rewritten            |
-| `CODEMAN_MAX_WEBVIEW_SOCKETS`        | 8       | Concurrent proxied WebSockets per dashboard |
+| Variable                            | Default | Meaning                                     |
+| ----------------------------------- | ------- | ------------------------------------------- |
+| `CODEMAN_MAX_WEBVIEWS`              | 50      | Saved dashboards per owner                  |
+| `CODEMAN_MAX_LIVE_WEBVIEW_FRAMES`   | 6       | Iframes kept mounted at once                |
+| `CODEMAN_WEBVIEW_CAPABILITY_TTL_MS` | 12h     | Rolling capability lifetime                 |
+| `CODEMAN_WEBVIEW_TIMEOUT_MS`        | 30000   | Upstream request timeout                    |
+| `CODEMAN_WEBVIEW_PROBE_TIMEOUT_MS`  | 8000    | Timeout for the Test button                 |
+| `CODEMAN_MAX_WEBVIEW_HTML_BYTES`    | 8MB     | Largest HTML document rewritten             |
+| `CODEMAN_MAX_WEBVIEW_SOCKETS`       | 8       | Concurrent proxied WebSockets per dashboard |
 
 Saved dashboards live in `~/.codeman/webviews.json`. Which tabs you have open is
 per-device (`localStorage`), since that is workspace layout rather than config.
@@ -179,7 +179,7 @@ layers cooperate so a dashboard talking to its own backend just works:
    credentials, which a sandboxed frame never does.
 
 On top of that, the proxy answers those requests with CORS headers. That sounds
-wrong for same-host requests, but a sandboxed iframe has an *opaque* origin, so the
+wrong for same-host requests, but a sandboxed iframe has an _opaque_ origin, so the
 browser treats every one of its `fetch`/XHR calls as cross-origin even though the
 URL is on Codeman itself. Without those headers, a dashboard renders perfectly and
 then every API call fails, which looks like the dashboard being broken.
@@ -240,12 +240,12 @@ then every API call fails, which looks like the dashboard being broken.
 
 ## Where the code lives
 
-| Concern                  | File                                    |
-| ------------------------ | --------------------------------------- |
-| Pure rewrite helpers     | `src/web/webview-proxy.ts`              |
-| Routes + proxy + sockets | `src/web/routes/webview-routes.ts`      |
-| Capability tokens        | `src/webview-capabilities.ts`           |
-| Persistence              | `src/webview-store.ts`                  |
-| Limits                   | `src/config/webview-limits.ts`          |
-| Frontend                 | `src/web/public/webview-tabs.js`        |
-| Auth exemption           | `src/web/middleware/auth.ts`             |
+| Concern                  | File                               |
+| ------------------------ | ---------------------------------- |
+| Pure rewrite helpers     | `src/web/webview-proxy.ts`         |
+| Routes + proxy + sockets | `src/web/routes/webview-routes.ts` |
+| Capability tokens        | `src/webview-capabilities.ts`      |
+| Persistence              | `src/webview-store.ts`             |
+| Limits                   | `src/config/webview-limits.ts`     |
+| Frontend                 | `src/web/public/webview-tabs.js`   |
+| Auth exemption           | `src/web/middleware/auth.ts`       |

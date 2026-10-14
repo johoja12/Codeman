@@ -192,43 +192,122 @@ Object.assign(CodemanApp.prototype, {
     this.activeWebviewId = this.activeWebviewId || null;
     this._webviewMaxFrames = this._webviewMaxFrames || 6;
     this._webviewFrameLru = this._webviewFrameLru || [];
+    this._webviewNavigationGeneration = this._webviewNavigationGeneration || 0;
+    this._webviewNavigationId = this._webviewNavigationId || null;
+    this._webviewOpenGenerations = this._webviewOpenGenerations || new Map();
+    this._webviewOpenStateLoaded = this._webviewOpenStateLoaded === true;
+    this._webviewInitRetryTimer = this._webviewInitRetryTimer || null;
+    this._webviewInitRetryScheduled = this._webviewInitRetryScheduled === true;
+    this._webviewListRefreshGeneration = this._webviewListRefreshGeneration || 0;
+    this._webviewListAppliedGeneration = this._webviewListAppliedGeneration || 0;
+    this._webviewDeletedIds = this._webviewDeletedIds || new Set();
 
-    await this.refreshWebviews();
+    const acquired = await this.refreshWebviews();
     this._installWebviewLostListener();
-
-    // Restore the previously open web tabs (per device: which dashboards you keep
-    // open is a workspace-layout choice, not something to sync across machines).
-    let saved = [];
-    try {
-      saved = JSON.parse(localStorage.getItem('codeman-webview-order') || '[]');
-    } catch {
-      saved = [];
-    }
-    this.webviewOrder = saved.filter((id) => this.webviews.has(id));
-    this.renderSessionTabs();
+    if (!acquired) this._scheduleWebviewInitRetry();
   },
 
+  /** One bounded recovery read for a transient failure during the sole shipping init call. */
+  _scheduleWebviewInitRetry() {
+    if (this._webviewOpenStateLoaded || this._webviewInitRetryScheduled || this._webviewInitRetryTimer !== null) return;
+    this._webviewInitRetryScheduled = true;
+    this._webviewInitRetryTimer = setTimeout(async () => {
+      this._webviewInitRetryTimer = null;
+      await this.refreshWebviews();
+    }, 2000);
+    if (!this._webviewInitPagehideHandler) {
+      this._webviewInitPagehideHandler = (event) => {
+        if (event.persisted) return;
+        this._clearWebviewInitRetry();
+      };
+      window.addEventListener('pagehide', this._webviewInitPagehideHandler);
+    }
+  },
+
+  _clearWebviewInitRetry() {
+    if (this._webviewInitRetryTimer !== null) clearTimeout(this._webviewInitRetryTimer);
+    this._webviewInitRetryTimer = null;
+    if (this._webviewInitPagehideHandler) {
+      window.removeEventListener('pagehide', this._webviewInitPagehideHandler);
+      this._webviewInitPagehideHandler = null;
+    }
+  },
+
+  /**
+   * Fetch the saved list.
+   *
+   * The in-flight promise is published on `_webviewsRefresh` (and the
+   * ever-loaded flag on `_webviewsLoaded`) so a loopback link tapped during page
+   * load can JOIN this load instead of finding an empty map and POSTing a
+   * duplicate record for an origin that already exists — see openUrlInWebTab().
+   */
   async refreshWebviews() {
-    const inFlight = this._apiJson('/api/webviews').then((data) => {
-      if (!data) return;
-      this.webviews = new Map((data.webviews || []).map((w) => [w.id, w]));
-      if (typeof data.maxLiveFrames === 'number') this._webviewMaxFrames = data.maxLiveFrames;
-      this._webviewsLoaded = true;
-      this.renderWebviewMenuItems();
-    });
+    const inFlight = this._refreshWebviewsOnce();
     this._webviewsRefresh = inFlight;
     try {
-      await inFlight;
+      return await inFlight;
     } finally {
       if (this._webviewsRefresh === inFlight) this._webviewsRefresh = null;
     }
   },
 
+  async _refreshWebviewsOnce() {
+    const generation = (this._webviewListRefreshGeneration || 0) + 1;
+    this._webviewListRefreshGeneration = generation;
+    let data;
+    try {
+      data = await this._apiJson('/api/webviews');
+    } catch {
+      return false;
+    }
+    if (!data || !Array.isArray(data.webviews)) return false;
+    // Order successful applications, not request starts: a valid earlier response
+    // may recover state while a newer overlapping request is still pending or
+    // fails. A newer success still wins, and deletion tombstones filter even a
+    // response whose request began before the trusted deletion event.
+    if (generation < (this._webviewListAppliedGeneration || 0)) return false;
+    this._webviewListAppliedGeneration = generation;
+    const deletedIds = this._webviewDeletedIds || new Set();
+    this.webviews = new Map(data.webviews.filter((w) => !deletedIds.has(w.id)).map((w) => [w.id, w]));
+    if (typeof data.maxLiveFrames === 'number') this._webviewMaxFrames = data.maxLiveFrames;
+    this._webviewsLoaded = true;
+    this.renderWebviewMenuItems();
+    if (!this._webviewOpenStateLoaded) {
+      // Restore the device-local OPEN SET only after the authoritative saved list
+      // exists. Any later successful retry or SSE refresh may be the first success.
+      this._loadWebviewOpenState();
+      this._webviewOpenStateLoaded = true;
+      this._clearWebviewInitRetry();
+      this.renderSessionTabs();
+    }
+    return true;
+  },
+
   /** SSE: the saved list changed (possibly on another device). */
   async _onWebviewChanged(data) {
-    await this.refreshWebviews();
-    // A dashboard deleted elsewhere must not linger as a dead tab here.
-    if (data && data.action === 'deleted' && data.id) this._removeWebviewTab(data.id);
+    const deletedId = data?.action === 'deleted' && data.id ? data.id : null;
+    if (deletedId) {
+      this._webviewDeletedIds = this._webviewDeletedIds || new Set();
+      this._webviewDeletedIds.add(deletedId);
+    }
+    const deletionSnapshot = deletedId ? this._flatTabRefs() : null;
+    const deletionNavigation = deletedId
+      ? { generation: this._webviewNavigationGeneration || 0, id: this._webviewNavigationId || null }
+      : null;
+    const acquired = await this.refreshWebviews();
+    if (deletedId) {
+      // Owner-routed deletion is authoritative even if the follow-up list read
+      // fails. Remove every local identity and use the pre-refresh ordering for
+      // active fallback because a successful read already omits this ref.
+      this.webviews?.delete(deletedId);
+      this.renderWebviewMenuItems();
+      const allowFallback =
+        (this._webviewNavigationGeneration || 0) === deletionNavigation.generation &&
+        (this._webviewNavigationId || null) === deletionNavigation.id;
+      this._removeWebviewTab(deletedId, deletionSnapshot, allowFallback);
+    } else if (!acquired) {
+      return;
+    }
     this.renderSessionTabs();
   },
 
@@ -284,40 +363,93 @@ Object.assign(CodemanApp.prototype, {
     window.addEventListener('message', this._webviewLostListener);
   },
 
-  _persistWebviewOrder() {
+  _normalizeWebviewOpenIds(value) {
+    if (!Array.isArray(value)) return [];
+    const requested = new Set(value.filter((id) => typeof id === 'string'));
+    return [...(this.webviews?.keys() || [])].filter((id) => requested.has(id));
+  },
+
+  /** Migrate legacy local ordering once, retaining only set membership. */
+  _loadWebviewOpenState() {
+    const current = this._normalizeWebviewOpenIds(this.webviewOrder);
+    let storage;
+    let stored;
     try {
-      localStorage.setItem('codeman-webview-order', JSON.stringify(this.webviewOrder || []));
+      storage = localStorage;
+      stored = storage.getItem('codeman-webview-open');
     } catch {
-      /* private mode / quota, order is a convenience, never fatal */
+      this.webviewOrder = current;
+      return;
     }
+
+    if (stored !== null) {
+      let parsed;
+      try {
+        parsed = JSON.parse(stored);
+      } catch {
+        parsed = [];
+      }
+      this.webviewOrder = this._normalizeWebviewOpenIds(parsed);
+      const normalized = JSON.stringify(this.webviewOrder);
+      if (stored !== normalized) {
+        try {
+          storage.setItem('codeman-webview-open', normalized);
+        } catch {
+          /* normalized openness remains usable in memory */
+        }
+      }
+      return;
+    }
+
+    let legacy;
+    try {
+      legacy = JSON.parse(storage.getItem('codeman-webview-order') || '[]');
+    } catch {
+      legacy = [];
+    }
+    this.webviewOrder = this._normalizeWebviewOpenIds(legacy);
+    try {
+      // Even [] is a migration marker: a stale legacy value must never be
+      // reimported after the user has closed every dashboard.
+      storage.setItem('codeman-webview-open', JSON.stringify(this.webviewOrder));
+    } catch {
+      /* migrated openness remains usable in memory */
+    }
+  },
+
+  _persistWebviewOpenState() {
+    this.webviewOrder = this._normalizeWebviewOpenIds(this.webviewOrder);
+    try {
+      localStorage.setItem('codeman-webview-open', JSON.stringify(this.webviewOrder));
+    } catch {
+      /* private mode / quota: openness remains usable in memory */
+    }
+  },
+
+  /** Compatibility name; the value is set-like openness, never tab order. */
+  _persistWebviewOrder() {
+    this._persistWebviewOpenState();
   },
 
   // ── Tab strip ─────────────────────────────────────────────────────────────
 
-  /**
-   * Tab HTML for every OPEN web tab, appended by _fullRenderSessionTabs().
-   * `startIndex` continues the Alt+N numbering after the session tabs.
-   */
+  /** Legacy flat renderer retained for callers outside the unified rail. */
   renderWebviewTabs(startIndex) {
     if (!this.webviewOrder || this.webviewOrder.length === 0) return '';
     const parts = [];
     let idx = startIndex;
 
     for (const id of this.webviewOrder) {
-      if (!this.webviews.get(id)) continue;
-      parts.push(this.renderWebviewTab(id, idx));
-      idx++;
+      const html = this.renderWebviewTab(id, idx);
+      if (html) parts.push(html);
+      if (html) idx++;
     }
     return parts.join('');
   },
 
-  /**
-   * One web tab's HTML; `idx` is its zero-based Alt+N slot (no badge from 9 up).
-   * The grouped vertical rail places single web tabs into their group with this,
-   * so a web tab's markup is the same in every layout.
-   */
+  /** One open webview tab at its position in the interleaved visible ref list. */
   renderWebviewTab(id, idx) {
-    const webview = this.webviews.get(id);
+    const webview = this.webviews?.get(id);
     if (!webview) return '';
     const isActive = id === this.activeWebviewId;
     const jsonId = escapeHtml(JSON.stringify(id));
@@ -332,6 +464,7 @@ Object.assign(CodemanApp.prototype, {
           <span class="tab-web-icon" aria-hidden="true">${icon || this._webviewGlobeIcon()}</span>
           <span class="tab-info">
             <span class="tab-name-row">
+              ${this._tabOrientation?.() === 'vertical' && this._tabRefFocused?.({ kind: 'webview', id }) ? '<span class="tab-focus-marker" aria-hidden="true">&#x2605;</span>' : ''}
               <span class="tab-name">${escapeHtml(webview.name)}</span>
             </span>
           </span>
@@ -363,17 +496,52 @@ Object.assign(CodemanApp.prototype, {
     const container = this.$('sessionTabs');
     if (!container) return;
     for (const tab of container.querySelectorAll('.session-tab[data-webview-id]')) {
-      tab.classList.toggle('active', tab.dataset.webviewId === this.activeWebviewId);
+      const active = tab.dataset.webviewId === this.activeWebviewId;
+      tab.classList.toggle('active', active);
+      tab.setAttribute('aria-selected', active ? 'true' : 'false');
     }
     if (this.activeWebviewId) {
       // A web tab is active, so no session tab may also look active.
-      for (const tab of container.querySelectorAll('.session-tab[data-id]')) tab.classList.remove('active');
+      for (const tab of container.querySelectorAll('.session-tab[data-id]')) {
+        tab.classList.remove('active');
+        tab.setAttribute('aria-selected', 'false');
+      }
+    }
+    for (const tab of container.querySelectorAll('.session-tab[data-focus-webview-id]')) {
+      tab.classList.remove('active');
+      tab.removeAttribute('aria-selected');
+      tab.setAttribute('aria-current', tab.dataset.focusWebviewId === this.activeWebviewId ? 'page' : 'false');
+    }
+    for (const tab of container.querySelectorAll('.session-tab[data-focus-session-id]')) {
+      tab.classList.remove('active');
+      tab.removeAttribute('aria-selected');
+      tab.setAttribute('aria-current', 'false');
     }
     this._syncTabTreeSelection?.(container);
     this._renderTabFocus?.();
   },
 
   // ── Opening / closing ─────────────────────────────────────────────────────
+
+  _beginWebviewOpenIntent(id) {
+    this._webviewNavigationGeneration = (this._webviewNavigationGeneration || 0) + 1;
+    this._webviewNavigationId = id;
+    this._webviewOpenGenerations = this._webviewOpenGenerations || new Map();
+    const idGeneration = (this._webviewOpenGenerations.get(id) || 0) + 1;
+    this._webviewOpenGenerations.set(id, idGeneration);
+    return { navigationGeneration: this._webviewNavigationGeneration, idGeneration };
+  },
+
+  _cancelPendingWebviewNavigation() {
+    this._webviewNavigationGeneration = (this._webviewNavigationGeneration || 0) + 1;
+    this._webviewNavigationId = null;
+  },
+
+  _cancelPendingWebviewOpen(id) {
+    this._webviewOpenGenerations = this._webviewOpenGenerations || new Map();
+    this._webviewOpenGenerations.set(id, (this._webviewOpenGenerations.get(id) || 0) + 1);
+    if (this._webviewNavigationId === id) this._cancelPendingWebviewNavigation();
+  },
 
   /**
    * Open (or focus) a dashboard tab. Mints a fresh capability every time: they are
@@ -392,6 +560,7 @@ Object.assign(CodemanApp.prototype, {
   async openWebview(id, options = {}) {
     const webview = this.webviews.get(id);
     if (!webview) return;
+    const intent = this._beginWebviewOpenIntent(id);
 
     // Opening a web tab yourself is choosing something else, so a
     // `#session=<id>` link still waiting for its session must not take the
@@ -399,17 +568,28 @@ Object.assign(CodemanApp.prototype, {
     // session:created could otherwise land inside.
     if (options.auto !== true) this._retireUrlSession?.();
 
+    const data = await this._apiJson(`/api/webviews/${encodeURIComponent(id)}/open`, { method: 'POST' });
+    if (!data) {
+      if (
+        this._webviewOpenGenerations.get(id) === intent.idGeneration &&
+        this._webviewNavigationGeneration === intent.navigationGeneration
+      ) {
+        this._webviewNavigationId = null;
+        this.showToast?.('Could not open URL', 'error');
+      }
+      return;
+    }
+    if (this._webviewOpenGenerations.get(id) !== intent.idGeneration) return;
+    if (data.webview) this.webviews.set(id, data.webview);
     if (!this.webviewOrder.includes(id)) {
       this.webviewOrder.push(id);
       this._persistWebviewOrder();
     }
-
-    const data = await this._apiJson(`/api/webviews/${encodeURIComponent(id)}/open`, { method: 'POST' });
-    if (!data) {
-      this.showToast?.('Could not open URL', 'error');
+    if (this._webviewNavigationGeneration !== intent.navigationGeneration) {
+      this.renderSessionTabs();
       return;
     }
-    if (data.webview) this.webviews.set(id, data.webview);
+    this._webviewNavigationId = null;
 
     let src = data.embedUrl || data.webview?.url || webview.url;
     // A string `path` (even '') means "go there": the proxy prefix is
@@ -542,7 +722,21 @@ Object.assign(CodemanApp.prototype, {
     this.renderSessionTabs();
   },
 
-  _removeWebviewTab(id) {
+  /**
+   * Every open tab in strip order (sessions, then web tabs) as {kind, id} refs:
+   * the neighbour a closed web tab hands the active state to.
+   */
+  _flatTabRefs() {
+    return [
+      ...(this.sessionOrder || []).filter((id) => this.sessions?.has(id)).map((id) => ({ kind: 'session', id })),
+      ...(this.webviewOrder || []).filter((id) => this.webviews?.has(id)).map((id) => ({ kind: 'webview', id })),
+    ];
+  },
+
+  _removeWebviewTab(id, completeSnapshot, allowFallback = true) {
+    const before = completeSnapshot === undefined ? this._flatTabRefs() : completeSnapshot;
+    const completeBefore = Array.isArray(before) ? before : [];
+    this._cancelPendingWebviewOpen(id);
     this.webviewOrder = (this.webviewOrder || []).filter((x) => x !== id);
     this._webviewFrameLru = (this._webviewFrameLru || []).filter((x) => x !== id);
     this._persistWebviewOrder();
@@ -553,15 +747,20 @@ Object.assign(CodemanApp.prototype, {
 
     if (this.activeWebviewId === id) {
       this.activeWebviewId = null;
-      const next = this.webviewOrder[0];
-      if (next) {
-        this.openWebview(next, { auto: true });
-      } else {
-        this._hideWebviewLayer();
-        // Fall back to whatever session was last shown, or the welcome screen.
-        if (this.activeSessionId) this._updateActiveTabImmediate(this.activeSessionId);
-        else this.showWelcome?.();
-      }
+      this._hideWebviewLayer();
+      if (!allowFallback) return;
+      const targetIndex = completeBefore.findIndex((ref) => ref.kind === 'webview' && ref.id === id);
+      const isRenderable = (ref) =>
+        ref.kind === 'session'
+          ? this.sessions?.has(ref.id)
+          : this.webviewOrder.includes(ref.id) && this.webviews?.has(ref.id);
+      const next =
+        completeBefore.slice(targetIndex + 1).find(isRenderable) ||
+        completeBefore.slice(0, Math.max(0, targetIndex)).reverse().find(isRenderable);
+      if (next?.kind === 'session') this.selectSession?.(next.id);
+      else if (next?.kind === 'webview') this.openWebview(next.id, { auto: true });
+      else if (this.activeSessionId) this._updateActiveTabImmediate(this.activeSessionId);
+      else this.showWelcome?.();
     }
   },
 
@@ -761,6 +960,8 @@ Object.assign(CodemanApp.prototype, {
       this.showToast?.('Could not delete URL', 'error');
       return false;
     }
+    this._webviewDeletedIds = this._webviewDeletedIds || new Set();
+    this._webviewDeletedIds.add(id);
     this._removeWebviewTab(id);
     this.webviews.delete(id);
     this.renderWebviewMenuItems();

@@ -91,6 +91,8 @@ const MOBILE_OVERVIEW_PILL_LABEL = {
   needs: 'needs you',
   error: 'error',
   waiting: 'waiting',
+  waiting_agents: 'AGENTS',
+  checking_agents: 'CHECKING',
   working: 'working',
   idle: 'idle',
   done: 'done',
@@ -106,6 +108,8 @@ const MOBILE_OVERVIEW_SINCE_LABEL = {
   waiting: 'waiting',
   error: 'failed',
   working: 'working',
+  waiting_agents: 'waiting',
+  checking_agents: 'checking',
   idle: 'idle',
   done: 'ended',
 };
@@ -129,11 +133,10 @@ Object.assign(CodemanApp.prototype, {
    */
   _mobileOverviewState(session, hooks) {
     if (hooks && (hooks.has('permission_prompt') || hooks.has('elicitation_dialog'))) return 'needs';
-    if (session.status === 'error') return 'error';
+    const state = window.CodemanSessionActivity?.resolve(session).overviewState || session.status || 'idle';
+    if (state === 'error') return 'error';
     if (hooks && hooks.has('idle_prompt')) return 'waiting';
-    if (session.status === 'busy') return 'working';
-    if (session.status === 'stopped') return 'done';
-    return 'idle';
+    return state;
   },
 
   /**
@@ -156,7 +159,13 @@ Object.assign(CodemanApp.prototype, {
    */
   _mobileOverviewSince(state, session) {
     const activeAt = Number(session.lastActivityAt) || 0;
-    const at = state === 'working' ? Number(session.lastSubmitAt) || activeAt : activeAt;
+    const agentAt = Number(session.activityStatusSince) || 0;
+    const at =
+      state === 'working'
+        ? Number(session.lastSubmitAt) || activeAt
+        : state === 'waiting_agents' || state === 'checking_agents'
+          ? agentAt || activeAt
+          : activeAt;
     if (!at) return null;
     return { key: MOBILE_OVERVIEW_SINCE_LABEL[state] || state, at };
   },
@@ -218,6 +227,7 @@ Object.assign(CodemanApp.prototype, {
    * @param {Map<string, object>|Array} input.sessions live sessions (this.sessions)
    * @param {Array} input.cases case list (this.cases)
    * @param {Array<string>} [input.sessionOrder] the user's tab order, used as the tiebreak
+   * @param {boolean} [input.layoutPending] suppress live rows until owner ordering is ready
    * @param {Map<string, Set<string>>} [input.pendingHooks] this.pendingHooks
    * @param {Array} [input.history] unified session items (GET /api/sessions/unified)
    * @returns {{needsYou: Array, current: Array, past: Array, sessionCount: number}}
@@ -226,12 +236,13 @@ Object.assign(CodemanApp.prototype, {
     const cases = Array.isArray(input && input.cases) ? input.cases : [];
     const order = Array.isArray(input && input.sessionOrder) ? input.sessionOrder : [];
     const pendingHooks = (input && input.pendingHooks) || new Map();
-    const raw = (input && input.sessions) || [];
+    const raw = input?.layoutPending ? [] : (input && input.sessions) || [];
     const sessions = typeof raw.values === 'function' ? Array.from(raw.values()) : Array.from(raw);
 
     const rows = sessions.map((session) => {
       const matched = this._mobileOverviewCaseFor(session.workingDir, cases);
       const state = this._mobileOverviewState(session, pendingHooks.get && pendingHooks.get(session.id));
+      const activity = window.CodemanSessionActivity?.resolve(session);
       const exit = this._mobileOverviewExit(state, session);
       const orderIndex = order.indexOf(session.id);
       return {
@@ -256,6 +267,7 @@ Object.assign(CodemanApp.prototype, {
         // pair resolved for DISPLAY, and the two must not drift apart.
         lastActivityAt: Number(session.lastActivityAt) || 0,
         lastSubmitAt: Number(session.lastSubmitAt) || 0,
+        activityStatusSince: Number(session.activityStatusSince) || 0,
         since: exit ? exit.since : this._mobileOverviewSince(state, session),
         orderIndex: orderIndex === -1 ? Number.MAX_SAFE_INTEGER : orderIndex,
       };
@@ -306,7 +318,7 @@ Object.assign(CodemanApp.prototype, {
 
     return {
       needsYou: inSection(['needs', 'error', 'waiting']),
-      current: inSection(['working', 'idle', 'done']),
+      current: inSection(['working', 'waiting_agents', 'checking_agents', 'idle', 'done']),
       past,
       sessionCount: rows.length,
     };
@@ -736,6 +748,11 @@ Object.assign(CodemanApp.prototype, {
     item.className = 'mobile-overview-row mobile-overview-row--' + display;
     item.dataset.moAction = 'session';
     item.dataset.moSession = row.id;
+    const underlying = window.CodemanSessionActivity?.resolve({ status: row.activityStatus || row.state });
+    const presentationStatus = underlying?.overviewState === row.state ? row.activityStatus || row.state : row.state;
+    item.dataset.activityStatus = presentationStatus;
+    const activity = window.CodemanSessionActivity?.resolve({ status: presentationStatus });
+    item.setAttribute('aria-label', `${row.name}, ${activity?.ariaPhrase || row.state}`);
 
     const dot = document.createElement('span');
     dot.className = 'mobile-overview-dot mobile-overview-dot--' + display;

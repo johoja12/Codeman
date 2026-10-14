@@ -82,6 +82,13 @@ function loadApp() {
   app._isExternalPreviewPath = () => false;
   app.showToast = vi.fn();
   app.filePreviewContent = '';
+  app._fetchFilePreviewMetadata = async () => ({ type: 'pdf', size: 10 });
+  app._renderFilePreviewBody = async () => {
+    body.innerHTML = '<iframe></iframe>';
+    return true;
+  };
+  app._startFilePreviewPolling = () => {};
+  app._loadFilePreviewNavigation = async () => {};
   return { app, body, overlay, detachBtn, windowStub };
 }
 

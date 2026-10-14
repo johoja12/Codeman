@@ -120,6 +120,57 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') _crashDiagBeacon();
 });
 
+// rAF heartbeat — counts animation frames so we can detect rAF starvation
+// (compositor stuck, GPU process unhealthy) where longtask observer is silent
+// because the main thread isn't busy, just waiting.
+let _rafHeartbeatCount = 0;
+let _rafHeartbeatLast = performance.now();
+const _rafHeartbeat = () => { _rafHeartbeatCount++; requestAnimationFrame(_rafHeartbeat); };
+// Guarded: test harnesses load app.js into a DOM that has no animation frames.
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(_rafHeartbeat);
+
+// Periodic state snapshot — runs in setInterval so it fires even when rAF is
+// starved or SSE handlers stop firing. Only logs when something looks wrong,
+// to avoid breadcrumb spam during normal operation.
+setInterval(() => {
+  try {
+    const now = performance.now();
+    const elapsed = now - _rafHeartbeatLast;
+    _rafHeartbeatLast = now;
+    const rafsPerSec = elapsed > 0 ? (_rafHeartbeatCount * 1000 / elapsed) : 0;
+    _rafHeartbeatCount = 0;
+
+    const app = window.app;
+    const queued = (app?.pendingWrites?.reduce((s, w) => s + (w?.length || 0), 0) || 0)
+      + (app?.flickerFilterBuffer?.length || 0);
+    const sseState = app?.eventSource?.readyState ?? -1; // 0=connecting 1=open 2=closed
+    const heapMB = performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : 0;
+    const vis = document.visibilityState[0]; // 'v' or 'h'
+    const sessions = app?.sessions?.size ?? 0;
+
+    // Log when abnormal:
+    //   rAF starvation while tab visible (< 10/s, normal is ~60)
+    //   render queue piling up (> 64KB)
+    //   SSE not OPEN
+    const abnormal =
+      (vis === 'v' && rafsPerSec < 10) ||
+      queued > 65536 ||
+      sseState !== 1;
+    // Throttle-floor heartbeat: log at most once per minute even when
+    // everything looks normal so we can prove the main thread is alive
+    // (helps distinguish true freezes from quiet operation).
+    if (!_heartbeatFloorLast) _heartbeatFloorLast = 0;
+    const sinceFloor = now - _heartbeatFloorLast;
+    if (abnormal || sinceFloor > 60000) {
+      _heartbeatFloorLast = now;
+      _crashDiag.log(
+        `HB raf=${rafsPerSec.toFixed(0)}/s q=${(queued/1024).toFixed(0)}KB sse=${sseState} h=${heapMB}MB ${vis} s=${sessions}`
+      );
+    }
+  } catch {}
+}, 1000);
+let _heartbeatFloorLast = 0;
+
 window.addEventListener('error', (e) => {
   _crashDiag.log(`ERROR: ${e.message} at ${e.filename}:${e.lineno}`);
   console.error('[CRASH-DIAG] Uncaught error:', e.message, '\n  File:', e.filename, ':', e.lineno, ':', e.colno, '\n  Stack:', e.error?.stack);
@@ -180,10 +231,12 @@ const _SSE_HANDLER_MAP = [
   [SSE_EVENTS.SESSION_DELETED, '_onSessionDeleted'],
   [SSE_EVENTS.SESSION_TERMINAL, '_onSSETerminal'],
   [SSE_EVENTS.SESSION_NEEDS_REFRESH, '_onSSENeedsRefresh'],
+  [SSE_EVENTS.SESSION_RESIZED, '_onSessionResized'],
   [SSE_EVENTS.SESSION_CLEAR_TERMINAL, '_onSSEClearTerminal'],
   [SSE_EVENTS.SESSION_COMPLETION, '_onSessionCompletion'],
   [SSE_EVENTS.SESSION_ERROR, '_onSessionError'],
   [SSE_EVENTS.SESSION_EXIT, '_onSessionExit'],
+  [SSE_EVENTS.SESSION_INTERACTIVE, '_onSessionInteractive'],
   [SSE_EVENTS.SESSION_IDLE, '_onSessionIdle'],
   [SSE_EVENTS.SESSION_WORKING, '_onSessionWorking'],
   [SSE_EVENTS.SESSION_AUTO_CLEAR, '_onSessionAutoClear'],
@@ -320,7 +373,8 @@ const _SSE_HANDLER_MAP = [
 
   // Session order (global tab order sync, COD-131)
   [SSE_EVENTS.SESSION_ORDER_CHANGED, '_onSessionOrderChanged'],
-  // Owner tab layout (grouped vertical rail)
+
+  // Owner tab layout (COD-306)
   [SSE_EVENTS.TAB_LAYOUT_CHANGED, '_onTabLayoutChanged'],
 
   // Web tabs (dashboard URLs)
@@ -373,7 +427,7 @@ function paneExitAriaLabel(name, label) {
 // the render loop so it can be exercised directly: this is the only path a
 // session going live-to-exited ever takes, since that transition adds and
 // removes no tab and so never reaches the full rebuild.
-function applyPaneExitBadge(tab, paneExit) {
+function applyPaneExitBadge(tab, paneExit, activityPhrase) {
   const label = paneExitLabel(paneExit);
   const existing = tab.querySelector('.tab-exited-badge');
   // Quiets the status dot too. That dot reports `status`, which stays `idle` or
@@ -387,7 +441,13 @@ function applyPaneExitBadge(tab, paneExit) {
   // and writing English back on every pass would have it translate again.
   const name = tab.querySelector('.tab-name')?.dataset?.fullName;
   if (name) {
-    const aria = paneExitAriaLabel(name, label);
+    // The effective agent activity (waiting on / checking background agents) rides
+    // the accessible name too, so a state change that rebuilds nothing is still heard.
+    // A child session's placement (COD-510) is part of the name the full render
+    // set; keep it when only the activity or the exit changes.
+    const placement = tab.dataset.placementDescription;
+    const base = paneExitAriaLabel(name, label) + (placement ? `, ${placement}` : '');
+    const aria = activityPhrase ? `${base}, ${activityPhrase}` : base;
     if (tab.dataset.ariaSource !== aria) {
       tab.dataset.ariaSource = aria;
       tab.setAttribute('aria-label', aria);
@@ -527,6 +587,7 @@ const DEFAULT_SHORTCUTS = [
       { modifiers: ['alt'], key: 'k', code: 'KeyK' },
     ],
     action: 'openCommandPalette',
+    paletteAgentModes: ['claude', 'codex', 'opencode'],
   },
   {
     id: 'toggle-session-sidebar',
@@ -674,8 +735,35 @@ const DEFAULT_SHORTCUTS = [
     label: 'Close Panels',
     displayBindings: ['Escape'],
   },
+  {
+    id: 'rename-tab',
+    group: 'Session',
+    label: 'Rename Tab',
+    bindings: [{ modifiers: [], key: 'F2', code: 'F2' }],
+    action: 'renameActiveTab',
+  },
 ];
 
+// Smart copy is dispatched by terminal-ui.js so Ctrl+C can still reach the PTY
+// when there is no selection. Keep it out of the generic document shortcut loop.
+// Registry actions this document-level loop must NOT run: smart copy (terminal-ui.js)
+// and the tile-grid chords, which tile-grid.js's tileShortcutFor()/runTileShortcut()
+// dispatch only where they apply (setting on, grid open), so outside the grid the
+// key still reaches the terminal.
+const NON_DOCUMENT_SHORTCUT_ACTIONS = new Set([
+  'copyTerminalSelection',
+  'focusTileDown',
+  'focusTileLeft',
+  'focusTileRight',
+  'focusTileUp',
+  'moveTileDown',
+  'moveTileLeft',
+  'moveTileRight',
+  'moveTileUp',
+  'removeTile',
+  'toggleTileGrid',
+  'zoomTile',
+]);
 
 // ═══════════════════════════════════════════════════════════════
 // CodemanApp Class — constructor and global state
@@ -720,6 +808,9 @@ class CodemanApp {
     this.tabLayout = null;
     this.collapsedTabGroupIds = new Set(); // per-device, localStorage-backed
     this._hiddenTabGroupByRef = new Map(); // 'session:<id>' -> collapsed group id
+    // COD-512: until the first layout read settles, the vertical rail is not
+    // painted, so a reload never flashes the flat order before the groups.
+    this._tabLayoutFirstPaintPending = true;
     this._lastTabGroupStructureKey = null;
     this._tabRailSearch = ''; // rail search box text: in memory only, never persisted
     this.cases = [];
@@ -744,6 +835,7 @@ class CodemanApp {
     this.terminal = null;
     this.fitAddon = null;
     this.activeSessionId = null;
+    this._responseViewerMarkdown = '';
 
     // ── Session detach / undock (beta) ───────────────────────────────────
     // A "solo window" is a popped-out browser window showing exactly one
@@ -765,6 +857,11 @@ class CodemanApp {
     this._detachOrphanStrikes = new Map(); // id -> consecutive unanswered roll-calls (redock at 2)
 
     this._initGeneration = 0;     // dedup concurrent handleInit calls
+    this._subagentEventClock = 0;
+    this._subagentEventVersions = new Map();
+    this._subagentClearGeneration = 0;
+    this._subagentPersistenceQueues = new Map();
+    this._subagentPersistenceGenerations = new Map();
     this._initFallbackTimer = null; // fallback timer if SSE init doesn't arrive
     this._selectGeneration = 0;   // cancel stale selectSession loads
     // Non-shell sessions whose full tmux scrollback has already been replayed this
@@ -798,6 +895,7 @@ class CodemanApp {
     this.respawnActionLogs = {};      // { sessionId: [action, action, ...] } (max 20)
     this.timerCountdownInterval = null; // Interval for updating countdown display
     this.terminalBuffers = new Map(); // Store terminal content per session
+    this._sessionsLoadedSincePageOpen = new Set(); // First load after browser reload gets full tmux scrollback
     this.editingSessionId = null; // Session being edited in options modal
     this.pendingCloseSessionId = null; // Session pending close confirmation
     this.muxSessions = []; // Screen sessions for process monitor
@@ -806,10 +904,12 @@ class CodemanApp {
     this.ralphStates = new Map(); // Map<sessionId, { loop, todos }>
 
     // Subagent (Claude Code background agent) tracking
-    this.subagents = new Map(); // Map<agentId, SubagentInfo>
-    this.subagentActivity = new Map(); // Map<agentId, activity[]> - recent tool calls/progress
-    this.subagentToolResults = new Map(); // Map<agentId, Map<toolUseId, result>> - tool results by toolUseId
-    this.activeSubagentId = null; // Currently selected subagent for detail view
+    this.subagents = new Map(); // Map<agentKey, SubagentInfo>
+    this.subagentActivity = new Map(); // Map<agentKey, activity[]> - recent tool calls/progress
+    this.subagentToolResults = new Map(); // Map<agentKey, Map<toolUseId, result>> - tool results by toolUseId
+    this.activeSubagentKey = null; // Currently selected opaque agentKey for detail view
+    this._subagentIdentityDiagnostics = new Set();
+    this._subagentCompletionTimers = new Map(); // Map<agentKey, timeout[]>
     this.subagentPanelVisible = false;
 
     // Ultracode / Workflow run visualization (master-detail tab)
@@ -822,12 +922,12 @@ class CodemanApp {
     this.ultracodeWindowsClosed = new Set(); // runIds the user explicitly dismissed (don't re-pop)
     this.ultracodeWindowCloseTimers = new Map(); // runId -> auto-close timeout
     this.ultracodeWindowZIndex = 1000;
-    this.subagentWindows = new Map(); // Map<agentId, { element, position }>
+    this.subagentWindows = new Map(); // Map<agentKey, { element, position }>
     this.subagentWindowZIndex = ZINDEX_SUBAGENT_BASE;
-    this.minimizedSubagents = new Map(); // Map<sessionId, Set<agentId>> - minimized to tab
+    this.minimizedSubagents = new Map(); // Map<sessionId, Set<agentKey>> - minimized to tab
     this._subagentHideTimeout = null; // Timeout for hover-based dropdown hide
 
-    // PERSISTENT parent associations - agentId -> sessionId
+    // PERSISTENT parent associations - agentKey -> sessionId
     // This is the SINGLE SOURCE OF TRUTH for which tab an agent window connects to.
     // Once set, never recalculated. Persisted to localStorage and server.
     this.subagentParentMap = new Map();
@@ -839,7 +939,7 @@ class CodemanApp {
 
     // Teammate tmux pane terminals (Agent Teams feature)
     this.teammatePanesByName = new Map(); // Map<name, { paneTarget, sessionId, color }>
-    this.teammateTerminals = new Map(); // Map<agentId, { terminal, fitAddon, paneTarget, sessionId, resizeObserver }>
+    this.teammateTerminals = new Map(); // Map<agentKey|paneWindowKey, terminal state>
 
     this.terminalBufferCache = new Map(); // Map<sessionId, string> — client-side cache for instant tab re-visits (max 20)
 
@@ -876,13 +976,18 @@ class CodemanApp {
     this.attachmentHistoryCounts = new Map(); // Map<sessionId, count>
     this.attachmentHistoryItems = [];
     this.attachmentHistoryDrawerOpen = false;
+    this.filePreviewZoom = 1;
 
     // File browser state (methods in panels-ui.js)
     this.fileBrowserData = null;
+    this.fileBrowserSessionId = null;
+    this.fileBrowserLoadGeneration = 0;
     this.fileBrowserExpandedDirs = new Set();
+    this.fileBrowserLoadedDirs = new Set();
     this.fileBrowserFilter = '';
     this.fileBrowserAllExpanded = false;
     this.fileBrowserDragListeners = null;
+    this.fileBrowserCurrentDir = '';
     // Show hidden (dot-prefixed) files and folders in the File Viewer tree.
     // Per-device, persisted to its own localStorage key by panels-ui.js. Safe to
     // call a mixin method here: instantiation is deferred to DOMContentLoaded,
@@ -915,7 +1020,10 @@ class CodemanApp {
     this._ws = null;            // WebSocket instance for active session
     this._wsSessionId = null;   // Session ID the WS is connected to
     this._wsReady = false;      // True when WS is open and ready for I/O
-    this._wsState = 'disconnected'; // connecting | connected | reconnecting | fallback | disconnected
+    this._wsState = 'disconnected'; // connecting | connected | reconnecting | fallback | gone | disconnected
+    this._wsGoneSessionId = null; // exact session named by authoritative 4004/4009 close
+    this._terminalGoneFinalizedSessionIds = new Set();
+    this._wsLastClose = null; // { code, reason, at } for transport diagnostics
     this._wsLastRecvAt = 0;     // ms timestamp of the last frame received on the active WS
     // Session whose socket dropped unintentionally, so output produced during
     // the outage is missing from its buffer. Output frames carry no sequence
@@ -924,6 +1032,10 @@ class CodemanApp {
 
     // Terminal write batching with DEC 2026 sync support
     this.pendingWrites = [];
+    this._pendingWriteAcceptanceEpochs = [];
+    this._pendingWritesMaxAcceptanceEpoch = 0;
+    this._terminalOutputAcceptanceEpoch = 0;
+    this._mobileImeCommitOwnership = null;
     this.writeFrameScheduled = false;
     // xterm.write() parses asynchronously. Keep at most one live-output chunk
     // inside xterm so its private WriteBuffer cannot bypass our 128KB cap.
@@ -933,6 +1045,7 @@ class CodemanApp {
     this.syncWaitTimeout = null; // Timeout for incomplete sync blocks
     this._isLoadingBuffer = false; // true during chunkedTerminalWrite — blocks live SSE writes
     this._loadBufferQueue = null;  // queued SSE events during buffer load
+    this._loadBufferQueueAcceptanceEpochs = null;
     this._bufferLoadSeq = 0;
     this._bufferLoadOwner = null;
     // Single-flight token for terminal buffer recovery. The identity check also
@@ -942,6 +1055,8 @@ class CodemanApp {
     // Flicker filter state (buffers output after screen clears)
     this.flickerFilterBuffer = '';
     this.flickerFilterActive = false;
+    this._flickerFilterEpochSegments = [];
+    this._flickerFilterMaxAcceptanceEpoch = 0;
     this.flickerFilterTimeout = null;
 
     // Render debounce timers (managed by _debouncedCall)
@@ -952,6 +1067,10 @@ class CodemanApp {
 
     // SSE reconnect timeout (to prevent orphaned timeouts)
     this.sseReconnectTimeout = null;
+    // EventSource does not always emit `error` when its initial request hangs.
+    // Bound each connection attempt so the usual backoff can recover it.
+    this._sseConnectTimeout = null;
+    this._sseConnectTimeoutMs = 15000;
 
     // SSE event listener cleanup function (to prevent listener accumulation on reconnect)
     this._sseListenerCleanup = null;
@@ -1038,6 +1157,39 @@ class CodemanApp {
     // Notification system
     this.notificationManager = new NotificationManager(this);
     this.idleTimers = new Map(); // Map<sessionId, timeout> for stuck detection
+    this._foreignResizeTimer = null; // COD-179 debounce for reconcile-after-foreign-resize
+    this._foreignResizeDirty = null; // sessionId dirtied by a foreign resize mid-turn (final reconcile on idle)
+    this._lastReconcileWrite = null; // {id, buf} of the last reconcile rewrite — unchanged capture = no-op tick
+    // COD-180: heal busy remote TUI tabs on a cadence (all guards live in the tick)
+    this._remoteReconcileInterval = setInterval(() => this._remoteReconcileTick(), REMOTE_RECONCILE_TICK_MS);
+    // ── COD-187 live mirror ──
+    // Codex/gemini tabs render only the current screen (scrollback 0); scroll-up
+    // opens a frozen history view fed from the canonical tmux capture.
+    this._viewMode = 'live'; // 'live' | 'history' — meaningful only for mirror sessions
+    this._historyLoadGen = 0; // aborts stale history fetches
+    this._historyInitialLoadGen = 0; // COD-291: generation whose first history buffer is still pending
+    this._historyMissedOutput = false; // live output arrived while frozen in history
+    this._lastMirrorFrame = null; // {id, buf} dedupe for _refreshMirrorFrame
+    this._historyExitAt = 0; // history re-entry cooldown timestamp
+    this._historyPartial = false; // COD-187 lazy load: history view holds only the last N lines
+    this._historyPrefetch = null; // COD-190 speculative prefetch {id, at, promise}
+    this._historyExpandInFlight = false;
+    this._historyEntryAccum = 0; // wheel-up accumulation toward history entry
+    this._historyEntryAccumAt = 0;
+    this._historyScrollFraction = 0; // fractional wheel rows accumulated while history owns xterm
+    // Cached setting flag (hot path) — read storage directly: the settings-ui
+    // mixin may not be attached yet at construct time. Default ON.
+    let liveMirror = true;
+    try {
+      const lmKey =
+        typeof MobileDetection !== 'undefined' && MobileDetection.getDeviceType() === 'mobile'
+          ? 'codeman-app-settings-mobile'
+          : 'codeman-app-settings';
+      liveMirror = JSON.parse(localStorage.getItem(lmKey) || '{}').liveMirrorEnabled !== false;
+    } catch {
+      /* default ON */
+    }
+    this._liveMirrorEnabled = liveMirror;
 
     // DOM element cache for performance (avoid repeated getElementById calls)
     this._elemCache = {};
@@ -1192,11 +1344,13 @@ class CodemanApp {
     this.restorePlanUsageChip();
     this.applySkin();
     this.applyLocalization();
-    // Calls applyTabWrapSettings() itself (it owns tabs-two-rows / tabs-show-folder)
-    // and then applies the sidebar variant on top — do not call both.
+    // applySessionListLayout() re-parents #sessionTabs and calls
+    // applyTabWrapSettings() itself; the COD-286 rail runs after it and yields
+    // whenever the sidebar layout is the active one (see applyTabOrientation).
     this.applySessionListLayout();
-    this.applyTabOrientation();
-    this.initTabRailResize?.();
+    this.applyTabOrientation();  // COD-286 — before the wrap pass: vertical disables it
+    this.initTabRailResize?.();  // COD-299 — apply device width before terminal creation
+    this.applyTabWrapSettings();
     this.applyMonitorVisibility();
     this.applyLineageLineSettings?.();
     this._installLineageStripScrollListener?.();
@@ -1215,6 +1369,7 @@ class CodemanApp {
     requestAnimationFrame(() => {
       this.initTerminal();
       this.loadFontSize();
+      this._initTerminalViewerActivity();
       this.connectSSE();
       // Only fetch state if SSE init event hasn't arrived within 3s (avoids duplicate handleInit)
       this._initFallbackTimer = setTimeout(() => {
@@ -1263,7 +1418,8 @@ class CodemanApp {
     // Setup online/offline detection
     this.setupOnlineDetection();
     // Load server-stored settings (async, re-applies visibility after load)
-    this.loadAppSettingsFromServer(settingsPromise).then(() => {
+    this._settingsSyncPromise = this.loadAppSettingsFromServer(settingsPromise).catch(() => {});
+    this._settingsSyncPromise.then(() => {
       this.applyHeaderVisibilitySettings();
       this.applySkin();
       this.applyLocalization();
@@ -1307,6 +1463,75 @@ class CodemanApp {
       console.log('[CRASH-DIAG] WebGL renderer enabled');
       this._installWebGLLongTaskGuard();
     } catch (_e) { /* WebGL2 unavailable — canvas renderer used */ }
+  }
+
+  _initTerminalViewerActivity() {
+    if (this._terminalViewerActivityPagehideHandler) {
+      window.removeEventListener('pagehide', this._terminalViewerActivityPagehideHandler);
+      this._terminalViewerActivityPagehideHandler = null;
+    }
+    this._terminalViewerActivity?.destroy();
+    const terminalTarget = document.getElementById('terminalContainer');
+    if (!terminalTarget || !window.CodemanTerminalViewerActivity) return;
+
+    const controller = window.CodemanTerminalViewerActivity.create({
+      documentTarget: document,
+      windowTarget: window,
+      terminalTarget,
+      isVisible: () => document.visibilityState === 'visible',
+      isFocused: () => document.hasFocus(),
+      activeSessionId: () => this.activeSessionId,
+      dimensions: () => {
+        // A capture/size ACK may have adopted another viewer's phone width.
+        // Explicit activation asks for this container, not that inherited grid.
+        const wanted = this.getTerminalDimensions?.();
+        const fitted = this.getFittedTerminalDimensions?.();
+        return wanted && fitted ? { ...wanted, viewportType: fitted.viewportType } : null;
+      },
+      transportIdentity: () => {
+        if (
+          !this._wsReady ||
+          this._wsSessionId !== this.activeSessionId ||
+          !this._ws ||
+          this._ws.readyState !== WebSocket.OPEN
+        ) return null;
+        return this._ws;
+      },
+      send: (frame) => {
+        if (
+          !this._wsReady ||
+          this._wsSessionId !== this.activeSessionId ||
+          !this._ws ||
+          this._ws?.readyState !== WebSocket.OPEN
+        ) return false;
+        try {
+          this._ws.send(JSON.stringify(frame));
+          // va claims ownership; the ordered resize gets the authoritative size
+          // ACK so a previously refused/adopted grid can widen on the first try.
+          this.sendResize?.(this.activeSessionId, { preserveFont: true })?.catch?.(() => {});
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      now: () =>
+        typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now(),
+    });
+    this._terminalViewerActivity = controller;
+
+    const pagehideHandler = (event) => {
+      if (event.persisted) return;
+      if (
+        this._terminalViewerActivity !== controller ||
+        this._terminalViewerActivityPagehideHandler !== pagehideHandler
+      ) return;
+      controller.destroy();
+      this._terminalViewerActivity = null;
+      window.removeEventListener('pagehide', pagehideHandler);
+      this._terminalViewerActivityPagehideHandler = null;
+    };
+    this._terminalViewerActivityPagehideHandler = pagehideHandler;
+    window.addEventListener('pagehide', pagehideHandler);
   }
 
   /**
@@ -1378,30 +1603,203 @@ class CodemanApp {
     } catch {}
   }
 
+  getShortcutRegistry() {
+    const settings = this.loadAppSettingsFromStorage?.() || {};
+    const shortcutOverrides = settings.shortcutOverrides || {};
+    return this.getDefaultShortcutRegistry().map((shortcut) => {
+      const override = shortcutOverrides[shortcut.id];
+      if (!override || typeof override !== 'object') return shortcut;
+      const next = { ...shortcut };
+      if (typeof override.disabled === 'boolean') next.disabled = override.disabled;
+      if (Array.isArray(override.bindings)) {
+        next.bindings = this.normalizeShortcutBindings(override.bindings);
+        delete next.displayBindings;
+      }
+      if (Array.isArray(override.paletteAgentModes)) {
+        const valid = ['claude', 'shell', 'opencode', 'codex', 'gemini', 'antigravity', 'pi'];
+        const filtered = override.paletteAgentModes.filter((m) => valid.includes(m));
+        if (filtered.length) next.paletteAgentModes = filtered;
+      }
+      return next;
+    });
+  }
+
+  getDefaultShortcutRegistry() {
+    return DEFAULT_SHORTCUTS.map((shortcut) => ({
+      ...shortcut,
+      bindings: shortcut.bindings ? shortcut.bindings.map((binding) => ({ ...binding, modifiers: [...(binding.modifiers || [])] })) : undefined,
+      displayBindings: shortcut.displayBindings ? [...shortcut.displayBindings] : undefined,
+      paletteAgentModes: shortcut.paletteAgentModes ? [...shortcut.paletteAgentModes] : undefined,
+    }));
+  }
+
+  getPaletteAgentModes() {
+    const registry = this.getShortcutRegistry?.() || [];
+    const palette = registry.find((s) => s.id === 'command-palette');
+    const modes = Array.isArray(palette?.paletteAgentModes) && palette.paletteAgentModes.length
+      ? palette.paletteAgentModes
+      : ['claude', 'codex', 'opencode'];
+    const valid = ['claude', 'shell', 'opencode', 'codex', 'gemini', 'antigravity', 'pi'];
+    return modes.filter((m) => valid.includes(m));
+  }
+
+  normalizeShortcutBindings(bindings) {
+    return bindings
+      .filter((binding) => binding && typeof binding === 'object')
+      .map((binding) => ({
+        key: typeof binding.key === 'string' ? binding.key : '',
+        code: typeof binding.code === 'string' ? binding.code : undefined,
+        modifiers: Array.isArray(binding.modifiers)
+          ? binding.modifiers.filter((modifier) => ['ctrl', 'meta', 'alt', 'shift'].includes(modifier))
+          : [],
+      }))
+      .filter((binding) => binding.key || binding.code);
+  }
+
+  matchesShortcutEvent(e, shortcut) {
+    if (!shortcut || shortcut.disabled || !Array.isArray(shortcut.bindings)) return false;
+    return shortcut.bindings.some((binding) => {
+      const modifiers = binding.modifiers || [];
+      const wantsPrimary = modifiers.includes('ctrl') || modifiers.includes('meta');
+      if (wantsPrimary !== !!(e.ctrlKey || e.metaKey)) return false;
+      if (modifiers.includes('shift') !== !!e.shiftKey) return false;
+      if (modifiers.includes('alt') !== !!e.altKey) return false;
+      if (binding.code && e.code === binding.code) return true;
+      return !!(
+        binding.key &&
+        typeof e.key === 'string' &&
+        e.key.toLowerCase() === String(binding.key).toLowerCase()
+      );
+    });
+  }
+
+  // A bare F1-F12 keydown that the registry may claim (F2 = Rename Tab, COD-450).
+  // Typing never produces a function key, so it cannot steal text; a focused
+  // text field keeps its own, while xterm's helper textarea is the terminal and
+  // does not count as one.
+  isFunctionKeyShortcut(e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return false;
+    if (!/^F([1-9]|1[0-2])$/.test(e.code || e.key || '')) return false;
+    const t = e.target;
+    if (t?.isContentEditable) return false;
+    const tag = String(t?.tagName || '').toUpperCase();
+    if (tag === 'TEXTAREA' && t.classList?.contains('xterm-helper-textarea')) return true;
+    return tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT';
+  }
+
+  // The registry entry the document capture handler should run for this keydown,
+  // or null. Every binding needs Ctrl/Cmd/Alt except a bare function key, so
+  // plain typing exits early without touching the registry.
+  documentShortcutFor(e) {
+    if (!e.ctrlKey && !e.metaKey && !e.altKey && !this.isFunctionKeyShortcut(e)) return null;
+    for (const shortcut of this.getShortcutRegistry()) {
+      // Smart copy (#211) is dispatched by shouldCopyTerminalSelectionFromShortcut()
+      // in terminal-ui.js, never from here: the caller preventDefaults on every
+      // match, so with no selection Ctrl+C would be swallowed and the user would
+      // lose the interrupt key. Upstream gets this by omitting the action from its
+      // SHORTCUT_ACTIONS map; we dispatch by method name, so the skip is explicit.
+      if (NON_DOCUMENT_SHORTCUT_ACTIONS.has(shortcut.action)) continue;
+      if (this.matchesShortcutEvent(e, shortcut)) return shortcut;
+    }
+    return null;
+  }
+
+  shortcutEventKey(e) {
+    const shiftedCodeKeys = {
+      Slash: '?',
+      Equal: '+',
+      BracketLeft: '{',
+      BracketRight: '}',
+    };
+    if (e.shiftKey && shiftedCodeKeys[e.code]) return shiftedCodeKeys[e.code];
+    return e.key || '';
+  }
+
+  runShortcutAction(shortcut) {
+    if (!shortcut?.action) return false;
+    if (shortcut.action === 'toggleVoiceInput') {
+      VoiceInput.toggle();
+      return true;
+    }
+    const fn = this[shortcut.action];
+    if (typeof fn !== 'function') return false;
+    fn.call(this);
+    return true;
+  }
+
+  formatShortcutBinding(binding) {
+    if (typeof binding === 'string') return binding;
+    const parts = [];
+    const modifiers = binding.modifiers || [];
+    if (modifiers.includes('ctrl')) parts.push('Ctrl');
+    if (modifiers.includes('meta')) parts.push('Cmd');
+    if (modifiers.includes('alt')) parts.push('Alt/Option');
+    if (modifiers.includes('shift')) parts.push('Shift');
+    const key = binding.key || binding.code || '';
+    parts.push(key.length === 1 && /[a-z]/.test(key) ? key.toUpperCase() : key);
+    return parts.filter(Boolean).join('+');
+  }
+
+  renderShortcutOverlay() {
+    const list = document.getElementById('shortcutOverlayList');
+    if (!list) return;
+    const groups = {};
+    for (const shortcut of this.getShortcutRegistry()) {
+      if (shortcut.disabled) continue;
+      const group = shortcut.group || 'General';
+      if (!groups[group]) groups[group] = [];
+      groups[group].push(shortcut);
+    }
+    const formatBindings = (s) => {
+      // An action with no key (Close Session by default) is still listed, so the
+      // overlay says so instead of showing an empty key column.
+      // Key names, never translated: "Home" is also a dictionary word (the Home
+      // button), so without the skip zh-CN showed the key as 主页.
+      if (s.displayBindings) return s.displayBindings.map((b) => `<kbd data-i18n-skip>${escapeHtml(b)}</kbd>`).join(' / ');
+      if (!s.bindings) return '';
+      if (s.bindings.length === 0) return '<span class="shortcut-overlay-unbound">not bound</span>';
+      return s.bindings
+        .map((binding) => `<kbd data-i18n-skip>${escapeHtml(this.formatShortcutBinding(binding))}</kbd>`)
+        .join(' / ');
+    };
+    list.innerHTML = Object.entries(groups)
+      .map(
+        ([group, shortcuts]) =>
+          `<div class="shortcut-overlay-group"><div class="shortcut-overlay-group-label">${escapeHtml(group)}</div>` +
+          shortcuts
+            .map(
+              (shortcut) =>
+                `<div class="shortcut-overlay-row"><span class="shortcut-overlay-label">${escapeHtml(shortcut.label)}</span><span class="shortcut-overlay-keys">${formatBindings(shortcut)}</span></div>`
+            )
+            .join('') +
+          '</div>'
+      )
+      .join('');
+  }
+
+  showShortcutOverlay() {
+    const modal = document.getElementById('shortcutOverlayModal');
+    if (!modal) return;
+    this.renderShortcutOverlay();
+    modal.classList.add('active');
+    this.activeFocusTrap = new FocusTrap(modal);
+    this.activeFocusTrap.activate();
+  }
+
+  closeShortcutOverlay() {
+    const modal = document.getElementById('shortcutOverlayModal');
+    if (modal) modal.classList.remove('active');
+    if (this.activeFocusTrap) {
+      this.activeFocusTrap.deactivate();
+      this.activeFocusTrap = null;
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════════
   // Event Listeners (Keyboard Shortcuts, Resize, Beforeunload)
   // ═══════════════════════════════════════════════════════════════
 
   setupEventListeners() {
-    // Action name → handler map for the shortcut registry (DEFAULT_SHORTCUTS +
-    // user overrides from settings.shortcutOverrides, merged by
-    // getShortcutRegistry()). The command palette chord is deliberately NOT in
-    // this map — shouldOpenCommandPaletteFromShortcut() dispatches it above with
-    // focus-target awareness (it must fire from the terminal but not from inputs).
-    const SHORTCUT_ACTIONS = {
-      showShortcutOverlay: () => this.showShortcutOverlay(),
-      killActiveSession: () => this.killActiveSession(),
-      nextSession: () => this.nextSession(),
-      clearTerminal: () => this.clearTerminal(),
-      restoreTerminalSize: () => this.restoreTerminalSize(),
-      increaseFontSize: () => this.increaseFontSize(),
-      decreaseFontSize: () => this.decreaseFontSize(),
-      toggleVoiceInput: () => VoiceInput.toggle(),
-      moveActiveTabLeft: () => this.moveActiveTabLeft(),
-      moveActiveTabRight: () => this.moveActiveTabRight(),
-      toggleSessionSidebar: () => this.toggleSessionSidebar(),
-    };
-
     // Use capture to handle before terminal
     document.addEventListener('keydown', (e) => {
       // A field that exists to show what a key does (Settings → Key tester, `data-raw-keys`) must
@@ -1412,6 +1810,7 @@ class CodemanApp {
 
       // Don't intercept keys during CJK IME composition
       if (e.isComposing || e.keyCode === 229) return;
+      if (this._capturingShortcutId || e.target?.classList?.contains('shortcut-binding-input')) return;
 
       if (this.shouldOpenCommandPaletteFromShortcut?.(e)) {
         e.preventDefault();
@@ -1419,7 +1818,7 @@ class CodemanApp {
         return;
       }
 
-      // Escape - close panels and modals (different logic: no preventDefault, no return)
+      // Escape - let the active group menu consume the key before closing unrelated UI.
       if (e.key === 'Escape') {
         // An open group menu (or a grouped-rail drag) owns this Escape: close
         // just that, not every panel behind it.
@@ -1444,8 +1843,16 @@ class CodemanApp {
           this.handleTabRailSearchKeydown(e);
           return;
         }
+        // The View Response overlay is a top-level layer: close it first and
+        // consume the key so ESC never reaches xterm/the CLI (where it has its own
+        // cancel semantics), then restore terminal focus. Explicit close (not a
+        // toggle) so a second Escape can't reopen it (COD-229). The file preview
+        // stacks above it (z 5100 vs 5000), so it gets the key first (COD-474).
+        if (this._maybeCloseFilePreviewOnEscape?.(e)) return;
+        if (this._maybeCloseResponseViewerOnEscape(e)) return;
         this.closeAllPanels();
         this.closeHelp();
+        this.closeShortcutOverlay();
         if (this.attachmentHistoryDrawerOpen) this.closeAttachmentHistory();
         this.closeSessionManager();
         this.closeCommandPalette?.();
@@ -1469,23 +1876,16 @@ class CodemanApp {
         const digitMatch = code.match(/^Digit([1-9])$/);
         if (digitMatch) {
           const idx = parseInt(digitMatch[1], 10) - 1;
-          // Sessions occupy 1..N and web tabs continue from N+1, matching the
-          // numbers actually painted on the tabs. Resolve through the same
-          // live-session projection the render paints: sessionOrder can
-          // transiently hold a dead id (delete raced against the order sync),
-          // and raw indexing then names the wrong tab for every key to its
-          // right, web tabs included.
-          const live = this.sessionOrder.filter((id) => this.sessions.has(id));
-          if (idx < live.length) {
+          // Focus rows first (COD-509), then sessions, then web tabs: the
+          // numbers actually painted on the tabs. Resolved through the live
+          // projection the render paints: sessionOrder can transiently hold a
+          // dead id (delete raced against the order sync), and raw indexing
+          // then names the wrong tab for every key to its right.
+          const target = this._tabAltRefs()[idx];
+          if (target) {
             e.preventDefault();
-            this.selectSession(live[idx]);
-          } else {
-            const webIdx = idx - live.length;
-            const webId = (this.webviewOrder || [])[webIdx];
-            if (webId) {
-              e.preventDefault();
-              this.openWebview(webId);
-            }
+            if (target.kind === 'session') this.selectSession(target.id);
+            else this.openWebview(target.id);
           }
           return;
         }
@@ -1511,19 +1911,11 @@ class CodemanApp {
       }
 
       // Match against the shortcut registry so user rebinds and per-shortcut
-      // disables (App Settings → Shortcuts) take effect. Every dispatchable
-      // binding requires Ctrl/Cmd/Alt (capture enforces the same), so plain
-      // typing exits early without touching the registry.
-      if (!e.ctrlKey && !e.metaKey && !e.altKey) return;
-      for (const shortcut of this.getShortcutRegistry()) {
-        if (shortcut.disabled || !shortcut.action) continue;
-        const action = SHORTCUT_ACTIONS[shortcut.action];
-        if (!action) continue;
-        if (this.matchesShortcutEvent(e, shortcut)) {
-          e.preventDefault();
-          action();
-          return;
-        }
+      // disables (App Settings → Shortcuts) take effect.
+      const shortcut = this.documentShortcutFor(e);
+      if (shortcut) {
+        e.preventDefault();
+        this.runShortcutAction(shortcut);
       }
     }, true); // Use capture phase to handle before terminal
 
@@ -1537,6 +1929,17 @@ class CodemanApp {
 
     // Color picker for session customization
     this.setupColorPicker();
+
+    window.addEventListener('resize', () => {
+      clearTimeout(this._tabOverflowResizeTimer);
+      this._tabOverflowResizeTimer = setTimeout(() => this.updateTabOverflowMode(), 80);
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) this._scheduleTerminalRepaint();
+    });
+
+    window.addEventListener('focus', () => this._scheduleTerminalRepaint());
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -1855,8 +2258,12 @@ class CodemanApp {
     // with the grid closed.
     if (on && this._tileGrid?.has(id)) this.removeTile(id, { gone: true });
     const container = this.$('sessionTabs');
-    const tab = container && container.querySelector(`.session-tab[data-id="${id}"]`);
-    if (tab) tab.classList.toggle('detached', on);
+    if (!container) return;
+    for (const tab of container.querySelectorAll(
+      `.session-tab[data-id="${CSS.escape(id)}"], .session-tab[data-focus-session-id="${CSS.escape(id)}"]`
+    )) {
+      tab.classList.toggle('detached', on);
+    }
   }
 
   /** Poll a window we opened; when it closes, re-dock its tab. This is the
@@ -2060,6 +2467,8 @@ class CodemanApp {
   }
 
   connectSSE() {
+    this._clearTimer('_sseConnectTimeout');
+
     // Check if browser is offline
     if (!navigator.onLine) {
       this.setConnectionStatus('offline');
@@ -2103,7 +2512,21 @@ class CodemanApp {
     const _sseParams = new URLSearchParams({ clientId: this._clientId });
     const _sseFilterId = this._sseFilterSessionId(this.activeSessionId);
     if (_sseFilterId) _sseParams.set('sessions', _sseFilterId);
-    this.eventSource = new EventSource(CodemanBase.url(`/api/events?${_sseParams.toString()}`));
+    const eventSource = new EventSource(CodemanBase.url(`/api/events?${_sseParams.toString()}`));
+    this.eventSource = eventSource;
+
+    // A pending EventSource request can remain in CONNECTING without firing
+    // `open` or `error` (for example after a mobile device resumes on a VPN).
+    // EventSource.OPEN protects the narrow race where the connection opened
+    // but its `open` callback has not run yet when this timer fires.
+    const connectTimeout = setTimeout(() => {
+      if (this._sseConnectTimeout !== connectTimeout) return;
+      this._sseConnectTimeout = null;
+      if (this.eventSource !== eventSource || eventSource.readyState === EventSource.OPEN) return;
+      console.warn(`[SSE] connection did not open within ${this._sseConnectTimeoutMs}ms, retrying`);
+      this._handleSseConnectionFailure(eventSource);
+    }, this._sseConnectTimeoutMs);
+    this._sseConnectTimeout = connectTimeout;
 
     // Store all event listeners for cleanup on reconnect.
     //
@@ -2117,21 +2540,20 @@ class CodemanApp {
         this._sseLastMessageAt = Date.now();
         handler(e);
       };
-      this.eventSource.addEventListener(event, stamped);
+      eventSource.addEventListener(event, stamped);
       listeners.push({ event, handler: stamped });
     };
 
     // Create cleanup function to remove all listeners
     this._sseListenerCleanup = () => {
       for (const { event, handler } of listeners) {
-        if (this.eventSource) {
-          this.eventSource.removeEventListener(event, handler);
-        }
+        eventSource.removeEventListener(event, handler);
       }
       listeners.length = 0;
     };
 
-    this.eventSource.onopen = () => {
+    eventSource.onopen = () => {
+      this._clearTimer('_sseConnectTimeout');
       this.reconnectAttempts = 0;
       // Start the liveness clock here, not at the first frame: the watchdog
       // only ever fires while the status is 'connected', and this is the
@@ -2139,31 +2561,7 @@ class CodemanApp {
       this._sseLastMessageAt = Date.now();
       this.setConnectionStatus('connected');
     };
-    this.eventSource.onerror = () => {
-      this.reconnectAttempts++;
-      if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-        this.setConnectionStatus('disconnected');
-      } else {
-        this.setConnectionStatus('reconnecting');
-      }
-      // Close the failed connection before scheduling reconnect
-      if (this.eventSource) {
-        this.eventSource.close();
-        this.eventSource = null;
-      }
-      // Clear any existing reconnect timeout before setting new one (prevents orphaned timeouts)
-      this._clearTimer('sseReconnectTimeout');
-      // Exponential backoff: 200ms, 500ms, 1s, 2s, 4s, ... up to 30s
-      // Fast first retry (200ms) for server-restart case (COM deploy),
-      // then ramp up for real network issues.
-      const delay = this.reconnectAttempts <= 1 ? 200
-        : Math.min(500 * Math.pow(2, this.reconnectAttempts - 2), 30000);
-      // Feeds the "Retrying in Ns" countdown. With a 30s cap on the backoff, a
-      // silent wait that long is indistinguishable from a hung app.
-      this._nextSseRetryAt = Date.now() + delay;
-      this._updateConnectionLossUi();
-      this.sseReconnectTimeout = setTimeout(() => this.connectSSE(), delay);
-    };
+    eventSource.onerror = () => this._handleSseConnectionFailure(eventSource);
 
     // Create stable handler wrappers once (reused across reconnects so
     // removeEventListener always matches the original reference)
@@ -2198,11 +2596,8 @@ class CodemanApp {
     // visible welcome list) on session structural changes. Extra listeners on the
     // same EventSource — EventSource supports multiple listeners per event — so the
     // existing handlers above are untouched. Registered through addListener so they
-    // are torn down with the rest on reconnect. Only structural events (created /
-    // deleted) trigger a refetch: session:updated is batch-broadcast every ~500ms
-    // per active session, which would otherwise turn an open modal / visible welcome
-    // list into a sustained ~1 Hz full ~/.claude/projects rescan loop.
-    for (const event of [SSE_EVENTS.SESSION_CREATED, SSE_EVENTS.SESSION_DELETED]) {
+    // are torn down with the rest on reconnect.
+    for (const event of [SSE_EVENTS.SESSION_CREATED, SSE_EVENTS.SESSION_UPDATED, SSE_EVENTS.SESSION_DELETED]) {
       addListener(event, () => this._onSessionListMaybeChanged());
     }
 
@@ -2312,6 +2707,29 @@ class CodemanApp {
       this._onSessionListMaybeChanged();
     });
 
+    // COD-124: session:parked / session:resumed carry only {id} — the new
+    // status lives locally, mirroring the session-park/resume-session flow
+    // in terminal-ui.js, so rows update live without a reload.
+    addListener(SSE_EVENTS.SESSION_PARKED, (e) => {
+      let data = null;
+      try {
+        data = JSON.parse(e.data);
+      } catch {
+        /* ignore malformed payload */
+      }
+      this._onSessionParked(data);
+    });
+
+    addListener(SSE_EVENTS.SESSION_RESUMED, (e) => {
+      let data = null;
+      try {
+        data = JSON.parse(e.data);
+      } catch {
+        /* ignore malformed payload */
+      }
+      this._onSessionResumed(data);
+    });
+
     // Liveness heartbeat. The handler is deliberately empty: the whole point
     // is the stamp inherited from addListener's wrapper. It still has to be
     // REGISTERED: EventSource only dispatches named events that have a
@@ -2324,6 +2742,36 @@ class CodemanApp {
     // ourselves. 5s granularity against a 45s threshold: cheap, and it keeps
     // the worst-case detection lag well under a heartbeat interval.
     this._sseStaleWatchdog = setInterval(() => this._checkSseStale(), 5000);
+  }
+
+  /** Close a failed SSE attempt and schedule the normal exponential retry. */
+  _handleSseConnectionFailure(eventSource) {
+    // A delayed error/timeout from an old EventSource must not close or reschedule
+    // the newer connection that replaced it.
+    if (this.eventSource !== eventSource) return;
+    this._clearTimer('_sseConnectTimeout');
+    this.reconnectAttempts++;
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      this.setConnectionStatus('disconnected');
+    } else {
+      this.setConnectionStatus('reconnecting');
+    }
+
+    // Close the failed connection before scheduling reconnect.
+    this.eventSource = null;
+    eventSource.close();
+    // Clear any existing reconnect timeout before setting new one (prevents orphaned timeouts).
+    this._clearTimer('sseReconnectTimeout');
+    // Exponential backoff: 200ms, 500ms, 1s, 2s, 4s, ... up to 30s.
+    // Fast first retry (200ms) for server-restart case (COM deploy), then ramp
+    // up for real network issues.
+    const delay = this.reconnectAttempts <= 1 ? 200
+      : Math.min(500 * Math.pow(2, this.reconnectAttempts - 2), 30000);
+    // Feeds the "Retrying in Ns" countdown. With a 30s cap on the backoff, a
+    // silent wait that long is indistinguishable from a hung app.
+    this._nextSseRetryAt = Date.now() + delay;
+    this._updateConnectionLossUi();
+    this.sseReconnectTimeout = setTimeout(() => this.connectSSE(), delay);
   }
 
   /**
@@ -2373,10 +2821,165 @@ class CodemanApp {
     this._ensureHostWakePoller?.();
   }
 
+  /**
+   * Merge one server activity event into the cached session without deriving a
+   * new raw status from the presentation-only waiting/checking states. This is
+   * the single browser transition path for snapshots and incremental events.
+   */
+  _applySessionActivityEvent(data, transition = 'updated', refresh = true) {
+    const incoming = data?.session || data;
+    if (!incoming?.id) return null;
+
+    let session = this.sessions.get(incoming.id);
+    const existed = !!session;
+    if (
+      !session &&
+      transition !== 'created' &&
+      transition !== 'hydrate' &&
+      !(transition === 'updated' && this._isFullSessionSnapshot(incoming))
+    ) {
+      return null;
+    }
+    if (!session) session = { id: incoming.id };
+    const previousStatus = session.status;
+    const previousActivityStatus = session.activityStatus;
+    const previousActivityStatusSince = session.activityStatusSince;
+
+    const activityOnlyUpdate =
+      transition === 'updated' &&
+      Object.keys(incoming).every((key) => key === 'id' || key === 'activityStatus' || key === 'activityStatusSince');
+    if (transition === 'updated' && existed && !activityOnlyUpdate) session = { id: incoming.id };
+
+    if (transition === 'created' || transition === 'hydrate' || transition === 'updated') {
+      Object.assign(session, incoming);
+    } else {
+      for (const key of ['status', 'activityStatus', 'activityStatusSince']) {
+        if (Object.prototype.hasOwnProperty.call(incoming, key)) session[key] = incoming[key];
+      }
+    }
+
+    const hasStatus = Object.prototype.hasOwnProperty.call(incoming, 'status');
+    const hasActivityStatus = Object.prototype.hasOwnProperty.call(incoming, 'activityStatus');
+    const hasActivitySince = Object.prototype.hasOwnProperty.call(incoming, 'activityStatusSince');
+    const clearsDerived = ['working', 'output', 'restart', 'parked', 'resumed', 'exit'].includes(transition);
+
+    if (clearsDerived) {
+      if (!hasStatus) {
+        if (transition === 'working' || transition === 'restart') session.status = 'busy';
+        else if (transition === 'parked') session.status = 'parked';
+        else if (transition === 'resumed') session.status = 'active';
+        else if (transition === 'exit') session.status = 'stopped';
+      }
+      session.activityStatus = session.status;
+      session.activityStatusSince = null;
+    } else if (transition === 'idle') {
+      const isAgentWait = incoming.activityStatus === 'waiting_agents' || incoming.activityStatus === 'checking_agents';
+      if (!hasStatus && !isAgentWait) session.status = 'idle';
+      if (!hasActivityStatus) {
+        delete session.activityStatus;
+        delete session.activityStatusSince;
+      } else if (!hasActivitySince) {
+        session.activityStatusSince = null;
+      }
+    } else if (!hasActivityStatus && (transition === 'created' || transition === 'hydrate' || hasStatus)) {
+      // A legacy/full snapshot without derived fields replaces older client
+      // state; it must not leave a waiting claim from the previous connection.
+      delete session.activityStatus;
+      delete session.activityStatusSince;
+    } else if (hasActivityStatus && !hasActivitySince) {
+      session.activityStatusSince = null;
+    }
+
+    this.sessions.set(incoming.id, session);
+
+    const effectiveStatus = session.activityStatus || session.status;
+    const timer = this.idleTimers?.get(incoming.id);
+    if (
+      effectiveStatus === 'waiting_agents' ||
+      effectiveStatus === 'checking_agents' ||
+      transition === 'working' ||
+      transition === 'output' ||
+      transition === 'restart' ||
+      transition === 'parked' ||
+      transition === 'resumed' ||
+      transition === 'exit'
+    ) {
+      if (timer) clearTimeout(timer);
+      this.idleTimers?.delete(incoming.id);
+    } else if (transition === 'idle' && effectiveStatus === 'idle' && !timer && !this.respawnStatus?.[incoming.id]?.enabled) {
+      const threshold = this.notificationManager?.preferences?.stuckThresholdMs || 600000;
+      this.idleTimers?.set(
+        incoming.id,
+        setTimeout(() => {
+          this._notifySession(
+            incoming.id,
+            'warning',
+            'session-stuck',
+            'Session Idle',
+            `Idle for ${Math.round(threshold / 60000)}+ minutes`
+          );
+          this.idleTimers.delete(incoming.id);
+        }, threshold)
+      );
+    }
+
+    const activityChanged =
+      !existed ||
+      previousStatus !== session.status ||
+      previousActivityStatus !== session.activityStatus ||
+      previousActivityStatusSince !== session.activityStatusSince;
+    if (refresh && (activityChanged || transition === 'created' || transition === 'updated')) {
+      this._refreshSessionActivitySurfaces();
+    }
+    return session;
+  }
+
+  _refreshSessionActivitySurfaces() {
+    this.renderSessionTabs();
+    this.renderMuxSessions?.();
+  }
+
+  _isFullSessionSnapshot(session) {
+    return (
+      !!session &&
+      Object.prototype.hasOwnProperty.call(session, 'pid') &&
+      typeof session.status === 'string' &&
+      typeof session.workingDir === 'string' &&
+      Object.prototype.hasOwnProperty.call(session, 'currentTaskId') &&
+      Number.isFinite(session.createdAt) &&
+      Number.isFinite(session.lastActivityAt)
+    );
+  }
+
+  _onSessionParked(data) {
+    const session = data?.id ? this._applySessionActivityEvent(data, 'parked') : null;
+    this._onSessionListMaybeChanged?.();
+    return session;
+  }
+
+  _onSessionResumed(data) {
+    const session = data?.id ? this._applySessionActivityEvent(data, 'resumed') : null;
+    if (data?.id) this._clearTerminalSessionGoneForRestart(data.id);
+    this._onSessionListMaybeChanged?.();
+    return session;
+  }
+
+  _onSessionInteractive(data) {
+    const session = data?.id ? this._applySessionActivityEvent(data, 'restart') : null;
+    if (data?.id) this._clearTerminalSessionGoneForRestart(data.id);
+    return session;
+  }
+
+  _onSessionRestarted(data) {
+    if (data?.id) this._applySessionActivityEvent(data, 'restart');
+  }
+
   _onSessionCreated(data) {
     // A session this tab is closing stays closed until the server answers.
     if (this._closingSessions?.has(data.id)) return;
-    this.sessions.set(data.id, data);
+    this._applySessionActivityEvent(data, 'created', false);
+    this.updateAttachmentHistoryCountFromSession?.(data);
+    // Add new session to end of tab order
     if (!this.sessionOrder.includes(data.id)) {
       // The server placed it when it recorded the creation (a child after its
       // parent, a grouped creation in its group) and broadcast that order
@@ -2394,7 +2997,7 @@ class CodemanApp {
     // A spawned session's lineage arc draws in with the tab. Keyed the same way
     // session-lineage.js tags its paths; a no-op unless a line-entrance theme is on.
     if (data.parentSessionId) this.markConnectionLineEntering?.('lineage:' + data.id);
-    this.renderSessionTabs();
+    this._refreshSessionActivitySurfaces();
     this.updateCost();
     // Start stats polling when first session appears
     if (this.sessions.size === 1) this.startSystemStatsPolling();
@@ -2402,14 +3005,15 @@ class CodemanApp {
   }
 
   _onSessionUpdated(data) {
-    const session = data.session || data;
+    const incoming = data.session || data;
     // A session this tab is closing stays closed until the server answers
     // (closeSession() puts it back if the delete is refused).
-    if (this._closingSessions?.has(session.id)) return;
-    const oldSession = this.sessions.get(session.id);
-    const claudeSessionIdJustSet = session.claudeSessionId && (!oldSession || !oldSession.claudeSessionId);
-    this.sessions.set(session.id, session);
-    this.renderSessionTabs();
+    if (this._closingSessions?.has(incoming.id)) return;
+    const oldSession = this.sessions.get(incoming.id);
+    const claudeSessionIdJustSet = incoming.claudeSessionId && (!oldSession || !oldSession.claudeSessionId);
+    const session = this._applySessionActivityEvent(incoming, 'updated');
+    if (!session) return;
+    this.updateAttachmentHistoryCountFromSession?.(session);
     this.updateCost();
     // Update tokens display if this is the active session
     if (session.id === this.activeSessionId && session.tokens) {
@@ -2451,6 +3055,9 @@ class CodemanApp {
       this.showWelcome();
     }
     this.renderSessionTabs();
+    // COD-97: re-render the Monitor so the closed session's row disappears
+    // immediately, instead of relying solely on a MUX_KILLED event that may race.
+    this.renderMuxSessions?.();
     this.renderRalphStatePanel();  // Update ralph panel after session deleted
     this.renderProjectInsightsPanel();  // Update project insights panel after session deleted
     // Stop stats polling when no sessions remain
@@ -2515,16 +3122,32 @@ class CodemanApp {
    * @returns {{flushQueued: boolean, since: number}} Options for `_finishBufferLoad`.
    */
   _bufferLoadFinishOpts(payload, headersReceivedAt) {
-    const capturedFromMux = payload?.source === 'mux-visible' || payload?.source === 'mux-full-history';
+    const capturedFromMux = payload?.source === 'mux-visible' || payload?.source === 'mux-full-history' || payload?.source === 'mux-frame';
     return { flushQueued: capturedFromMux, since: headersReceivedAt };
   }
 
   _onSessionTerminal(data) {
+    // Terminal output invalidates any older waiting/checking projection even
+    // when this tab is not active and therefore has no renderer work below.
+    this._applySessionActivityEvent(data, 'output');
     // Tile grid open: the main terminal is parked and its socket closed, so the
     // SSE fallback would write the focused tile's output into a hidden xterm.
     // The tiles carry their own output over their own sockets.
     if (this._tilesOwnTerminal?.()) return;
     if (data.id === this.activeSessionId) {
+      // COD-187: while frozen in the history view, live output is dropped —
+      // the exit-time frame refetch shows the final state. Flag it so the
+      // pill can advertise "new output below".
+      if (this._viewMode === 'history' && this._isMirrorSession(data.id)) {
+        if (!this._historyMissedOutput) {
+          this._historyMissedOutput = true;
+          this._updateHistoryPill?.();
+        }
+        return;
+      }
+      // A streamed redraw means the last captured frame no longer describes
+      // the rendered screen; the next reconcile must be allowed to repaint it.
+      if (this._isMirrorSession(data.id)) this._lastMirrorFrame = null;
       if (data.data.length > 32768) _crashDiag.log(`TERMINAL: ${(data.data.length/1024).toFixed(0)}KB`);
 
       // Hard cap all app-owned render queues plus the one xterm chunk currently
@@ -2609,7 +3232,18 @@ class CodemanApp {
   // Response Viewer — native-scroll panel for reading full Claude responses
   // ═══════════════════════════════════════════════════════════════
 
-  /** Strip dangerous elements and attributes from HTML (XSS prevention) */
+  /**
+   * Sanitize markdown-rendered HTML before innerHTML assignment (XSS / mXSS prevention).
+   *
+   * COD-56: delegates to DOMPurify (Cure53) via sanitize-html.js — an allowlist sanitizer that
+   * is the industry standard for mXSS defense. It replaces the previous hand-rolled DENYLIST,
+   * which never stripped `svg`/`math` (foreign-namespace mXSS vectors) or `style` (CSS-based
+   * vectors) and admitted any tag/attr it didn't explicitly name. The allowlist config lives in
+   * sanitize-html.js and permits only what markdown rendering produces.
+   *
+   * Fallback: if DOMPurify failed to load, fail CLOSED by escaping the entire string into a
+   * single text node rather than serving the raw (unsanitized) HTML.
+   */
   _sanitizeHtml(html) {
     if (typeof window !== 'undefined' && typeof window.sanitizeMarkdownHtml === 'function') {
       return window.sanitizeMarkdownHtml(html);
@@ -2698,15 +3332,32 @@ class CodemanApp {
       return `__CODEMAN_FENCE_${placeholders.length - 1}__`;
     });
 
-    // Split on blank-line paragraph boundaries; wrap any paragraph containing
-    // box-drawing/arrow chars in its own fenced block.
+    const looksLikeAsciiArtBlock = (chunk) => {
+      const lines = chunk.split('\n').filter((line) => line.trim());
+      if (lines.length === 0) return false;
+      if (lines.every((line) => /^[-*+]\s|^\d+[.)]\s/.test(line.trim()))) return false;
+      const boxLines = lines.filter((line) => BOX_PATTERN.test(line));
+      if (boxLines.length === 0) return false;
+      // Inline mentions such as "separator lines like ─────" are prose, not diagrams.
+      // Treat a chunk as ASCII art only when multiple lines carry box glyphs,
+      // or when a single non-empty line is predominantly box-drawing content.
+      if (boxLines.length >= 2) return true;
+      const onlyLine = boxLines[0];
+      const nonSpace = onlyLine.replace(/\s+/g, '');
+      const boxChars = (nonSpace.match(/[─-╿▀-▟]/g) || []).length;
+      return nonSpace.length >= 16 && boxChars / nonSpace.length >= 0.45;
+    };
+
+    // Split on blank-line paragraph boundaries; wrap actual box-drawing blocks
+    // in fenced code, but leave ordinary prose that merely mentions those glyphs
+    // alone so response text stays proportional and copy-friendly.
     const processed = masked
       .split(/(\n{2,})/)
       .map((chunk) => {
         if (/^\n{2,}$/.test(chunk)) return chunk; // keep separators
         if (!chunk.trim()) return chunk;
         if (chunk.includes('__CODEMAN_FENCE_')) return chunk;
-        if (BOX_PATTERN.test(chunk)) return '\n```\n' + chunk + '\n```\n';
+        if (looksLikeAsciiArtBlock(chunk)) return '\n```\n' + chunk + '\n```\n';
         return chunk;
       })
       .join('');
@@ -2776,6 +3427,31 @@ class CodemanApp {
           wrap.appendChild(actions);
           wrap.appendChild(pre);
         });
+        // COD-263: quote/comment blocks get the SAME one-click copy affordance as
+        // code blocks. Only TOP-LEVEL blockquotes are wrapped — a nested quote
+        // would otherwise sprout a second button inside its parent's copy region,
+        // and copying the outer block already includes the inner text.
+        tmpl.content.querySelectorAll('blockquote').forEach((bq) => {
+          if (bq.parentElement?.closest('blockquote')) return;
+
+          const wrap = document.createElement('div');
+          wrap.className = 'rv-quote-wrap';
+
+          const actions = document.createElement('div');
+          actions.className = 'rv-code-actions';
+
+          const copyBtn = document.createElement('button');
+          copyBtn.className = 'rv-copy-btn';
+          copyBtn.type = 'button';
+          copyBtn.setAttribute('aria-label', 'Copy quote');
+          copyBtn.setAttribute('title', 'Copy quote');
+          actions.appendChild(copyBtn);
+
+          bq.parentNode.insertBefore(wrap, bq);
+          wrap.appendChild(actions);
+          wrap.appendChild(bq);
+        });
+
         // Links open in a NEW tab.
         //
         // marked emits a bare `<a href>` and the sanitizer's allowlist has no
@@ -2807,16 +3483,118 @@ class CodemanApp {
   }
 
   /**
+   * Resolve an explicit response-viewer link to a safe workspace-relative preview path.
+   * The server remains the authoritative filesystem-containment boundary.
+   */
+  _resolveResponseViewerPreviewPath(rawHref, workingDir) {
+    if (!rawHref || String(rawHref).length > 3000) return null;
+
+    let candidate;
+    try {
+      candidate = decodeURIComponent(String(rawHref));
+    } catch {
+      return null;
+    }
+
+    if (
+      !candidate ||
+      candidate.length > 1000 ||
+      candidate.includes('\\') ||
+      candidate.includes('?') ||
+      candidate.includes('#') ||
+      /[\x00-\x1f\x7f]/.test(candidate) ||
+      /^[a-z][a-z0-9+.-]*:/i.test(candidate)
+    ) {
+      return null;
+    }
+
+    const previewExtensions = new Set([
+      'pdf',
+      'md',
+      'txt',
+      'png',
+      'jpg',
+      'jpeg',
+      'gif',
+      'webp',
+      'docx',
+      'pptx',
+      'xlsx',
+      'json',
+      'yaml',
+      'yml',
+      'csv',
+      'xml',
+      'sh',
+      'py',
+      'ts',
+      'js',
+    ]);
+    const extension = candidate.slice(candidate.lastIndexOf('.') + 1).toLowerCase();
+    if (!previewExtensions.has(extension)) return null;
+
+    const normalizePath = (filePath, absolute) => {
+      if (absolute && filePath === '/') return '/';
+      const normalized = [];
+      for (const [index, part] of filePath.split('/').entries()) {
+        if (!part) {
+          if (absolute && index === 0) continue;
+          return null;
+        }
+        if (part === '.') continue;
+        if (part === '..') return null;
+        normalized.push(part);
+      }
+      if (!normalized.length) return null;
+      return `${absolute ? '/' : ''}${normalized.join('/')}`;
+    };
+
+    if (!candidate.startsWith('/')) return normalizePath(candidate, false);
+
+    const normalizedCandidate = normalizePath(candidate, true);
+    const rawWorkingDir = String(workingDir || '');
+    const normalizedWorkingDir = normalizePath(
+      rawWorkingDir === '/' ? rawWorkingDir : rawWorkingDir.replace(/\/+$/, ''),
+      true
+    );
+    if (!normalizedCandidate || !normalizedWorkingDir) return null;
+    const workspacePrefix = normalizedWorkingDir === '/' ? '/' : `${normalizedWorkingDir}/`;
+    return normalizedCandidate.startsWith(workspacePrefix)
+      ? normalizedCandidate.slice(workspacePrefix.length)
+      : null;
+  }
+
+  /**
    * Bind click handlers inside the response viewer body. Uses event delegation
    * so a single listener serves every diagram-toggle button, including those
    * added when the conversation is reloaded. Idempotent via a dataset flag.
    */
-  _bindResponseViewerInteractions(body) {
-    if (!body || body.dataset.rvBound === '1') return;
+  _bindResponseViewerInteractions(body, responseSessionId = null) {
+    if (!body) return;
+    if (responseSessionId) body.dataset.rvSessionId = responseSessionId;
+    if (body.dataset.rvBound === '1') return;
     body.dataset.rvBound = '1';
     body.addEventListener('click', async (ev) => {
-      // File path (_linkifyFilePaths): open it in the preview overlay, which
-      // resolves workspace and out-of-workspace paths alike.
+      const messageCopyBtn = ev.target.closest('.rv-message-copy');
+      if (messageCopyBtn) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const message = messageCopyBtn.closest('.rv-message');
+        const source = message?.querySelector('.rv-text');
+        await this._copyResponseViewerPayload(this._prepareResponseViewerClipboard(source), {
+          controlEl: messageCopyBtn,
+          successMessage: 'Copied section as rich text',
+          fallbackMessage: 'Rich clipboard unavailable; copied section as plain text',
+          emptyMessage: 'No section content to copy',
+          failureMessage: 'Failed to copy section',
+        });
+        return;
+      }
+
+      // File path (_linkifyFilePaths): open it in the preview overlay. An
+      // out-of-workspace path has to be registered as an attachment first —
+      // the workspace-confined routes can only 404 on it — which is exactly
+      // what openExternalPathPreview does before previewing by id.
       const pathLink = ev.target.closest('a.rv-path');
       if (pathLink) {
         ev.preventDefault();
@@ -2830,6 +3608,7 @@ class CodemanApp {
         const sessionId = pathLink.dataset.sessionId || this.activeSessionId;
         const target = pathLink.dataset.linkified ? this._resolveLinkedFilePath?.(filePath, sessionId) : filePath;
         if (filePath && pathLink.dataset.folder) this.openFolderGrid(target || filePath, sessionId);
+        else if (filePath && this._isExternalPreviewPath?.(target || filePath, sessionId)) this.openExternalPathPreview(target || filePath, sessionId)?.catch?.((err) => console.error('External path preview failed:', err));
         else if (filePath) this.openFilePreview(target || filePath, sessionId);
         return;
       }
@@ -2861,13 +3640,16 @@ class CodemanApp {
         return;
       }
 
-      // One-click copy: lift the raw source from the sibling <pre><code>.
+      // One-click copy: lift the raw source from the sibling <pre><code>, or —
+      // COD-263 — the rendered text of the sibling <blockquote>.
       const copyBtn = ev.target.closest('.rv-copy-btn');
       if (copyBtn) {
         ev.preventDefault();
         ev.stopPropagation();
         const code = copyBtn.closest('.rv-code-wrap')?.querySelector('pre code');
-        const ok = code ? await this._copyText(code.textContent || '') : false;
+        const quote = copyBtn.closest('.rv-quote-wrap')?.querySelector('blockquote');
+        const text = code ? code.textContent || '' : quote ? this._quoteBlockText(quote) : null;
+        const ok = text !== null ? await this._copyText(text) : false;
         copyBtn.classList.remove('rv-copied', 'rv-copy-failed');
         copyBtn.classList.add(ok ? 'rv-copied' : 'rv-copy-failed');
         clearTimeout(copyBtn._resetTimer);
@@ -2875,6 +3657,22 @@ class CodemanApp {
           copyBtn.classList.remove('rv-copied', 'rv-copy-failed');
         }, 1500);
         return;
+      }
+
+      const link = ev.target.closest('a[href]');
+      const sessionId = body.dataset.rvSessionId || '';
+      if (link && sessionId) {
+        const session = this.sessions?.get?.(sessionId);
+        const previewPath = this._resolveResponseViewerPreviewPath(
+          link.getAttribute('href'),
+          session?.workingDir
+        );
+        if (previewPath) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this.openFilePreview(previewPath, sessionId);
+          return;
+        }
       }
 
       const btn = ev.target.closest('.rv-wrap-toggle');
@@ -2887,6 +3685,21 @@ class CodemanApp {
       const nowrap = pre.classList.toggle('rv-nowrap');
       wrap.classList.toggle('rv-wrap-nowrap', nowrap);
     });
+  }
+
+  /**
+   * COD-263 — plain text of a rendered quote/comment block, for one-click copy.
+   *
+   * Not `textContent`: a multi-paragraph blockquote renders as sibling <p>s, and
+   * textContent concatenates them with NO separator, so two paragraphs would be
+   * pasted as one run-on line. Join the block-level children with a blank line
+   * instead, and fall back to textContent for a quote with only inline content.
+   */
+  _quoteBlockText(quote) {
+    const blocks = Array.from(quote?.children || [])
+      .map((el) => (el.textContent || '').trim())
+      .filter(Boolean);
+    return blocks.length ? blocks.join('\n\n') : (quote?.textContent || '').trim();
   }
 
   /**
@@ -2915,6 +3728,329 @@ class CodemanApp {
     } catch {
       return false;
     }
+  }
+
+  _getResponseViewerCopySource(body) {
+    if (!body) return null;
+    const responseBlocks = body.querySelectorAll('[data-copy-role="response"] .rv-text');
+    if (responseBlocks.length > 0) return responseBlocks[responseBlocks.length - 1];
+    return body;
+  }
+
+  _getResponseViewerPlainText(source) {
+    const textSource = source.cloneNode(true);
+    textSource.querySelectorAll('br').forEach((lineBreak) => lineBreak.replaceWith(document.createTextNode('\n')));
+    textSource.querySelectorAll('ol').forEach((list) => {
+      const parsedStart = Number.parseInt(list.getAttribute('start') || '1', 10);
+      const start = Number.isNaN(parsedStart) ? 1 : parsedStart;
+      const items = Array.from(list.children).filter((child) => child.tagName === 'LI');
+      items.forEach((item, index) => {
+        item.insertBefore(document.createTextNode(`${start + index}. `), item.firstChild);
+      });
+    });
+    textSource.querySelectorAll('ul').forEach((list) => {
+      Array.from(list.children)
+        .filter((child) => child.tagName === 'LI')
+        .forEach((item) => item.insertBefore(document.createTextNode('• '), item.firstChild));
+    });
+    textSource.querySelectorAll('li > ol, li > ul').forEach((list) => list.before(document.createTextNode('\n')));
+    textSource.querySelectorAll('tr').forEach((row) => {
+      const cells = Array.from(row.children).filter((child) => child.tagName === 'TD' || child.tagName === 'TH');
+      cells.slice(1).forEach((cell) => cell.before(document.createTextNode('\t')));
+    });
+    textSource.querySelectorAll('blockquote, div, h1, h2, h3, h4, h5, h6, hr, li, p, pre, tr').forEach((block) => {
+      block.after(document.createTextNode('\n'));
+    });
+
+    return (textSource.innerText || textSource.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  /** Build a portable clipboard fragment from the rendered response viewer. */
+  _prepareResponseViewerClipboard(body) {
+    if (!body) return null;
+
+    const clone = body.cloneNode(true);
+    clone.querySelectorAll('.rv-code-actions').forEach((actions) => actions.remove());
+
+    // These wrappers only provide Codeman scrolling/toolbar behavior. Keep their content.
+    clone.querySelectorAll('.rv-code-wrap, .rv-table-wrap').forEach((wrapper) => {
+      wrapper.replaceWith(...Array.from(wrapper.childNodes));
+    });
+
+    // Retain semantic markup and links, but do not leak app-specific classes or data attributes.
+    const portableAttributes = new Set([
+      'alt', 'colspan', 'height', 'href', 'rowspan', 'src', 'start', 'title', 'type', 'width',
+    ]);
+    clone.querySelectorAll('*').forEach((el) => {
+      Array.from(el.attributes).forEach((attr) => {
+        if (!portableAttributes.has(attr.name.toLowerCase())) el.removeAttribute(attr.name);
+      });
+    });
+
+    // Small neutral styles survive Office-style paste targets without carrying the dark theme.
+    clone.querySelectorAll('table').forEach((table) => {
+      table.style.borderCollapse = 'collapse';
+    });
+    clone.querySelectorAll('th, td').forEach((cell) => {
+      cell.style.border = '1px solid #999';
+      cell.style.padding = '4px 8px';
+    });
+    clone.querySelectorAll('pre').forEach((pre) => {
+      pre.style.fontFamily = 'ui-monospace, SFMono-Regular, Consolas, monospace';
+      pre.style.whiteSpace = 'pre-wrap';
+    });
+    clone.querySelectorAll('code').forEach((code) => {
+      code.style.fontFamily = 'ui-monospace, SFMono-Regular, Consolas, monospace';
+    });
+    clone.querySelectorAll('blockquote').forEach((quote) => {
+      quote.style.borderLeft = '3px solid #999';
+      quote.style.marginLeft = '0';
+      quote.style.paddingLeft = '12px';
+    });
+
+    const html = clone.innerHTML.trim();
+    const text = this._getResponseViewerPlainText(clone);
+    return html || text ? { html, text } : null;
+  }
+
+  _setResponseViewerCopyState(success) {
+    const btn = document.getElementById('responseViewerCopy');
+    this._setCopyControlState(btn, success);
+  }
+
+  _setCopyControlState(btn, success) {
+    if (!btn) return;
+    btn.classList.remove('rv-copied', 'rv-copy-failed');
+    btn.classList.add(success ? 'rv-copied' : 'rv-copy-failed');
+    clearTimeout(btn._resetTimer);
+    btn._resetTimer = setTimeout(() => {
+      btn.classList.remove('rv-copied', 'rv-copy-failed');
+    }, 1500);
+  }
+
+  async _copyResponseViewerPayload(payload, options = {}) {
+    const {
+      controlEl = null,
+      successMessage = 'Copied response as rich text',
+      fallbackMessage = 'Rich clipboard unavailable; copied plain text',
+      emptyMessage = 'No response content to copy',
+      failureMessage = 'Failed to copy response',
+    } = options;
+
+    const setState = (success) => {
+      if (controlEl) this._setCopyControlState(controlEl, success);
+      else this._setResponseViewerCopyState(success);
+    };
+
+    if (!payload) {
+      setState(false);
+      this.showToast(emptyMessage, 'warning');
+      return;
+    }
+
+    try {
+      if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') {
+        throw new Error('Rich clipboard API unavailable');
+      }
+      const item = new ClipboardItem({
+        'text/html': new Blob([payload.html], { type: 'text/html' }),
+        'text/plain': new Blob([payload.text], { type: 'text/plain' }),
+      });
+      await navigator.clipboard.write([item]);
+      setState(true);
+      this.showToast(successMessage, 'success');
+      return;
+    } catch { /* Fall through to the established plain-text copy path. */ }
+
+    const copied = await this._copyText(payload.text);
+    setState(copied);
+    if (copied) {
+      this.showToast(fallbackMessage, 'warning');
+    } else {
+      this.showToast(failureMessage, 'error');
+    }
+  }
+
+  /** Copy the currently displayed response as HTML with a plain-text fallback. */
+  async copyResponseViewerRichText() {
+    const body = document.getElementById('responseViewerBody');
+    await this._copyResponseViewerPayload(
+      this._prepareResponseViewerClipboard(this._getResponseViewerCopySource(body))
+    );
+  }
+
+  /** Copy the raw Markdown source of the latest response without rendering it first. */
+  async copyResponseViewerMarkdown() {
+    const button = document.getElementById('responseViewerCopyMarkdown');
+    const markdown = this._responseViewerMarkdown || '';
+    if (!markdown) {
+      this._setCopyControlState(button, false);
+      this.showToast('No response content to copy', 'warning');
+      return;
+    }
+
+    const copied = await this._copyText(markdown);
+    this._setCopyControlState(button, copied);
+    this.showToast(copied ? 'Copied response as Markdown' : 'Failed to copy response as Markdown', copied ? 'success' : 'error');
+  }
+
+  _renderResponseViewerMessages(body, messages, responseSessionId = this.activeSessionId) {
+    body.innerHTML = '';
+    let previous = null;
+    for (const msg of messages) {
+      const kind = msg.kind || (msg.role === 'user' ? 'prompt' : 'response');
+      const label = msg.label || (msg.role === 'user' ? 'You' : 'Claude');
+      // Consecutive messages from one speaker inside one turn are segments of a
+      // single utterance: one badge, a hairline seam (`rv-msg-cont`).
+      // ⚠️ A numeric `turn` is REQUIRED, never same-role adjacency alone.
+      // Only the Claude reader emits turns; Codex, the external-CLI pane
+      // parser and an older server emit adjacent same-role blocks with none,
+      // and must keep one badged card per message.
+      const continuation =
+        !!previous && previous.role === msg.role && typeof msg.turn === 'number' && previous.turn === msg.turn;
+      previous = msg;
+      const div = document.createElement('div');
+      div.className = 'rv-message rv-msg-' + kind;
+      if (continuation) div.classList.add('rv-msg-cont');
+      if (msg.queued) div.dataset.queued = '1';
+      if (kind === 'response') div.dataset.copyRole = 'response';
+
+      const actions = document.createElement('div');
+      actions.className = 'rv-message-actions';
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'rv-message-copy';
+      copyBtn.type = 'button';
+      copyBtn.setAttribute('aria-label', `Copy ${label} block as rich text`);
+      copyBtn.setAttribute('title', `Copy ${label}`);
+      actions.appendChild(copyBtn);
+      div.appendChild(actions);
+
+      if (!continuation) {
+        const role = document.createElement('div');
+        role.className = 'rv-role rv-role-' + kind;
+        role.textContent = label;
+        div.appendChild(role);
+      }
+
+      const text = document.createElement('div');
+      text.className = 'rv-text';
+      text.innerHTML = this._renderMarkdown(msg.text || '');
+      div.appendChild(text);
+
+      body.appendChild(div);
+    }
+    this._bindResponseViewerInteractions(body, responseSessionId);
+  }
+
+  // COD-225: independent User / Tools / Responses visibility filters for the
+  // expanded More transcript. Pure client-side show/hide (no refetch); block order
+  // is untouched. Category -> block kinds: user -> prompt; tool -> tool + status;
+  // response -> response.
+  _defaultResponseFilterState() {
+    return { user: true, tool: true, response: true };
+  }
+
+  toggleTranscriptFilter(category, btn) {
+    if (!['user', 'tool', 'response'].includes(category)) return;
+    if (!this._responseFilterState) this._responseFilterState = this._defaultResponseFilterState();
+    const on = !this._responseFilterState[category];
+    this._responseFilterState[category] = on;
+    const button = btn || document.querySelector(`.rv-filter-btn[data-rv-filter="${category}"]`);
+    if (button) {
+      button.setAttribute('aria-pressed', on ? 'true' : 'false');
+      button.classList.toggle('rv-filter-off', !on);
+    }
+    this._applyResponseFilters();
+  }
+
+  _applyResponseFilters() {
+    const body = document.getElementById('responseViewerBody');
+    if (!body) return;
+    const st = this._responseFilterState || this._defaultResponseFilterState();
+    body.classList.toggle('rv-hide-user', !st.user);
+    body.classList.toggle('rv-hide-tool', !st.tool);
+    body.classList.toggle('rv-hide-response', !st.response);
+
+    // Derive the filtered-empty state from classes (not computed CSS display, which
+    // jsdom does not evaluate). A block is hidden when its category is toggled off.
+    const blocks = body.querySelectorAll('.rv-message');
+    let anyVisible = false;
+    blocks.forEach((b) => {
+      const hidden =
+        (!st.user && b.classList.contains('rv-msg-prompt')) ||
+        (!st.tool && (b.classList.contains('rv-msg-tool') || b.classList.contains('rv-msg-status'))) ||
+        (!st.response && b.classList.contains('rv-msg-response'));
+      if (!hidden) anyVisible = true;
+    });
+
+    let empty = body.querySelector('.response-viewer-filter-empty');
+    if (blocks.length > 0 && !anyVisible) {
+      if (!empty) {
+        empty = document.createElement('div');
+        empty.className = 'response-viewer-filter-empty';
+        empty.textContent = 'No transcript blocks match the current filters.';
+        body.appendChild(empty);
+      }
+      empty.hidden = false;
+    } else if (empty) {
+      empty.hidden = true;
+    }
+  }
+
+  // Show the filter bar and return every category to visible, so reopening the
+  // transcript starts from a predictable all-visible default (COD-225).
+  _showResponseFilters() {
+    this._responseFilterState = this._defaultResponseFilterState();
+    const bar = document.getElementById('responseViewerFilters');
+    if (bar) {
+      bar.hidden = false;
+      bar.querySelectorAll('.rv-filter-btn').forEach((b) => {
+        b.setAttribute('aria-pressed', 'true');
+        b.classList.remove('rv-filter-off');
+      });
+    }
+    this._applyResponseFilters();
+  }
+
+  // Hide the filter bar for the Last Response single-response view (no transcript
+  // blocks to filter) and clear any lingering hide classes.
+  _hideResponseFilters() {
+    const bar = document.getElementById('responseViewerFilters');
+    if (bar) bar.hidden = true;
+    const body = document.getElementById('responseViewerBody');
+    if (body) body.classList.remove('rv-hide-user', 'rv-hide-tool', 'rv-hide-response');
+  }
+
+  // Explicit, idempotent close for the View Response overlay. Returns true only
+  // when it actually closed an open viewer (so the Escape handler can consume the
+  // key), false if it was already closed. Restores focus to the active terminal so
+  // a keyboard user resumes typing at the CLI prompt with no mouse click (COD-229).
+  // Shared by the × button, the backdrop, the toggle's close branch, and Escape.
+  closeResponseViewer() {
+    const viewer = document.getElementById('responseViewer');
+    if (!viewer || !viewer.classList.contains('visible')) return false;
+    const backdrop = document.getElementById('responseViewerBackdrop');
+    viewer.classList.remove('visible');
+    if (backdrop) backdrop.classList.remove('visible');
+    if (this.terminal) {
+      try {
+        this.terminal.focus();
+      } catch {
+        /* terminal may be detached mid-teardown */
+      }
+    }
+    return true;
+  }
+
+  // Escape-key seam: close the viewer if open and consume the event so ESC does not
+  // reach xterm/the CLI. Returns true when the key was consumed (COD-229).
+  _maybeCloseResponseViewerOnEscape(e) {
+    if (!this.closeResponseViewer()) return false;
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    return true;
   }
 
   /** Build one response-viewer message so the brief and full views share markup and CSS. */
@@ -3029,13 +4165,15 @@ class CodemanApp {
 
     const isOpen = viewer.classList.contains('visible');
     if (isOpen) {
-      viewer.classList.remove('visible');
-      backdrop.classList.remove('visible');
+      this.closeResponseViewer();
       return;
     }
 
     if (!this.activeSessionId) return;
+    const responseSessionId = this.activeSessionId;
     try {
+      const session = this.sessions?.get?.(responseSessionId);
+      const mode = session?.mode || '';
       // Source 1: Transcript JSONL (best quality — clean structured text from Claude).
       // `context=turn` asks for the last ANSWERED turn as messages: a Claude
       // answer is a median of 3 model messages (p90 11), and `text` alone is
@@ -3043,7 +4181,7 @@ class CodemanApp {
       // rows before it. Readers that know no `turn` context (Codex, the pane
       // parser, an older server) answer with `text` only, and that path is
       // unchanged below.
-      const res = await fetch(`/api/sessions/${this.activeSessionId}/last-response?context=turn`);
+      const res = await fetch(`/api/sessions/${responseSessionId}/last-response?context=turn`);
       const data = (await res.json())?.data ?? {};
       let lastResponse = data.text || '';
       const turnMessages = (Array.isArray(data.messages) ? data.messages : []).filter(
@@ -3070,6 +4208,8 @@ class CodemanApp {
         }
       }
 
+      this._responseViewerMarkdown = lastResponse;
+
       const body = document.getElementById('responseViewerBody');
       if (turnMessages.length > 0) {
         // The whole last turn, rendered exactly as the full view renders that
@@ -3083,14 +4223,14 @@ class CodemanApp {
           body.appendChild(this._buildResponseViewerMessage(msg.text, 'assistant', agentLabel, { ...msg, continuation }));
           previous = msg;
         }
-        this._bindResponseViewerInteractions(body);
+        this._bindResponseViewerInteractions(body, responseSessionId);
       } else if (lastResponse) {
         // Keep the brief view inside the same message wrapper as the full
         // conversation view. The wrapper supplies the card, role badge and
         // descendant markdown styles that direct body children do not get.
         body.innerHTML = '';
         body.appendChild(this._buildResponseViewerMessage(lastResponse, 'assistant', this._getResponseViewerAgentLabel()));
-        this._bindResponseViewerInteractions(body);
+        this._bindResponseViewerInteractions(body, responseSessionId);
       } else {
         body.textContent =
           window.codemanT?.('No response yet — send a message in this session first.') ||
@@ -3101,7 +4241,12 @@ class CodemanApp {
       const title = document.getElementById('responseViewerTitle');
       const moreBtn = document.getElementById('responseViewerMore');
       if (title) title.textContent = 'Last Response';
-      if (moreBtn) { moreBtn.style.display = ''; moreBtn.textContent = 'More'; }
+      if (moreBtn) {
+        moreBtn.style.display = data.hasContext ? '' : 'none';
+        moreBtn.textContent = 'More';
+      }
+      // Last Response is a single rendered block, not a transcript — no filters here.
+      this._hideResponseFilters();
 
       viewer.classList.add('visible');
       backdrop.classList.add('visible');
@@ -3118,10 +4263,11 @@ class CodemanApp {
 
   async loadFullContext() {
     if (!this.activeSessionId) return;
+    const responseSessionId = this.activeSessionId;
     const moreBtn = document.getElementById('responseViewerMore');
     if (moreBtn) moreBtn.textContent = '...';
     try {
-      const res = await fetch(`/api/sessions/${this.activeSessionId}/last-response?context=full`);
+      const res = await fetch(`/api/sessions/${responseSessionId}/last-response?context=full`);
       const data = (await res.json())?.data ?? {};
       const messages = data.messages || [];
       const body = document.getElementById('responseViewerBody');
@@ -3149,29 +4295,29 @@ class CodemanApp {
         return;
       }
 
-      // Render conversation thread
-      const agentLabel = this._getResponseViewerAgentLabel();
-      body.innerHTML = '';
-      let previous = null;
-      for (const msg of messages) {
-        // ⚠️ A numeric `turn` is REQUIRED, never same-role adjacency alone.
-        // Only the Claude reader emits turns; Codex and the external-CLI pane
-        // parser emit adjacent assistant/response blocks with no turn at all, and
-        // an older server emits none either — all three must keep rendering one
-        // badged card per message exactly as they do today.
-        const continuation =
-          !!previous && previous.role === msg.role && typeof msg.turn === 'number' && previous.turn === msg.turn;
-        body.appendChild(this._buildResponseViewerMessage(msg.text, msg.role, agentLabel, { ...msg, continuation }));
-        previous = msg;
-      }
-      this._bindResponseViewerInteractions(body);
+      const lastResponse = [...messages].reverse().find((msg) => {
+        const kind = msg.kind || (msg.role === 'user' ? 'prompt' : 'response');
+        return kind === 'response';
+      });
+      if (lastResponse) this._responseViewerMarkdown = lastResponse.text || '';
 
+      // Turn segmentation (one message per model message) lives INSIDE the block
+      // renderer, which is the only full-view renderer here: it renders transcript
+      // kinds (prompt/tool/status/response) the two-role builder cannot express.
+      this._renderResponseViewerMessages(body, messages, responseSessionId);
+      this._showResponseFilters();
+
+      const hasStructuredKinds = messages.some((msg) => typeof msg.kind === 'string');
+      // ⚠️ A numeric `turn` gates the turn count exactly as it gates continuation
+      // rendering: only the Claude reader emits turns; Codex, the external-CLI pane
+      // parser and an older server emit none, and must keep the message-only title.
       const turns = new Set(messages.filter((msg) => typeof msg.turn === 'number').map((msg) => msg.turn)).size;
-      if (title) {
-        title.textContent = turns
-          ? `Conversation (${messages.length} messages, ${turns} turns)`
-          : `Conversation (${messages.length} messages)`;
-      }
+      if (title)
+        title.textContent = hasStructuredKinds
+          ? `Transcript (${messages.length} blocks)`
+          : turns
+            ? `Conversation (${messages.length} messages, ${turns} turns)`
+            : `Conversation (${messages.length} messages)`;
       if (moreBtn) moreBtn.style.display = 'none';
       // Scroll to bottom (latest message)
       body.scrollTop = body.scrollHeight;
@@ -3245,6 +4391,10 @@ class CodemanApp {
       // Still inside the deadline: an abort here rejects the body stream, which
       // is exactly the case a header-only timeout could not reach.
       const json = await res.json();
+      // COD-463: every capture says whether a remote pane was served from the
+      // local copy (ssh backoff); the banner warns the view may not be live.
+      const captureSessionId = /\/api\/sessions\/([^/?]+)\/terminal/.exec(url)?.[1];
+      if (captureSessionId) this.noteRemoteCaptureState?.(decodeURIComponent(captureSessionId), json?.data);
       return { json, headers: res.headers, headersAt };
     } catch (err) {
       if (err?.name === 'AbortError') {
@@ -3284,6 +4434,13 @@ class CodemanApp {
     // Skip if buffer load already in progress — avoids competing clear+rewrite cycles
     if (this._isLoadingBuffer) return false;
     if (this._terminalRefreshOwner?.sessionId === sessionId) return false;
+    // COD-187: mirror tabs recover with a cheap frame repaint, never a history
+    // replay (in history view the exit refetch heals instead).
+    if (this._isMirrorSession(this.activeSessionId)) {
+      if (this._viewMode === 'history') return false;
+      this._lastMirrorFrame = null;
+      return (await this._refreshMirrorFrame(sessionId)) === true;
+    }
     const refreshOwner = { sessionId };
     this._terminalRefreshOwner = refreshOwner;
     try {
@@ -3381,10 +4538,366 @@ class CodemanApp {
     if (sessionId && this._wsOutputGapSession === sessionId) this._wsOutputGapSession = null;
   }
 
+  _onSessionResized(data) {
+    if (data.id !== this.activeSessionId || !this.terminal) return;
+    const session = this.sessions.get(data.id);
+    if (!this._isMirrorSession(data.id) && session?.mode !== 'codex' && session?.mode !== 'gemini' && session?.mode !== 'antigravity') return;
+    // Our own resize (or one that happens to match us) can't misalign our view.
+    if (this.terminal.cols === data.cols && this.terminal.rows === data.rows) return;
+    this._foreignResizeDirty = data.id;
+    clearTimeout(this._foreignResizeTimer);
+    this._foreignResizeTimer = setTimeout(() => {
+      this._reconcileForeignResize(data.id);
+    }, FOREIGN_RESIZE_SETTLE_MS);
+  }
+
+  /**
+   * Rewrite the active terminal from the tmux capture (COD-179 foreign resize,
+   * COD-180 idle/periodic remote reconcile). Only a canonical full-history
+   * capture may REPLACE the terminal (`source === 'mux-full-history'`) — a
+   * degraded response (remote ssh capture failed → one local screen, or raw
+   * byte history) must never wipe accumulated scrollback. A repeat of the last
+   * written buffer is skipped so a periodic tick with no changes is a no-op.
+   */
+  async _reconcileForeignResize(sessionId) {
+    if (sessionId !== this.activeSessionId || !this.terminal) {
+      // Tab switched — selectSession's own rewrite paints a clean state.
+      this._foreignResizeDirty = null;
+      return;
+    }
+    // COD-187: mirror tabs never replay history — a cheap frame refresh is the
+    // repair for every trigger that lands here (foreign resize, idle, WS
+    // reconnect). In history view the exit refetch heals instead.
+    if (this._isMirrorSession(sessionId)) {
+      this._foreignResizeDirty = null;
+      if (this._viewMode !== 'history') await this._refreshMirrorFrame(sessionId);
+      return;
+    }
+    // A buffer load is already repainting; keep the dirty flag so the idle
+    // fallback re-checks later rather than racing two clear+rewrite cycles.
+    if (this._isLoadingBuffer) return;
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/terminal`);
+      const data = (await res.json())?.data ?? {};
+      if (sessionId !== this.activeSessionId || this._isLoadingBuffer) return;
+      if (data.source !== 'mux-full-history') return;
+      if (data.terminalBuffer) {
+        if (this._lastReconcileWrite?.id === sessionId && this._lastReconcileWrite.buf === data.terminalBuffer) {
+          this._foreignResizeDirty = null;
+          return;
+        }
+        this._resetTerminalForReplay();
+        await this.chunkedTerminalWrite(data.terminalBuffer);
+        this.terminal.scrollToBottom();
+        this._localEchoOverlay?.rerender();
+        this._lastReconcileWrite = { id: sessionId, buf: data.terminalBuffer };
+        this._foreignResizeDirty = null;
+      }
+    } catch (err) {
+      console.error('foreign-resize reconcile failed:', err);
+    }
+  }
+
+  /** COD-182: any codex/gemini/agy tab — stale rows can appear locally too (reattach/reconnect churn). */
+  _isTuiSession(sessionId) {
+    const session = this.sessions.get(sessionId);
+    return session?.mode === 'codex' || session?.mode === 'gemini' || session?.mode === 'antigravity';
+  }
+
+  /** COD-180: remote codex/gemini sessions — the live nested-tmux stream corrupts scrollback; reconcile heals it. */
+  _isRemoteTuiSession(sessionId) {
+    return this._isTuiSession(sessionId) && !!this.sessions.get(sessionId)?.remote;
+  }
+
+  /**
+   * COD-187: live-mirror mode — agent-TUI tab with the per-device setting ON
+   * (default). Includes claude (user opt-in expansion): mirror is purely a
+   * client rendering mode, so claude's server-side stream parsing (tokens,
+   * Ralph, prompt detection) is untouched. Deliberately NOT built on
+   * _isTuiSession — that helper also gates LEGACY (setting-OFF) repair paths,
+   * which must keep excluding claude exactly as before. COD-209: OpenCode is
+   * deliberately excluded because its pure TUI owns the scrollable conversation
+   * pane; Codeman history mode would intercept gestures the foreground app needs.
+   */
+  _isMirrorSession(sessionId) {
+    return this._liveMirrorEnabled && this._isMirrorEligible(sessionId);
+  }
+
+  /** Modes the live mirror applies to when the setting is ON. */
+  _isMirrorEligible(sessionId) {
+    const mode = this.sessions.get(sessionId)?.mode;
+    return mode === 'codex' || mode === 'gemini' || mode === 'claude';
+  }
+
+  /** COD-187: settings hook — flips the cached flag and re-selects the active TUI tab so the mode applies immediately. */
+  _applyLiveMirrorSetting(enabled) {
+    const on = enabled !== false; // default ON
+    if (this._liveMirrorEnabled === on) return;
+    this._liveMirrorEnabled = on;
+    const id = this.activeSessionId;
+    if (id && this._isMirrorEligible(id)) {
+      this.selectSession(id, { forceReload: true });
+    }
+  }
+
+  /**
+   * COD-187: repaint a live-mirror tab's screen from the canonical frame
+   * capture (`?frame=1` — cursor-positioned snapshot of the pane, remote-aware
+   * server-side). This is the mirror-mode replacement for every full-history
+   * repair path: idle, WS reconnect, foreign resize, needsRefresh,
+   * clearTerminal. Single-flight, generation-guarded, deduped on content.
+   */
+  async _refreshMirrorFrame(sessionId) {
+    if (sessionId !== this.activeSessionId || !this.terminal) return false;
+    if (!this._isMirrorSession(sessionId)) return false;
+    if (this._viewMode === 'history' || this._isLoadingBuffer) return false;
+    if (this._mirrorFrameInFlight) return false;
+    this._mirrorFrameInFlight = true;
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/terminal?frame=1&mirror=1`);
+      const data = (await res.json())?.data ?? {};
+      this.noteRemoteCaptureState?.(sessionId, data);
+      if (sessionId !== this.activeSessionId || this._viewMode === 'history' || this._isLoadingBuffer) return false;
+      if (data.source !== 'mux-frame' || !data.terminalBuffer) return false;
+      if (this._lastMirrorFrame?.id === sessionId && this._lastMirrorFrame.buf === data.terminalBuffer) return true;
+      this._resetTerminalForReplay();
+      await this.chunkedTerminalWrite(data.terminalBuffer);
+      this._localEchoOverlay?.rerender();
+      this._lastMirrorFrame = { id: sessionId, buf: data.terminalBuffer };
+      return true;
+    } catch (err) {
+      console.error('mirror frame refresh failed:', err);
+      return false;
+    } finally {
+      this._mirrorFrameInFlight = false;
+    }
+  }
+
+  /**
+   * COD-187: open the frozen history view — raise scrollback, fetch the
+   * canonical tmux full-history capture (remote-sourced for remote sessions,
+   * COD-180) and freeze it under a pill. tmux copy-mode semantics.
+   */
+  /**
+   * COD-190: speculative history prefetch — fired on the FIRST upward scroll
+   * tick so the fetch (dominated by the ssh RTT on remote sessions) overlaps
+   * the entry threshold instead of following it. Short TTL: the capture's
+   * last screen must still match the live frame for the no-jump landing.
+   */
+  _prefetchHistory() {
+    const id = this.activeSessionId;
+    if (!id || !this._isMirrorSession(id) || this._viewMode !== 'live') return;
+    if (this._historyPrefetch?.id === id && Date.now() - this._historyPrefetch.at < HISTORY_PREFETCH_TTL_MS) return;
+    this._historyPrefetch = {
+      id,
+      at: Date.now(),
+      promise: fetch(`/api/sessions/${id}/terminal?lines=${HISTORY_INITIAL_LINES}`)
+        .then((r) => r.json())
+        .catch(() => null),
+    };
+  }
+
+  async _enterHistoryView(carryLines = 0) {
+    const sessionId = this.activeSessionId;
+    if (!sessionId || !this.terminal) return;
+    if (!this._isMirrorSession(sessionId) || this._viewMode !== 'live') return;
+    if (this._isLoadingBuffer) return;
+    this._viewMode = 'history';
+    this._historyMissedOutput = false;
+    this._historyScrollFraction = 0;
+    const gen = ++this._historyLoadGen;
+    this._historyInitialLoadGen = gen;
+    this._showHistoryPill('History — loading…');
+    // COD-190 no-jump anchor: remember which viewport row the last non-empty
+    // line sits on. The capture strips trailing blank rows, so "bottom of
+    // buffer" lands HIGHER than the live frame — anchoring on content keeps
+    // the entry pixel-stable instead.
+    const preBuf = this.terminal.buffer.active;
+    let anchorRow = -1;
+    for (let r = this.terminal.rows - 1; r >= 0; r--) {
+      if ((preBuf.getLine(preBuf.viewportY + r)?.translateToString(true) ?? '').trim()) {
+        anchorRow = r;
+        break;
+      }
+    }
+    this.terminal.options.scrollback = this._userScrollback();
+    try {
+      // Fast first page (COD-187 lazy load): last HISTORY_INITIAL_LINES lines.
+      // Prefer the speculative prefetch (COD-190) started on the first
+      // up-tick; single-use — consume and clear.
+      const prefetch =
+        this._historyPrefetch?.id === sessionId && Date.now() - this._historyPrefetch.at < HISTORY_PREFETCH_TTL_MS
+          ? this._historyPrefetch.promise
+          : null;
+      this._historyPrefetch = null;
+      const json = await (prefetch ?? fetch(`/api/sessions/${sessionId}/terminal?lines=${HISTORY_INITIAL_LINES}`).then((r) => r.json()));
+      const data = json?.data ?? {};
+      if (gen !== this._historyLoadGen || sessionId !== this.activeSessionId || this._viewMode !== 'history') return;
+      if (data.source !== 'mux-full-history' || !data.terminalBuffer) {
+        this.showToast?.('History unavailable for this session', 'warning');
+        this._exitHistoryView();
+        return;
+      }
+      this._historyPartial = data.historyPartial === true;
+      // COD-190 atomic swap: ONE write wrapped in DEC 2026 synchronized-update
+      // markers — xterm 6 holds rendering until the terminator, so the blank
+      // clear frame never paints. Embedded 2026 markers are stripped from the
+      // content so they can't terminate our window early. No terminal.reset()
+      // here (it would drop sync mode); \x1b[3J\x1b[H\x1b[2J clears
+      // scrollback + screen in place.
+      const owner = this._beginBufferLoad(`history-${gen}`);
+      const content = data.terminalBuffer.replace(DEC_SYNC_STRIP_RE, '');
+      await new Promise((resolve) => this.terminal.write(`\x1b[?2026h\x1b[3J\x1b[H\x1b[2J${content}\x1b[?2026l`, resolve));
+      this._finishBufferLoad(owner);
+      if (gen !== this._historyLoadGen || this._viewMode !== 'history') return;
+      this._historyInitialLoadGen = 0;
+      // COD-190 no-jump landing: place the history's last non-empty line on
+      // the SAME viewport row it occupied in the live frame (content-anchored
+      // — the capture trims trailing blanks, so plain scrollToBottom would
+      // shift everything up). Then apply the user's accumulated wheel delta
+      // so their own gesture carries them up into history smoothly.
+      const nb = this.terminal.buffer.active;
+      let lastContent = -1;
+      for (let i = nb.baseY + this.terminal.rows - 1; i >= 0; i--) {
+        if ((nb.getLine(i)?.translateToString(true) ?? '').trim()) {
+          lastContent = i;
+          break;
+        }
+      }
+      if (anchorRow >= 0 && lastContent >= 0) {
+        this.terminal.scrollToLine(Math.max(0, Math.min(nb.baseY, lastContent - anchorRow)));
+      } else {
+        this.terminal.scrollToBottom();
+      }
+      const carryRows = Math.max(0, Math.trunc(carryLines));
+      if (carryRows > 0) this.terminal.scrollLines(-carryRows);
+      this._updateHistoryPill();
+    } catch (err) {
+      console.error('history view load failed:', err);
+      if (gen === this._historyLoadGen && this._viewMode === 'history') this._exitHistoryView();
+    }
+  }
+
+  /**
+   * COD-187 lazy load: the user hit the top of the partial history — replace
+   * it with the unbounded capture, preserving the reading position (anchored
+   * by distance from the bottom, which both captures share).
+   */
+  async _expandHistoryFull() {
+    const sessionId = this.activeSessionId;
+    if (!sessionId || this._viewMode !== 'history' || !this._historyPartial) return;
+    if (this._historyExpandInFlight) return;
+    this._historyExpandInFlight = true;
+    const gen = this._historyLoadGen;
+    this._showHistoryPill('History — loading older…');
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/terminal?capture=1`);
+      const data = (await res.json())?.data ?? {};
+      if (gen !== this._historyLoadGen || this._viewMode !== 'history') return;
+      if (data.source !== 'mux-full-history' || !data.terminalBuffer) {
+        this._historyPartial = false;
+        this._updateHistoryPill();
+        return;
+      }
+      const bufBefore = this.terminal.buffer.active;
+      const distFromBottom = bufBefore.baseY - bufBefore.viewportY;
+      const owner = this._beginBufferLoad(`history-${gen}-full`);
+      this._resetTerminalForReplay();
+      await this.chunkedTerminalWrite(data.terminalBuffer, TERMINAL_CHUNK_SIZE, owner);
+      if (gen !== this._historyLoadGen || this._viewMode !== 'history') return;
+      this._historyPartial = false;
+      const buf = this.terminal.buffer.active;
+      this.terminal.scrollToLine(Math.max(0, buf.baseY - distFromBottom));
+      this._updateHistoryPill();
+    } catch (err) {
+      console.error('history expand failed:', err);
+    } finally {
+      this._historyExpandInFlight = false;
+    }
+  }
+
+  /** COD-187: leave history — trim scrollback back to 0 and repaint the live frame. */
+  _exitHistoryView() {
+    if (this._viewMode !== 'history') return;
+    this._viewMode = 'live';
+    this._historyLoadGen++;
+    this._historyInitialLoadGen = 0;
+    this._historyMissedOutput = false;
+    this._historyPartial = false;
+    this._historyScrollFraction = 0;
+    this._historyExitAt = Date.now();
+    this._hideHistoryPill();
+    // Stale sticky-scroll grace must not survive into live mode.
+    this._lastUserScrollUpAt = null;
+    if (this.terminal && this.activeSessionId && this._isMirrorSession(this.activeSessionId)) {
+      this.terminal.options.scrollback = 0; // trims the freeze-frame instantly
+      this._lastMirrorFrame = null; // force the repaint even if the frame text matches
+      this._refreshMirrorFrame(this.activeSessionId);
+    }
+  }
+
+  _showHistoryPill(text) {
+    const pill = document.getElementById('historyPill');
+    if (!pill) return;
+    pill.textContent = text;
+    pill.hidden = false;
+  }
+
+  _updateHistoryPill() {
+    if (this._viewMode !== 'history') return;
+    let base = 'History (frozen) — Esc or scroll to bottom to resume';
+    if (this._historyPartial) base += ' · scroll to top for older';
+    this._showHistoryPill(this._historyMissedOutput ? `${base} · new output below` : base);
+  }
+
+  _hideHistoryPill() {
+    const pill = document.getElementById('historyPill');
+    if (pill) pill.hidden = true;
+  }
+
+  /**
+   * COD-180: periodic mid-turn reconcile for busy REMOTE TUI sessions. Their
+   * live stream is nested-tmux repaint traffic that mangles what lands in
+   * browser scrollback (lost table rows, partial frames); a capture rewrite
+   * every tick bounds any corruption's lifetime to ~25s. Skipped unless the
+   * user is parked at the bottom (never yank someone reading scrollback); an
+   * unchanged capture is a no-op via the compare in _reconcileForeignResize.
+   */
+  _remoteReconcileTick() {
+    const id = this.activeSessionId;
+    if (!id || !this.terminal || this._isLoadingBuffer) return;
+    if (this._isMirrorSession(id)) {
+      // Nested remote redraws can lose cells without closing the WebSocket.
+      // Heal from the canonical frame even when the agent is idle.
+      if (this.sessions.get(id)?.remote && this._viewMode !== 'history') {
+        this._refreshMirrorFrame(id);
+      }
+      return;
+    }
+    if (!this._isRemoteTuiSession(id)) return;
+    // Deliberately NOT gated on busy status: remote codex sessions often never
+    // flip to busy (their "Working (…)" frames arrive as partial cell updates
+    // split across chunks, defeating the working-state match — see COD-180
+    // notes), and an unchanged capture makes an idle tick a cheap no-op via
+    // the content-compare in _reconcileForeignResize.
+    const buf = this.terminal.buffer.active;
+    if (buf.viewportY !== buf.baseY) return; // scrolled up — don't yank
+    this._reconcileForeignResize(id);
+  }
+
   async _onSessionClearTerminal(data) {
     // The tiles get the clear over their own sockets; the parked main terminal must not refetch.
     if (this._tilesOwnTerminal?.()) return;
     if (data.id === this.activeSessionId) {
+      // COD-187: mirror tabs repaint from the frame capture instead of a
+      // history replay (in history view, exit refetches).
+      if (this._isMirrorSession(data.id)) {
+        if (this._viewMode !== 'history' && !this._isLoadingBuffer) {
+          this._lastMirrorFrame = null; // pane was cleared — force the rewrite
+          await this._refreshMirrorFrame(data.id);
+        }
+        return;
+      }
       // Skip if selectSession is already loading the buffer — clearTerminal arriving
       // during buffer load would clear the terminal mid-write, causing visible flicker
       // and a race between two concurrent chunkedTerminalWrite calls (especially on mobile
@@ -3449,11 +4962,9 @@ class CodemanApp {
   }
 
   _onSessionExit(data) {
-    if (this._wsSessionId === data.id) this._disconnectWs();
-    const session = this.sessions.get(data.id);
+    this._finalizeTerminalSessionGone(data.id);
+    const session = this._applySessionActivityEvent(data, 'exit');
     if (session) {
-      session.status = 'stopped';
-      this.renderSessionTabs();
       if (data.id === this.activeSessionId) this._updateLocalEchoState();
     }
     // Notify on unexpected exit (non-zero code)
@@ -3463,41 +4974,40 @@ class CodemanApp {
   }
 
   _onSessionIdle(data) {
-    const session = this.sessions.get(data.id);
+    const session = this._applySessionActivityEvent(data, 'idle');
+    const effectiveStatus = session?.activityStatus || session?.status;
     if (session) {
-      session.status = 'idle';
-      this.renderSessionTabs();
+      // waiting/checking is a server-owned agent transition, not a local idle
+      // edge: no Ctrl+L, local-echo flip, reconcile, or stuck timer.
+      if (effectiveStatus === 'waiting_agents' || effectiveStatus === 'checking_agents') return;
       this.sendPendingCtrlL(data.id);
       if (data.id === this.activeSessionId) this._updateLocalEchoState();
     }
-    // Start stuck detection timer (only if no respawn running)
-    if (!this.respawnStatus[data.id]?.enabled) {
-      const threshold = this.notificationManager?.preferences?.stuckThresholdMs || 600000;
-      clearTimeout(this.idleTimers.get(data.id));
-      this.idleTimers.set(data.id, setTimeout(() => {
-        this._notifySession(data.id, 'warning', 'session-stuck', 'Session Idle', `Idle for ${Math.round(threshold / 60000)}+ minutes`);
-        this.idleTimers.delete(data.id);
-      }, threshold));
+    // COD-179: a foreign resize dirtied this view mid-turn — later repaints may
+    // have re-corrupted it after the debounced rewrite. COD-180/182: ALL TUI
+    // tabs (remote AND local codex/gemini) reconcile on idle — remote live
+    // streams are nested-tmux repaint traffic that corrupts scrollback, and
+    // local tabs pick up stale rows from reattach/reconnect churn (COD-182:
+    // duplicated composer placeholder after a deploy restart). Turn end is the
+    // stable point to swap in the canonical capture; an unchanged capture is
+    // a no-op via the content compare.
+    if (data.id === this.activeSessionId && (this._foreignResizeDirty === data.id || this._isTuiSession(data.id))) {
+      clearTimeout(this._foreignResizeTimer);
+      this._foreignResizeTimer = setTimeout(() => {
+        this._reconcileForeignResize(data.id);
+      }, TUI_REDRAW_SETTLE_MS);
     }
   }
 
   _onSessionWorking(data) {
-    const session = this.sessions.get(data.id);
+    const session = this._applySessionActivityEvent(data, 'working');
     if (session) {
-      session.status = 'busy';
       // Only clear tab alert if no pending hooks (permission_prompt, elicitation_dialog, etc.)
       if (!this.pendingHooks.has(data.id)) {
         this.tabAlerts.delete(data.id);
       }
-      this.renderSessionTabs();
       this.sendPendingCtrlL(data.id);
       if (data.id === this.activeSessionId) this._updateLocalEchoState();
-    }
-    // Clear stuck detection timer
-    const timer = this.idleTimers.get(data.id);
-    if (timer) {
-      clearTimeout(timer);
-      this.idleTimers.delete(data.id);
     }
   }
 
@@ -3697,44 +5207,200 @@ class CodemanApp {
   // WebSocket Terminal I/O
   // ═══════════════════════════════════════════════════════════════
 
+  _flushPendingTerminalResize(sessionId, socket) {
+    const pending = this._pendingTerminalResize;
+    if (
+      !pending ||
+      pending.sessionId !== sessionId ||
+      this.activeSessionId !== sessionId ||
+      this._ws !== socket ||
+      !this._wsReady
+    ) return false;
+    try {
+      socket.send(JSON.stringify(pending.frame));
+      if (this._pendingTerminalResize === pending) this._pendingTerminalResize = null;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  _isTerminalSessionGone(sessionId) {
+    return (
+      typeof sessionId === 'string' &&
+      (this._terminalGoneFinalizedSessionIds?.has(sessionId) === true ||
+        (sessionId === this.activeSessionId && sessionId === this._wsGoneSessionId && this._wsState === 'gone'))
+    );
+  }
+
+  _finalizeTerminalSessionGone(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId.length === 0) return false;
+    const finalized = (this._terminalGoneFinalizedSessionIds ??= new Set());
+    const firstFinalization = !finalized.has(sessionId);
+    let hadQueuedInput = false;
+    if (firstFinalization) {
+      finalized.add(sessionId);
+      hadQueuedInput = this._pendingDeliveries?.delete?.(sessionId) === true;
+      if (this._pendingTerminalResize?.sessionId === sessionId) this._pendingTerminalResize = null;
+      this._terminalViewerActivity?.clearSession?.(sessionId);
+      if (hadQueuedInput) this._persistReliableNow();
+    }
+
+    const stillActive = this.activeSessionId === sessionId;
+    if (stillActive) {
+      this._wsGoneSessionId = sessionId;
+      this._wsState = 'gone';
+    }
+    if (this._wsSessionId === sessionId) this._disconnectWs();
+    if (stillActive) {
+      this._wsState = 'gone';
+      this._updateConnectionIndicator();
+      if (firstFinalization) {
+        this.showToast?.(
+          hadQueuedInput
+            ? 'Session ended — queued terminal input could not be delivered'
+            : 'Terminal session is no longer available',
+          hadQueuedInput ? 'error' : 'warning'
+        );
+      }
+    }
+    return firstFinalization;
+  }
+
+  _clearTerminalSessionGoneForRestart(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId.length === 0) return false;
+    const finalized = this._terminalGoneFinalizedSessionIds;
+    const wasGone = finalized?.has(sessionId) || this._wsGoneSessionId === sessionId;
+    if (!wasGone) return false;
+    finalized?.delete(sessionId);
+    if (this._wsGoneSessionId === sessionId) this._wsGoneSessionId = null;
+    if (this.activeSessionId === sessionId) {
+      this._wsState = 'disconnected';
+      this._updateConnectionIndicator();
+      this._connectWs(sessionId);
+    }
+    return true;
+  }
+
+  _prepareFreshSocketInputReplay(sessionId, socket) {
+    const list = this._pendingDeliveries?.get?.(sessionId);
+    if (!list || list.length === 0) return true;
+    if (
+      this.activeSessionId !== sessionId ||
+      this._wsSessionId !== sessionId ||
+      this._ws !== socket ||
+      !this._wsReady ||
+      socket?.readyState !== WebSocket.OPEN
+    ) return false;
+    const controller = this._terminalViewerActivity;
+    if (!controller) return false;
+    if (controller.isCurrentTransportActivated?.(sessionId) === true) return true;
+    controller.activate?.('input-replay');
+    return controller.isCurrentTransportActivated?.(sessionId) === true;
+  }
+
+  // A selection fetches its canonical terminal snapshot before the replacement
+  // WS listener is necessarily attached. Output produced in that handoff gap
+  // remains in tmux but is not delivered to this browser. Reconcile once the
+  // matching transport is live, but defer until selectSession has released its
+  // buffer-load gate so the refresh cannot be dropped as a competing rewrite.
+  _queueTransportActivationReconcile(sessionId, selectGen) {
+    this._transportActivationReconcile = { sessionId, selectGen, wsReady: false };
+  }
+
+  _markTransportActivationReady(sessionId) {
+    const pending = this._transportActivationReconcile;
+    if (!pending || pending.sessionId !== sessionId || pending.selectGen !== this._selectGeneration) return;
+    pending.wsReady = true;
+    this._flushTransportActivationReconcile(sessionId, pending.selectGen);
+  }
+
+  _flushTransportActivationReconcile(sessionId, selectGen) {
+    const pending = this._transportActivationReconcile;
+    if (
+      !pending ||
+      !pending.wsReady ||
+      pending.sessionId !== sessionId ||
+      pending.selectGen !== selectGen ||
+      selectGen !== this._selectGeneration ||
+      this.activeSessionId !== sessionId
+    ) {
+      return;
+    }
+    if (this._isLoadingBuffer) return;
+    this._transportActivationReconcile = null;
+    void this._onSessionNeedsRefresh({ id: sessionId });
+  }
+
+  // Release the terminal-load UI gate before checking the transport handoff.
+  // Both successful snapshot replays and failed fetches must take this path:
+  // a live WS may have opened while the canonical fetch was still in flight.
+  _releaseTerminalLoadAndReconcile(sessionId, selectGen) {
+    this._clearTerminalLoadState(sessionId, selectGen);
+    this._flushTransportActivationReconcile(sessionId, selectGen);
+  }
+
   /**
    * Open a WebSocket for terminal I/O on the given session.
-   * Replaces HTTP POST input and SSE terminal output with a single
-   * bidirectional connection. Falls back to SSE+POST if WS fails.
+   * Browser terminal input requires this ownership-capable bidirectional
+   * connection. SSE can still carry output while a transient WS outage queues
+   * reliable browser input for the next activated socket.
    */
   _connectWs(sessionId) {
+    if (this._isTerminalSessionGone(sessionId)) return;
+    this._wsGoneSessionId = null;
+    // A passive resize belongs to the session measured when it was queued. A
+    // real tab switch must not carry that geometry into the next session.
+    if (this._pendingTerminalResize?.sessionId !== sessionId) this._pendingTerminalResize = null;
     this._disconnectWs();
     this._wsState = 'connecting';
     this._updateConnectionIndicator();
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // Pass a per-TAB identity on the upgrade URL so the server's connection
-    // registry scopes the per-session limit by connection (COD-137): a same-tab
-    // reconnect supersedes its own socket instead of consuming a new slot and
-    // tripping a spurious 4008, while two tabs of the same browser (which share
-    // the localStorage clientId) each keep their own socket. The bare clientId
-    // still rides the input frames for seq dedup. Omitted if clientId is
-    // unavailable (server then treats the upgrade as anonymous — still admitted
-    // up to the limit).
+    // Scope registry identity per tab: reconnects from this tab supersede their
+    // own socket, while two tabs sharing the browser-wide clientId can coexist.
+    // Input frames keep the bare clientId for durable sequence deduplication.
     const cid = this._clientId ? `${this._clientId}:${this._wsTabNonce}` : '';
     const cidQuery = cid ? `?cid=${encodeURIComponent(cid)}` : '';
     const url = `${proto}//${location.host}${CodemanBase.base}/ws/sessions/${sessionId}/terminal${cidQuery}`;
     const ws = new WebSocket(url);
     this._ws = ws;
     this._wsSessionId = sessionId;
+    this._wsReady = false;
+    this._wsState = 'connecting';
+    this._updateConnectionIndicator();
 
     ws.onopen = () => {
       // Only mark ready if this is still the intended session
       if (this._ws === ws) {
         this._wsReady = true;
         this._wsState = 'connected';
+        this._markTransportActivationReady(sessionId);
+        // COD-182: a RECONNECT (attempts > 0) means the server or link dropped
+        // mid-session — the reattach/redraw churn in that window leaves stale
+        // rows in TUI tabs (e.g. duplicated composer placeholder after a
+        // deploy restart). Schedule a one-shot capture reconcile once output
+        // settles. First-connects skip this: selectSession just painted.
+        const wasReconnect = this._wsReconnectAttempts > 0;
         this._wsReconnectAttempts = 0;
         this._updateConnectionIndicator();
-        // Send a typed resize over the fresh socket: syncs PTY dims after
-        // (re)connects AND registers the desktop sizing claim server-side —
-        // selectSession's earlier resizes ran before this WS existed, so they
-        // went over HTTP, which never claims (see ws-routes sizingToken).
-        this.sendResize(sessionId)?.catch?.(() => {});
+        if (wasReconnect && (this._isTuiSession(sessionId) || this._isMirrorSession(sessionId))) {
+          clearTimeout(this._foreignResizeTimer);
+          this._foreignResizeTimer = setTimeout(() => {
+            this._reconcileForeignResize(sessionId);
+          }, FOREIGN_RESIZE_SETTLE_MS);
+        }
+        // A reconnect cannot claim sizing by itself. Retry only explicit viewer
+        // activity that occurred while its matching socket was unavailable.
+        this._terminalViewerActivity?.flushPending('ws-open');
+        // Durable input is an explicit user action. Even when no old pending va
+        // survived (reload or an old-socket i failure), establish ownership on
+        // this exact fresh socket before replaying geometry or bytes.
+        const inputReplayReady = this._prepareFreshSocketInputReplay(sessionId, ws);
+        // Then replay the latest passive geometry on the exact fresh socket.
+        // z never activates: the server applies it only if this token owns the
+        // session, otherwise it merely remembers the dimensions for later va.
+        this._flushPendingTerminalResize(sessionId, ws);
         this._startMobileResizeRetry(sessionId);
         // Flush any durably-queued input over the fresh socket (covers frames a
         // prior half-open socket silently dropped, and input typed while offline).
@@ -3791,14 +5457,25 @@ class CodemanApp {
       this._ws = null;
       this._wsSessionId = null;
       this._wsReady = false;
+      this._wsLastClose = {
+        code: event.code,
+        reason: event.reason || '',
+        at: new Date().toISOString(),
+      };
       this._stopMobileResizeRetry();
+      try {
+        this._mobileImePreview?.reset?.();
+      } catch {
+        // The preview is visual-only; reconnect policy must continue.
+      }
+      this._mobileImeCommitOwnership = null;
 
       // Decide what to do next from the close code + how many consecutive
       // reconnects we've already made (pure policy in constants.js):
       //   reconnect      → transient (server restart, network blip, ping timeout);
       //                    schedule a backoff retry while this session stays active.
-      //   retry-fallback → too-many-connections / unknown rejection; show the HTTP
-      //                    fallback but keep retrying so we return to WS when it clears.
+      //   retry-fallback → too-many-connections / unknown rejection; keep input
+      //                    queued and retry until ownership-capable WS returns.
       //   give-up        → 4004 (not found) / 4009 (terminated); the session is gone.
       // _disconnectWs() nulls onclose for intentional disconnects, so we never land here for those.
       const plan = window.CodemanWsReconnect.plan(event.code, this._wsReconnectAttempts || 0);
@@ -3831,9 +5508,12 @@ class CodemanApp {
       this._wsOutputGapSession = sessionId;
 
       const stillActive = this.activeSessionId === sessionId;
+      if (stillActive && plan.action !== 'give-up') {
+        this._scheduleWsCloseRefresh(sessionId);
+      }
       if (plan.action === 'give-up') {
-        this._wsState = stillActive ? 'fallback' : 'disconnected';
-        this._updateConnectionIndicator();
+        this._clearTimer('_wsReconnectTimer');
+        this._finalizeTerminalSessionGone(sessionId);
       } else if (plan.action === 'reconnect') {
         if (stillActive) {
           this._wsState = 'reconnecting';
@@ -3851,8 +5531,8 @@ class CodemanApp {
           this._updateConnectionIndicator();
         }
       } else {
-        // retry-fallback: surface the HTTP fallback, but keep trying on a bounded
-        // timer so the transport returns to WS once the transient condition clears.
+        // retry-fallback: surface queued reconnect state and keep trying on a
+        // bounded timer until ownership-capable WS returns.
         this._wsState = stillActive ? 'fallback' : 'disconnected';
         this._updateConnectionIndicator();
         if (stillActive) {
@@ -3872,6 +5552,16 @@ class CodemanApp {
     };
   }
 
+  _scheduleWsCloseRefresh(sessionId) {
+    this._clearTimer('_wsCloseRefreshTimer');
+    this._wsCloseRefreshTimer = setTimeout(() => {
+      this._wsCloseRefreshTimer = null;
+      if (this.activeSessionId === sessionId) {
+        this._onSessionNeedsRefresh({ id: sessionId });
+      }
+    }, 250);
+  }
+
   /** Close the active WebSocket connection (if any). */
   _disconnectWs() {
     this._clearTimer('_wsReconnectTimer');
@@ -3879,14 +5569,23 @@ class CodemanApp {
     // this first, so a reset would restart the exponential backoff ladder at
     // attempt 0 on every retry (≈0ms tight reconnect loop during an outage).
     // ws.onopen zeroes the counter once a connection actually succeeds.
-    this._wsState = 'disconnected';
+    const preserveGone = this._isTerminalSessionGone(this._wsSessionId || this.activeSessionId);
+    if (!preserveGone) this._wsState = 'disconnected';
     this._stopMobileResizeRetry();
+    try {
+      this._mobileImePreview?.reset?.();
+    } catch {
+      // The preview is visual-only; disconnect must continue.
+    }
+    this._mobileImeCommitOwnership = null;
     if (this._ws) {
       this._ws.onclose = null; // Prevent re-entrant cleanup
       this._ws.close();
       this._ws = null;
       this._wsSessionId = null;
       this._wsReady = false;
+      if (!preserveGone) this._wsState = 'disconnected';
+      this._updateConnectionIndicator();
     }
   }
 
@@ -3931,10 +5630,12 @@ class CodemanApp {
    * blocks the keystroke flush; never silently drops on a half-open socket.
    * @param {string} sessionId
    * @param {string} input
-   * @param {{useMux?: boolean}} [opts] - useMux only affects the POST fallback.
+   * @param {{useMux?: boolean}} [opts] - retained in durable records for compatibility.
    */
   _sendInputAsync(sessionId, input, opts) {
     if (!sessionId || !input) return;
+    if (this._isTerminalSessionGone(sessionId)) return;
+    if (sessionId === this.activeSessionId) this._terminalViewerActivity?.activate?.('terminal-input');
     const useMux = opts?.useMux === true;
     // Both transports refuse a frame over the server's limit (issue #484), and a
     // refused frame used to sit at the head of the durable queue for good. So an
@@ -4036,6 +5737,9 @@ class CodemanApp {
 
   /** Record one input frame and kick delivery. The record lives until ACKed. */
   _reliableSend(sessionId, data, useMux) {
+    // A 4004/4009 close is authoritative: no reconnect will ever drain new
+    // records for this still-selected dead terminal.
+    if (this._isTerminalSessionGone(sessionId)) return;
     const seq = this._nextSeq(sessionId);
     const rec = { seq, data, useMux: !!useMux, ts: Date.now(), tries: 0, sentAt: 0 };
     let list = this._pendingDeliveries.get(sessionId);
@@ -4064,6 +5768,10 @@ class CodemanApp {
     const list = this._pendingDeliveries.get(sessionId);
     if (!list || list.length === 0) return;
 
+    // Input typed while ownership activation is pending must stay durable but
+    // undelivered. ws.onopen flushes va, then latest z, then calls _onWsReady.
+    if (this._terminalViewerActivity?.hasPending?.(sessionId)) return;
+
     // Fast path: WebSocket open for this session — fire each not-yet-sent record
     // over the single ordered stream. They stay pending until the server ACKs
     // them ({t:'ia'}); a frame swallowed by a half-open socket is re-sent after
@@ -4077,62 +5785,15 @@ class CodemanApp {
           rec.sentAt = Date.now();
           rec.tries++;
         } catch {
-          break; // socket died mid-send — reconnect/POST drainer retries
+          break; // socket died mid-send — the reconnect drainer retries
         }
       }
       return;
     }
 
-    // Slow path: no WS — POST records in order, awaiting each (the HTTP 2xx is
-    // the ACK). Serialized per session so seq order survives async fetches.
-    if (this._postDraining.has(sessionId)) return;
-    this._postDraining.add(sessionId);
-    (async () => {
-      try {
-        for (;;) {
-          const cur = this._pendingDeliveries.get(sessionId);
-          if (!cur || cur.length === 0) break;
-          // If the WebSocket came back mid-drain, yield to it (the acked stream)
-          // so we don't redundantly re-POST what onopen is already re-sending.
-          if (this._inputSocketFor(sessionId)) {
-            break;
-          }
-          const rec = cur[0];
-          rec.tries++;
-          rec.sentAt = Date.now();
-          let resp = null;
-          try {
-            const body = { input: rec.data, seq: rec.seq, clientId: this._clientId };
-            if (rec.useMux) body.useMux = true;
-            resp = await fetch(`/api/sessions/${sessionId}/input`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(body),
-              keepalive: rec.data.length < 65536,
-            });
-          } catch {
-            resp = null;
-          }
-          if (resp && resp.ok) {
-            this._ackDelivery(sessionId, rec.seq);
-          } else if (resp && (resp.status === 404 || resp.status === 410)) {
-            // Session no longer exists — the input can never land. Drop it
-            // rather than retry forever (not a "lost" prompt: the target is gone).
-            this._ackDelivery(sessionId, rec.seq);
-          } else if (resp && (resp.status === 400 || resp.status === 413)) {
-            // The frame itself was refused, so a retry gets the same answer. Kept
-            // queued, it was re-POSTed every 2 s forever and blocked every later
-            // input for this session behind it (issue #484). 401/403 stay
-            // transient: an expired login delivers fine once the user signs in.
-            this._dropRejectedInput(sessionId, rec);
-          } else {
-            break; // offline / 5xx — leave queued; sweep + reconnect retry later
-          }
-        }
-      } finally {
-        this._postDraining.delete(sessionId);
-      }
-    })();
+    // No ownership-capable WS: retain the exact durable queue. Browser input
+    // must never bypass viewer ownership through the trusted HTTP API. The
+    // bounded WS reconnect path will call _onWsReady and redeliver in order.
   }
 
   /** Drop a frame the server refused for good, and say so once. */
@@ -4213,8 +5874,19 @@ class CodemanApp {
   }
 
   /** Called from ws.onopen — flush everything pending over the fresh socket. */
-  _onWsReady(sessionId) {
+  _onWsReady(sessionId, options = {}) {
     const list = this._pendingDeliveries.get(sessionId);
+    if (!list || list.length === 0) return;
+    // A second terminal's own socket (split pane, tile) replays its queue as soon as
+    // it opens: every input frame activates that viewer server-side on arrival, so
+    // the primary pane's activation handshake does not apply to it.
+    const extraSocketReady =
+      this._wsSessionId !== sessionId && this._extraInputSockets?.get(sessionId)?.ws?.readyState === WebSocket.OPEN;
+    const activationReady =
+      options.activationReady === true ||
+      extraSocketReady ||
+      this._prepareFreshSocketInputReplay(sessionId, this._ws);
+    if (!activationReady) return;
     if (list) for (const r of list) r.sentAt = 0; // fresh socket ⇒ re-send all
     this._drainSession(sessionId);
   }
@@ -4222,8 +5894,8 @@ class CodemanApp {
   /**
    * Periodic retry. For the active WS session, an oldest frame unacked past the
    * timeout means the socket is (half-)dead — close it to force a fast reconnect
-   * (onclose → reconnect → onopen → _onWsReady re-sends). Other sessions just
-   * (re)drain over POST.
+   * (onclose → reconnect → onopen → _onWsReady re-sends). Other sessions remain
+   * queued until their ownership-capable WS is active.
    */
   _redeliverSweep() {
     if (this._pendingDeliveries.size === 0) return;
@@ -4410,8 +6082,15 @@ class CodemanApp {
           cls = 'connected'; label = 'WS'; detail = 'Terminal connected over WebSocket';
           break;
         case 'fallback':
-          cls = 'fallback'; label = 'HTTP'; detail = 'WebSocket unavailable — input sent over HTTP';
+          cls = 'reconnecting'; label = 'WS…'; detail = 'WebSocket unavailable — input queued until reconnect';
           break;
+        case 'gone':
+          return {
+            display: 'flex',
+            dotClass: 'connection-dot offline',
+            text: 'Ended',
+            title: 'Terminal session is no longer available',
+          };
         case 'reconnecting':
           cls = 'reconnecting'; label = 'WS…'; detail = 'Reconnecting WebSocket';
           break;
@@ -4645,10 +6324,16 @@ class CodemanApp {
     this.connectSSE();
     // The terminal socket does not always come back on its own (planWsReconnect
     // 'give-up'), so the same button re-arms it. With the tile grid open the
-    // main socket is parked on purpose: re-arm the tiles' sockets instead.
+    // main socket is parked on purpose: re-arm the tiles' sockets instead. An
+    // authoritative 4004/4009 remains closed: retrying cannot revive a terminal
+    // session the server says no longer exists.
     if (this._tilesOwnTerminal?.()) {
       for (const { tile } of this._tileGrid.tiles.values()) tile.reconnectNow();
-    } else if (this.activeSessionId && this._wsState !== 'connected') {
+    } else if (
+      this.activeSessionId &&
+      this._wsState !== 'connected' &&
+      !this._isTerminalSessionGone(this.activeSessionId)
+    ) {
       this._wsReconnectAttempts = 0;
       this._connectWs(this.activeSessionId);
     }
@@ -4689,7 +6374,88 @@ class CodemanApp {
     cjkEl.style.display = showCjk ? 'block' : 'none';
     cjkEl.setAttribute('aria-hidden', showCjk ? 'false' : 'true');
     if (!showCjk) window.cjkActive = false;
+    try { this._updateTypingBlockedBanner?.(showCjk && window.cjkActive ? 'cjk' : 'none'); } catch {}
     if (typeof KeyboardHandler !== 'undefined') KeyboardHandler.updateLayoutForKeyboard();
+  }
+
+  /**
+   * COD-103: reflect which Codeman CLI alias is on PATH in user-facing help text.
+   * Sets the Agent Checkpoint hint's `<code>` to the resolved alias and toggles a
+   * sibling not-on-PATH warning. The attachment-drawer empty state reads
+   * `this.codemanCli` on its own re-render (see panels-ui renderAttachmentHistory),
+   * so re-render it here if it's currently open.
+   */
+  _applyCodemanCliHints() {
+    const cli = this.codemanCli || { onPath: true, name: 'aicodeman' };
+    const name = cli.name || 'aicodeman';
+    const codeEl = document.getElementById('checkpointCliHint');
+    if (codeEl) codeEl.textContent = `${name} checkpoint -m compact|clear`;
+    const warnEl = document.getElementById('checkpointCliPathWarning');
+    if (warnEl) warnEl.hidden = cli.onPath !== false ? true : false;
+    // Refresh the attachment drawer empty state only if the drawer already
+    // exists and is showing the empty state (don't eagerly create the drawer).
+    if (document.getElementById('attachmentHistoryDrawer') && !(this.attachmentHistoryItems || []).length) {
+      this.renderAttachmentHistory?.();
+    }
+  }
+
+  _isUsableXtermSnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== 'string' || snapshot.length < 8) return false;
+    const visibleText = snapshot
+      .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+      .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+      .replace(/\x1b[()][0-2A-Z]/g, '')
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
+      .trim();
+    return visibleText.length >= 3;
+  }
+
+  _replaceSubagentSnapshot(records) {
+    const next = new Map();
+    this._subagentEventVersions.clear();
+    for (const record of Array.isArray(records) ? records : []) {
+      const agentKey = this._requireSubagentEventKey?.(record, 'snapshot');
+      if (!agentKey) continue;
+      next.set(agentKey, record);
+      this._touchSubagentEvent?.(agentKey);
+    }
+    this.subagents = next;
+  }
+
+  _reportSubagentRestoreFailure(err) {
+    const diagnosticKey = 'restore-chain';
+    if (!this._subagentIdentityDiagnostics) this._subagentIdentityDiagnostics = new Set();
+    if (this._subagentIdentityDiagnostics.has(diagnosticKey)) return;
+    this._subagentIdentityDiagnostics.add(diagnosticKey);
+    console.warn('[subagents] failed to restore persisted window state:', err);
+  }
+
+  async _restoreSubagentStateForInit(gen) {
+    try {
+      await this.loadSubagentParentMap(gen);
+      if (gen !== this._initGeneration) return;
+
+      for (const [agentKey, sessionId] of this.subagentParentMap) {
+        if (gen !== this._initGeneration) return;
+        const agent = this.subagents.get(agentKey);
+        if (agent && this.sessions.has(sessionId)) {
+          agent.parentSessionId = sessionId;
+          const session = this.sessions.get(sessionId);
+          if (session) agent.parentSessionName = this.getSessionName(session);
+          this.subagents.set(agentKey, agent);
+        }
+      }
+
+      for (const [agentKey] of this.subagents) {
+        if (gen !== this._initGeneration) return;
+        if (!this.subagentParentMap.has(agentKey)) this.findParentSessionForSubagent(agentKey);
+      }
+
+      if (gen !== this._initGeneration) return;
+      await this.restoreSubagentWindowStates(gen);
+    } catch (err) {
+      if (gen === this._initGeneration) this._reportSubagentRestoreFailure(err);
+    }
   }
 
   /**
@@ -4722,10 +6488,14 @@ class CodemanApp {
     this._clearTimer('flickerFilterTimeout');
     this.flickerFilterBuffer = '';
     this.flickerFilterActive = false;
+    this._flickerFilterEpochSegments = [];
+    this._flickerFilterMaxAcceptanceEpoch = 0;
     // Clear pending terminal writes
     this._clearTimer('syncWaitTimeout');
     this._clearTimer('_clientDropRecoveryTimer');
     this.pendingWrites = [];
+    this._pendingWriteAcceptanceEpochs = [];
+    this._pendingWritesMaxAcceptanceEpoch = 0;
     this.writeFrameScheduled = false;
     // Release the one-chunk-in-flight gate with the rest of the write queue.
     // flushPendingWrites() early-returns while this is set, so a reset that
@@ -4737,6 +6507,7 @@ class CodemanApp {
     this._terminalWriteInFlightBytes = 0;
     this._isLoadingBuffer = false;
     this._loadBufferQueue = null;
+    this._loadBufferQueueAcceptanceEpochs = null;
     this._bufferLoadOwner = null;
     this._terminalRefreshOwner = null;
     // Abort any in-flight chunkedTerminalWrite (SSE reconnect reloads buffers)
@@ -4755,18 +6526,31 @@ class CodemanApp {
     // Clear parent name cache (prevents stale session name entries accumulating)
     if (this._parentNameCache) this._parentNameCache.clear();
     // Clear subagent activity/results maps (prevents leaks if data.subagents is missing)
+    this.subagents.clear();
     this.subagentActivity.clear();
     this.subagentToolResults.clear();
+    this.subagentParentMap.clear();
+    this._subagentEventVersions.clear();
+    this.minimizedSubagents.clear();
+    this.activeSubagentKey = null;
+    for (const timer of this._subagentWindowRenderTimeouts?.values() || []) clearTimeout(timer);
+    this._subagentWindowRenderTimeouts?.clear();
+    for (const timers of this._subagentCompletionTimers.values()) {
+      for (const timer of timers) clearTimeout(timer);
+    }
+    this._subagentCompletionTimers.clear();
     // Clear ultracode workflow run state (re-seeded from data.workflowRuns below)
     if (this.workflowRuns) this.workflowRuns.clear();
     if (this.workflowRunDetails) this.workflowRunDetails.clear();
     this.activeWorkflowRunId = null;
     this.activeWorkflowPhaseIndex = null;
     // Clean up mobile/keyboard handlers and re-init (prevents listener accumulation on reconnect)
+    this._destroyMobileImePreview?.();
     MobileDetection.cleanup();
     KeyboardHandler.cleanup();
     MobileDetection.init();
     KeyboardHandler.init();
+    this._initMobileImePreview?.();
     // Clear tab alerts
     this.tabAlerts.clear();
     this.attachmentHistoryCounts.clear();
@@ -4819,6 +6603,11 @@ class CodemanApp {
     this._serverCjkOverride = data.inputCjkForm || false;
     this._updateCjkInputState();
 
+    // COD-103: which Codeman CLI alias is on PATH, for the checkpoint hint and
+    // the attachment-drawer empty state. Persist so panels-ui can read it on
+    // re-render; update the static checkpoint hint now.
+    this.codemanCli = data.codemanCli || { onPath: true, name: 'aicodeman' };
+    this._applyCodemanCliHints();
     // Plan-usage chip: server's last-known telemetry, so it shows immediately on
     // a fresh load / reconnect (authoritative; wins over the localStorage restore).
     if (data.planUsage) this.updatePlanUsageChip(data.planUsage);
@@ -4865,7 +6654,8 @@ class CodemanApp {
     this._resetAllAppState(keepTerminal);
 
     data.sessions.forEach(s => {
-      this.sessions.set(s.id, s);
+      this._applySessionActivityEvent(s, 'hydrate', false);
+      this.updateAttachmentHistoryCountFromSession?.(s);
       // Load ralph state from session data (only if not explicitly closed by user)
       if ((s.ralphLoop || s.ralphTodos) && !this.ralphClosedSessions.has(s.id)) {
         this.ralphStates.set(s.id, {
@@ -4920,7 +6710,7 @@ class CodemanApp {
     }
 
     this.updateCost();
-    this.renderSessionTabs();
+    this._refreshSessionActivitySurfaces();
 
     // Approvals Inbox: re-seed pending prompts from the server so alerts
     // survive reloads and SSE reconnects (methods in approvals-ui.js).
@@ -4939,42 +6729,25 @@ class CodemanApp {
 
     // Load subagents - clear all related maps to prevent memory leaks on reconnect
     if (data.subagents) {
+      for (const timer of this._subagentWindowRenderTimeouts?.values() || []) clearTimeout(timer);
+      this._subagentWindowRenderTimeouts?.clear();
+      for (const timers of this._subagentCompletionTimers.values()) {
+        for (const timer of timers) clearTimeout(timer);
+      }
+      this._subagentCompletionTimers.clear();
       this.subagents.clear();
       this.subagentActivity.clear();
       this.subagentToolResults.clear();
-      data.subagents.forEach(s => {
-        this.subagents.set(s.agentId, s);
-      });
+      this.minimizedSubagents.clear();
+      this.activeSubagentKey = null;
+      this._replaceSubagentSnapshot(data.subagents);
       this.renderSubagentPanel();
 
       // Load PERSISTENT parent associations FIRST, before restoring windows
       // This ensures connection lines are drawn to the correct tabs
       // Clear the in-memory map first to ensure fresh state from storage
       this.subagentParentMap.clear();
-      this.loadSubagentParentMap().then(() => {
-        // Apply stored parent associations to agents
-        for (const [agentId, sessionId] of this.subagentParentMap) {
-          const agent = this.subagents.get(agentId);
-          if (agent && this.sessions.has(sessionId)) {
-            agent.parentSessionId = sessionId;
-            const session = this.sessions.get(sessionId);
-            if (session) {
-              agent.parentSessionName = this.getSessionName(session);
-            }
-            this.subagents.set(agentId, agent);
-          }
-        }
-
-        // Now try to find parents for any agents that don't have one yet
-        for (const [agentId] of this.subagents) {
-          if (!this.subagentParentMap.has(agentId)) {
-            this.findParentSessionForSubagent(agentId);
-          }
-        }
-
-        // Finally, restore window states (this opens windows with correct parent info)
-        this.restoreSubagentWindowStates();
-      });
+      void this._restoreSubagentStateForInit(gen);
     }
 
     // Seed ultracode workflow runs (LEFT-pane summaries) from the snapshot
@@ -4982,10 +6755,6 @@ class CodemanApp {
       this.seedWorkflowRuns(data.workflowRuns);
     }
 
-    // Restore previously active session (survives page reload + SSE reconnect)
-    // Must always re-select because handleInit clears terminal state above.
-    // Reset activeSessionId so selectSession doesn't early-return.
-    // Guard: skip if a newer handleInit has already started (race between loadState + SSE init).
     if (gen !== this._initGeneration) return;
 
     // Solo (detached) window: always show exactly the target session, ignoring
@@ -5020,6 +6789,7 @@ class CodemanApp {
     const previousActiveId = this.activeSessionId;
     if (this.sessionOrder.length === 0) {
       this.activeSessionId = null;
+      this.updateFileBrowserHeaderButton?.();
     } else {
       // Priority: current active > localStorage > first session
       let restoreId = previousActiveId;
@@ -5040,6 +6810,7 @@ class CodemanApp {
         this._splitPane?.reconnectNow?.();
       } else {
         this.activeSessionId = null;
+        this.updateFileBrowserHeaderButton?.();
         // A tile grid stored open on this device (tile-grid.js) comes back IN
         // PLACE of the single-view restore below, so the main terminal never
         // loads (its first select would pull a whole-history capture only to
@@ -5066,6 +6837,1213 @@ class CodemanApp {
       console.error('Failed to load state:', err);
     }
   }
+
+
+  _ensureTabLayoutCoordinator() {
+    if (this._tabLayoutCoordinator) return this._tabLayoutCoordinator;
+    if (!window.CodemanTabLayout) return null;
+    this._tabLayoutCoordinator = window.CodemanTabLayout.createLoadCoordinator({
+      fetchLayout: async () => {
+        const data = await this._apiJson('/api/tab-layout');
+        if (!data?.layout) throw new Error('Tab layout unavailable');
+        return data.layout;
+      },
+      applyLayout: (layout) => this._applyTabLayout(layout),
+      applyFallback: () => this._applyTabLayout(null),
+      // 5 s, 10 s, 20 s, 40 s, then stop until the next SSE init or
+      // tab:layoutChanged asks again: an unreachable server must not cost a
+      // fetch every 5 s for as long as the page stays open.
+      retryDelayMs: 5000,
+      maxRetryDelayMs: 60000,
+      maxRetries: 4,
+      scheduleRetry: (retry, delayMs) => setTimeout(retry, delayMs),
+      cancelRetry: (timer) => clearTimeout(timer),
+    });
+    return this._tabLayoutCoordinator;
+  }
+
+  _loadTabLayout() {
+    const coordinator = this._ensureTabLayoutCoordinator();
+    if (!coordinator) {
+      this._releaseTabLayoutFirstPaint();
+      return Promise.resolve(false);
+    }
+    // A read that hangs must not leave the rail blank: paint whatever is known.
+    if (this._tabLayoutFirstPaintPending && !this._tabLayoutFirstPaintTimer) {
+      this._tabLayoutFirstPaintTimer = setTimeout(() => this._releaseTabLayoutFirstPaint(), 2500);
+    }
+    return coordinator.load();
+  }
+
+  /** True while the first-paint hold applies (vertical rail, first read in flight). */
+  _tabLayoutFirstPaintHeld() {
+    return this._tabLayoutFirstPaintPending && !!this._tabLayoutCoordinator && this._tabOrientation() === 'vertical';
+  }
+
+  _releaseTabLayoutFirstPaint({ render = true } = {}) {
+    if (this._tabLayoutFirstPaintTimer) clearTimeout(this._tabLayoutFirstPaintTimer);
+    this._tabLayoutFirstPaintTimer = null;
+    if (!this._tabLayoutFirstPaintPending) return false;
+    const wasHeld = this._tabLayoutFirstPaintHeld();
+    this._tabLayoutFirstPaintPending = false;
+    if (wasHeld && render) this._fullRenderSessionTabs();
+    return wasHeld;
+  }
+
+  _onTabLayoutChanged(data) {
+    const me = window.__codemanUser;
+    // Another user's layout changed: nothing of ours moved. (The GET is
+    // owner-scoped server-side, so this is a saved request, not a guard.)
+    if (me?.multiUser && typeof data?.owner === 'string' && data.owner !== me.username) return;
+    if (Number.isSafeInteger(data?.version) && this.tabLayout && data.version <= this.tabLayout.version) return;
+    // Our own write is in flight: its response is the newer truth, and a read
+    // racing it could repaint the pre-edit layout. Re-read once it settles.
+    if (this._tabLayoutEditor?.hasPending()) {
+      this._tabLayoutReloadPending = true;
+      return;
+    }
+    this._loadTabLayout();
+  }
+
+  _applyTabLayout(layout) {
+    let next = null;
+    if (layout) {
+      try {
+        next = window.CodemanTabLayout.normalizeLayout(layout);
+      } catch {
+        next = null;
+      }
+    }
+    // An overtaken response is already dropped by the coordinator; this guards a
+    // reordering between the coordinator and an SSE-triggered reload.
+    if (next && this.tabLayout && next.version < this.tabLayout.version) return;
+    const editor = this._tabLayoutEditor;
+    if (editor) {
+      // A failed read says nothing about the layout, and dropping the editor now
+      // would lose the edit outright: a write in flight would never get its 409
+      // rebased. Keep the held layout and the editor; read again once it settles.
+      if (!next && editor.hasPending()) {
+        this._tabLayoutReloadPending = true;
+        return;
+      }
+      if (next && editor.isWriting()) {
+        // The write's own response decides; read again after it.
+        this._tabLayoutReloadPending = true;
+        return;
+      }
+      // Unsaved edits are rebased onto the read (adoptExternal repaints); with
+      // none, the editor is simply rebuilt from the new layout on next use.
+      if (next && editor.hasPending() && editor.adoptExternal(next)) return;
+      if (editor.hasPending()) this.showToast?.('Your tab group edit was not saved.', 'error');
+      editor.dispose();
+      this._tabLayoutEditor = null;
+    }
+    this.tabLayout = next;
+    // The first read settled (a fallback included): the rail may paint now.
+    const released = this._releaseTabLayoutFirstPaint({ render: false });
+    const storage = this._getTabCollapseStorage();
+    const collapsed = storage && next
+      ? window.CodemanTabLayout.loadCollapsedGroupIds(storage, next.groups.map((group) => group.id))
+      : { ids: [], ok: !next };
+    if (!collapsed.ok) this._tabCollapseStorageFailed = true;
+    this.collapsedTabGroupIds = new Set(collapsed.ids);
+    // The server announces a layout change on every session create/close, web
+    // tab create/delete and order PUT, and most of those move nothing on this
+    // rail (always so on the flat rail, which is every owner without groups).
+    // Rebuild only when what the rail would draw actually changed.
+    if (released || this._isTabGroupStructureStale()) this._fullRenderSessionTabs();
+    // Edits left unsaved by the previous page (see _persistPendingTabLayoutEdits).
+    if (next && !this._tabLayoutRestoreChecked) {
+      this._tabLayoutRestoreChecked = true;
+      this._restorePendingTabLayoutEdits();
+    }
+  }
+
+  _getTabCollapseStorage() {
+    if (this._tabCollapseStorageFailed) return null;
+    try {
+      return window.localStorage;
+    } catch {
+      this._tabCollapseStorageFailed = true;
+      return null;
+    }
+  }
+
+  _projectTabGroups() {
+    if (!this.tabLayout || this._tabOrientation() !== 'vertical' || !window.CodemanTabLayout) return null;
+    return window.CodemanTabLayout.project(this.tabLayout, {
+      // sessionOrder, not the sessions Map: rows are built in that order, so a
+      // session the layout has not placed yet lands where the flat strip has it.
+      liveSessionIds: this.sessionOrder.filter((id) => this.sessions.has(id)),
+      openWebviewIds: (this.webviewOrder || []).filter((id) => this.webviews?.has(id)),
+      parents: this._tabLayoutParents(),
+      // A rail search shows matches inside collapsed groups too, so it projects
+      // every group open. The stored per-device collapse state is untouched and
+      // applies again as soon as the search is cleared.
+      collapsedGroupIds: this._tabRailSearchActive() ? [] : [...this.collapsedTabGroupIds],
+      focusCollapsed: !this._tabRailSearchActive() && this._focusGroupCollapsed(),
+      activeSessionId: this.activeSessionId,
+      activeWebviewId: this.activeWebviewId,
+    });
+  }
+
+  _tabGroupStructureKey(projection) {
+    const key = window.CodemanTabLayout?.structureKey(this.tabLayout, projection, [...this.collapsedTabGroupIds]) ?? null;
+    // Placement badges and Focus stars are drawn by the full render only, so a
+    // change to either is structural even when no row moved.
+    return key === null ? null : `${key}|${JSON.stringify(this._tabPlacements())}`;
+  }
+
+  _focusGroupCollapsed() {
+    if (this._focusCollapsed === undefined) {
+      const storage = this._getTabCollapseStorage();
+      const loaded = storage ? window.CodemanTabLayout.loadFocusCollapsed(storage) : { collapsed: false, ok: false };
+      this._focusCollapsed = loaded.collapsed;
+      if (!loaded.ok) this._tabCollapseStorageFailed = true;
+    }
+    return this._focusCollapsed;
+  }
+
+  /** Per-device Focus collapse (COD-509): the twin of a group's collapse. */
+  toggleFocusGroupCollapsed(forceCollapsed) {
+    if (this._tabRailSearchActive()) return false;
+    const shouldCollapse = forceCollapsed === undefined ? !this._focusGroupCollapsed() : forceCollapsed === true;
+    const storage = this._getTabCollapseStorage();
+    if (!storage || !window.CodemanTabLayout.saveFocusCollapsed(storage, shouldCollapse).ok) this._tabCollapseStorageFailed = true;
+    this._focusCollapsed = shouldCollapse;
+    this._fullRenderSessionTabs();
+    return true;
+  }
+
+  /** `{ '<kind>:<id>': { state, parentId, canFollow } }` for every child session. */
+  _tabPlacements() {
+    if (!this.tabLayout || !window.CodemanTabLayout?.describePlacements) return {};
+    const parents = this._tabLayoutParents();
+    const key = JSON.stringify(parents);
+    if (this._tabPlacementCache?.layout !== this.tabLayout || this._tabPlacementCache.parents !== key) {
+      this._tabPlacementCache = {
+        layout: this.tabLayout,
+        parents: key,
+        placements: window.CodemanTabLayout.describePlacements(this.tabLayout, parents),
+      };
+    }
+    return this._tabPlacementCache.placements;
+  }
+
+  _tabPlacementPresentation(ref) {
+    const placement = this._tabPlacements()[`${ref.kind}:${ref.id}`];
+    if (!placement) return null;
+    const parent = this.sessions.get(placement.parentId);
+    const parentName = parent ? this.getSessionName(parent) : placement.parentId;
+    switch (placement.state) {
+      case 'inherited':
+        return { ...placement, short: 'Follows parent', description: `Follows parent ${parentName}` };
+      case 'manual':
+        return { ...placement, short: 'Manual', description: `Placed manually; can follow ${parentName}` };
+      case 'cycle':
+        return { ...placement, short: 'Parent cycle', description: 'Parent cycle; placed independently' };
+      default:
+        return { ...placement, short: 'Parent unavailable', description: 'Parent unavailable; placed independently' };
+    }
+  }
+
+  _tabStoredRef(ref) {
+    const location = this._tabRefLocation(ref);
+    return location ? location.refs[location.index] : null;
+  }
+
+  _tabRefFocused(ref) {
+    return this._tabStoredRef(ref)?.focus === true;
+  }
+
+  setTabRefFocus(ref, focused) {
+    return this.editTabLayout({ type: 'setFocus', ref, focused }, `${ref.kind}:${ref.id}`);
+  }
+
+  /**
+   * Destination index in the stored Focus order for a one-step move, or null.
+   * Steps over focused refs this browser cannot draw (a web tab closed here, a
+   * session that is gone), so a move always passes a VISIBLE neighbour.
+   */
+  _focusMoveTarget(ref, delta) {
+    if ((delta !== 1 && delta !== -1) || !this.tabLayout) return null;
+    const order = window.CodemanTabLayout.orderedFocusRefs(this.tabLayout);
+    const keyOf = (entry) => `${entry.kind}:${entry.id}`;
+    const from = order.findIndex((entry) => keyOf(entry) === keyOf(ref));
+    if (from < 0) return null;
+    const visible = new Set((this._projectTabGroups()?.focusRefs || []).map(keyOf));
+    for (let index = from + delta; index >= 0 && index < order.length; index += delta) {
+      if (visible.has(keyOf(order[index]))) return index;
+    }
+    return null;
+  }
+
+  moveFocusRefBy(ref, delta) {
+    const index = this._focusMoveTarget(ref, delta);
+    if (index === null) return false;
+    return this.editTabLayout({ type: 'moveFocus', ref, index }, `${ref.kind}:${ref.id}`);
+  }
+
+  /**
+   * Alt+1..9 targets, in the numbers the rail paints: Focus first (COD-509),
+   * then the flat strip's order (sessions, then open web tabs).
+   */
+  _tabAltRefs(projection = this._projectTabGroups()) {
+    const live = this.sessionOrder.filter((id) => this.sessions.has(id));
+    const open = (this.webviewOrder || []).filter((id) => this.webviews?.has(id));
+    if (!window.CodemanTabLayout?.altRefs) {
+      return [...live.map((id) => ({ kind: 'session', id })), ...open.map((id) => ({ kind: 'webview', id }))];
+    }
+    return window.CodemanTabLayout.altRefs(projection, live, open);
+  }
+
+  _isTabGroupStructureStale(projection = this._projectTabGroups()) {
+    return this._tabGroupStructureKey(projection) !== this._lastTabGroupStructureKey;
+  }
+
+  toggleTabGroupCollapsed(groupId, forceCollapsed) {
+    // Every group is drawn open while the rail search runs; a toggle then would
+    // change what the user sees only after the search is cleared.
+    if (this._tabRailSearchActive()) return false;
+    if (groupId === window.CodemanTabLayout?.FOCUS_SECTION_ID) return this.toggleFocusGroupCollapsed(forceCollapsed);
+    if (!this.tabLayout?.groups?.some((group) => group.id === groupId)) return false;
+    const next = new Set(this.collapsedTabGroupIds);
+    const shouldCollapse = forceCollapsed === undefined ? !next.has(groupId) : forceCollapsed === true;
+    if (shouldCollapse) next.add(groupId);
+    else next.delete(groupId);
+    const storage = this._getTabCollapseStorage();
+    const saved = storage
+      ? window.CodemanTabLayout.saveCollapsedGroupIds(storage, [...next])
+      : { ids: [], ok: false };
+    if (!saved.ok) this._tabCollapseStorageFailed = true;
+    this.collapsedTabGroupIds = new Set(saved.ids);
+    // The full render also redraws connectors anchored to rows that just moved.
+    this._fullRenderSessionTabs();
+    return this.collapsedTabGroupIds.has(groupId) === shouldCollapse;
+  }
+
+  _tabLayoutEditable() {
+    return !!(this.tabLayout && window.CodemanTabLayout && this._tabOrientation() === 'vertical');
+  }
+
+  _tabLayoutParents() {
+    const parents = {};
+    for (const session of this.sessions.values()) {
+      if (session?.parentSessionId && session.parentSessionId !== session.id) parents[session.id] = session.parentSessionId;
+    }
+    return parents;
+  }
+
+  _tabLayoutWriteBody({ baseVersion, layout, operations }) {
+    // Legacy whole-layout writes preserve the server's Focus flags. A batch
+    // that changes Focus must carry its intent through the semantic API.
+    if (operations?.some((operation) => operation.type === 'setFocus' || operation.type === 'moveFocus')) {
+      return { baseVersion, operations };
+    }
+    return { baseVersion, layout: { ...layout, updatedAt: layout.updatedAt || new Date().toISOString() } };
+  }
+
+  async _putTabLayout(request) {
+    const body = this._tabLayoutWriteBody(request);
+    const response = await this._api('/api/tab-layout', { method: 'PUT', body });
+    if (!response) return { ok: false, status: 0, layout: null };
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {}
+    return { ok: response.ok, status: response.status, layout: data?.data?.layout || null };
+  }
+
+  _ensureTabLayoutEditor() {
+    if (this._tabLayoutEditor || !this.tabLayout) return this._tabLayoutEditor || null;
+    this._tabLayoutEditor = window.CodemanTabLayout.createEditCoordinator({
+      initialLayout: this.tabLayout,
+      put: (request) => this._putTabLayout(request),
+      fetchLayout: async () => {
+        const data = await this._apiJson('/api/tab-layout');
+        if (!data?.layout) throw new Error('Tab layout unavailable');
+        return data.layout;
+      },
+      applyLayout: (layout) => this._adoptEditedTabLayout(layout),
+      reportError: (message) => this.showToast?.(message, 'error'),
+      onFailure: () => {
+        // The rail may still show an edit the server refused: read the truth.
+        this._tabLayoutReloadPending = true;
+      },
+      onSettled: () => {
+        if (!this._tabLayoutReloadPending) return;
+        this._tabLayoutReloadPending = false;
+        this._loadTabLayout();
+      },
+    });
+    return this._tabLayoutEditor;
+  }
+
+  _adoptEditedTabLayout(layout) {
+    this.tabLayout = layout;
+    const storage = this._getTabCollapseStorage();
+    if (storage) {
+      // Forget collapse state for groups that no longer exist.
+      const collapsed = window.CodemanTabLayout.loadCollapsedGroupIds(storage, layout.groups.map((group) => group.id));
+      if (collapsed.ok) this.collapsedTabGroupIds = new Set(collapsed.ids);
+    }
+    this._fullRenderSessionTabs();
+  }
+
+  editTabLayout(operation, focusIdentity) {
+    if (!this._tabLayoutEditable()) return false;
+    const active = document.activeElement;
+    const rail = this.$('sessionTabs');
+    if (focusIdentity && (!active || active === document.body || rail?.contains(active))) {
+      this._tabFocusIdentity = focusIdentity;
+      this._tabRefocusAfterEdit = true;
+    }
+    try {
+      const editor = this._ensureTabLayoutEditor();
+      // A drop can be two edits ("leave Focus, then move"). Validate the whole
+      // list on the held layout first, so a bad second step queues neither.
+      const operations = Array.isArray(operation) ? operation : [operation];
+      operations.reduce((layout, next) => window.CodemanTabLayout.applyOperation(layout, next), editor.getLayout());
+      for (const next of operations) editor.enqueue(next);
+      return true;
+    } catch (error) {
+      this._tabRefocusAfterEdit = false;
+      this.showToast?.(error?.message || 'Could not save tab groups.', 'error');
+      return false;
+    }
+  }
+
+  _newTabGroupId() {
+    return globalThis.crypto?.randomUUID?.() || `group-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  createTabGroup({ ref = null, index } = {}) {
+    if (!this._tabLayoutEditable()) return false;
+    const id = this._newTabGroupId();
+    const name = window.CodemanI18n?.t?.('New group') || 'New group';
+    if (!this.editTabLayout({ type: 'createGroup', id, name, ...(Number.isInteger(index) ? { index } : {}) }, `group:${id}`)) {
+      return false;
+    }
+    if (ref) this.editTabLayout({ type: 'moveRef', ref, groupId: id, index: 0, parents: this._tabLayoutParents() });
+    this.startTabGroupRename(id);
+    return true;
+  }
+
+  deleteTabGroup(groupId) {
+    const groups = this.tabLayout?.groups || [];
+    const index = groups.findIndex((group) => group.id === groupId);
+    if (index < 0) return false;
+    if (!window.confirm(`Delete group "${groups[index].name}"? Its tabs move to Ungrouped.`)) {
+      // The menu that asked is gone; put the keyboard back on the group.
+      this.$('sessionTabs')?.querySelector(`[data-tab-group-header="${CSS.escape(groupId)}"]`)?.focus();
+      return false;
+    }
+    const neighbour = groups[index + 1] || groups[index - 1];
+    return this.editTabLayout({ type: 'deleteGroup', groupId }, neighbour ? `group:${neighbour.id}` : null);
+  }
+
+  moveTabGroup(groupId, delta) {
+    const groups = this.tabLayout?.groups || [];
+    const from = groups.findIndex((group) => group.id === groupId);
+    const to = from + delta;
+    if (from < 0 || to < 0 || to >= groups.length) return false;
+    return this.editTabLayout({ type: 'reorderGroup', groupId, index: to }, `group:${groupId}`);
+  }
+
+  _tabRefLocation(ref) {
+    const same = (candidate) => candidate.kind === ref.kind && candidate.id === ref.id;
+    for (const group of this.tabLayout?.groups || []) {
+      const index = group.refs.findIndex(same);
+      if (index >= 0) return { groupId: group.id, refs: group.refs, index };
+    }
+    const index = this.tabLayout?.ungrouped?.findIndex(same) ?? -1;
+    return index >= 0 ? { groupId: null, refs: this.tabLayout.ungrouped, index } : null;
+  }
+
+  moveTabRef(ref, groupId, anchor = null, placement = 'before') {
+    const parents = this._tabLayoutParents();
+    let destination;
+    try {
+      destination = window.CodemanTabLayout.moveDestination(this.tabLayout, ref, groupId, anchor, placement, parents);
+    } catch {
+      return false;
+    }
+    return this.editTabLayout({ type: 'moveRef', ref, ...destination, parents }, `${ref.kind}:${ref.id}`);
+  }
+
+  _tabRefMoveActions(ref) {
+    if (!this._tabLayoutEditable()) return [];
+    const location = this._tabRefLocation(ref);
+    if (!location) return [];
+    const actions = [];
+    const grouped = this.tabLayout.groups.length > 0;
+    const focused = location.refs[location.index]?.focus === true;
+    if (grouped) actions.push(...this._tabRefPlacementActions(ref));
+    actions.push({ label: focused ? 'Remove from Focus' : 'Add to Focus', run: () => this.setTabRefFocus(ref, !focused) });
+    if (focused) {
+      // A Focus row is drawn in Focus, so up/down reorder Focus, not its group.
+      if (this._focusMoveTarget(ref, -1) !== null) actions.push({ label: 'Move up in Focus', run: () => this.moveFocusRefBy(ref, -1) });
+      if (this._focusMoveTarget(ref, 1) !== null) actions.push({ label: 'Move down in Focus', run: () => this.moveFocusRefBy(ref, 1) });
+    }
+    // Up/down follow the STORED order, which is what the rail paints: a named
+    // group keeps it even under the activity sort (COD-494); Ungrouped is
+    // ranked by the sort then, and has nothing to reorder.
+    if (grouped && !focused && (location.groupId !== null || !this.isTabRailSorted())) {
+      // The sessions that follow this one move with it, so "down" means past
+      // the first row that is not part of that block.
+      const moving = new Set(window.CodemanTabLayout.movingRefKeys(this.tabLayout, ref, this._tabLayoutParents()));
+      const previous = location.refs[location.index - 1];
+      const next = location.refs.slice(location.index + 1).find((candidate) => !moving.has(`${candidate.kind}:${candidate.id}`));
+      if (previous) actions.push({ label: 'Move up', run: () => this.moveTabRef(ref, location.groupId, previous, 'before') });
+      if (next) actions.push({ label: 'Move down', run: () => this.moveTabRef(ref, location.groupId, next, 'after') });
+    }
+    for (const group of this.tabLayout.groups) {
+      if (group.id === location.groupId) continue;
+      // Quoted: a group may be NAMED "New group" or "ungrouped", which unquoted
+      // would read (and, case-insensitively, translate) exactly like the
+      // fixed "Move to new group" / "Move to Ungrouped" entries next to it.
+      actions.push({ label: `Move to "${group.name}"`, run: () => this.moveTabRef(ref, group.id) });
+    }
+    if (location.groupId !== null) actions.push({ label: 'Move to Ungrouped', run: () => this.moveTabRef(ref, null) });
+    // At the server's group cap a new group can only fail, so it is not offered.
+    if (this._canCreateTabGroup()) actions.push({ label: 'Move to new group', run: () => this.createTabGroup({ ref }) });
+    return actions;
+  }
+
+  closeTabGroupMenu({ restoreFocus = false } = {}) {
+    const menu = this._tabGroupMenu;
+    if (!menu) return;
+    const trigger = this._tabGroupMenuTrigger;
+    const identity = this._tabGroupMenuKey;
+    this._tabGroupMenu = null;
+    this._tabGroupMenuTrigger = null;
+    this._tabGroupMenuKey = null;
+    document.removeEventListener('pointerdown', this._tabGroupMenuOutside, true);
+    document.removeEventListener('keydown', this._tabGroupMenuKeydown, true);
+    window.removeEventListener('resize', this._tabGroupMenuResize);
+    this._tabGroupMenuOutside = this._tabGroupMenuKeydown = this._tabGroupMenuResize = null;
+    menu.remove();
+    if (!restoreFocus) return;
+    // The trigger may have been re-rendered while the menu was open; find the
+    // live tree item by identity.
+    const rail = this.$('sessionTabs');
+    const item =
+      (trigger?.isConnected && trigger.closest('[role="treeitem"]')) ||
+      [...(rail?.querySelectorAll('[role="treeitem"]') || [])].find((el) => this._tabTreeIdentity(el) === identity);
+    item?.focus();
+  }
+
+  _canCreateTabGroup() {
+    const max = window.CodemanTabLayout?.MAX_GROUPS;
+    return !max || (this.tabLayout?.groups?.length || 0) < max;
+  }
+
+  /**
+   * Start a session straight into a group (COD-512): the run carries
+   * `tabGroupId`, and the server files the new session there when it
+   * registers it with the layout, so it never flashes in Ungrouped first.
+   */
+  async createSessionInTabGroup(groupId) {
+    if (this._runInFlight) {
+      this.showToast?.('A session is already starting.', 'info');
+      return false;
+    }
+    if (!this.tabLayout?.groups?.some((group) => group.id === groupId)) return false;
+    // The new row must be visible where it lands.
+    this.toggleTabGroupCollapsed(groupId, false);
+    try {
+      await this.run({ tabGroupId: groupId });
+      return true;
+    } catch (error) {
+      this.showToast?.(error?.message || 'Could not start session.', 'error');
+      return false;
+    }
+  }
+
+  openTabGroupMenu(event, groupId) {
+    const groups = this.tabLayout?.groups || [];
+    const index = groups.findIndex((group) => group.id === groupId);
+    if (index < 0) return false;
+    return this._openTabLayoutMenu(event, `group:${groupId}`, 'Group actions', [
+      ...(this.canOpenTileGrid?.() ? [{ label: 'Open group as tiles', run: () => this.openGroupAsTiles(groupId) }] : []),
+      { label: 'Rename group', run: () => this.startTabGroupRename(groupId) },
+      { label: 'New session in group', run: () => this.createSessionInTabGroup(groupId) },
+      ...(this._canCreateTabGroup() ? [{ label: 'New group', run: () => this.createTabGroup({ index: index + 1 }) }] : []),
+      ...(index > 0 ? [{ label: 'Move group up', run: () => this.moveTabGroup(groupId, -1) }] : []),
+      ...(index < groups.length - 1 ? [{ label: 'Move group down', run: () => this.moveTabGroup(groupId, 1) }] : []),
+      { label: 'Delete group', className: 'danger', run: () => this.deleteTabGroup(groupId) },
+    ]);
+  }
+
+  openTabWebviewMenu(event, webviewId) {
+    const moves = this._tabRefMoveActions({ kind: 'webview', id: webviewId });
+    if (!moves.length) {
+      this.showWebviewModal?.(webviewId);
+      return false;
+    }
+    return this._openTabLayoutMenu(event, `webview:${webviewId}`, 'Web tab actions', [
+      { label: 'Web tab settings', run: () => this.showWebviewModal?.(webviewId) },
+      ...moves,
+    ]);
+  }
+
+  _openTabLayoutMenu(event, identity, ariaLabel, actions) {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const trigger = event?.currentTarget || null;
+    // Opening the same menu again closes it (a toggle, like the row menu).
+    if (this._tabGroupMenu && this._tabGroupMenuKey === identity) {
+      this.closeTabGroupMenu();
+      return false;
+    }
+    this.closeTabGroupMenu();
+    this.closeTabRailActionMenu?.();
+    if (!this._tabLayoutEditable()) return false;
+    const menu = document.createElement('div');
+    menu.className = 'tab-rail-action-menu tab-layout-group-action-menu';
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', ariaLabel);
+    for (const action of actions) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.setAttribute('role', 'menuitem');
+      button.textContent = action.label;
+      if (action.className) button.className = action.className;
+      button.addEventListener('click', () => {
+        this.closeTabGroupMenu();
+        action.run();
+      });
+      menu.appendChild(button);
+    }
+    document.body.appendChild(menu);
+    const anchor = (trigger?.getBoundingClientRect ? trigger : null) || this.$('sessionTabs');
+    const rect = anchor?.getBoundingClientRect?.() || { left: 8, bottom: 8, right: 8 };
+    const menuRect = menu.getBoundingClientRect();
+    const left = event?.clientX && event.type === 'contextmenu' ? event.clientX : rect.left;
+    menu.style.left = `${Math.max(8, Math.min(left, window.innerWidth - menuRect.width - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - menuRect.height - 8))}px`;
+
+    this._tabGroupMenu = menu;
+    this._tabGroupMenuTrigger = trigger;
+    this._tabGroupMenuKey = identity;
+    this._tabGroupMenuOutside = (pointerEvent) => {
+      if (menu.contains(pointerEvent.target) || (trigger && trigger.contains?.(pointerEvent.target))) return;
+      this.closeTabGroupMenu();
+    };
+    // Capture on document, so Escape closes THIS menu and nothing else (the
+    // global Escape handler defers to it, see the keydown listener in init).
+    this._tabGroupMenuKeydown = (keyEvent) => {
+      if (keyEvent.key !== 'Escape') return;
+      keyEvent.preventDefault();
+      keyEvent.stopImmediatePropagation();
+      this.closeTabGroupMenu({ restoreFocus: true });
+    };
+    this._tabGroupMenuResize = () => this.closeTabGroupMenu();
+    document.addEventListener('pointerdown', this._tabGroupMenuOutside, true);
+    document.addEventListener('keydown', this._tabGroupMenuKeydown, true);
+    window.addEventListener('resize', this._tabGroupMenuResize);
+    menu.addEventListener('keydown', (keyEvent) => {
+      const buttons = [...menu.querySelectorAll('button')];
+      const at = buttons.indexOf(document.activeElement);
+      if (keyEvent.key === 'ArrowDown' || keyEvent.key === 'ArrowUp') {
+        keyEvent.preventDefault();
+        buttons[(at + (keyEvent.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]?.focus();
+      } else if (keyEvent.key === 'Home' || keyEvent.key === 'End') {
+        keyEvent.preventDefault();
+        buttons[keyEvent.key === 'Home' ? 0 : buttons.length - 1]?.focus();
+      } else if (keyEvent.key === 'Tab') {
+        // Tab would walk out and leave the popup on screen: dismiss to the row.
+        keyEvent.preventDefault();
+        this.closeTabGroupMenu({ restoreFocus: true });
+      }
+    });
+    // Focus leaving by any other route (a click elsewhere, a programmatic move).
+    // Hops between the menu's own items are not a departure.
+    menu.addEventListener('focusout', (focusEvent) => {
+      if (focusEvent.relatedTarget && menu.contains(focusEvent.relatedTarget)) return;
+      if (this._tabGroupMenu === menu) this.closeTabGroupMenu();
+    });
+    menu.querySelector('button')?.focus();
+    return true;
+  }
+
+  startTabGroupRename(groupId) {
+    if (!this.tabLayout?.groups?.some((candidate) => candidate.id === groupId)) return false;
+    // Cancelling another editor re-renders the rail, so look the header up after.
+    this._activeRename?.cancel();
+    const group = this.tabLayout?.groups?.find((candidate) => candidate.id === groupId);
+    const header = this.$('sessionTabs')?.querySelector(`[data-tab-group-header="${CSS.escape(groupId)}"]`);
+    const label = header?.querySelector('.tab-layout-group-name');
+    if (!group || !label) return false;
+    this._inlineRenameActive = true;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'tab-layout-group-rename-input';
+    input.value = group.name;
+    input.maxLength = 60;
+    input.setAttribute('aria-label', 'Group name');
+    label.classList.add('tab-layout-group-name--renaming');
+    label.replaceChildren(input);
+    // The header toggles collapse on click and opens its menu on right-click;
+    // neither may fire from inside the editor.
+    for (const type of ['click', 'contextmenu', 'pointerdown']) input.addEventListener(type, (e) => e.stopPropagation());
+
+    let settled = false;
+    const handle = { groupId, cancel: () => settle(false) };
+    // `fromBlur`: focus already moved somewhere the user chose (the terminal,
+    // another control). Pulling it back to the header from inside the blur
+    // handler wins over that move, so a blur commit never asks for refocus.
+    const settle = (commit, { fromBlur = false } = {}) => {
+      if (settled) return;
+      settled = true;
+      const name = input.value.trim();
+      // Only the current editor owns the guard: a newer rename keeps it.
+      if (this._activeRename !== handle) return;
+      this._activeRename = null;
+      this._inlineRenameActive = false;
+      const current = this.tabLayout?.groups?.find((candidate) => candidate.id === groupId);
+      const focusIdentity = fromBlur ? null : `group:${groupId}`;
+      if (commit && current && name && name !== current.name) {
+        if (this.editTabLayout({ type: 'renameGroup', groupId, name }, focusIdentity)) return;
+      }
+      if (focusIdentity) {
+        this._tabFocusIdentity = focusIdentity;
+        this._tabRefocusAfterEdit = true;
+      }
+      this._fullRenderSessionTabs();
+    };
+    this._activeRename = handle;
+    input.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        settle(true);
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        settle(false);
+      }
+    });
+    input.addEventListener('blur', () => settle(true, { fromBlur: true }));
+    input.focus();
+    input.select();
+    return true;
+  }
+
+  _bindTabLayoutPointerDrag(container) {
+    if (!container || container._tabLayoutDragBound) return;
+    container._tabLayoutDragBound = true;
+    container.addEventListener('pointerdown', (e) => this._onTabLayoutPointerDown(e, container));
+    container.addEventListener('pointermove', (e) => this._onTabLayoutPointerMove(e, container));
+    container.addEventListener('pointerup', (e) => this._finishTabLayoutPointerDrag(e, container));
+    container.addEventListener('pointercancel', () => this._cancelTabLayoutPointerDrag(container));
+    container.addEventListener('lostpointercapture', () => this._cancelTabLayoutPointerDrag(container));
+  }
+
+  _onTabLayoutPointerDown(e, container) {
+    // A press whose release never reached us (let go outside the rail, or
+    // outside the window) must not survive into this one: a stale pending
+    // press turned into a phantom drag on the next hover, and a replaced drag
+    // left its Escape listener behind for good.
+    if (this._tabLayoutDrag) this._cancelTabLayoutPointerDrag(container);
+    if (e.button !== 0 || e.pointerType === 'touch' || !container.classList.contains('session-tabs--grouped')) return;
+    if (this._inlineRenameActive || !this._tabLayoutEditable()) return;
+    // Controls keep their own click; only the row body or the header drags.
+    if (e.target.closest('.tab-actions, .tab-badge, .tab-layout-group-menu, button, input, [onclick*="stopPropagation"]')) return;
+    const header = e.target.closest('[data-tab-group-header]');
+    const row = header ? null : e.target.closest('.session-tab');
+    let source = null;
+    if (header) source = { type: 'group', groupId: header.dataset.tabGroupHeader };
+    else if (row?.dataset.webviewId) source = { type: 'ref', ref: { kind: 'webview', id: row.dataset.webviewId } };
+    else if (row?.dataset.id) source = { type: 'ref', ref: { kind: 'session', id: row.dataset.id } };
+    if (!source) return;
+    const drag = { pointerId: e.pointerId, x: e.clientX, y: e.clientY, source, origin: header || row, active: false, target: null };
+    // Capture is only taken once the press becomes a drag, so until then the
+    // release can land outside the rail: hear it on window.
+    drag.windowUp = (upEvent) => this._finishTabLayoutPointerDrag(upEvent, container);
+    drag.windowCancel = () => this._cancelTabLayoutPointerDrag(container);
+    window.addEventListener('pointerup', drag.windowUp, true);
+    window.addEventListener('pointercancel', drag.windowCancel, true);
+    this._tabLayoutDrag = drag;
+  }
+
+  _tabLayoutDropTarget(x, y, container) {
+    const hit = document.elementFromPoint(x, y);
+    if (!hit || !container.contains(hit)) return null;
+    const row = hit.closest('.session-tab');
+    const section = hit.closest('.tab-layout-group');
+    const sectionGroup = section ? section.dataset.tabGroupId || null : undefined;
+    // A sorted rail paints its own order in Ungrouped, so a row there can only
+    // be dropped INTO the section; named groups and Focus keep their saved
+    // order (COD-494) and take between-row drops.
+    if (row && section && (sectionGroup !== null || !this.isTabRailSorted())) {
+      const ref = row.dataset.webviewId ? { kind: 'webview', id: row.dataset.webviewId } : { kind: 'session', id: row.dataset.id };
+      const rect = row.getBoundingClientRect();
+      return { type: 'ref', ref, groupId: sectionGroup, placement: y >= rect.top + rect.height / 2 ? 'after' : 'before', element: row };
+    }
+    if (sectionGroup === undefined) return null;
+    const element = section.querySelector(':scope > .tab-layout-group-header');
+    return sectionGroup === null ? { type: 'ungrouped', element } : { type: 'group', groupId: sectionGroup, element };
+  }
+
+  _clearTabLayoutDropMarks(container) {
+    container.querySelectorAll('.tab-layout-drop-before, .tab-layout-drop-after, .tab-layout-drop-into').forEach((el) =>
+      el.classList.remove('tab-layout-drop-before', 'tab-layout-drop-after', 'tab-layout-drop-into')
+    );
+  }
+
+  _onTabLayoutPointerMove(e, container) {
+    const drag = this._tabLayoutDrag;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    // The primary button is up, so the release went somewhere we never heard.
+    if ((e.buttons & 1) === 0) {
+      this._cancelTabLayoutPointerDrag(container);
+      return;
+    }
+    if (!drag.active) {
+      if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < 6) return;
+      drag.active = true;
+      drag.origin.classList.add('tab-layout-dragging');
+      container.classList.add('tab-layout-drag-active');
+      this.closeTabGroupMenu();
+      this.closeTabRailActionMenu?.();
+      try {
+        container.setPointerCapture(e.pointerId);
+      } catch {}
+      if (this._tabLayoutDragKeydown) document.removeEventListener('keydown', this._tabLayoutDragKeydown, true);
+      this._tabLayoutDragKeydown = (keyEvent) => {
+        if (keyEvent.key !== 'Escape') return;
+        keyEvent.preventDefault();
+        keyEvent.stopImmediatePropagation();
+        this._cancelTabLayoutPointerDrag(container);
+      };
+      document.addEventListener('keydown', this._tabLayoutDragKeydown, true);
+    }
+    e.preventDefault();
+    const target = this._tabLayoutDropTarget(e.clientX, e.clientY, container);
+    this._clearTabLayoutDropMarks(container);
+    drag.target = target;
+    if (!target?.element) return;
+    const cls = target.type === 'ref' && drag.source.type === 'ref' ? `tab-layout-drop-${target.placement}` : 'tab-layout-drop-into';
+    target.element.classList.add(cls);
+  }
+
+  _cancelTabLayoutPointerDrag(container) {
+    const drag = this._tabLayoutDrag;
+    if (!drag) return;
+    this._tabLayoutDrag = null;
+    if (drag.windowUp) window.removeEventListener('pointerup', drag.windowUp, true);
+    if (drag.windowCancel) window.removeEventListener('pointercancel', drag.windowCancel, true);
+    drag.origin?.classList.remove('tab-layout-dragging');
+    container?.classList.remove('tab-layout-drag-active');
+    if (container) this._clearTabLayoutDropMarks(container);
+    if (this._tabLayoutDragKeydown) document.removeEventListener('keydown', this._tabLayoutDragKeydown, true);
+    this._tabLayoutDragKeydown = null;
+    if (drag.active) {
+      // The click that ends a drag must not also select the row or toggle the header.
+      const swallow = (clickEvent) => {
+        clickEvent.stopPropagation();
+        clickEvent.preventDefault();
+      };
+      window.addEventListener('click', swallow, { capture: true, once: true });
+      setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 0);
+    }
+  }
+
+  _finishTabLayoutPointerDrag(e, container) {
+    const drag = this._tabLayoutDrag;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    const target = drag.active ? this._tabLayoutDropTarget(e.clientX, e.clientY, container) || drag.target : null;
+    this._cancelTabLayoutPointerDrag(container);
+    if (!target) return;
+    const operation = window.CodemanTabLayout.dropOperation(this.tabLayout, drag.source, target, this._tabLayoutParents());
+    if (!operation) return;
+    const identity = drag.source.type === 'group' ? `group:${drag.source.groupId}` : `${drag.source.ref.kind}:${drag.source.ref.id}`;
+    this.editTabLayout(operation, identity);
+  }
+
+  _persistPendingTabLayoutEdits() {
+    const editor = this._tabLayoutEditor;
+    const operations = editor?.pendingOperations?.() || [];
+    if (!operations.length) return false;
+    try {
+      sessionStorage.setItem(
+        'codeman:tab-layout-pending',
+        JSON.stringify({ owner: this._tabLayoutOwnerKey(), baseVersion: editor.baseVersion(), savedAt: Date.now(), operations })
+      );
+    } catch {}
+    try {
+      const layout = editor.getLayout();
+      void fetch('/api/tab-layout', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(this._tabLayoutWriteBody({ baseVersion: editor.baseVersion(), layout, operations: editor.pendingWireOperations?.() || operations })),
+        keepalive: true,
+      }).catch(() => {});
+    } catch {}
+    return true;
+  }
+
+  _tabLayoutOwnerKey() {
+    const me = window.__codemanUser;
+    if (!me) return null;
+    return me.multiUser ? me.username : '@single';
+  }
+
+  _restorePendingTabLayoutEdits() {
+    let saved;
+    try {
+      const raw = sessionStorage.getItem('codeman:tab-layout-pending');
+      if (!raw) return false;
+      saved = JSON.parse(raw);
+    } catch {
+      return false;
+    }
+    const owner = this._tabLayoutOwnerKey();
+    if (owner === null) {
+      // Who we are is not known yet (/api/me still loading): decide once it is.
+      if (!this._tabLayoutRestoreWaiting) {
+        this._tabLayoutRestoreWaiting = true;
+        document.addEventListener(
+          'codeman:me',
+          () => {
+            this._tabLayoutRestoreWaiting = false;
+            this._restorePendingTabLayoutEdits();
+          },
+          { once: true }
+        );
+      }
+      return false;
+    }
+    try {
+      sessionStorage.removeItem('codeman:tab-layout-pending');
+    } catch {}
+    const operations = saved?.operations;
+    if (!Array.isArray(operations) || !operations.length || !this.tabLayout || !window.CodemanTabLayout) return false;
+    if (saved.owner !== owner) return false;
+    const age = Date.now() - saved.savedAt;
+    if (!Number.isFinite(age) || age < 0 || age > TAB_LAYOUT_PENDING_MAX_AGE_MS) return false;
+    if (!Number.isSafeInteger(saved.baseVersion) || saved.baseVersion > this.tabLayout.version) return false;
+    return this._ensureTabLayoutEditor().restore(operations);
+  }
+
+  _tabTreeItems(container) {
+    const sorted = this.isTabRailSorted();
+    const orderOf = (el) => Number(getComputedStyle(el).order) || 0;
+    const items = [];
+    for (const section of container.querySelectorAll('.tab-layout-group')) {
+      // A group the search emptied is hidden whole, header included.
+      if (section.classList.contains('tab-filtered-out')) continue;
+      const header = section.querySelector(':scope > [role="treeitem"]');
+      if (header) items.push(header);
+      const rows = [...section.querySelectorAll('.session-tab[role="treeitem"]:not(.tab-filtered-out)')];
+      if (sorted) rows.sort((a, b) => orderOf(a) - orderOf(b));
+      items.push(...rows);
+    }
+    return items;
+  }
+
+  _applyTabTreePositions(container) {
+    const items = this._tabTreeItems(container);
+    const sets = new Map();
+    for (const item of items) {
+      const owner = item.getAttribute('aria-level') === '2' ? item.closest('[role="group"]') : container;
+      if (!sets.has(owner)) sets.set(owner, []);
+      sets.get(owner).push(item);
+    }
+    for (const members of sets.values()) {
+      members.forEach((item, index) => {
+        const setsize = String(members.length);
+        const posinset = String(index + 1);
+        if (item.getAttribute('aria-setsize') !== setsize) item.setAttribute('aria-setsize', setsize);
+        if (item.getAttribute('aria-posinset') !== posinset) item.setAttribute('aria-posinset', posinset);
+      });
+    }
+    return items;
+  }
+
+  _syncTabGroupHeaderAlerts(container, projection) {
+    const alerts = window.CodemanTabLayout?.hiddenGroupAlerts(projection, (id) => this.tabAlerts?.get(id)) || {};
+    for (const header of container.querySelectorAll('[data-tab-group-header]')) {
+      const alert = alerts[header.dataset.tabGroupHeader];
+      header.classList.toggle('tab-alert-action', alert === 'action');
+      header.classList.toggle('tab-alert-idle', alert === 'idle');
+    }
+  }
+
+  _syncTabTreeSelection(container) {
+    if (container?.getAttribute('role') !== 'tree') return;
+    for (const row of container.querySelectorAll('.session-tab')) {
+      row.setAttribute('aria-selected', row.classList.contains('active') ? 'true' : 'false');
+    }
+  }
+
+  _handleTabTreeKeydown(e, container) {
+    if (e.target?.closest?.('input, textarea, select, [contenteditable="true"]')) return;
+    const items = this._tabTreeItems(container);
+    const current = e.target?.closest?.('[role="treeitem"]');
+    // A key pressed on a control INSIDE a row (its close or overflow button,
+    // focused by a click or handed focus back by the action menu) belongs to
+    // that control: Enter there must reopen the menu, not re-select the row.
+    // Same contract as the flat list, which acts only on a focused row.
+    if (!current || current !== e.target) return;
+    const index = items.indexOf(current);
+    if (index < 0) return;
+    const groupId = current.dataset.tabGroupHeader || null;
+    const expanded = current.getAttribute('aria-expanded') === 'true';
+    // A group with no open rows is a leaf (no aria-expanded): nothing to open.
+    const expandable = current.hasAttribute('aria-expanded');
+    const focusAt = (next) => {
+      if (!next) return;
+      this._setTabTreeStop(container, next);
+      next.focus();
+    };
+    const toggle = (collapse) => {
+      // The toggle re-renders the rail; keep focus on this header through it.
+      this._tabFocusIdentity = `group:${groupId}`;
+      this.toggleTabGroupCollapsed(groupId, collapse);
+    };
+
+    // Alt+Up/Down on a Focus row reorders Focus (COD-509), the keyboard twin
+    // of dragging it.
+    if (e.altKey && !e.shiftKey && !e.ctrlKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown') && !groupId) {
+      const ref = current.dataset.webviewId
+        ? { kind: 'webview', id: current.dataset.webviewId }
+        : current.dataset.id
+          ? { kind: 'session', id: current.dataset.id }
+          : null;
+      if (!ref || !this._tabRefFocused(ref)) return;
+      e.preventDefault();
+      this.moveFocusRefBy(ref, e.key === 'ArrowDown' ? 1 : -1);
+      return;
+    }
+    switch (e.key) {
+      case 'ArrowDown':
+      case 'ArrowUp': {
+        const step = e.key === 'ArrowDown' ? 1 : -1;
+        focusAt(items[(index + step + items.length) % items.length]);
+        break;
+      }
+      case 'Home':
+        focusAt(items[0]);
+        break;
+      case 'End':
+        focusAt(items[items.length - 1]);
+        break;
+      case 'ArrowRight':
+        if (!groupId || !expandable) return;
+        if (!expanded) toggle(false);
+        else {
+          const child = items.find((item) => item.closest('[role="group"]')?.id === current.getAttribute('aria-owns'));
+          if (!child) return;
+          focusAt(child);
+        }
+        break;
+      case 'ArrowLeft':
+        if (groupId) {
+          if (!expandable || !expanded) return;
+          toggle(true);
+        } else {
+          const group = current.closest('[role="group"]');
+          const header = group ? container.querySelector(`[aria-owns="${CSS.escape(group.id)}"]`) : null;
+          if (!header) return;
+          focusAt(header);
+        }
+        break;
+      case 'Enter':
+      case ' ':
+        if (groupId) toggle();
+        else this._activateTabRow(current);
+        break;
+      case 'F2':
+        if (!groupId || !this.startTabGroupRename(groupId)) return;
+        break;
+      case 'F10':
+      case 'ContextMenu': {
+        if (e.key === 'F10' && !e.shiftKey) return;
+        const synthetic = { preventDefault() {}, stopPropagation() {}, currentTarget: current };
+        if (groupId) {
+          this.openTabGroupMenu(synthetic, groupId);
+        } else if (current.dataset.id) {
+          this.openTabRailActionMenu?.(synthetic, current.dataset.id);
+        } else if (current.dataset.webviewId) {
+          this.openTabWebviewMenu(synthetic, current.dataset.webviewId);
+        } else return;
+        break;
+      }
+      default:
+        return;
+    }
+    e.preventDefault();
+  }
+
+  _activateTabRow(row) {
+    if (row?.dataset.webviewId) return this.openWebview(row.dataset.webviewId);
+    if (row?.dataset.id) return this.selectSession(row.dataset.id, { forceReload: true });
+    return undefined;
+  }
+
+  _applyTabListRole(container, grouped) {
+    if (grouped) {
+      container.setAttribute('role', 'tree');
+      container.setAttribute('aria-label', 'Sessions');
+    } else if (container.getAttribute('role') === 'tree') {
+      container.setAttribute('role', 'tablist');
+      container.setAttribute('aria-label', 'Session tabs');
+    }
+  }
+
+  _applyTabTreeSemantics(container, { identity = null, refocus = false } = {}) {
+    for (const row of container.querySelectorAll('.session-tab')) {
+      row.setAttribute('role', 'treeitem');
+      row.setAttribute('aria-selected', row.classList.contains('active') ? 'true' : 'false');
+      row.setAttribute('aria-level', row.closest('[role="group"]') ? '2' : '1');
+      // Controls stay clickable, but leave the tab order: the tree has ONE stop,
+      // and a row's actions are reachable from it with Shift+F10 / ContextMenu.
+      for (const control of row.querySelectorAll('[tabindex], button, a[href], input, select, textarea')) {
+        control.tabIndex = -1;
+      }
+    }
+    for (const header of container.querySelectorAll('[data-tab-group-header]')) header.setAttribute('aria-level', '1');
+    const items = this._applyTabTreePositions(container);
+
+    const byIdentity = (id) => (id ? items.find((item) => this._tabTreeIdentity(item) === id) : null);
+    // A focused row that a collapse just hid hands focus to its group header.
+    const hiddenIn = identity ? this._hiddenTabGroupByRef?.get(identity) : null;
+    const target =
+      byIdentity(identity) ||
+      (hiddenIn ? byIdentity(`group:${hiddenIn}`) : null) ||
+      items.find((item) => item.getAttribute('aria-selected') === 'true') ||
+      items[0];
+    if (!target) return;
+    this._setTabTreeStop(container, target);
+    if (refocus && document.activeElement !== target) target.focus();
+  }
+
+  _setTabTreeStop(container, item) {
+    for (const el of container.querySelectorAll('[role="treeitem"]')) el.tabIndex = el === item ? 0 : -1;
+  }
+
+  _tabTreeIdentity(element) {
+    const item = element?.closest?.('[data-tab-group-header], .session-tab');
+    if (!item) return null;
+    if (item.dataset.tabGroupHeader) return `group:${item.dataset.tabGroupHeader}`;
+    if (item.dataset.webviewId) return `webview:${item.dataset.webviewId}`;
+    if (item.dataset.id) return `session:${item.dataset.id}`;
+    return null;
+  }
+
+  _canSwapActiveTabWith(neighbourId) {
+    const projection = this._projectTabGroups();
+    if (!projection) return true;
+    const sectionOf = (id) => projection.sectionByRef[`session:${id}`];
+    return sectionOf(this.activeSessionId) === sectionOf(neighbourId);
+  }
+
+  setupTabKeyboardNavigation(container) {
+    // Remove existing listener if any to avoid duplicates
+    if (this._tabKeydownHandler) {
+      container.removeEventListener('keydown', this._tabKeydownHandler);
+    }
+
+    this._tabKeydownHandler = (e) => {
+      // The grouped rail is a tree with its own key model; everything else
+      // (header strip, sidebar, flat rail) keeps the tab-strip walk below.
+      if (container.getAttribute('role') === 'tree') {
+        this._handleTabTreeKeydown(e, container);
+        return;
+      }
+      // Up/Down are aliases of Left/Right, not replacements: the strip stays
+      // arrow-key navigable exactly as before, the vertical sidebar just gains
+      // the axis a user reaches for there.
+      if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'Enter', ' '].includes(e.key)) return;
+
+      // Rows hidden by the sidebar filter must not be steppable.
+      const tabs = [...container.querySelectorAll('.session-tab:not(.tab-filtered-out)')];
+      // ⚠️ A sorted rail paints its rows with the flex `order` property while the
+      // DOM stays in `sessionOrder` (that is what keeps the Alt+N badge and the
+      // drag model honest), so a DOM-order walk steps around the screen instead of
+      // down it: ArrowDown from the top card lands wherever that session happens to
+      // sit in the tab order. Walk what the eye sees. Read the COMPUTED order, not
+      // the inline one, or web tabs (pinned past the cards by a CSS `order: 9999`
+      // rather than an inline style) read as 0 and the walk starts on them. Array
+      // sort is stable, so equal orders keep DOM order, which is the unsorted case.
+      if (this.isTabRailSorted() || container.classList.contains('tabs-triage')) {
+        const orderOf = (el) => Number(getComputedStyle(el).order) || 0;
+        // Case clusters are boxes in DOM order and a sorted rail orders rows
+        // INSIDE each one, so the box goes first in the key.
+        const boxes = [...container.querySelectorAll(':scope > .tab-cluster')];
+        const boxOf = (el) => boxes.indexOf(el.closest('.tab-cluster'));
+        tabs.sort((a, b) => boxOf(a) - boxOf(b) || orderOf(a) - orderOf(b));
+      }
+      const currentIndex = tabs.indexOf(document.activeElement);
+
+      // Enter or Space activates the tab
+      if ((e.key === 'Enter' || e.key === ' ') && currentIndex >= 0) {
+        e.preventDefault();
+        this._activateTabRow(tabs[currentIndex]);
+        return;
+      }
+
+      if (currentIndex < 0) return;
+
+      let newIndex;
+      switch (e.key) {
+        case 'ArrowLeft':
+        case 'ArrowUp':
+          newIndex = currentIndex > 0 ? currentIndex - 1 : tabs.length - 1;
+          break;
+        case 'ArrowRight':
+        case 'ArrowDown':
+          newIndex = currentIndex < tabs.length - 1 ? currentIndex + 1 : 0;
+          break;
+        case 'Home':
+          newIndex = 0;
+          break;
+        case 'End':
+          newIndex = tabs.length - 1;
+          break;
+        default:
+          return;
+      }
+
+      e.preventDefault();
+      tabs[newIndex]?.focus();
+    };
+
+    container.addEventListener('keydown', this._tabKeydownHandler);
+
+    // Grouped tree: a row or header focused by pointer becomes the tab stop, so
+    // Tab-ing away and back returns to it and there is still exactly one stop.
+    if (!this._tabTreeFocusinHandler) {
+      this._tabTreeFocusinHandler = (e) => {
+        if (container.getAttribute('role') !== 'tree') return;
+        const item = e.target?.closest?.('[role="treeitem"]');
+        if (item && container.contains(item)) this._setTabTreeStop(container, item);
+      };
+      container.addEventListener('focusin', this._tabTreeFocusinHandler);
+    }
+  }
+
+  /** Full Focus order, including entries that are not currently renderable. */
+
+  /**
+   * Move one Focus entry past the next visible one in that direction. The index
+   * is absolute in the stored Focus order, so a focused-but-hidden ref between
+   * the two neighbours is stepped over rather than landed on.
+   */
+
+  /** Destination index for a Focus move, or null when the entry cannot move. */
+
+
+
+
+
+
+
+
+
+
 
   // ═══════════════════════════════════════════════════════════════
   // Debounce Utility
@@ -5120,7 +8098,8 @@ class CodemanApp {
   applySessionSidebarFontSize(settings = null) {
     const resolvedSettings = settings ?? this.loadAppSettingsFromStorage();
     const size = this.resolveSessionSidebarFontSize(resolvedSettings?.sessionSidebarFontSize);
-    document.documentElement.style.setProperty('--session-sidebar-name-font-size', `${size}px`);
+    const root = document.documentElement;
+    root.style.setProperty('--session-sidebar-name-font-size', `${size}px`);
     return size;
   }
 
@@ -5246,11 +8225,23 @@ class CodemanApp {
    * @param {Array<string>} ids live session ids, in tab order
    * @returns {Map<string, number>|null}
    */
+  /**
+   * True for a row the user ordered by hand: one stored in a named group, or in
+   * Focus. The activity sort leaves those in their saved order (COD-494) and
+   * ranks only Ungrouped, so selecting a grouped session never moves it.
+   */
+  _isSavedOrderTabRef(ref) {
+    const location = this._tabRefLocation(ref);
+    if (!location) return false;
+    return location.groupId !== null || location.refs[location.index]?.focus === true;
+  }
+
   _tabRailSortOrder(ids) {
     if (!this.isTabRailSorted()) return null;
     if (!window.CodemanSessionOrder || typeof this._mobileOverviewState !== 'function') return null;
     const rows = [];
     for (let i = 0; i < ids.length; i++) {
+      if (this._isSavedOrderTabRef({ kind: 'session', id: ids[i] })) continue;
       const session = this.sessions.get(ids[i]);
       if (!session) continue;
       rows.push({
@@ -5705,6 +8696,10 @@ class CodemanApp {
     const sidebarList = document.getElementById('sessionSidebarList');
     if (!tabsEl || !headerHost || !sidebarList) return;
 
+    // Three possible homes for the ONE #sessionTabs node: the sidebar (either
+    // detail level), the COD-286 vertical rail, or the header host. Keyed off
+    // `sidebar` rather than `mode === 'header'` so 'sidebar-rich' cannot fall
+    // through to the rail branch.
     const rail = document.getElementById('tabRail');
     const railOwnsTabs =
       !sidebar && document.documentElement.getAttribute('data-tab-orientation') === 'vertical';
@@ -5717,6 +8712,7 @@ class CodemanApp {
     // would let the sidebar CSS style a strip that has nothing to style.
     document.documentElement.dataset.sidebarDetail = mode === 'sidebar-rich' ? 'rich' : 'simple';
     document.documentElement.dataset.sidebar = collapsed ? 'collapsed' : 'expanded';
+    // Derived from the resolved host, not from `sidebar`: the rail is vertical too.
     tabsEl.setAttribute('aria-orientation', host === headerHost ? 'horizontal' : 'vertical');
 
     const btn = document.getElementById('sidebarToggleBtn');
@@ -6034,6 +9030,9 @@ class CodemanApp {
    * it, both of which come from mobile-overview.js below.
    */
   _sidebarRichPillLabel(state) {
+    if (state === 'waiting_agents' || state === 'checking_agents') {
+      return window.CodemanSessionActivity?.resolve({ status: 'idle', activityStatus: state }).compactLabel || state;
+    }
     return {
       needs: 'needs you',
       error: 'error',
@@ -6216,6 +9215,8 @@ class CodemanApp {
   // ═══════════════════════════════════════════════════════════════
 
   renderSessionTabs({ immediate = false } = {}) {
+    // COD-235: the Files header button follows the active session on every tab render.
+    this.updateFileBrowserHeaderButton?.();
     // Don't re-render while user is typing in the inline rename input
     if (this._inlineRenameActive) return;
     if (immediate) {
@@ -6281,8 +9282,11 @@ class CodemanApp {
     const container = this.$('sessionTabs');
     if (!container) return;
     const tab =
-      (sessionId && container.querySelector(`.session-tab[data-id="${sessionId}"]`)) ||
-      container.querySelector('.session-tab.active');
+      [...container.querySelectorAll('.session-tab')].find((candidate) =>
+        this.activeWebviewId
+          ? candidate.dataset.webviewId === this.activeWebviewId
+          : sessionId && candidate.dataset.id === sessionId
+      ) || container.querySelector('.session-tab.active');
     if (!tab) return;
 
     // Sidebar layout AND the vertical rail: the list scrolls VERTICALLY in its
@@ -6435,29 +9439,29 @@ class CodemanApp {
   }
 
   _updateTerminalLoadTab(sessionId) {
-    const tab = this.$('sessionTabs')?.querySelector(`.session-tab[data-id="${sessionId}"]`);
-    if (!tab) return;
-
+    const tabs = this.$('sessionTabs')?.querySelectorAll(
+      `.session-tab[data-id="${CSS.escape(sessionId)}"], .session-tab[data-focus-session-id="${CSS.escape(sessionId)}"]`
+    );
+    if (!tabs?.length) return;
     const loadState = this.terminalLoadStates.get(sessionId);
-    tab.classList.toggle('tab-loading', !!loadState);
-    if (loadState) {
-      tab.setAttribute('aria-busy', 'true');
-      tab.dataset.loadPhase = loadState.phase;
-      if (!tab.querySelector('.tab-load-spinner')) {
-        const spinner = document.createElement('span');
-        spinner.className = 'tab-load-spinner';
-        spinner.setAttribute('aria-hidden', 'true');
-        const numberEl = tab.querySelector('.tab-number');
-        if (numberEl) {
-          numberEl.insertAdjacentElement('afterend', spinner);
-        } else {
-          tab.insertBefore(spinner, tab.firstChild);
+    for (const tab of tabs) {
+      tab.classList.toggle('tab-loading', !!loadState);
+      if (loadState) {
+        tab.setAttribute('aria-busy', 'true');
+        tab.dataset.loadPhase = loadState.phase;
+        if (!tab.querySelector('.tab-load-spinner')) {
+          const spinner = document.createElement('span');
+          spinner.className = 'tab-load-spinner';
+          spinner.setAttribute('aria-hidden', 'true');
+          const numberEl = tab.querySelector('.tab-number');
+          if (numberEl) numberEl.insertAdjacentElement('afterend', spinner);
+          else tab.insertBefore(spinner, tab.firstChild);
         }
+      } else {
+        tab.setAttribute('aria-busy', 'false');
+        delete tab.dataset.loadPhase;
+        tab.querySelector('.tab-load-spinner')?.remove();
       }
-    } else {
-      tab.setAttribute('aria-busy', 'false');
-      delete tab.dataset.loadPhase;
-      tab.querySelector('.tab-load-spinner')?.remove();
     }
   }
 
@@ -6468,7 +9472,7 @@ class CodemanApp {
     // debounced just BEFORE the rename opened still fires ~100ms later and lands
     // here directly. finishRename() re-renders on both commit and cancel, so a
     // render dropped here is picked back up when the rename settles.
-    if (this._inlineRenameActive) return;
+    if (this._inlineRenameActive || this._tabLayoutFirstPaintHeld()) return;
     const container = this.$('sessionTabs');
     const existingTabs = container.querySelectorAll('.session-tab[data-id]');
     const existingIds = new Set([...existingTabs].map(t => t.dataset.id));
@@ -6539,7 +9543,10 @@ class CodemanApp {
         // re-marks the session tab active moments after a web tab was selected,
         // leaving two tabs lit at once.
         const isActive = id === this.activeSessionId && !this.activeWebviewId;
-        const status = session.status || 'idle';
+        const activity = window.CodemanSessionActivity?.resolve(session) || {
+          effectiveStatus: session.status || 'idle', cssState: session.status || 'idle', ariaPhrase: session.status || 'idle',
+        };
+        const status = activity.effectiveStatus;
         const name = this.getSessionName(session);
         const taskStats = session.taskStats || { running: 0, total: 0 };
         const hasRunningTasks = taskStats.running > 0;
@@ -6588,7 +9595,7 @@ class CodemanApp {
 
         // Inject tab-number badge if missing (added after initial render)
         if (!tab.querySelector('.tab-number')) {
-          const idx = this.sessionOrder.indexOf(id);
+          const idx = this._tabAltRefs().findIndex((ref) => ref.kind === 'session' && ref.id === id);
           if (idx >= 0 && idx < 9) {
             const numSpan = document.createElement('span');
             numSpan.className = 'tab-number';
@@ -6599,14 +9606,15 @@ class CodemanApp {
 
         // Update status indicator
         const statusEl = tab.querySelector('.tab-status');
-        if (statusEl && !statusEl.classList.contains(status)) {
-          statusEl.className = `tab-status ${status}`;
+        if (statusEl && !statusEl.classList.contains(activity.cssState)) {
+          statusEl.className = `tab-status ${activity.cssState}`;
         }
+        tab.dataset.activityStatus = status;
 
         // The exited-agent badge (Ark0N/Codeman#446). A session going from live
         // to exited changes no tab count, so the full rebuild below never runs
         // for it and this is the only path that ever draws the badge.
-        applyPaneExitBadge(tab, session.paneExit);
+        applyPaneExitBadge(tab, session.paneExit, activity.ariaPhrase);
 
         // Rich sidebar meta ("created 3d ago · working 12m" + pill). The stamps
         // themselves move on _tickSidebarRichTimes(); this is here for the parts
@@ -6785,6 +9793,10 @@ class CodemanApp {
     const defaults = this.getDefaultSettings();
     const manualTwoRows = deviceType === 'desktop' ? (settings.tabTwoRows ?? defaults.tabTwoRows ?? false) : false;
 
+    // COD-286: the vertical rail is a column that scrolls, so the whole
+    // horizontal overflow machinery (auto-wrap + the COD-147 header wrap) is
+    // meaningless there — and leaving `tabs-auto-wrap` set would fight the
+    // rail's own flex-direction. Drop both and bail out.
     const orientation = window.CodemanTabOverflow?.resolveTabOrientation
       ? window.CodemanTabOverflow.resolveTabOrientation({
           deviceType,
@@ -6798,6 +9810,7 @@ class CodemanApp {
 
     if (manualTwoRows || deviceType !== 'desktop') {
       container.classList.remove('tabs-auto-wrap');
+      this._applyHeaderRightWrap(deviceType, false, false);
       // Wrap decided: the state labels' column follows it (_sizeTabTriageGutter).
       this._sizeTabTriageGutter(container, this._lastTabTriage);
       return;
@@ -6814,8 +9827,29 @@ class CodemanApp {
       return;
     }
 
-    // Measure the natural one-row overflow, then enable wrapping only if needed.
+    if (manualTwoRows || deviceType !== 'desktop') {
+      container.classList.remove('tabs-auto-wrap');
+      // Manual two-rows on desktop wraps the header too; non-desktop never wraps.
+      this._applyHeaderRightWrap(deviceType, manualTwoRows, false);
+      return;
+    }
+
+    // Measure the natural one-row overflow against a STATE-INDEPENDENT reference
+    // frame, then enable wrapping only if needed.
+    //
+    // COD-147 couples the tab-wrap decision to the header: when tabs wrap we also add
+    // `.header--tabs-wrapped`, which shrinks `.header-right` and WIDENS the tab area.
+    // That widened clientWidth is the very number we measure below — so if we measured
+    // while the header were still wrapped, a tab set that overflows the NARROW area but
+    // fits the WIDE one would report "fits" -> unwrap -> narrow area overflows -> wrap
+    // -> ... flip-flopping 1<->2 rows on every SSE-driven tab re-render (the s1-rental
+    // flicker). Reset the header to its unwrapped baseline BEFORE measuring so the
+    // decision depends only on natural tab width vs the fixed narrow area — a stable
+    // fixed point. (No paint happens between these class writes and the measure: the
+    // browser only repaints after this synchronous frame completes.)
+    const wasWrapped = container.classList.contains('tabs-auto-wrap');
     container.classList.remove('tabs-auto-wrap');
+    document.querySelector('.header')?.classList.remove('header--tabs-wrapped');
     const shouldWrap = window.CodemanTabOverflow?.shouldAutoWrapTabs
       ? window.CodemanTabOverflow.shouldAutoWrapTabs({
           deviceType,
@@ -6828,6 +9862,35 @@ class CodemanApp {
       : container.scrollWidth > container.clientWidth + 1;
 
     container.classList.toggle('tabs-auto-wrap', shouldWrap);
+    // COD-147: mirror the final tab-wrap state onto the header so .header-right wraps too.
+    this._applyHeaderRightWrap(deviceType, manualTwoRows, shouldWrap);
+    // COD-213: when wrap state changes the header height changes, shrinking/growing the
+    // terminal container. The ResizeObserver fires but with a 300ms debounce — call
+    // fit() immediately so dimensions are correct the instant the layout settles.
+    if (shouldWrap !== wasWrapped) this.syncTerminalGeometry?.();
+  }
+
+  // COD-147: toggle `header--tabs-wrapped` so the right-side cluster wraps to a
+  // 2nd line when tabs do, freeing horizontal width for the tab area.
+  _applyHeaderRightWrap(deviceType, manualTwoRows, autoWrap) {
+    const header = document.querySelector('.header');
+    if (!header) return;
+    const wrapped = window.CodemanTabOverflow?.shouldWrapHeaderRight
+      ? window.CodemanTabOverflow.shouldWrapHeaderRight({ deviceType, manualTwoRows, autoWrap })
+      : deviceType === 'desktop' && (manualTwoRows || autoWrap);
+    header.classList.toggle('header--tabs-wrapped', wrapped);
+  }
+
+  toggleMobileHeaderUtilities() {
+    const header = document.querySelector('.header');
+    const appShell = document.querySelector('.app');
+    const toggle = document.querySelector('.mobile-header-utility-toggle');
+    if (!header || !appShell || !toggle) return;
+
+    const expanded = header.classList.toggle('mobile-utilities-expanded');
+    appShell.classList.toggle('mobile-header-utilities-expanded', expanded);
+    toggle.setAttribute('aria-expanded', String(expanded));
+    window.dispatchEvent(new Event('resize'));
   }
 
   /**
@@ -6867,7 +9930,7 @@ class CodemanApp {
 
   _fullRenderSessionTabs() {
     this.closeTabRailActionMenu?.();
-    if (this._inlineRenameActive) return;
+    if (this._inlineRenameActive || this._tabLayoutFirstPaintHeld()) return;
     // The group menu's trigger is about to be replaced.
     this.closeTabGroupMenu();
     const container = this.$('sessionTabs');
@@ -6929,6 +9992,8 @@ class CodemanApp {
     // one band of values per state. Null in the grouped rail and with grouping
     // off, and the rows then carry exactly the inline order they did before.
     const groupProjection = this._projectTabGroups();
+    // Alt+N slot per row: Focus first, then the flat strip's order.
+    const altSlots = new Map(this._tabAltRefs(groupProjection).map((ref, index) => [`${ref.kind}:${ref.id}`, index]));
     const triage = this._tabTriageLayout(liveIds, groupProjection, railSortOrder);
     const listOrder = triage ? triage.order : railSortOrder;
     // Clustered by case: rows are wrapped in one box per case below, and a tab
@@ -6943,11 +10008,15 @@ class CodemanApp {
       const session = this.sessions.get(id);
       if (!session) continue; // Skip if session was removed
       const railOrderStyle = listOrder?.has(id) ? ` style="order:${listOrder.get(id)}"` : '';
+      const altSlot = altSlots.get(`session:${id}`) ?? _tabIdx;
 
       // See the note in the incremental path: a web tab owns the active highlight
       // while one is open, even though activeSessionId stays set.
       const isActive = id === this.activeSessionId && !this.activeWebviewId;
-      const status = session.status || 'idle';
+      const activity = window.CodemanSessionActivity?.resolve(session) || {
+        effectiveStatus: session.status || 'idle', cssState: session.status || 'idle', ariaPhrase: session.status || 'idle',
+      };
+      const status = activity.effectiveStatus;
       const name = this.getSessionName(session);
       const mode = session.mode || 'claude';
       const color = session.color || 'default';
@@ -7008,16 +10077,29 @@ class CodemanApp {
         : `<span class="tab-harness run-mode-dot ${escapeHtml(mode)}" aria-hidden="true"></span>`;
 
       const inlineSessionActions = this.shouldInlineSessionActions();
-      const tabActionsHtml = `<span class="tab-actions"><span class="tab-gear" onclick="event.stopPropagation(); app.openSessionOptions(${escapeHtml(JSON.stringify(id))})" title="Session options" aria-label="Session options" tabindex="0">&#x2699;</span><span class="tab-detach" onclick="event.stopPropagation(); app.detachSession(${escapeHtml(JSON.stringify(id))})" title="Open in a new window" aria-label="Open session in a new window" tabindex="0">&#x29C9;</span><span class="tab-close" onclick="event.stopPropagation(); app.requestCloseSession(${escapeHtml(JSON.stringify(id))})" title="Close session" aria-label="Close session" tabindex="0">&times;</span><button type="button" class="tab-more" onclick="event.stopPropagation(); app.openTabRailActionMenu(event, ${escapeHtml(JSON.stringify(id))})" title="Session actions" aria-label="Session actions">&#x22EF;</button></span>`;
+      const tabActionsHtml = `<span class="tab-actions"><span class="tab-gear" onclick="event.stopPropagation(); app.openSessionOptions(${escapeHtml(JSON.stringify(id))})" title="Session options" aria-label="Session options" tabindex="0">&#x2699;</span><span class="tab-detach" onclick="event.stopPropagation(); app.detachSession(${escapeHtml(JSON.stringify(id))})" title="Open in a new window" aria-label="Open session in a new window" tabindex="0">&#x29C9;</span><span class="tab-close" onclick="event.stopPropagation(); app.requestCloseSession(${escapeHtml(JSON.stringify(id))})" title="Close session" aria-label="Close session" tabindex="0">&times;</span><button type="button" class="tab-more" onclick="event.stopPropagation(); app.openTabRailActionMenu(event, ${escapeHtml(JSON.stringify(id))})" title="Session actions" aria-label="Session actions" aria-haspopup="menu" aria-expanded="false">&#x22EF;</button></span>`;
 
-      rowHtml.set(id, `<div class="session-tab ${isActive ? 'active' : ''}${alertClass}${richClass}${paneExitBadge ? ' tab-agent-exited' : ''}${loadState ? ' tab-loading' : ''}${this.hasTabDetachOverride(id) ? ' tab-show-detach' : ''}${this._tileGrid?.has(id) ? ' in-tiles' : ''}"${richData}${railOrderStyle} data-id="${id}" data-color="${color}" ${loadState ? `data-load-phase="${escapeHtml(loadState.phase)}"` : ''} onclick="app.handleSessionTabClick(event, ${escapeHtml(JSON.stringify(id))})" oncontextmenu="event.preventDefault(); app.startInlineRename(${escapeHtml(JSON.stringify(id))})" tabindex="0" role="tab" aria-selected="${isActive ? 'true' : 'false'}" aria-busy="${loadState ? 'true' : 'false'}" aria-label="${escapeHtml(paneExitAriaLabel(name, paneExitBadge))}" data-aria-source="${escapeHtml(paneExitAriaLabel(name, paneExitBadge))}" ${tabTooltip ? `title="${escapeHtml(tabTooltip)}"` : ''}>
-          ${_tabIdx < 9 ? '<span class="tab-number">' + (_tabIdx + 1) + '</span>' : ''}
+      // COD-510: a child session says where it sits relative to its parent, in
+      // the badge, the tooltip and its accessible name. Grouped rail only.
+      const placement = groupProjection ? this._tabPlacementPresentation({ kind: 'session', id }) : null;
+      const placementBadge = placement
+        ? `<span class="tab-placement-state tab-placement-state--${escapeHtml(placement.state)}" aria-hidden="true">${escapeHtml(placement.short)}</span>`
+        : '';
+      const focusMarker = groupProjection && this._tabRefFocused({ kind: 'session', id })
+        ? '<span class="tab-focus-marker" aria-hidden="true">&#x2605;</span>'
+        : '';
+      const tabAria = `${paneExitAriaLabel(name, paneExitBadge)}${placement ? `, ${placement.description}` : ''}, ${activity.ariaPhrase}`;
+      const rowTooltip = placement ? (tabTooltip ? `${tabTooltip}\n${placement.description}` : placement.description) : tabTooltip;
+      rowHtml.set(id, `<div class="session-tab ${isActive ? 'active' : ''}${alertClass}${richClass}${paneExitBadge ? ' tab-agent-exited' : ''}${loadState ? ' tab-loading' : ''}${this.hasTabDetachOverride(id) ? ' tab-show-detach' : ''}${this._tileGrid?.has(id) ? ' in-tiles' : ''}"${richData}${railOrderStyle} data-id="${id}" data-color="${color}" data-activity-status="${escapeHtml(status)}"${placement ? ` data-placement-description="${escapeHtml(placement.description)}"` : ''} ${loadState ? `data-load-phase="${escapeHtml(loadState.phase)}"` : ''} onclick="app.handleSessionTabClick(event, ${escapeHtml(JSON.stringify(id))})" oncontextmenu="event.preventDefault(); app.startInlineRename(${escapeHtml(JSON.stringify(id))})" tabindex="0" role="tab" aria-selected="${isActive ? 'true' : 'false'}" aria-busy="${loadState ? 'true' : 'false'}" aria-label="${escapeHtml(tabAria)}" data-aria-source="${escapeHtml(tabAria)}" ${rowTooltip ? `title="${escapeHtml(rowTooltip)}"` : ''}>
+          ${altSlot < 9 ? '<span class="tab-number">' + (altSlot + 1) + '</span>' : ''}
           ${loadState ? '<span class="tab-load-spinner" aria-hidden="true"></span>' : ''}
-          <span class="tab-status ${status}" aria-hidden="true"></span>
+          <span class="tab-status ${escapeHtml(activity.cssState)}" aria-hidden="true"></span>
           <span class="tab-info">
             <span class="tab-name-row">
               ${tabModeHtml}
+              ${focusMarker}
               <span class="tab-name" data-session-id="${id}" data-full-name="${escapeHtml(name)}">${tabLabel}</span>
+              ${placementBadge}
               ${paneExitBadge ? `<span class="tab-exited-badge" data-label="${escapeHtml(paneExitBadge)}" aria-hidden="true">${escapeHtml(paneExitBadge)}</span>` : ''}
               ${inlineSessionActions ? tabActionsHtml : ''}
               <span class="tab-detached-badge" aria-hidden="true">detached</span>
@@ -7042,7 +10124,7 @@ class CodemanApp {
       // Grouped vertical rail. Web tabs keep their flat-strip Alt+N slot (after
       // every session), wherever their group puts them.
       const webviewSlots = new Map(
-        (this.webviewOrder || []).filter((wid) => this.webviews?.has(wid)).map((wid, i) => [wid, _tabIdx + i])
+        (this.webviewOrder || []).filter((wid) => this.webviews?.has(wid)).map((wid) => [wid, altSlots.get(`webview:${wid}`) ?? Infinity])
       );
       parts.push(
         window.CodemanTabLayout.renderProjection(
@@ -7125,132 +10207,15 @@ class CodemanApp {
     // underneath a render, and a solo window forces 'header' regardless.
     if (richRows) this._startSidebarRichClock();
     else this._stopSidebarRichClock();
+
+    // Home surfaces and an open command palette list the same sessions; a full
+    // rebuild (create/delete/reorder) must refresh them too.
+    this._refreshMobileOverviewIfVisible?.();
+    this._refreshHomeSessionsIfVisible?.();
+    this._refreshCommandPaletteIfOpen?.();
   }
 
   // Set up arrow key navigation for session tabs (accessibility)
-  setupTabKeyboardNavigation(container) {
-    // Remove existing listener if any to avoid duplicates
-    if (this._tabKeydownHandler) {
-      container.removeEventListener('keydown', this._tabKeydownHandler);
-    }
-
-    this._tabKeydownHandler = (e) => {
-      // The grouped rail is a tree with its own key model; everything else
-      // (header strip, sidebar, flat rail) keeps the tab-strip walk below.
-      if (container.getAttribute('role') === 'tree') {
-        this._handleTabTreeKeydown(e, container);
-        return;
-      }
-      // Up/Down are aliases of Left/Right, not replacements: the strip stays
-      // arrow-key navigable exactly as before, the vertical sidebar just gains
-      // the axis a user reaches for there.
-      if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'Enter', ' '].includes(e.key)) return;
-
-      // Rows hidden by the sidebar filter must not be steppable.
-      const tabs = [...container.querySelectorAll('.session-tab:not(.tab-filtered-out)')];
-      // ⚠️ A sorted rail paints its rows with the flex `order` property while the
-      // DOM stays in `sessionOrder` (that is what keeps the Alt+N badge and the
-      // drag model honest), so a DOM-order walk steps around the screen instead of
-      // down it: ArrowDown from the top card lands wherever that session happens to
-      // sit in the tab order. Walk what the eye sees. Read the COMPUTED order, not
-      // the inline one, or web tabs (pinned past the cards by a CSS `order: 9999`
-      // rather than an inline style) read as 0 and the walk starts on them. Array
-      // sort is stable, so equal orders keep DOM order, which is the unsorted case.
-      if (this.isTabRailSorted() || container.classList.contains('tabs-triage')) {
-        const orderOf = (el) => Number(getComputedStyle(el).order) || 0;
-        // Case clusters are boxes in DOM order and a sorted rail orders rows
-        // INSIDE each one, so the box goes first in the key.
-        const boxes = [...container.querySelectorAll(':scope > .tab-cluster')];
-        const boxOf = (el) => boxes.indexOf(el.closest('.tab-cluster'));
-        tabs.sort((a, b) => boxOf(a) - boxOf(b) || orderOf(a) - orderOf(b));
-      }
-      const currentIndex = tabs.indexOf(document.activeElement);
-
-      // Enter or Space activates the tab
-      if ((e.key === 'Enter' || e.key === ' ') && currentIndex >= 0) {
-        e.preventDefault();
-        this._activateTabRow(tabs[currentIndex]);
-        return;
-      }
-
-      if (currentIndex < 0) return;
-
-      let newIndex;
-      switch (e.key) {
-        case 'ArrowLeft':
-        case 'ArrowUp':
-          newIndex = currentIndex > 0 ? currentIndex - 1 : tabs.length - 1;
-          break;
-        case 'ArrowRight':
-        case 'ArrowDown':
-          newIndex = currentIndex < tabs.length - 1 ? currentIndex + 1 : 0;
-          break;
-        case 'Home':
-          newIndex = 0;
-          break;
-        case 'End':
-          newIndex = tabs.length - 1;
-          break;
-        default:
-          return;
-      }
-
-      e.preventDefault();
-      tabs[newIndex]?.focus();
-    };
-
-    container.addEventListener('keydown', this._tabKeydownHandler);
-
-    // Grouped tree: a row or header focused by pointer becomes the tab stop, so
-    // Tab-ing away and back returns to it and there is still exactly one stop.
-    if (!this._tabTreeFocusinHandler) {
-      this._tabTreeFocusinHandler = (e) => {
-        if (container.getAttribute('role') !== 'tree') return;
-        const item = e.target?.closest?.('[role="treeitem"]');
-        if (item && container.contains(item)) this._setTabTreeStop(container, item);
-      };
-      container.addEventListener('focusin', this._tabTreeFocusinHandler);
-    }
-  }
-
-  /** Select a session row or open a web-tab row (Enter/Space, either layout). */
-  _activateTabRow(row) {
-    if (row?.dataset.webviewId) return this.openWebview(row.dataset.webviewId);
-    if (row?.dataset.id) return this.selectSession(row.dataset.id, { forceReload: true });
-    return undefined;
-  }
-
-  // ═══════════════════════════════════════════════════════════════
-  // Grouped rail: tree semantics and keyboard model
-  // ═══════════════════════════════════════════════════════════════
-  //
-  // Only the GROUPED vertical rail is a tree. #sessionTabs becomes role=tree;
-  // named-group headers are level-1 treeitems that own their rows (level 2);
-  // ungrouped rows and a collapsed group's kept selection are level 1. One item
-  // carries tabindex=0 (roving), every control inside a row is removed from the
-  // tab order, and focus is restored by identity across full re-renders. The
-  // flat rail and the header strip keep role=tablist / role=tab untouched.
-
-  /** #sessionTabs is a tablist (index.html) except while it holds the grouped tree. */
-  _applyTabListRole(container, grouped) {
-    if (grouped) {
-      container.setAttribute('role', 'tree');
-      container.setAttribute('aria-label', 'Sessions');
-    } else if (container.getAttribute('role') === 'tree') {
-      container.setAttribute('role', 'tablist');
-      container.setAttribute('aria-label', 'Session tabs');
-    }
-  }
-
-  /** Stable identity of a tree item (or anything inside one) across re-renders. */
-  _tabTreeIdentity(element) {
-    const item = element?.closest?.('[data-tab-group-header], .session-tab');
-    if (!item) return null;
-    if (item.dataset.tabGroupHeader) return `group:${item.dataset.tabGroupHeader}`;
-    if (item.dataset.webviewId) return `webview:${item.dataset.webviewId}`;
-    if (item.dataset.id) return `session:${item.dataset.id}`;
-    return null;
-  }
 
   /**
    * Visible tree items in the order the eye reads them: each section's header,
@@ -7258,58 +10223,6 @@ class CodemanApp {
    * inside their own group column, so rows are ordered by COMPUTED order within
    * a section (stable, so the unsorted rail keeps DOM order).
    */
-  _tabTreeItems(container) {
-    const sorted = this.isTabRailSorted();
-    const orderOf = (el) => Number(getComputedStyle(el).order) || 0;
-    const items = [];
-    for (const section of container.querySelectorAll('.tab-layout-group')) {
-      // A group the search emptied is hidden whole, header included.
-      if (section.classList.contains('tab-filtered-out')) continue;
-      const header = section.querySelector(':scope > [role="treeitem"]');
-      if (header) items.push(header);
-      const rows = [...section.querySelectorAll('.session-tab[role="treeitem"]:not(.tab-filtered-out)')];
-      if (sorted) rows.sort((a, b) => orderOf(a) - orderOf(b));
-      items.push(...rows);
-    }
-    return items;
-  }
-
-  /** Move the single tab stop to `item` (every other tree item gets -1). */
-  _setTabTreeStop(container, item) {
-    for (const el of container.querySelectorAll('[role="treeitem"]')) el.tabIndex = el === item ? 0 : -1;
-  }
-
-  /**
-   * Turn freshly rendered rows into tree items and place the roving tab stop.
-   * Rows arrive as the flat strip's markup (role=tab, tabindex=0 on the row and
-   * its controls); only their semantics change here, never their content.
-   */
-  _applyTabTreeSemantics(container, { identity = null, refocus = false } = {}) {
-    for (const row of container.querySelectorAll('.session-tab')) {
-      row.setAttribute('role', 'treeitem');
-      row.setAttribute('aria-selected', row.classList.contains('active') ? 'true' : 'false');
-      row.setAttribute('aria-level', row.closest('[role="group"]') ? '2' : '1');
-      // Controls stay clickable, but leave the tab order: the tree has ONE stop,
-      // and a row's actions are reachable from it with Shift+F10 / ContextMenu.
-      for (const control of row.querySelectorAll('[tabindex], button, a[href], input, select, textarea')) {
-        control.tabIndex = -1;
-      }
-    }
-    for (const header of container.querySelectorAll('[data-tab-group-header]')) header.setAttribute('aria-level', '1');
-    const items = this._applyTabTreePositions(container);
-
-    const byIdentity = (id) => (id ? items.find((item) => this._tabTreeIdentity(item) === id) : null);
-    // A focused row that a collapse just hid hands focus to its group header.
-    const hiddenIn = identity ? this._hiddenTabGroupByRef?.get(identity) : null;
-    const target =
-      byIdentity(identity) ||
-      (hiddenIn ? byIdentity(`group:${hiddenIn}`) : null) ||
-      items.find((item) => item.getAttribute('aria-selected') === 'true') ||
-      items[0];
-    if (!target) return;
-    this._setTabTreeStop(container, target);
-    if (refocus && document.activeElement !== target) target.focus();
-  }
 
   /**
    * aria-posinset / aria-setsize within each level, in PAINTED order: the
@@ -7317,24 +10230,6 @@ class CodemanApp {
    * group's own rows. Runs after every full render AND after an incremental pass,
    * because the activity-sorted rail re-sorts rows in place. Returns the items.
    */
-  _applyTabTreePositions(container) {
-    const items = this._tabTreeItems(container);
-    const sets = new Map();
-    for (const item of items) {
-      const owner = item.getAttribute('aria-level') === '2' ? item.closest('[role="group"]') : container;
-      if (!sets.has(owner)) sets.set(owner, []);
-      sets.get(owner).push(item);
-    }
-    for (const members of sets.values()) {
-      members.forEach((item, index) => {
-        const setsize = String(members.length);
-        const posinset = String(index + 1);
-        if (item.getAttribute('aria-setsize') !== setsize) item.setAttribute('aria-setsize', setsize);
-        if (item.getAttribute('aria-posinset') !== posinset) item.setAttribute('aria-posinset', posinset);
-      });
-    }
-    return items;
-  }
 
   /**
    * A collapsed group hides its rows, including ones that need the user. Its
@@ -7343,14 +10238,6 @@ class CodemanApp {
    * behind a collapse is never invisible. Patched in place on both render paths:
    * alerts change without a rebuild.
    */
-  _syncTabGroupHeaderAlerts(container, projection) {
-    const alerts = window.CodemanTabLayout?.hiddenGroupAlerts(projection, (id) => this.tabAlerts?.get(id)) || {};
-    for (const header of container.querySelectorAll('[data-tab-group-header]')) {
-      const alert = alerts[header.dataset.tabGroupHeader];
-      header.classList.toggle('tab-alert-action', alert === 'action');
-      header.classList.toggle('tab-alert-idle', alert === 'idle');
-    }
-  }
 
   /**
    * A tab that first appears inside a COLLAPSED group (a spawned child, a session
@@ -7385,12 +10272,6 @@ class CodemanApp {
   }
 
   /** Keep aria-selected on the grouped tree in step with the .active class. */
-  _syncTabTreeSelection(container) {
-    if (container?.getAttribute('role') !== 'tree') return;
-    for (const row of container.querySelectorAll('.session-tab')) {
-      row.setAttribute('aria-selected', row.classList.contains('active') ? 'true' : 'false');
-    }
-  }
 
   /**
    * Keyboard model of the grouped tree (WAI-ARIA tree view): Up/Down walk the
@@ -7398,91 +10279,6 @@ class CodemanApp {
    * collapses a header or climbs from a row to its header, Enter/Space select a
    * row or toggle a header, Shift+F10 / ContextMenu open a row's actions.
    */
-  _handleTabTreeKeydown(e, container) {
-    if (e.target?.closest?.('input, textarea, select, [contenteditable="true"]')) return;
-    const items = this._tabTreeItems(container);
-    const current = e.target?.closest?.('[role="treeitem"]');
-    // A key pressed on a control INSIDE a row (its close or overflow button,
-    // focused by a click or handed focus back by the action menu) belongs to
-    // that control: Enter there must reopen the menu, not re-select the row.
-    // Same contract as the flat list, which acts only on a focused row.
-    if (!current || current !== e.target) return;
-    const index = items.indexOf(current);
-    if (index < 0) return;
-    const groupId = current.dataset.tabGroupHeader || null;
-    const expanded = current.getAttribute('aria-expanded') === 'true';
-    // A group with no open rows is a leaf (no aria-expanded): nothing to open.
-    const expandable = current.hasAttribute('aria-expanded');
-    const focusAt = (next) => {
-      if (!next) return;
-      this._setTabTreeStop(container, next);
-      next.focus();
-    };
-    const toggle = (collapse) => {
-      // The toggle re-renders the rail; keep focus on this header through it.
-      this._tabFocusIdentity = `group:${groupId}`;
-      this.toggleTabGroupCollapsed(groupId, collapse);
-    };
-
-    switch (e.key) {
-      case 'ArrowDown':
-      case 'ArrowUp': {
-        const step = e.key === 'ArrowDown' ? 1 : -1;
-        focusAt(items[(index + step + items.length) % items.length]);
-        break;
-      }
-      case 'Home':
-        focusAt(items[0]);
-        break;
-      case 'End':
-        focusAt(items[items.length - 1]);
-        break;
-      case 'ArrowRight':
-        if (!groupId || !expandable) return;
-        if (!expanded) toggle(false);
-        else {
-          const child = items.find((item) => item.closest('[role="group"]')?.id === current.getAttribute('aria-owns'));
-          if (!child) return;
-          focusAt(child);
-        }
-        break;
-      case 'ArrowLeft':
-        if (groupId) {
-          if (!expandable || !expanded) return;
-          toggle(true);
-        } else {
-          const group = current.closest('[role="group"]');
-          const header = group ? container.querySelector(`[aria-owns="${CSS.escape(group.id)}"]`) : null;
-          if (!header) return;
-          focusAt(header);
-        }
-        break;
-      case 'Enter':
-      case ' ':
-        if (groupId) toggle();
-        else this._activateTabRow(current);
-        break;
-      case 'F2':
-        if (!groupId || !this.startTabGroupRename(groupId)) return;
-        break;
-      case 'F10':
-      case 'ContextMenu': {
-        if (e.key === 'F10' && !e.shiftKey) return;
-        const synthetic = { preventDefault() {}, stopPropagation() {}, currentTarget: current };
-        if (groupId) {
-          this.openTabGroupMenu(synthetic, groupId);
-        } else if (current.dataset.id) {
-          this.openTabRailActionMenu?.(synthetic, current.dataset.id);
-        } else if (current.dataset.webviewId) {
-          this.openTabWebviewMenu(synthetic, current.dataset.webviewId);
-        } else return;
-        break;
-      }
-      default:
-        return;
-    }
-    e.preventDefault();
-  }
 
   handleSessionTabClick(event, sessionId) {
     event?.preventDefault?.();
@@ -7497,7 +10293,7 @@ class CodemanApp {
     if (!keyboardOpen && MobileDetection.isTouchDevice()) {
       document.activeElement?.blur?.();
     }
-    return this.selectSession(sessionId, { forceReload: true });
+    return this.selectSession(sessionId);
   }
 
 
@@ -7532,9 +10328,8 @@ class CodemanApp {
     }
   }
 
-  // Save session order to localStorage and (debounced) sync to the server so it
-  // follows the user across devices (COD-131). localStorage stays the offline
-  // fallback; the server is authoritative and echoes back via SSE.
+  // Legacy entry point retained for old callers. Owner layout semantic edits
+  // are the sole ordering authority.
   saveSessionOrder() {
     try {
       localStorage.setItem('codeman-session-order', JSON.stringify(this.sessionOrder));
@@ -7551,9 +10346,8 @@ class CodemanApp {
     }, 400);
   }
 
-  // COD-131: another device (or our own debounced push) reordered tabs. Adopt the
-  // server order as the new base and reconcile to our currently-open sessions.
-  // Guard against no-op churn so an echo of our own push doesn't flicker the tabs.
+  // Ignore legacy broadcasts while owner layout controls rendering. The old
+  // branch remains only for compatibility with unmanaged embeds.
   _onSessionOrderChanged(data) {
     if (!data || !Array.isArray(data.order)) return;
     try {
@@ -7581,172 +10375,25 @@ class CodemanApp {
   // collapse. With no groups (or any read failure) the rail is the flat list it
   // has always been. Editing the groups is the next block.
 
-  _ensureTabLayoutCoordinator() {
-    if (this._tabLayoutCoordinator) return this._tabLayoutCoordinator;
-    if (!window.CodemanTabLayout) return null;
-    this._tabLayoutCoordinator = window.CodemanTabLayout.createLoadCoordinator({
-      fetchLayout: async () => {
-        const data = await this._apiJson('/api/tab-layout');
-        if (!data?.layout) throw new Error('Tab layout unavailable');
-        return data.layout;
-      },
-      applyLayout: (layout) => this._applyTabLayout(layout),
-      applyFallback: () => this._applyTabLayout(null),
-      // 5 s, 10 s, 20 s, 40 s, then stop until the next SSE init or
-      // tab:layoutChanged asks again: an unreachable server must not cost a
-      // fetch every 5 s for as long as the page stays open.
-      retryDelayMs: 5000,
-      maxRetryDelayMs: 60000,
-      maxRetries: 4,
-      scheduleRetry: (retry, delayMs) => setTimeout(retry, delayMs),
-      cancelRetry: (timer) => clearTimeout(timer),
-    });
-    return this._tabLayoutCoordinator;
-  }
-
-  _loadTabLayout() {
-    return this._ensureTabLayoutCoordinator()?.load() ?? Promise.resolve(false);
-  }
-
   /** SSE tab:layoutChanged carries `{ owner, version }`; the layout itself is re-read. */
-  _onTabLayoutChanged(data) {
-    const me = window.__codemanUser;
-    // Another user's layout changed: nothing of ours moved. (The GET is
-    // owner-scoped server-side, so this is a saved request, not a guard.)
-    if (me?.multiUser && typeof data?.owner === 'string' && data.owner !== me.username) return;
-    if (Number.isSafeInteger(data?.version) && this.tabLayout && data.version <= this.tabLayout.version) return;
-    // Our own write is in flight: its response is the newer truth, and a read
-    // racing it could repaint the pre-edit layout. Re-read once it settles.
-    if (this._tabLayoutEditor?.hasPending()) {
-      this._tabLayoutReloadPending = true;
-      return;
-    }
-    this._loadTabLayout();
-  }
 
   /** Adopt a layout read (or null after a failed read, which renders flat). */
-  _applyTabLayout(layout) {
-    let next = null;
-    if (layout) {
-      try {
-        next = window.CodemanTabLayout.normalizeLayout(layout);
-      } catch {
-        next = null;
-      }
-    }
-    // An overtaken response is already dropped by the coordinator; this guards a
-    // reordering between the coordinator and an SSE-triggered reload.
-    if (next && this.tabLayout && next.version < this.tabLayout.version) return;
-    const editor = this._tabLayoutEditor;
-    if (editor) {
-      // A failed read says nothing about the layout, and dropping the editor now
-      // would lose the edit outright: a write in flight would never get its 409
-      // rebased. Keep the held layout and the editor; read again once it settles.
-      if (!next && editor.hasPending()) {
-        this._tabLayoutReloadPending = true;
-        return;
-      }
-      if (next && editor.isWriting()) {
-        // The write's own response decides; read again after it.
-        this._tabLayoutReloadPending = true;
-        return;
-      }
-      // Unsaved edits are rebased onto the read (adoptExternal repaints); with
-      // none, the editor is simply rebuilt from the new layout on next use.
-      if (next && editor.hasPending() && editor.adoptExternal(next)) return;
-      if (editor.hasPending()) this.showToast?.('Your tab group edit was not saved.', 'error');
-      editor.dispose();
-      this._tabLayoutEditor = null;
-    }
-    this.tabLayout = next;
-    const storage = this._getTabCollapseStorage();
-    const collapsed = storage && next
-      ? window.CodemanTabLayout.loadCollapsedGroupIds(storage, next.groups.map((group) => group.id))
-      : { ids: [], ok: !next };
-    if (!collapsed.ok) this._tabCollapseStorageFailed = true;
-    this.collapsedTabGroupIds = new Set(collapsed.ids);
-    // The server announces a layout change on every session create/close, web
-    // tab create/delete and order PUT, and most of those move nothing on this
-    // rail (always so on the flat rail, which is every owner without groups).
-    // Rebuild only when what the rail would draw actually changed.
-    if (this._isTabGroupStructureStale()) this._fullRenderSessionTabs();
-    // A Focus flag set on another device is not a structural change of the
-    // list, so it would not rebuild it: draw the section on its own.
-    else if (this._renderTabFocus()) this.updateConnectionLines?.();
-    // Edits left unsaved by the previous page (see _persistPendingTabLayoutEdits).
-    if (next && !this._tabLayoutRestoreChecked) {
-      this._tabLayoutRestoreChecked = true;
-      this._restorePendingTabLayoutEdits();
-    }
-  }
 
   /** localStorage, or null once it has failed (collapse then stays all-expanded). */
-  _getTabCollapseStorage() {
-    if (this._tabCollapseStorageFailed) return null;
-    try {
-      return window.localStorage;
-    } catch {
-      this._tabCollapseStorageFailed = true;
-      return null;
-    }
-  }
 
   /**
    * The grouped projection for the CURRENT render, or null when the rail should
    * render flat: horizontal strip (incl. phones and the sidebar, which force it),
    * no layout yet, a failed read, or a layout without groups.
    */
-  _projectTabGroups() {
-    if (!this.tabLayout || this._tabOrientation() !== 'vertical' || !window.CodemanTabLayout) return null;
-    return window.CodemanTabLayout.project(this.tabLayout, {
-      // sessionOrder, not the sessions Map: rows are built in that order, so a
-      // session the layout has not placed yet lands where the flat strip has it.
-      liveSessionIds: this.sessionOrder.filter((id) => this.sessions.has(id)),
-      openWebviewIds: (this.webviewOrder || []).filter((id) => this.webviews?.has(id)),
-      // A rail search shows matches inside collapsed groups too, so it projects
-      // every group open. The stored per-device collapse state is untouched and
-      // applies again as soon as the search is cleared.
-      collapsedGroupIds: this._tabRailSearchActive() ? [] : [...this.collapsedTabGroupIds],
-      activeSessionId: this.activeSessionId,
-      activeWebviewId: this.activeWebviewId,
-      // A session spawned by another one shows up in its parent's group at once.
-      parents: this._tabLayoutParents(),
-    });
-  }
-
-  _tabGroupStructureKey(projection) {
-    return window.CodemanTabLayout?.structureKey(this.tabLayout, projection, [...this.collapsedTabGroupIds]) ?? null;
-  }
 
   /** True when the DOM's grouping no longer matches what a render would draw. */
-  _isTabGroupStructureStale(projection = this._projectTabGroups()) {
-    return this._tabGroupStructureKey(projection) !== this._lastTabGroupStructureKey;
-  }
 
   /**
    * Collapse/expand one group (header click). Per-device: stored in localStorage,
    * never sent to the server, so collapsing on a laptop leaves the desktop alone.
    * A storage failure leaves every group expanded rather than half-remembered.
    */
-  toggleTabGroupCollapsed(groupId, forceCollapsed) {
-    // Every group is drawn open while the rail search runs; a toggle then would
-    // change what the user sees only after the search is cleared.
-    if (this._tabRailSearchActive()) return false;
-    if (!this.tabLayout?.groups?.some((group) => group.id === groupId)) return false;
-    const next = new Set(this.collapsedTabGroupIds);
-    const shouldCollapse = forceCollapsed === undefined ? !next.has(groupId) : forceCollapsed === true;
-    if (shouldCollapse) next.add(groupId);
-    else next.delete(groupId);
-    const storage = this._getTabCollapseStorage();
-    const saved = storage
-      ? window.CodemanTabLayout.saveCollapsedGroupIds(storage, [...next])
-      : { ids: [], ok: false };
-    if (!saved.ok) this._tabCollapseStorageFailed = true;
-    this.collapsedTabGroupIds = new Set(saved.ids);
-    // The full render also redraws connectors anchored to rows that just moved.
-    this._fullRenderSessionTabs();
-    return this.collapsedTabGroupIds.has(groupId) === shouldCollapse;
-  }
 
   // ═══════════════════════════════════════════════════════════════
   // Owner tab layout: the Focus section (pinned shortcuts)
@@ -7762,18 +10409,6 @@ class CodemanApp {
   // stop and Up/Down/Home/End between shortcuts; each shortcut is a button, so
   // Enter/Space select its tab, and the context-menu key opens "Remove from
   // Focus". Collapse is per-device localStorage, like a group's.
-
-  /** True when `ref` carries `focus: true` in the held layout. */
-  _tabRefFocused(ref) {
-    const location = this._tabRefLocation(ref);
-    return location?.refs[location.index]?.focus === true;
-  }
-
-  /** Pin or unpin a row. One named operation through the edit coordinator. */
-  setTabRefFocus(ref, focused) {
-    if (!this._tabRefLocation(ref)) return false;
-    return this.editTabLayout({ type: 'setFocus', ref: { kind: ref.kind, id: ref.id }, focused: focused === true }, `${ref.kind}:${ref.id}`);
-  }
 
   /** The row menu's Focus entry ([] where the rail cannot edit the layout). */
   _tabRefFocusActions(ref) {
@@ -7851,6 +10486,13 @@ class CodemanApp {
    * so connector lines anchored to its rows need a redraw).
    */
   _renderTabFocus() {
+    // The fork projects Focus as ordinary rail rows with the existing group
+    // keyboard navigation. Do not also draw upstream's duplicate shortcuts.
+    if (this._projectTabGroups()?.sections.some((section) => section.focus)) {
+      const previousHost = document.getElementById('tabFocus');
+      if (previousHost) { previousHost.hidden = true; previousHost.replaceChildren(); }
+      return false;
+    }
     const refs = this._tabFocusRefs();
     const host = refs.length ? this._tabFocusHost() : document.getElementById('tabFocus');
     if (!host) return false;
@@ -7978,184 +10620,25 @@ class CodemanApp {
   // and retried; a failure re-reads. Editing is a vertical-rail feature: the
   // header strip, the sidebar and phones never offer it.
 
-  _tabLayoutEditable() {
-    return !!(this.tabLayout && window.CodemanTabLayout && this._tabOrientation() === 'vertical');
-  }
-
   /** child session id -> parent session id, so a moved session takes the sessions that follow it. */
-  _tabLayoutParents() {
-    const parents = {};
-    for (const session of this.sessions.values()) {
-      if (session?.parentSessionId && session.parentSessionId !== session.id) parents[session.id] = session.parentSessionId;
-    }
-    return parents;
-  }
-
-  async _putTabLayout({ baseVersion, layout }) {
-    const body = { baseVersion, layout: { ...layout, updatedAt: layout.updatedAt || new Date().toISOString() } };
-    const response = await this._api('/api/tab-layout', { method: 'PUT', body });
-    if (!response) return { ok: false, status: 0, layout: null };
-    let data = null;
-    try {
-      data = await response.json();
-    } catch {}
-    return { ok: response.ok, status: response.status, layout: data?.data?.layout || null };
-  }
-
-  _ensureTabLayoutEditor() {
-    if (this._tabLayoutEditor || !this.tabLayout) return this._tabLayoutEditor || null;
-    this._tabLayoutEditor = window.CodemanTabLayout.createEditCoordinator({
-      initialLayout: this.tabLayout,
-      put: (request) => this._putTabLayout(request),
-      fetchLayout: async () => {
-        const data = await this._apiJson('/api/tab-layout');
-        if (!data?.layout) throw new Error('Tab layout unavailable');
-        return data.layout;
-      },
-      applyLayout: (layout) => this._adoptEditedTabLayout(layout),
-      reportError: (message) => this.showToast?.(message, 'error'),
-      onFailure: () => {
-        // The rail may still show an edit the server refused: read the truth.
-        this._tabLayoutReloadPending = true;
-      },
-      onSettled: () => {
-        if (!this._tabLayoutReloadPending) return;
-        this._tabLayoutReloadPending = false;
-        this._loadTabLayout();
-      },
-    });
-    return this._tabLayoutEditor;
-  }
 
   /** The editor's view of the layout (optimistic or confirmed) becomes the rail. */
-  _adoptEditedTabLayout(layout) {
-    this.tabLayout = layout;
-    const storage = this._getTabCollapseStorage();
-    if (storage) {
-      // Forget collapse state for groups that no longer exist.
-      const collapsed = window.CodemanTabLayout.loadCollapsedGroupIds(storage, layout.groups.map((group) => group.id));
-      if (collapsed.ok) this.collapsedTabGroupIds = new Set(collapsed.ids);
-    }
-    this._fullRenderSessionTabs();
-  }
 
   /**
    * Apply one edit. `focusIdentity` names the tree item that should hold focus
    * afterwards (the moved row, the renamed group), so a keyboard user who acted
    * from a menu lands back in the rail rather than on <body>.
    */
-  editTabLayout(operation, focusIdentity) {
-    if (!this._tabLayoutEditable()) return false;
-    const active = document.activeElement;
-    const rail = this.$('sessionTabs');
-    if (focusIdentity && (!active || active === document.body || rail?.contains(active))) {
-      this._tabFocusIdentity = focusIdentity;
-      this._tabRefocusAfterEdit = true;
-    }
-    try {
-      this._ensureTabLayoutEditor().enqueue(operation);
-      return true;
-    } catch (error) {
-      this._tabRefocusAfterEdit = false;
-      this.showToast?.(error?.message || 'Could not save tab groups.', 'error');
-      return false;
-    }
-  }
-
-  _newTabGroupId() {
-    return globalThis.crypto?.randomUUID?.() || `group-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  }
 
   /** New group (optionally holding `ref`), then straight into renaming it. */
-  createTabGroup({ ref = null, index } = {}) {
-    if (!this._tabLayoutEditable()) return false;
-    const id = this._newTabGroupId();
-    const name = window.CodemanI18n?.t?.('New group') || 'New group';
-    if (!this.editTabLayout({ type: 'createGroup', id, name, ...(Number.isInteger(index) ? { index } : {}) }, `group:${id}`)) {
-      return false;
-    }
-    if (ref) this.editTabLayout({ type: 'moveRef', ref, groupId: id, index: 0, parents: this._tabLayoutParents() });
-    this.startTabGroupRename(id);
-    return true;
-  }
-
-  deleteTabGroup(groupId) {
-    const groups = this.tabLayout?.groups || [];
-    const index = groups.findIndex((group) => group.id === groupId);
-    if (index < 0) return false;
-    if (!window.confirm(`Delete group "${groups[index].name}"? Its tabs move to Ungrouped.`)) {
-      // The menu that asked is gone; put the keyboard back on the group.
-      this.$('sessionTabs')?.querySelector(`[data-tab-group-header="${CSS.escape(groupId)}"]`)?.focus();
-      return false;
-    }
-    const neighbour = groups[index + 1] || groups[index - 1];
-    return this.editTabLayout({ type: 'deleteGroup', groupId }, neighbour ? `group:${neighbour.id}` : null);
-  }
-
-  moveTabGroup(groupId, delta) {
-    const groups = this.tabLayout?.groups || [];
-    const from = groups.findIndex((group) => group.id === groupId);
-    const to = from + delta;
-    if (from < 0 || to < 0 || to >= groups.length) return false;
-    return this.editTabLayout({ type: 'reorderGroup', groupId, index: to }, `group:${groupId}`);
-  }
 
   /** Where a ref is stored: { groupId (null = Ungrouped), refs, index } or null. */
-  _tabRefLocation(ref) {
-    const same = (candidate) => candidate.kind === ref.kind && candidate.id === ref.id;
-    for (const group of this.tabLayout?.groups || []) {
-      const index = group.refs.findIndex(same);
-      if (index >= 0) return { groupId: group.id, refs: group.refs, index };
-    }
-    const index = this.tabLayout?.ungrouped?.findIndex(same) ?? -1;
-    return index >= 0 ? { groupId: null, refs: this.tabLayout.ungrouped, index } : null;
-  }
-
-  moveTabRef(ref, groupId, anchor = null, placement = 'before') {
-    const parents = this._tabLayoutParents();
-    let destination;
-    try {
-      destination = window.CodemanTabLayout.moveDestination(this.tabLayout, ref, groupId, anchor, placement, parents);
-    } catch {
-      return false;
-    }
-    return this.editTabLayout({ type: 'moveRef', ref, ...destination, parents }, `${ref.kind}:${ref.id}`);
-  }
 
   /**
    * Group placement actions for a row's action menu: reorder within its
    * container, move to another group, out to Ungrouped, or into a new group.
    * Empty outside the vertical rail, so the header strip's menu is unchanged.
    */
-  _tabRefMoveActions(ref) {
-    if (!this._tabLayoutEditable()) return [];
-    const location = this._tabRefLocation(ref);
-    if (!location) return [];
-    const grouped = this.tabLayout.groups.length > 0;
-    const actions = grouped ? this._tabRefPlacementActions(ref) : [];
-    // Up/down follow the STORED order, which is what the rail paints unless a
-    // sort is on (then the sort decides and there is nothing to reorder).
-    if (grouped && !this.isTabRailSorted()) {
-      // The sessions that follow this one move with it, so "down" means past
-      // the first row that is not part of that block.
-      const moving = new Set(window.CodemanTabLayout.movingRefKeys(this.tabLayout, ref, this._tabLayoutParents()));
-      const previous = location.refs[location.index - 1];
-      const next = location.refs.slice(location.index + 1).find((candidate) => !moving.has(`${candidate.kind}:${candidate.id}`));
-      if (previous) actions.push({ label: 'Move up', run: () => this.moveTabRef(ref, location.groupId, previous, 'before') });
-      if (next) actions.push({ label: 'Move down', run: () => this.moveTabRef(ref, location.groupId, next, 'after') });
-    }
-    for (const group of this.tabLayout.groups) {
-      if (group.id === location.groupId) continue;
-      // Quoted: a group may be NAMED "New group" or "ungrouped", which unquoted
-      // would read (and, case-insensitively, translate) exactly like the
-      // fixed "Move to new group" / "Move to Ungrouped" entries next to it.
-      actions.push({ label: `Move to "${group.name}"`, run: () => this.moveTabRef(ref, group.id) });
-    }
-    if (location.groupId !== null) actions.push({ label: 'Move to Ungrouped', run: () => this.moveTabRef(ref, null) });
-    // At the server's group cap a new group can only fail, so it is not offered.
-    if (this._canCreateTabGroup()) actions.push({ label: 'Move to new group', run: () => this.createTabGroup({ ref }) });
-    return actions;
-  }
 
   /**
    * A child session's placement, for its row menu: an informational note (where
@@ -8213,143 +10696,8 @@ class CodemanApp {
    * Escape, a pointer outside it, focus leaving it, Tab, a viewport resize, an
    * action, and any full re-render of the rail (which would orphan its trigger).
    */
-  closeTabGroupMenu({ restoreFocus = false } = {}) {
-    const menu = this._tabGroupMenu;
-    if (!menu) return;
-    const trigger = this._tabGroupMenuTrigger;
-    const identity = this._tabGroupMenuKey;
-    this._tabGroupMenu = null;
-    this._tabGroupMenuTrigger = null;
-    this._tabGroupMenuKey = null;
-    document.removeEventListener('pointerdown', this._tabGroupMenuOutside, true);
-    document.removeEventListener('keydown', this._tabGroupMenuKeydown, true);
-    window.removeEventListener('resize', this._tabGroupMenuResize);
-    this._tabGroupMenuOutside = this._tabGroupMenuKeydown = this._tabGroupMenuResize = null;
-    menu.remove();
-    if (!restoreFocus) return;
-    // The trigger may have been re-rendered while the menu was open; find the
-    // live tree item by identity. A flat-rail row (a web tab's menu opens there
-    // too, from ContextMenu or Shift+F10) is a `.session-tab` with role=tab.
-    const rail = this.$('sessionTabs');
-    const item =
-      (trigger?.isConnected && trigger.closest('[role="treeitem"], .tab-focus-item, .session-tab')) ||
-      [...(rail?.querySelectorAll('[role="treeitem"]') || [])].find((el) => this._tabTreeIdentity(el) === identity);
-    item?.focus();
-  }
-
-  _canCreateTabGroup() {
-    const max = window.CodemanTabLayout?.MAX_GROUPS;
-    return !max || (this.tabLayout?.groups?.length || 0) < max;
-  }
-
-  openTabGroupMenu(event, groupId) {
-    const groups = this.tabLayout?.groups || [];
-    const index = groups.findIndex((group) => group.id === groupId);
-    if (index < 0) return false;
-    return this._openTabLayoutMenu(event, `group:${groupId}`, 'Group actions', [
-      { label: 'New session', run: () => this.createSessionInTabGroup(groupId) },
-      ...(this.canOpenTileGrid?.() ? [{ label: 'Open group as tiles', run: () => this.openGroupAsTiles(groupId) }] : []),
-      { label: 'Rename group', run: () => this.startTabGroupRename(groupId) },
-      ...(this._canCreateTabGroup() ? [{ label: 'New group', run: () => this.createTabGroup({ index: index + 1 }) }] : []),
-      ...(index > 0 ? [{ label: 'Move group up', run: () => this.moveTabGroup(groupId, -1) }] : []),
-      ...(index < groups.length - 1 ? [{ label: 'Move group down', run: () => this.moveTabGroup(groupId, 1) }] : []),
-      { label: 'Delete group', className: 'danger', run: () => this.deleteTabGroup(groupId) },
-    ]);
-  }
 
   /** Keyboard actions for a web-tab row in the vertical rail: its settings plus group moves. */
-  openTabWebviewMenu(event, webviewId) {
-    const ref = { kind: 'webview', id: webviewId };
-    const moves = [...this._tabRefFocusActions(ref), ...this._tabRefMoveActions(ref)];
-    if (!moves.length) {
-      this.showWebviewModal?.(webviewId);
-      return false;
-    }
-    return this._openTabLayoutMenu(event, `webview:${webviewId}`, 'Web tab actions', [
-      { label: 'Web tab settings', run: () => this.showWebviewModal?.(webviewId) },
-      ...moves,
-    ]);
-  }
-
-  _openTabLayoutMenu(event, identity, ariaLabel, actions) {
-    event?.preventDefault?.();
-    event?.stopPropagation?.();
-    const trigger = event?.currentTarget || null;
-    // Opening the same menu again closes it (a toggle, like the row menu).
-    if (this._tabGroupMenu && this._tabGroupMenuKey === identity) {
-      this.closeTabGroupMenu();
-      return false;
-    }
-    this.closeTabGroupMenu();
-    this.closeTabRailActionMenu?.();
-    if (!this._tabLayoutEditable()) return false;
-    const menu = document.createElement('div');
-    menu.className = 'tab-rail-action-menu tab-layout-group-action-menu';
-    menu.setAttribute('role', 'menu');
-    menu.setAttribute('aria-label', ariaLabel);
-    for (const action of actions) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.setAttribute('role', 'menuitem');
-      button.textContent = action.label;
-      if (action.className) button.className = action.className;
-      button.addEventListener('click', () => {
-        this.closeTabGroupMenu();
-        action.run();
-      });
-      menu.appendChild(button);
-    }
-    document.body.appendChild(menu);
-    const anchor = (trigger?.getBoundingClientRect ? trigger : null) || this.$('sessionTabs');
-    const rect = anchor?.getBoundingClientRect?.() || { left: 8, bottom: 8, right: 8 };
-    const menuRect = menu.getBoundingClientRect();
-    const left = event?.clientX && event.type === 'contextmenu' ? event.clientX : rect.left;
-    menu.style.left = `${Math.max(8, Math.min(left, window.innerWidth - menuRect.width - 8))}px`;
-    menu.style.top = `${Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - menuRect.height - 8))}px`;
-
-    this._tabGroupMenu = menu;
-    this._tabGroupMenuTrigger = trigger;
-    this._tabGroupMenuKey = identity;
-    this._tabGroupMenuOutside = (pointerEvent) => {
-      if (menu.contains(pointerEvent.target) || (trigger && trigger.contains?.(pointerEvent.target))) return;
-      this.closeTabGroupMenu();
-    };
-    // Capture on document, so Escape closes THIS menu and nothing else (the
-    // global Escape handler defers to it, see the keydown listener in init).
-    this._tabGroupMenuKeydown = (keyEvent) => {
-      if (keyEvent.key !== 'Escape') return;
-      keyEvent.preventDefault();
-      keyEvent.stopImmediatePropagation();
-      this.closeTabGroupMenu({ restoreFocus: true });
-    };
-    this._tabGroupMenuResize = () => this.closeTabGroupMenu();
-    document.addEventListener('pointerdown', this._tabGroupMenuOutside, true);
-    document.addEventListener('keydown', this._tabGroupMenuKeydown, true);
-    window.addEventListener('resize', this._tabGroupMenuResize);
-    menu.addEventListener('keydown', (keyEvent) => {
-      const buttons = [...menu.querySelectorAll('button')];
-      const at = buttons.indexOf(document.activeElement);
-      if (keyEvent.key === 'ArrowDown' || keyEvent.key === 'ArrowUp') {
-        keyEvent.preventDefault();
-        buttons[(at + (keyEvent.key === 'ArrowDown' ? 1 : -1) + buttons.length) % buttons.length]?.focus();
-      } else if (keyEvent.key === 'Home' || keyEvent.key === 'End') {
-        keyEvent.preventDefault();
-        buttons[keyEvent.key === 'Home' ? 0 : buttons.length - 1]?.focus();
-      } else if (keyEvent.key === 'Tab') {
-        // Tab would walk out and leave the popup on screen: dismiss to the row.
-        keyEvent.preventDefault();
-        this.closeTabGroupMenu({ restoreFocus: true });
-      }
-    });
-    // Focus leaving by any other route (a click elsewhere, a programmatic move).
-    // Hops between the menu's own items are not a departure.
-    menu.addEventListener('focusout', (focusEvent) => {
-      if (focusEvent.relatedTarget && menu.contains(focusEvent.relatedTarget)) return;
-      if (this._tabGroupMenu === menu) this.closeTabGroupMenu();
-    });
-    menu.querySelector('button')?.focus();
-    return true;
-  }
 
   // ─── Inline group rename ───────────────────────────────────────────
 
@@ -8360,68 +10708,6 @@ class CodemanApp {
    * IME composition keys belong to the IME. The commit goes through the edit
    * coordinator, so it is serialized behind any write already in flight.
    */
-  startTabGroupRename(groupId) {
-    if (!this.tabLayout?.groups?.some((candidate) => candidate.id === groupId)) return false;
-    // Cancelling another editor re-renders the rail, so look the header up after.
-    this._activeRename?.cancel();
-    const group = this.tabLayout?.groups?.find((candidate) => candidate.id === groupId);
-    const header = this.$('sessionTabs')?.querySelector(`[data-tab-group-header="${CSS.escape(groupId)}"]`);
-    const label = header?.querySelector('.tab-layout-group-name');
-    if (!group || !label) return false;
-    this._inlineRenameActive = true;
-    const input = document.createElement('input');
-    input.type = 'text';
-    input.className = 'tab-layout-group-rename-input';
-    input.value = group.name;
-    input.maxLength = 60;
-    input.setAttribute('aria-label', 'Group name');
-    label.classList.add('tab-layout-group-name--renaming');
-    label.replaceChildren(input);
-    // The header toggles collapse on click and opens its menu on right-click;
-    // neither may fire from inside the editor.
-    for (const type of ['click', 'contextmenu', 'pointerdown']) input.addEventListener(type, (e) => e.stopPropagation());
-
-    let settled = false;
-    const handle = { groupId, cancel: () => settle(false) };
-    // `fromBlur`: focus already moved somewhere the user chose (the terminal,
-    // another control). Pulling it back to the header from inside the blur
-    // handler wins over that move, so a blur commit never asks for refocus.
-    const settle = (commit, { fromBlur = false } = {}) => {
-      if (settled) return;
-      settled = true;
-      const name = input.value.trim();
-      // Only the current editor owns the guard: a newer rename keeps it.
-      if (this._activeRename !== handle) return;
-      this._activeRename = null;
-      this._inlineRenameActive = false;
-      const current = this.tabLayout?.groups?.find((candidate) => candidate.id === groupId);
-      const focusIdentity = fromBlur ? null : `group:${groupId}`;
-      if (commit && current && name && name !== current.name) {
-        if (this.editTabLayout({ type: 'renameGroup', groupId, name }, focusIdentity)) return;
-      }
-      if (focusIdentity) {
-        this._tabFocusIdentity = focusIdentity;
-        this._tabRefocusAfterEdit = true;
-      }
-      this._fullRenderSessionTabs();
-    };
-    this._activeRename = handle;
-    input.addEventListener('keydown', (e) => {
-      e.stopPropagation();
-      if (e.isComposing || e.keyCode === 229) return;
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        settle(true);
-      } else if (e.key === 'Escape') {
-        e.preventDefault();
-        settle(false);
-      }
-    });
-    input.addEventListener('blur', () => settle(true, { fromBlur: true }));
-    input.focus();
-    input.select();
-    return true;
-  }
 
   // ─── Pointer drag in the grouped rail ──────────────────────────────
 
@@ -8432,137 +10718,8 @@ class CodemanApp {
    * header strip keep the HTML5 drag in setupTabDragHandlers() untouched.
    * Keyboard equivalents live in the row and group menus.
    */
-  _bindTabLayoutPointerDrag(container) {
-    if (!container || container._tabLayoutDragBound) return;
-    container._tabLayoutDragBound = true;
-    container.addEventListener('pointerdown', (e) => this._onTabLayoutPointerDown(e, container));
-    container.addEventListener('pointermove', (e) => this._onTabLayoutPointerMove(e, container));
-    container.addEventListener('pointerup', (e) => this._finishTabLayoutPointerDrag(e, container));
-    container.addEventListener('pointercancel', () => this._cancelTabLayoutPointerDrag(container));
-    container.addEventListener('lostpointercapture', () => this._cancelTabLayoutPointerDrag(container));
-  }
-
-  _onTabLayoutPointerDown(e, container) {
-    // A press whose release never reached us (let go outside the rail, or
-    // outside the window) must not survive into this one: a stale pending
-    // press turned into a phantom drag on the next hover, and a replaced drag
-    // left its Escape listener behind for good.
-    if (this._tabLayoutDrag) this._cancelTabLayoutPointerDrag(container);
-    if (e.button !== 0 || e.pointerType === 'touch' || !container.classList.contains('session-tabs--grouped')) return;
-    if (this._inlineRenameActive || !this._tabLayoutEditable()) return;
-    // Controls keep their own click; only the row body or the header drags.
-    if (e.target.closest('.tab-actions, .tab-badge, .tab-layout-group-menu, button, input, [onclick*="stopPropagation"]')) return;
-    const header = e.target.closest('[data-tab-group-header]');
-    const row = header ? null : e.target.closest('.session-tab');
-    let source = null;
-    if (header) source = { type: 'group', groupId: header.dataset.tabGroupHeader };
-    else if (row?.dataset.webviewId) source = { type: 'ref', ref: { kind: 'webview', id: row.dataset.webviewId } };
-    else if (row?.dataset.id) source = { type: 'ref', ref: { kind: 'session', id: row.dataset.id } };
-    if (!source) return;
-    const drag = { pointerId: e.pointerId, x: e.clientX, y: e.clientY, source, origin: header || row, active: false, target: null };
-    // Capture is only taken once the press becomes a drag, so until then the
-    // release can land outside the rail: hear it on window.
-    drag.windowUp = (upEvent) => this._finishTabLayoutPointerDrag(upEvent, container);
-    drag.windowCancel = () => this._cancelTabLayoutPointerDrag(container);
-    window.addEventListener('pointerup', drag.windowUp, true);
-    window.addEventListener('pointercancel', drag.windowCancel, true);
-    this._tabLayoutDrag = drag;
-  }
 
   /** What a pointer at (x, y) would drop onto, from the rendered rail. */
-  _tabLayoutDropTarget(x, y, container) {
-    const hit = document.elementFromPoint(x, y);
-    if (!hit || !container.contains(hit)) return null;
-    const row = hit.closest('.session-tab');
-    const section = hit.closest('.tab-layout-group');
-    const sectionGroup = section ? section.dataset.tabGroupId || null : undefined;
-    // A sorted rail paints its own order, so a row can only be dropped INTO a
-    // group, never between two rows.
-    if (row && section && !this.isTabRailSorted()) {
-      const ref = row.dataset.webviewId ? { kind: 'webview', id: row.dataset.webviewId } : { kind: 'session', id: row.dataset.id };
-      const rect = row.getBoundingClientRect();
-      return { type: 'ref', ref, groupId: sectionGroup, placement: y >= rect.top + rect.height / 2 ? 'after' : 'before', element: row };
-    }
-    if (sectionGroup === undefined) return null;
-    const element = section.querySelector(':scope > .tab-layout-group-header');
-    return sectionGroup === null ? { type: 'ungrouped', element } : { type: 'group', groupId: sectionGroup, element };
-  }
-
-  _clearTabLayoutDropMarks(container) {
-    container.querySelectorAll('.tab-layout-drop-before, .tab-layout-drop-after, .tab-layout-drop-into').forEach((el) =>
-      el.classList.remove('tab-layout-drop-before', 'tab-layout-drop-after', 'tab-layout-drop-into')
-    );
-  }
-
-  _onTabLayoutPointerMove(e, container) {
-    const drag = this._tabLayoutDrag;
-    if (!drag || drag.pointerId !== e.pointerId) return;
-    // The primary button is up, so the release went somewhere we never heard.
-    if ((e.buttons & 1) === 0) {
-      this._cancelTabLayoutPointerDrag(container);
-      return;
-    }
-    if (!drag.active) {
-      if (Math.hypot(e.clientX - drag.x, e.clientY - drag.y) < 6) return;
-      drag.active = true;
-      drag.origin.classList.add('tab-layout-dragging');
-      container.classList.add('tab-layout-drag-active');
-      this.closeTabGroupMenu();
-      this.closeTabRailActionMenu?.();
-      try {
-        container.setPointerCapture(e.pointerId);
-      } catch {}
-      if (this._tabLayoutDragKeydown) document.removeEventListener('keydown', this._tabLayoutDragKeydown, true);
-      this._tabLayoutDragKeydown = (keyEvent) => {
-        if (keyEvent.key !== 'Escape') return;
-        keyEvent.preventDefault();
-        keyEvent.stopImmediatePropagation();
-        this._cancelTabLayoutPointerDrag(container);
-      };
-      document.addEventListener('keydown', this._tabLayoutDragKeydown, true);
-    }
-    e.preventDefault();
-    const target = this._tabLayoutDropTarget(e.clientX, e.clientY, container);
-    this._clearTabLayoutDropMarks(container);
-    drag.target = target;
-    if (!target?.element) return;
-    const cls = target.type === 'ref' && drag.source.type === 'ref' ? `tab-layout-drop-${target.placement}` : 'tab-layout-drop-into';
-    target.element.classList.add(cls);
-  }
-
-  _cancelTabLayoutPointerDrag(container) {
-    const drag = this._tabLayoutDrag;
-    if (!drag) return;
-    this._tabLayoutDrag = null;
-    if (drag.windowUp) window.removeEventListener('pointerup', drag.windowUp, true);
-    if (drag.windowCancel) window.removeEventListener('pointercancel', drag.windowCancel, true);
-    drag.origin?.classList.remove('tab-layout-dragging');
-    container?.classList.remove('tab-layout-drag-active');
-    if (container) this._clearTabLayoutDropMarks(container);
-    if (this._tabLayoutDragKeydown) document.removeEventListener('keydown', this._tabLayoutDragKeydown, true);
-    this._tabLayoutDragKeydown = null;
-    if (drag.active) {
-      // The click that ends a drag must not also select the row or toggle the header.
-      const swallow = (clickEvent) => {
-        clickEvent.stopPropagation();
-        clickEvent.preventDefault();
-      };
-      window.addEventListener('click', swallow, { capture: true, once: true });
-      setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 0);
-    }
-  }
-
-  _finishTabLayoutPointerDrag(e, container) {
-    const drag = this._tabLayoutDrag;
-    if (!drag || drag.pointerId !== e.pointerId) return;
-    const target = drag.active ? this._tabLayoutDropTarget(e.clientX, e.clientY, container) || drag.target : null;
-    this._cancelTabLayoutPointerDrag(container);
-    if (!target) return;
-    const operation = window.CodemanTabLayout.dropOperation(this.tabLayout, drag.source, target, this._tabLayoutParents());
-    if (!operation) return;
-    const identity = drag.source.type === 'group' ? `group:${drag.source.groupId}` : `${drag.source.ref.kind}:${drag.source.ref.id}`;
-    this.editTabLayout(operation, identity);
-  }
 
   // ─── Unsaved edits across a reload ─────────────────────────────────
 
@@ -8572,34 +10729,8 @@ class CodemanApp {
    * the keepalive lands, the copy replays to no change after reload; if it lost
    * a race, the copy is rebased onto the fresh layout and saved properly.
    */
-  _persistPendingTabLayoutEdits() {
-    const editor = this._tabLayoutEditor;
-    const operations = editor?.pendingOperations?.() || [];
-    if (!operations.length) return false;
-    try {
-      sessionStorage.setItem(
-        'codeman:tab-layout-pending',
-        JSON.stringify({ owner: this._tabLayoutOwnerKey(), baseVersion: editor.baseVersion(), savedAt: Date.now(), operations })
-      );
-    } catch {}
-    try {
-      const layout = editor.getLayout();
-      void fetch('/api/tab-layout', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ baseVersion: editor.baseVersion(), layout: { ...layout, updatedAt: layout.updatedAt || new Date().toISOString() } }),
-        keepalive: true,
-      }).catch(() => {});
-    } catch {}
-    return true;
-  }
 
   /** Whose layout this page edits, as the server keys it (`@single` without multi-user). */
-  _tabLayoutOwnerKey() {
-    const me = window.__codemanUser;
-    if (!me) return null;
-    return me.multiUser ? me.username : '@single';
-  }
 
   /**
    * Replay the previous page's unsaved edits, but only that page's: the copy is
@@ -8607,42 +10738,6 @@ class CodemanApp {
    * is older than a reload could explain, or names a layout newer than the one
    * just read (a different server behind the same origin).
    */
-  _restorePendingTabLayoutEdits() {
-    let saved;
-    try {
-      const raw = sessionStorage.getItem('codeman:tab-layout-pending');
-      if (!raw) return false;
-      saved = JSON.parse(raw);
-    } catch {
-      return false;
-    }
-    const owner = this._tabLayoutOwnerKey();
-    if (owner === null) {
-      // Who we are is not known yet (/api/me still loading): decide once it is.
-      if (!this._tabLayoutRestoreWaiting) {
-        this._tabLayoutRestoreWaiting = true;
-        document.addEventListener(
-          'codeman:me',
-          () => {
-            this._tabLayoutRestoreWaiting = false;
-            this._restorePendingTabLayoutEdits();
-          },
-          { once: true }
-        );
-      }
-      return false;
-    }
-    try {
-      sessionStorage.removeItem('codeman:tab-layout-pending');
-    } catch {}
-    const operations = saved?.operations;
-    if (!Array.isArray(operations) || !operations.length || !this.tabLayout || !window.CodemanTabLayout) return false;
-    if (saved.owner !== owner) return false;
-    const age = Date.now() - saved.savedAt;
-    if (!Number.isFinite(age) || age < 0 || age > TAB_LAYOUT_PENDING_MAX_AGE_MS) return false;
-    if (!Number.isSafeInteger(saved.baseVersion) || saved.baseVersion > this.tabLayout.version) return false;
-    return this._ensureTabLayoutEditor().restore(operations);
-  }
 
   // Set up drag-and-drop handlers on tab elements
   setupTabDragHandlers() {
@@ -8763,12 +10858,6 @@ class CodemanApp {
    * and the row menu's moves go through moveRef instead, which can cross a
    * group). Any other layout: always allowed.
    */
-  _canSwapActiveTabWith(neighbourId) {
-    const projection = this._projectTabGroups();
-    if (!projection) return true;
-    const sectionOf = (id) => projection.sectionByRef[`session:${id}`];
-    return sectionOf(this.activeSessionId) === sectionOf(neighbourId);
-  }
 
   moveActiveTabLeft() {
     if (!this.activeSessionId) return;
@@ -8829,23 +10918,6 @@ class CodemanApp {
   }
 
   /**
-   * Clean up state from the previous session before switching tabs.
-   * Handles: WebSocket teardown, CJK clear, flicker filter, tab completion,
-   * terminal write queue, IME composition, and local echo flush.
-   * @param {string} newSessionId - The session being switched TO.
-   */
-  _isUsableXtermSnapshot(snapshot) {
-    if (!snapshot || typeof snapshot !== 'string' || snapshot.length < 8) return false;
-    const visibleText = snapshot
-      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
-      .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
-      .replace(/\x1b[()][0-2A-Z]/g, '')
-      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
-      .trim();
-    return visibleText.length >= 3;
-  }
-
-  /**
    * Persist one xterm snapshot to localStorage, bounded to a fixed key budget
    * regardless of how many sessions are live, and resilient to quota errors.
    * The previous inline version only pruned snapshots for sessions that no
@@ -8901,9 +10973,20 @@ class CodemanApp {
     // mode !== 'shell'), so skip the serialize() + cache slot + localStorage
     // quota for them. Unknown/undefined mode still snapshots, matching restore.
     const outgoingSession = this.activeSessionId ? this.sessions?.get?.(this.activeSessionId) : null;
+    // COD-187: leaving a history view (or any mirror tab) — reset live-mirror
+    // state; a scrollback-0 serialize is worthless, so skip the snapshot too.
+    const outgoingMirror = this.activeSessionId && this._isMirrorSession(this.activeSessionId);
+    if (outgoingMirror || this._viewMode === 'history') {
+      this._viewMode = 'live';
+      this._historyLoadGen++;
+      this._historyMissedOutput = false;
+      this._historyPrefetch = null;
+      this._hideHistoryPill?.();
+    }
     if (
       !skipSnapshot &&
       this.activeSessionId &&
+      !outgoingMirror &&
       outgoingSession?.mode !== 'shell' &&
       this._serializeAddon &&
       this._xtermSnapshots
@@ -8955,6 +11038,8 @@ class CodemanApp {
     this._clearTimer('flickerFilterTimeout');
     this.flickerFilterBuffer = '';
     this.flickerFilterActive = false;
+    this._flickerFilterEpochSegments = [];
+    this._flickerFilterMaxAcceptanceEpoch = 0;
 
     // Clear tab completion detection flag — don't carry across sessions
     this._tabCompletionSessionId = null;
@@ -8967,6 +11052,8 @@ class CodemanApp {
     // Clean up pending terminal writes to prevent old session data from appearing in new session
     this._clearTimer('syncWaitTimeout');
     this.pendingWrites = [];
+    this._pendingWriteAcceptanceEpochs = [];
+    this._pendingWritesMaxAcceptanceEpoch = 0;
     this.writeFrameScheduled = false;
     // Release the one-chunk-in-flight gate with the rest of the write queue.
     // flushPendingWrites() early-returns while this is set, so a reset that
@@ -8978,6 +11065,7 @@ class CodemanApp {
     this._terminalWriteInFlightBytes = 0;
     this._isLoadingBuffer = false;
     this._loadBufferQueue = null;
+    this._loadBufferQueueAcceptanceEpochs = null;
     this._bufferLoadOwner = null;
     // Abort any in-flight chunkedTerminalWrite from the previous session.
     // Without this, old rAF-scheduled chunks continue writing stale data
@@ -9416,6 +11504,10 @@ class CodemanApp {
   }
 
   async selectSession(sessionId, options = {}) {
+    // A session choice supersedes any webview response still in flight. The
+    // request may finish and leave that dashboard open in the background, but
+    // it must not mount or steal the active surface after this intent.
+    this._cancelPendingWebviewNavigation?.();
     // Picking another tab yourself retires a `#session=<id>` link still
     // waiting for its session, which would otherwise take the tab from you
     // whenever that session turned up (see _selectUrlSession).
@@ -9425,11 +11517,12 @@ class CodemanApp {
     // If this session is popped out into its own window, raise that window
     // instead of showing it inline (focus-on-click for detached tabs). If we
     // owned a now-closed window, _raiseDetached re-docks and returns false so
-    // we fall through and load it inline.
+    // we fall through to normal inline selection.
     if (!this.isSoloWindow && this.detachedSessions.has(sessionId)) {
       if (this._raiseDetached(sessionId)) return;
     }
     const forceReload = options?.forceReload === true;
+    this.closeMobileHeaderUtilities?.();
     // ⚠️ `auto: true` marks a selection the APP made rather than the human:
     // the boot restore, a solo window opening its target, a `#session=<id>`
     // link from another page, the fallback after the active session is
@@ -9439,13 +11532,22 @@ class CodemanApp {
     // fails toward acknowledging rather than toward an alert that can never be
     // cleared.
     const userInitiated = options?.auto !== true;
-    if (this.activeSessionId === sessionId && !forceReload) {
+    // Terminal sizing activity currently shares this audited `auto: true`
+    // intent contract: app-restored selections stay passive, human choices own.
+    // `!activeWebviewId`: with a dashboard foregrounded, re-selecting the
+    // session behind it is a real switch, not a no-op, so it must not early-return.
+    if (this.activeSessionId === sessionId && !this.activeWebviewId && !forceReload) {
       // Tapping the tab you are already on is still "I checked it". The alert
       // can be armed on the ACTIVE tab (a live idle_prompt fires regardless of
       // which tab is showing, and so does the reload seed), and every other
       // clear path runs on the switch this early return skips, leaving a
       // yellow tab that no tap could clear.
-      if (userInitiated) this.markIdleAlertSeen(sessionId);
+      if (userInitiated) {
+        this.markIdleAlertSeen(sessionId);
+        this.applyTerminalFontPolicy?.(this.sessions.get(sessionId)?.mode);
+        try { this.syncTerminalGeometry?.(); } catch {}
+        this._terminalViewerActivity?.activate('session-select');
+      }
       return;
     }
     // Tile grid open (tile-grid.js): a tiled session is FOCUSED in its tile and
@@ -9464,15 +11566,16 @@ class CodemanApp {
     }
     if (this.activeSessionId === sessionId && forceReload) {
       this.terminalBufferCache?.delete(sessionId);
-      this._xtermSnapshots?.delete(sessionId);
-      try { localStorage.removeItem(`codeman-xs-${sessionId}`); } catch {}
       this._clearTimer('syncWaitTimeout');
       this.pendingWrites = [];
+      this._pendingWriteAcceptanceEpochs = [];
+      this._pendingWritesMaxAcceptanceEpoch = 0;
       this.writeFrameScheduled = false;
       this._terminalWriteInFlight = false;
       this._terminalWriteInFlightBytes = 0;
       this._isLoadingBuffer = false;
       this._loadBufferQueue = null;
+      this._loadBufferQueueAcceptanceEpochs = null;
       this._terminalRefreshOwner = null;
       this._chunkedWriteGen = (this._chunkedWriteGen || 0) + 1;
       // Anything typed but not yet submitted lives in the local-echo overlay and
@@ -9491,7 +11594,17 @@ class CodemanApp {
     // Desktop always focuses; touch focuses only while the on-screen keyboard
     // is already open (so a tab switch doesn't pop the keyboard).
     const shouldFocusTerminal = this._shouldFocusTerminalForTabSwitch();
-    if (shouldFocusTerminal && this.terminal) this.terminal.focus();
+    const focusTerminalWithoutActivation = () => {
+      const focusTerminal = () => this.terminal.focus();
+      if (this._terminalViewerActivity?.runWithoutActivation) {
+        this._terminalViewerActivity.runWithoutActivation(focusTerminal);
+      } else {
+        focusTerminal();
+      }
+    };
+    if (shouldFocusTerminal && this.terminal) {
+      focusTerminalWithoutActivation();
+    }
 
     const _selStart = performance.now();
     const _selName = this.sessions.get(sessionId)?.name || sessionId.slice(0,8);
@@ -9510,7 +11623,14 @@ class CodemanApp {
     this._hideWebviewLayer?.();
 
     this._cleanupPreviousSession(sessionId);
+    // COD-187: scrollback ownership — mirror tabs run at 0 (pure screen
+    // mirror; nothing accumulates), everything else gets the user's value
+    // back. The ONLY other writers are _enterHistoryView/_exitHistoryView.
+    this.terminal.options.scrollback = this._isMirrorSession(sessionId) ? 0 : this._userScrollback();
     this.activeSessionId = sessionId;
+    // Font metrics must match the selected mode before the socket can flush an
+    // activation and before the first fit/resize measures this viewer.
+    this.applyTerminalFontPolicy?.(this.sessions.get(sessionId)?.mode);
     this._activateFileBrowserSession?.(sessionId);
     // Repaint the partial-history banner for the tab being switched TO. The
     // replay paths refresh it when their fetch lands; without this the previous
@@ -9519,12 +11639,21 @@ class CodemanApp {
     this._historyNoticeRevealedFor = null;
     this._renderHistoryTruncationBanner();
     try { localStorage.setItem('codeman-active-session', sessionId); } catch {}
+    // COD-285: sync terminal background to the session's mode *before* any
+    // buffer write/entrance animation so opencode's black panels don't stripe
+    // against the daylight slate (#161b23). See paste-1786223652769.
+    try { this.syncTerminalBackground?.(); } catch {}
     // Narrow SSE filter to the active session — server stops streaming
     // session:terminal events for other sessions to this client. Cuts
     // SSE traffic ~Nx for N concurrent sessions. Fire-and-forget; on the
     // rare race where server doesn't know our clientId yet, the next
     // selectSession or reconnect catches up.
     this._updateSseSubscription(sessionId);
+    this._queueTransportActivationReconcile(sessionId, selectGen);
+    // Open WebSocket as soon as the active session is known. It does not
+    // depend on terminal buffer loading, and opening it early keeps normal
+    // typing on the ordered WS path instead of briefly accumulating offline.
+    this._connectWs(sessionId);
     this.hideWelcome();
     // Terminal-pane entrance: plays for a freshly created session, and on every
     // switch when that option is on. Transform/opacity/clip-path only, xterm's
@@ -9593,7 +11722,7 @@ class CodemanApp {
               body: JSON.stringify({ clearBreaker: true }),
             });
             session.respawnBlocked = false;
-            session.status = 'busy';
+            this._onSessionRestarted({ id: sessionId });
           } catch (err) {
             console.error('Failed to restart crash-looped session:', err);
           }
@@ -9609,7 +11738,7 @@ class CodemanApp {
             : `/api/sessions/${sessionId}/interactive`;
           await fetch(endpoint, { method: 'POST' });
           // Update local session state
-          session.status = 'busy';
+          this._onSessionRestarted({ id: sessionId });
         } catch (err) {
           console.error('Failed to attach to restored session:', err);
         }
@@ -9625,12 +11754,28 @@ class CodemanApp {
     // ⚠️ BEFORE `_beginBufferLoad` on purpose: inside it, every live SSE event
     // for this session queues instead of painting, so a slow font would hold
     // output back rather than merely mis-measuring the grid.
-    if (this._terminalFontReady) {
-      await this._terminalFontReady;
-      if (this._isStaleSelect(selectGen)) {
-        this._clearTerminalLoadState(sessionId, selectGen);
-        return;
-      }
+    if (this._terminalFontReady) await this._terminalFontReady;
+
+    // A restored-session attach can outlive a newer tab selection (and the font
+    // wait above is one more place it can lose the race). Do not let its
+    // continuation measure or resize the winner's shared terminal.
+    if (this._isStaleSelect(selectGen)) {
+      this._clearTerminalLoadState(sessionId, selectGen);
+      return;
+    }
+
+    // The selected session owns this terminal now. Fit its geometry before the
+    // viewer claims sizing ownership so the activation and resize describe the
+    // shape this tab actually displays. Automatic selections fit locally but
+    // do not claim the shared PTY.
+    let dimsChanged = false;
+    if (document.visibilityState === 'visible') {
+      this._paneWidthRefused = false;
+      this.syncTerminalGeometry?.();
+    }
+    if (userInitiated && document.visibilityState === 'visible') {
+      this._terminalViewerActivity?.activate('session-select');
+      dimsChanged = (await this.sendResize(sessionId).catch(() => false)) === true;
     }
 
     // Load terminal buffer for this session
@@ -9647,6 +11792,10 @@ class CodemanApp {
     // Without this, SSE events arriving during the fetch() gap compete with
     // the buffer write, causing 70KB+ single-frame flushes that stall WebGL.
     // chunkedTerminalWrite also sets this, but we need it before the fetch too.
+    let discardedLiveOutputDuringLoad = false;
+    const discardOptions = {
+      onDiscardedQueued: () => { discardedLiveOutputDuringLoad = true; },
+    };
     const bufferLoadOwner = this._beginBufferLoad(selectGen);
     // COD-144: track whether the load painted nothing (empty fetch + no cache).
     // For that just-created-session case we flush (not discard) queued SSE events.
@@ -9656,23 +11805,6 @@ class CodemanApp {
     // blanked before the fetch, because only then is there nothing on screen.
     let clearedBeforeFresh = false;
     try {
-      // Fit terminal to container BEFORE writing any buffer data.
-      // If the browser was resized while viewing another session, the terminal
-      // canvas may be at stale dimensions — content would render at wrong width.
-      // A width refusal belonged to the PREVIOUS session's pane, and while it
-      // stands sendResize keeps the columns it last adopted; this pane's own
-      // report re-establishes it if another device holds this one too.
-      this._paneWidthRefused = false;
-      this.syncTerminalGeometry();
-
-      // Also push the new dimensions to the PTY. Without this, codex/codeman
-      // sees the size that was set the last time the throttled resize handler
-      // fired (often the size of a different session's container, or the
-      // initial tmux default). The visible symptom is codex rendering inside
-      // a small region with empty rows below the status bar.
-      // sendResize is a no-op on the server when dims haven't changed, so
-      // calling it every tab switch is cheap.
-      const dimsChanged = await this.sendResize(sessionId, { forceHttp: true }).catch(() => false);
       // The size the capture below will be taken against. The debounced resize
       // handler can move the terminal again while the load runs, so this is a
       // recorded value rather than a later read of `_lastResizeDims`.
@@ -9693,12 +11825,16 @@ class CodemanApp {
       //
       // Try in-memory first (fast); fall back to localStorage so snapshots
       // survive tab discards / browser reloads.
-      let snapshot = this._xtermSnapshots?.get(sessionId);
+      // COD-187: mirror tabs never restore snapshots or cache — the frame
+      // fetch below is the sole first paint (a scrollback-0 serialize is one
+      // screen of stale content at best).
+      const mirror = this._isMirrorSession(sessionId);
+      let snapshot = mirror ? null : this._xtermSnapshots?.get(sessionId);
       if (snapshot && !this._isUsableXtermSnapshot(snapshot)) {
         this._xtermSnapshots?.delete(sessionId);
         snapshot = null;
       }
-      if (!snapshot) {
+      if (!snapshot && !mirror) {
         try {
           const persisted = localStorage.getItem(`codeman-xs-${sessionId}`);
           if (persisted && this._isUsableXtermSnapshot(persisted)) {
@@ -9716,7 +11852,7 @@ class CodemanApp {
       }
       const sessionIsBusy = session && (session.status === 'busy' || session.status === 'working');
       let restoredSnapshot = false;
-      if (snapshot && !sessionIsBusy && session?.mode !== 'shell') {
+      if (snapshot && session?.mode !== 'shell' && (!sessionIsBusy || session?.mode === 'codex')) {
         _crashDiag.log(`SNAPSHOT_RESTORE: ${(snapshot.length/1024).toFixed(0)}KB`);
         this._setTerminalLoadState(sessionId, selectGen, 'replaying');
         this._resetTerminalForReplay();
@@ -9727,10 +11863,10 @@ class CodemanApp {
         }
         this.scrollToLastNonEmptyLine();
         _crashDiag.log('SNAPSHOT_RESTORE_DONE');
-        // Snapshot restore is only first paint. Inactive tabs intentionally
-        // unsubscribe from high-volume terminal output, so they can miss bytes
-        // emitted while away. Keep going and replace the snapshot with the
-        // canonical live tmux pane frame from /terminal.
+        // Snapshot restore is authoritative for Codex scrollback. Codex's TUI
+        // current frame can omit earlier assistant output that xterm already
+        // preserved, so the fetch below should update cache/state without
+        // replacing this rendered snapshot.
         restoredSnapshot = true;
       }
 
@@ -9739,7 +11875,7 @@ class CodemanApp {
       // jarring double-render: stale content appears, then the terminal flashes
       // blank and rewrites with fresh data. Skip the cache and write the fresh
       // buffer once for a single clean transition.
-      const cachedBuffer = this.terminalBufferCache.get(sessionId);
+      const cachedBuffer = mirror ? undefined : this.terminalBufferCache.get(sessionId);
       // `clearedBeforeFresh` is declared above the try, because the catch reads
       // it — re-declaring it here would shadow that and silently break it.
       if (cachedBuffer && !sessionIsBusy && !restoredSnapshot && session?.mode !== 'shell') {
@@ -9750,7 +11886,8 @@ class CodemanApp {
         const { parsedAt: cacheParsedAt } = await this.chunkedTerminalWrite(
           cachedBuffer,
           TERMINAL_CHUNK_SIZE,
-          bufferLoadOwner
+          bufferLoadOwner,
+          discardOptions
         );
         cacheResetAndParseMs = cacheParsedAt - cacheReplayStartedAt;
         if (this._isStaleSelect(selectGen)) {
@@ -9772,7 +11909,7 @@ class CodemanApp {
       // dimensions (a real SIGWINCH → Ink redraw); a same-size tab switch sent
       // no resize, so waiting would just add latency. Shell sessions never need
       // it, so terminal content can appear immediately when switching shells.
-      if (session?.mode !== 'shell' && dimsChanged) {
+      if (session?.mode !== 'shell' && dimsChanged && !mirror) {
         await new Promise((resolve) => setTimeout(resolve, TUI_REDRAW_SETTLE_MS));
         if (this._isStaleSelect(selectGen)) {
           this._clearTerminalLoadState(sessionId, selectGen);
@@ -9808,20 +11945,19 @@ class CodemanApp {
       const shellSession = session?.mode === 'shell';
       const paneKeepsNoHistory =
         !session?.remote && !session?.docker && this._paneHistoryLines?.get(sessionId) === 0;
-      const useFullHistory = !shellSession && (paneKeepsNoHistory || !this._fullHistoryLoaded.has(sessionId));
+      const useFullHistory = !mirror && !shellSession && (paneKeepsNoHistory || !this._fullHistoryLoaded.has(sessionId));
       if (useFullHistory) this._fullHistoryLoaded.add(sessionId);
+      this._sessionsLoadedSincePageOpen.add(sessionId);
       const fetchStartedAt = performance.now();
       const tailUrl = `/api/sessions/${sessionId}/terminal?tail=${TERMINAL_TAIL_SIZE}`;
       let capture;
       try {
-        capture = await this._fetchTerminalCapture(
-          useFullHistory
+        const captureUrl = mirror
+          ? `/api/sessions/${sessionId}/terminal?frame=1&mirror=1`
+          : useFullHistory
             ? `/api/sessions/${sessionId}/terminal?full=1`
-            : shellSession
-              ? `/api/sessions/${sessionId}/terminal?${SHELL_LOAD_QUERY}`
-              : tailUrl,
-          { full: useFullHistory }
-        );
+            : shellSession ? `/api/sessions/${sessionId}/terminal?${SHELL_LOAD_QUERY}` : tailUrl;
+        capture = await this._fetchTerminalCapture(captureUrl, { full: useFullHistory });
       } catch (err) {
         // The deadline made a slow link reachable for the first time, and the
         // pane was already blanked above — so an abort here used to leave a
@@ -9859,11 +11995,30 @@ class CodemanApp {
         // Skip rewrite if fresh buffer matches cache — avoids visible clear+rewrite flash.
         // On slow connections (mobile 5G), the gap between clear() and chunkedWrite() is
         // very visible, causing the terminal to flash blank then repaint.
-        // A snapshot restore or a busy-clear leaves the terminal showing
-        // something other than the cache, so the fetched buffer must be
-        // replayed even when it byte-matches the cache.
+        // A restored Codex snapshot keeps the browser's richer scrollback ONLY
+        // while it is provably not stale: either nothing new happened since the
+        // cached canonical buffer, or live output is still streaming (busy) and
+        // will reconcile the viewport. Inactive tabs unsubscribe from terminal
+        // output, so the fetched frame is the only way an idle tab learns about
+        // output produced while the user was away — preserving unconditionally
+        // left tabs frozen on a mid-turn frame forever (COD-175).
+        const canonicalUnchanged = data.terminalBuffer === cachedBuffer;
+        // COD-92: byte-identical canonical buffer ⇒ keep the restored snapshot
+        // for ANY mode (skip the clear+rewrite flash); busy allowance stays
+        // codex-only. Predicate lives in terminal-ui.js (unit-tested).
+        const preserveSnapshotScrollback = this._shouldPreserveSnapshotScrollback({
+          restoredSnapshot,
+          clearedForBusy: clearedBeforeFresh,
+          // Renamed from requestFullHistory when the #205 merge replaced the
+          // per-page-open flag with the per-session _fullHistoryLoaded Set.
+          requestFullHistory: useFullHistory,
+          canonicalUnchanged,
+          sessionIsBusy,
+          mode: session?.mode,
+        });
         const needsRewrite =
-          restoredSnapshot || clearedBeforeFresh || data.terminalBuffer !== cachedBuffer;
+          clearedBeforeFresh ||
+          (!preserveSnapshotScrollback && (restoredSnapshot || data.terminalBuffer !== cachedBuffer));
         if (needsRewrite) {
           _crashDiag.log(`REWRITE: ${(data.terminalBuffer.length/1024).toFixed(0)}KB`);
           this._setTerminalLoadState(sessionId, selectGen, 'replaying');
@@ -9890,9 +12045,13 @@ class CodemanApp {
           this.terminal.scrollToBottom();
         }
 
+        if (mirror) {
+          // COD-187: frames are not cached (always refetched); remember the
+          // painted frame so _refreshMirrorFrame can dedupe.
+          this._lastMirrorFrame = { id: sessionId, buf: data.terminalBuffer };
         // Shell selection always uses a fresh bounded tail, so retaining its
         // payload only wastes memory and can evict useful TUI caches.
-        if (session?.mode === 'shell') {
+        } else if (session?.mode === 'shell') {
           this.terminalBufferCache.delete(sessionId);
         } else {
           // Update cache (cap at 20 entries)
@@ -9908,6 +12067,12 @@ class CodemanApp {
         // clear stale content now; either way queued live output must be flushed.
         if (!clearedBeforeFresh) this._resetTerminalForReplay();
         bufferWasEmpty = true;
+        // COD-187: a mirror tab whose frame fetch came back degraded/empty
+        // recovers from live repaints; nudge one frame retry for idle panes
+        // that won't repaint on their own.
+        if (mirror) {
+          setTimeout(() => this._refreshMirrorFrame(sessionId), 2000);
+        }
       }
 
       const terminalLoadTiming = {
@@ -9963,18 +12128,8 @@ class CodemanApp {
         });
       }
 
-      // Fire-and-forget resize to nudge Ink via SIGWINCH on real size changes.
-      // Previously we also sent Ctrl+L (\x0c) here to force a full Ink redraw,
-      // but Claude Code 2.x treats Ctrl+L as a two-step "clear conversation"
-      // command — if a page refresh or SSE reconnect ran selectSession twice
-      // within Claude's confirmation window, the second \x0c silently wiped the
-      // conversation. Stale Ink frames in the tailed buffer are a cosmetic
-      // annoyance that disappear on the user's next keypress; data loss is not
-      // acceptable. Do NOT re-introduce Ctrl+L here.
-      this.sendResize(sessionId);
-      // sendResize fits synchronously before its first await, so this reads the
-      // size that survived the load rather than the one the capture was taken
-      // at. The two differ whenever the terminal was still settling.
+      // Read the size that survived the load rather than the one the capture
+      // was taken at. The two differ whenever the terminal was still settling.
       const dimsAfterLoad = this.getTerminalDimensions?.();
       // Only a visible-frame capture positions its rows absolutely, and only
       // that frame can be damaged by a terminal of the wrong size. A `full=1`
@@ -10067,11 +12222,8 @@ class CodemanApp {
       const idleCb = typeof requestIdleCallback === 'function' ? requestIdleCallback : (cb) => setTimeout(cb, 16);
       idleCb(() => this._refreshSessionPanels(sessionId, selectGen));
 
-      // Open WebSocket for low-latency terminal I/O (after buffer load completes)
-      this._connectWs(sessionId);
-
       _crashDiag.log('FOCUS');
-      if (shouldFocusTerminal && this.terminal) this.terminal.focus();
+      if (shouldFocusTerminal && this.terminal) focusTerminalWithoutActivation();
       this.scrollToLastNonEmptyLine();
       // If we switched INTO this tab while the soft keyboard is already up, no
       // viewport-resize transition fires (handleViewportResize only runs
@@ -10087,7 +12239,17 @@ class CodemanApp {
       const selectDoneMs = performance.now() - _selStart;
       terminalLoadTiming.selectDoneMs = selectDoneMs;
       this._recordTerminalLoadTiming(terminalLoadTiming);
-      this._clearTerminalLoadState(sessionId, selectGen);
+      this._releaseTerminalLoadAndReconcile(sessionId, selectGen);
+      if (discardedLiveOutputDuringLoad && this.activeSessionId === sessionId && selectGen === this._selectGeneration) {
+        this._onSessionNeedsRefresh({ id: sessionId });
+      }
+      this._scheduleTerminalRepaint();
+      // COD-284b: tab-switch / multi-reload tear — second fit+refresh after buffer paint
+      requestAnimationFrame(() => {
+        try { this.syncTerminalGeometry?.(); } catch {}
+        try { this.terminal?.refresh(0, Math.max(0, (this.terminal.rows || 24) - 1)); } catch {}
+        this._syncTerminalTouchAction?.();
+      });
       _crashDiag.log(`SELECT_DONE: ${selectDoneMs.toFixed(0)}ms`);
       console.log(`[CRASH-DIAG] selectSession DONE: ${sessionId.slice(0,8)} in ${selectDoneMs.toFixed(0)}ms`);
       // Remember whether the replay was worth it, because `resizeRetry` only
@@ -10245,32 +12407,7 @@ class CodemanApp {
     this.updateSubagentWindowVisibility();
 
     // Load file browser if enabled
-    const settings = this.loadAppSettingsFromStorage();
-    if (settings.showFileBrowser) {
-      const fileBrowserPanel = this.$('fileBrowserPanel');
-      if (fileBrowserPanel) {
-        fileBrowserPanel.classList.add('visible');
-        this.loadFileBrowser(sessionId);
-        // Attach drag listeners if not already attached
-        if (!this.fileBrowserDragListeners) {
-          const header = fileBrowserPanel.querySelector('.file-browser-header');
-          if (header) {
-            const onFirstDrag = () => {
-              if (!fileBrowserPanel.style.left) {
-                const rect = fileBrowserPanel.getBoundingClientRect();
-                fileBrowserPanel.style.left = `${rect.left}px`;
-                fileBrowserPanel.style.top = `${rect.top}px`;
-                fileBrowserPanel.style.right = 'auto';
-              }
-            };
-            header.addEventListener('mousedown', onFirstDrag);
-            header.addEventListener('touchstart', onFirstDrag, { passive: true });
-            this.fileBrowserDragListeners = this.makeWindowDraggable(fileBrowserPanel, header);
-            this.fileBrowserDragListeners._onFirstDrag = onFirstDrag;
-          }
-        }
-      }
-    }
+    this.showConfiguredFileBrowserPanel?.(sessionId);
   }
 
   // Shared cleanup for all session data — called from both closeSession() and session:deleted handler
@@ -10305,8 +12442,16 @@ class CodemanApp {
     // real session removal, never on a tab switch.
     this._pendingDeliveries?.delete(sessionId);
     this._seqCounters?.delete(sessionId);
-    this._postDraining?.delete(sessionId);
     this._persistReliableState();
+    if (this._wsSessionId === sessionId) this._disconnectWs();
+    this._terminalGoneFinalizedSessionIds?.delete(sessionId);
+    if (this._pendingTerminalResize?.sessionId === sessionId) this._pendingTerminalResize = null;
+    this._terminalViewerActivity?.clearSession?.(sessionId);
+    if (this._wsGoneSessionId === sessionId) {
+      this._wsGoneSessionId = null;
+      if (this._wsState === 'gone') this._wsState = 'disconnected';
+      this._updateConnectionIndicator?.();
+    }
     this.ralphStates.delete(sessionId);
     this.ralphClosedSessions.delete(sessionId);
     this.projectInsights.delete(sessionId);
@@ -10371,6 +12516,8 @@ class CodemanApp {
       } else if (wasActive) {
         this.activeSessionId = null;
         try { localStorage.removeItem('codeman-active-session'); } catch {}
+        // COD-285: reset terminal background to the skin's slate when no session is active
+        try { this.syncTerminalBackground?.(); } catch {}
         // Next tab in the user's own order, skipping ids the cleanup has not
         // caught up with yet: sessionOrder can transiently hold a dead id
         // (delete racing the order sync), which is the same reason Alt+N
@@ -10516,10 +12663,19 @@ class CodemanApp {
     // Deselect active session and show welcome screen
     this.activeSessionId = null;
     try { localStorage.removeItem('codeman-active-session'); } catch {}
+    try { this.syncTerminalBackground?.(); } catch {}
     this.terminal.clear();
     this.showWelcome();
     this.renderSessionTabs();
     this.renderRalphStatePanel();
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // Upload
+  // ═══════════════════════════════════════════════════════════════
+
+  openUploadPopup() {
+    window.open('/upload.html', 'codeman-upload', 'width=520,height=600,resizable=yes');
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -10547,6 +12703,11 @@ class CodemanApp {
   // ═══════════════════════════════════════════════════════════════
   // Kill Sessions
   // ═══════════════════════════════════════════════════════════════
+
+  renameActiveTab() {
+    if (!this.activeSessionId) return;
+    this.startInlineRename(this.activeSessionId);
+  }
 
   async killActiveSession() {
     if (!this.activeSessionId) {
@@ -10695,96 +12856,6 @@ class CodemanApp {
         ? `Lifetime: ${this.globalStats.totalSessionsCreated} sessions created${showCost ? '\nEstimated cost based on Claude Opus pricing' : ''}`
         : `Token usage across active sessions${showCost ? '\nEstimated cost based on Claude Opus pricing' : ''}`;
     }
-  }
-
-  // ─── Shortcut Registry ───────────────────────────────────────────────────────
-  // Returns the merged shortcut list: DEFAULT_SHORTCUTS with any per-shortcut
-  // overrides from settings.shortcutOverrides applied on top.
-
-  getShortcutRegistry() {
-    const settings = this.loadAppSettingsFromStorage();
-    const shortcutOverrides = settings.shortcutOverrides || {};
-    return DEFAULT_SHORTCUTS.map((shortcut) => {
-      const override = shortcutOverrides[shortcut.id];
-      if (!override) return shortcut;
-      // Only binding-shaped fields may come from storage — id/label/group/action
-      // stay trusted so persisted data can never redirect a shortcut's action or
-      // spoof another row in the settings/overlay renderers.
-      const merged = { ...shortcut };
-      if (Array.isArray(override.bindings)) {
-        merged.bindings = override.bindings;
-        delete merged.displayBindings; // show the override, not the stale default label
-      }
-      if (typeof override.disabled === 'boolean') merged.disabled = override.disabled;
-      return merged;
-    });
-  }
-
-  matchesShortcutEvent(e, shortcut) {
-    if (!shortcut || !Array.isArray(shortcut.bindings)) return false;
-    return shortcut.bindings.some((binding) => {
-      const mods = binding.modifiers || [];
-      // Ctrl and Cmd are interchangeable as the primary modifier (parity with
-      // the legacy shortcut table), but every OTHER pressed modifier must be
-      // declared by the binding — a plain Ctrl+K binding must not also swallow
-      // Ctrl+Shift+K (the Firefox devtools chord).
-      const wantsPrimary = mods.includes('ctrl') || mods.includes('meta');
-      if (wantsPrimary !== !!(e.ctrlKey || e.metaKey)) return false;
-      if (mods.includes('shift') !== !!e.shiftKey) return false;
-      if (mods.includes('alt') !== !!e.altKey) return false;
-      // Match the physical key when the binding pins one (layout-independent),
-      // or the produced character otherwise (layout-dependent keys like '+').
-      if (binding.code && e.code === binding.code) return true;
-      if (binding.key && typeof e.key === 'string' && e.key.toLowerCase() === binding.key.toLowerCase()) return true;
-      return false;
-    });
-  }
-
-  // ─── Shortcut Overlay Modal ───────────────────────────────────────────────────
-  // Ctrl/Alt+? opens a floating overlay listing all keyboard shortcuts, grouped
-  // by category. Uses the merged registry so user overrides are reflected.
-
-  showShortcutOverlay() {
-    const modal = document.getElementById('shortcutOverlayModal');
-    if (!modal) return;
-    this.renderShortcutOverlay();
-    modal.classList.add('active');
-    modal.focus?.();
-  }
-
-  renderShortcutOverlay() {
-    const list = document.getElementById('shortcutOverlayList');
-    if (!list) return;
-    const registry = this.getShortcutRegistry();
-    const groups = {};
-    for (const shortcut of registry) {
-      const g = shortcut.group || 'General';
-      if (!groups[g]) groups[g] = [];
-      groups[g].push(shortcut);
-    }
-    const fmtBindings = (s) => {
-      // Key names, never translated: "Home" is also a dictionary word (the Home
-      // button), so without the skip zh-CN showed the key as 主页.
-      if (s.displayBindings) return s.displayBindings.map((b) => `<kbd data-i18n-skip>${escapeHtml(b)}</kbd>`).join(' / ');
-      if (!s.bindings) return '';
-      // An action with no key (Close Session by default) is still listed, so the
-      // overlay says so instead of showing an empty key column.
-      if (s.bindings.length === 0) return '<span class="shortcut-overlay-unbound">not bound</span>';
-      return s.bindings.map((b) => {
-        const parts = [...(b.modifiers || []).map((m) => m.charAt(0).toUpperCase() + m.slice(1)), b.key || b.code || ''];
-        return `<kbd data-i18n-skip>${escapeHtml(parts.join('+'))}</kbd>`;
-      }).join(' / ');
-    };
-    list.innerHTML = Object.entries(groups).map(([group, items]) =>
-      `<div class="shortcut-overlay-group"><div class="shortcut-overlay-group-label">${escapeHtml(group)}</div>` +
-      items.map((s) => `<div class="shortcut-overlay-row"><span class="shortcut-overlay-label">${escapeHtml(s.label)}</span><span class="shortcut-overlay-keys">${fmtBindings(s)}</span></div>`).join('') +
-      `</div>`
-    ).join('');
-  }
-
-  closeShortcutOverlay() {
-    const modal = document.getElementById('shortcutOverlayModal');
-    if (modal) modal.classList.remove('active');
   }
 
 }

@@ -3,6 +3,13 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import { clearDocumentPreviewCache, getOfficePreviewPdfPath } from '../src/document-preview-cache.js';
 
+// COD-426: the LibreOffice path now consults the capability gate before
+// spawning, and spawns the RESOLVED binary. Stub the gate so this suite keeps
+// testing the cache/dedup behaviour without needing a real LibreOffice.
+vi.mock('../src/office-converter-runtime.js', () => ({
+  probeOfficeConverter: vi.fn(async () => ({ usable: true, bin: '/usr/bin/libreoffice' })),
+}));
+
 vi.mock('node:child_process', () => ({
   execFile: vi.fn((_cmd, _args, _options, callback) => {
     setTimeout(() => callback(null, { stdout: '', stderr: '' }), 1);
@@ -66,7 +73,7 @@ describe('document-preview-cache', () => {
     expect(thirdPath).toBe(firstPath);
     expect(mockedExecFile).toHaveBeenCalledTimes(1);
     expect(mockedExecFile).toHaveBeenCalledWith(
-      'soffice',
+      '/usr/bin/libreoffice',
       expect.arrayContaining([
         '--headless',
         '--convert-to',
@@ -99,6 +106,7 @@ describe('document-preview-cache', () => {
     expect(decodedCommand).toContain('.docx');
     expect(decodedCommand).toContain('$output = ');
     expect(decodedCommand).toContain('.pdf');
+    expect(decodedCommand).toContain('ExportAsFixedFormat($output, 17, $false, 0, 0, 0, 0, 7)');
     expect(mockedExecFile).not.toHaveBeenCalledWith(
       'soffice',
       expect.any(Array),

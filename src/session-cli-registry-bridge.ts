@@ -79,6 +79,27 @@ function legacyConfigFor(entry: CliEntry, options: SpawnBridgeOptions): Record<s
 }
 
 /**
+ * The complete, server-resolved shell command line this session was given, if its CLI declares
+ * one (`launch.rawCommandField`) and the caller actually sent a non-blank value.
+ *
+ * Returned VERBATIM: it is owner-authored shell text that replaces the templated launch, which
+ * is exactly why every caller must first re-check the owner's bypass grant.
+ */
+export function rawLaunchCommand(entry: CliEntry, options: SpawnBridgeOptions): string | undefined {
+  const field = entry.launch.rawCommandField;
+  if (field === undefined) return undefined;
+  const raw = legacyConfigFor(entry, options)?.[field];
+  return typeof raw === 'string' && raw.trim().length > 0 ? raw : undefined;
+}
+
+/** Same question, addressed by mode — for callers holding only a mode and an option bag. */
+export function rawLaunchCommandForMode(mode: string, options: Record<string, unknown>): string | undefined {
+  const entry = getCli(mode);
+  if (!entry) return undefined;
+  return rawLaunchCommand(entry, options as unknown as SpawnBridgeOptions);
+}
+
+/**
  * Same lookup, addressed by mode rather than by entry, for callers holding only a mode and an
  * option bag (tmux-manager's env configuration). Returns undefined for an unregistered mode.
  */
@@ -89,6 +110,28 @@ export function legacyConfigForMode(
   const entry = getCli(mode);
   if (!entry) return undefined;
   return legacyConfigFor(entry, options as unknown as SpawnBridgeOptions);
+}
+
+/**
+ * Where a captured native resume id belongs for this mode: the `<Mode>Config` field to write,
+ * and the key inside it this CLI's `resumeId` param is read from.
+ *
+ * The same two pieces of registry data the readers above use (`legacyConfigField` +
+ * `legacyConfigAliases`), applied in the writing direction — which is what lets
+ * `_applyNativeResumeIdForResume()` in session.ts stop hardcoding
+ * codex→`resumeSessionId` / opencode→`continueSession` / gemini→`resumeSession` /
+ * antigravity→`resumeConversationId`. Those four pairs are declared per entry already, so the
+ * hand-written chain was a second copy of them that could drift.
+ *
+ * `undefined` for an entry with no `<Mode>Config` object at all (claude, shell) and for an
+ * unregistered mode — the callers' existing "no on-disk resume mechanism, stay inert" case.
+ */
+export function legacyResumeSlot(mode: string): { field: string; key: string } | undefined {
+  const entry = getCli(mode);
+  const field = entry?.launch.legacyConfigField;
+  if (!entry || field === undefined) return undefined;
+  if (entry.launch.params.resumeId === undefined) return undefined;
+  return { field, key: entry.launch.legacyConfigAliases?.resumeId ?? 'resumeId' };
 }
 
 /**

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { WebServer } from '../src/web/server.js';
+import { SseEvent, approvalResolvedEventPayload } from '../src/web/sse-events.js';
 import { EventEmitter } from 'node:events';
 import { safeRmHomeTree } from './mocks/index.js';
 import { homedir } from 'node:os';
@@ -32,6 +33,30 @@ function parseSSEEvents(text: string): Array<{ event: string; data: unknown }> {
 
   return events;
 }
+
+it('exports the dedicated suppressed-hook event name', () => {
+  expect(SseEvent.HookSuppressed).toBe('hook:suppressed');
+});
+
+it('serializes the optional removed-item sequence in approval:resolved payloads', () => {
+  expect(
+    approvalResolvedEventPayload({
+      id: 'approval-1',
+      sessionId: 'session-1',
+      kind: 'idle',
+      resolution: 'resolved_in_terminal',
+      sourceSequence: 42,
+    })
+  ).toMatchObject({ sourceSequence: 42 });
+  expect(
+    approvalResolvedEventPayload({
+      id: 'legacy-approval',
+      sessionId: 'session-1',
+      kind: 'idle',
+      resolution: 'resolved_in_terminal',
+    })
+  ).not.toHaveProperty('sourceSequence');
+});
 
 describe('SSE Events', () => {
   let server: WebServer;

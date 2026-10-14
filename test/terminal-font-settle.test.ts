@@ -181,7 +181,7 @@ describe('selectSession font gate', () => {
     // AND applies the floor it reports, so xterm and the PTY cannot disagree
     // (#464). The gate this test guards is unchanged — the font must be
     // measured before the terminal is.
-    const fit = body.indexOf('this.syncTerminalGeometry();');
+    const fit = body.indexOf('this.syncTerminalGeometry?.();', wait);
     expect(wait).toBeGreaterThan(-1);
     expect(fit).toBeGreaterThan(-1);
     expect(wait).toBeLessThan(fit);
@@ -199,7 +199,8 @@ describe('selectSession font gate', () => {
   it('keeps the synchronous focus ahead of the wait (iOS Safari)', () => {
     // iOS honours programmatic focus only inside the user-gesture call stack,
     // which the first await ends.
-    const focus = body.indexOf('if (shouldFocusTerminal && this.terminal) this.terminal.focus();');
+    // Downstream calls focusTerminalWithoutActivation() inside the same guard.
+    const focus = body.indexOf('shouldFocusTerminal && this.terminal');
     const wait = body.indexOf('await this._terminalFontReady');
     expect(focus).toBeGreaterThan(-1);
     expect(focus).toBeLessThan(wait);
@@ -209,6 +210,8 @@ describe('selectSession font gate', () => {
     const wait = body.indexOf('await this._terminalFontReady');
     const guard = body.indexOf('this._isStaleSelect(selectGen)', wait);
     expect(guard).toBeGreaterThan(-1);
-    expect(guard - wait).toBeLessThan(200);
+    // Bound raised from 200: downstream carries an explanatory comment between the
+    // wait and the guard (263 chars). Still pins 'immediately after the wait'.
+    expect(guard - wait).toBeLessThan(400);
   });
 });

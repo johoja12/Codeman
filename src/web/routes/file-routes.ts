@@ -6,23 +6,38 @@
  * design in docs/file-viewer-edit-plan.md).
  */
 
-import { FastifyInstance, type FastifyReply } from 'fastify';
-import { basename as pathBasename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
+import {
+  basename as pathBasename,
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  posix as pathPosix,
+  relative,
+  resolve,
+  sep,
+} from 'node:path';
 import { createReadStream, realpathSync } from 'node:fs';
-import type { Readable } from 'node:stream';
 import fs from 'node:fs/promises';
+import type { Readable } from 'node:stream';
 import { createHash, randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
-import type {
-  ApiResponse,
-  FilesystemBrowseData,
-  FilesystemBrowseEntry,
-  FilesystemBrowseRoot,
-  FilesystemPreviewKind,
-  FileWriteData,
+import { fileURLToPath } from 'node:url';
+import {
+  ApiErrorCode,
+  createErrorResponse,
+  getErrorMessage,
+  type ApiResponse,
+  type FilesystemBrowseData,
+  type FilesystemBrowseEntry,
+  type FilesystemBrowseRoot,
+  type FilesystemPreviewKind,
+  type FileWriteData,
+  type SessionAttachmentHistoryItem,
+  type SessionState,
+  type AuthUser,
 } from '../../types.js';
-import { ApiErrorCode, createErrorResponse, getErrorMessage } from '../../types.js';
-import { compileFileQuery } from '../../utils/file-query.js';
 import { describeUnknownPath, probePathKind } from '../../utils/bounded-path-probe.js';
 import { fileStreamManager } from '../../file-stream-manager.js';
 import {
@@ -30,9 +45,12 @@ import {
   AttachmentRegistrationError,
   attachmentRecordToEvent,
   attachmentRegistry,
+  buildAttachmentRoutes,
   buildFileThumbnailRoute,
   getAttachmentType,
   isSupportedAttachmentExtension,
+  maxServableAttachmentBytes,
+  resolveGeneratedArtifactReadPath,
   registerExternalAttachment,
   TEXT_ATTACHMENT_EXTENSIONS,
   VIDEO_ATTACHMENT_EXTENSIONS,
@@ -46,10 +64,32 @@ import {
   listFolder,
   validFolderFileName,
 } from '../../folder-listing.js';
+import {
+  documentMagicMatchesExt,
+  isAllowedUploadExtension,
+  sanitizeUploadFilename,
+  UPLOAD_ALLOWED_EXTENSIONS,
+} from '../document-upload.js';
+import { MAX_PASTE_IMAGE_BYTES } from '../../config/buffer-limits.js';
+import { buildExternalAttachmentHistoryItem, sanitizeAttachmentHistoryItem } from '../../session-attachment-history.js';
 import { generateFirstPageThumbnail } from '../../document-thumbnailer.js';
 import { getOfficePreviewPdfPath, getPreviewPdfDownloadName } from '../../document-preview-cache.js';
-import { sanitizeAttachmentHistoryItem } from '../../session-attachment-history.js';
-import { isBlockedAttachmentPath, isUnderTree, loadAttachmentGuardConfig } from '../../config/attachment-guard.js';
+import { probeOfficeConverter } from '../../office-converter-runtime.js';
+import {
+  buildTextExportHtml,
+  classifyExportBranch,
+  convertHtmlToPdf,
+  isSupportedExportFormat,
+} from '../../document-pdf-export.js';
+import { documentVersionStore } from '../../document-version-store.js';
+import {
+  convertDocxToHtml,
+  extractDocumentText,
+  isBinaryDocExtension,
+  isDiffableDocExtension,
+} from '../../document-text-extract.js';
+import { wordDiff } from '../../utils/word-diff.js';
+import { compileFileQuery } from '../../utils/file-query.js';
 import { isMultiUserMode, userSpacePath } from '../../config/multiuser.js';
 import {
   CASES_DIR,
@@ -58,22 +98,40 @@ import {
   getAuthUser,
   parseBody,
   validateSessionFilePath,
-  validateSessionFilePathLexical,
 } from '../route-helpers.js';
-import type { FastifyRequest } from 'fastify';
-import type { SessionAttachmentHistoryItem, SessionRemote, SessionState } from '../../types/session.js';
+import { downloadTooLargeMessage, exceedsDownloadLimit } from '../../config/buffer-limits.js';
+import { parseByteRange } from '../http-range.js';
+import { isSensitivePath } from '../sensitive-path.js';
+import {
+  ensureLocalUploadDirectory,
+  isBlockedAttachmentPath,
+  isUnderTree,
+  loadAttachmentGuardConfig,
+  resolveLocalUploadDirectory,
+  UploadDirectoryResolutionError,
+} from '../../config/attachment-guard.js';
+import { SseEvent } from '../sse-events.js';
+import { writeRemoteFileBytes } from '../../remote-file-transfer.js';
+import {
+  createRemoteWorkspaceDirectory,
+  deleteRemoteWorkspacePath,
+  downloadRemoteWorkspaceFile,
+  getRemoteWorkspaceFileInfo,
+  listRemoteWorkspaceDirectory,
+  readRemoteWorkspaceFile,
+  remoteWorkspacePath,
+  renameRemoteWorkspacePath,
+} from '../../remote-sftp.js';
+import { dataPath } from '../../config/instance.js';
 import {
   RemoteFileAccessError,
   remoteCreateReadStream,
   remoteProbePaths,
-  remoteReadFile,
   type RemoteProbe,
 } from '../../remote-files.js';
-import { downloadTooLargeMessage, exceedsDownloadLimit } from '../../config/buffer-limits.js';
-import { parseByteRange } from '../http-range.js';
-import { isSensitivePath } from '../sensitive-path.js';
-import { SseEvent } from '../sse-events.js';
+import { registerGeneratedArtifactAttachment } from '../../generated-artifact-attachments.js';
 import type { ConfigPort, EventPort, SessionPort } from '../ports/index.js';
+import type { SessionRemote } from '../../types/session.js';
 import { FilesystemBrowseQuerySchema, FilesystemPreviewQuerySchema, FileWriteSchema } from '../schemas.js';
 import {
   MAX_EDITABLE_BYTES,
@@ -83,12 +141,34 @@ import {
   isEditableFileName,
 } from '../../config/file-editing.js';
 
-/**
- * Upper bound on an XLSX the browser preview will fetch (`?preview=true`).
- * Parsing happens client-side in spreadsheet-preview-worker.js, so this caps
- * what a single preview can hand the worker; the renderer refuses the same size
- * before fetching. An explicit download is unaffected (global download cap).
- */
+// Client-side hard timeout for the remote document-upload ssh transfer. Mirrors
+// the paste-image timeout (session-routes.ts) so both remote writes behave the same.
+const REMOTE_ATTACHMENT_SSH_TIMEOUT_MS = 15_000;
+
+async function probeRemoteWorkspacePath(
+  remote: SessionRemote,
+  relativePath: string,
+  expectedKind: RemoteProbe['kind']
+): Promise<RemoteProbe | null> {
+  const targetPath = remoteWorkspacePath(remote, relativePath);
+  const workspacePath = remoteWorkspacePath(remote);
+  const paths = targetPath === workspacePath ? [workspacePath] : [targetPath, workspacePath];
+  const probes = await remoteProbePaths(remote, paths);
+  const target = probes[0] ?? null;
+  const workspace = targetPath === workspacePath ? target : (probes[1] ?? null);
+  if (!target || target.kind !== expectedKind || !workspace || workspace.kind !== 'directory') return null;
+
+  const relativeToWorkspace = pathPosix.relative(workspace.realPath, target.realPath);
+  if (
+    pathPosix.isAbsolute(relativeToWorkspace) ||
+    relativeToWorkspace === '..' ||
+    relativeToWorkspace.startsWith(`..${pathPosix.sep}`)
+  ) {
+    return null;
+  }
+  return target;
+}
+
 export const MAX_XLSX_BROWSER_PREVIEW_BYTES = 10 * 1024 * 1024;
 
 /** Whether a raw request is an XLSX browser preview over the preview cap. */
@@ -118,6 +198,7 @@ const MIME_TYPES: Record<string, string> = {
   jpeg: 'image/jpeg',
   gif: 'image/gif',
   webp: 'image/webp',
+  avif: 'image/avif',
   ico: 'image/x-icon',
   bmp: 'image/bmp',
   // Media needs a real type, not the octet-stream fallback: a <video>/<audio>
@@ -145,6 +226,32 @@ const MIME_TYPES: Record<string, string> = {
   txt: 'text/plain',
 };
 
+function sanitizeDownloadName(fileName: string): string {
+  return fileName.replace(/["\\\r\n]/g, '_');
+}
+
+function parsePreviewFileUri(uri: unknown): string {
+  if (typeof uri !== 'string' || uri.trim().length === 0) {
+    throw new AttachmentRegistrationError('Missing file URI', 400);
+  }
+
+  let filePath: string;
+  try {
+    if (!/^file:\/\/\//i.test(uri)) throw new Error('form');
+    const parsed = new URL(uri);
+    if (parsed.protocol !== 'file:' || parsed.hostname !== '') throw new Error('scheme');
+    filePath = fileURLToPath(parsed);
+  } catch {
+    throw new AttachmentRegistrationError('Invalid file URI', 400);
+  }
+
+  const extension = extname(filePath).slice(1).toLowerCase();
+  if (!isAbsolute(filePath) || !isSupportedAttachmentExtension(extension)) {
+    throw new AttachmentRegistrationError('Unsupported file URI', 400);
+  }
+  return filePath;
+}
+
 function buildContentDisposition(disposition: 'inline' | 'attachment', fileName: string): string {
   const cleaned = fileName.replace(/["\\\r\n]/g, '_');
   const fallback = cleaned.replace(/[^\x20-\x7e]/g, '_') || 'file';
@@ -155,7 +262,7 @@ function buildContentDisposition(disposition: 'inline' | 'attachment', fileName:
   return `${disposition}; filename="${fallback}"; filename*=UTF-8''${encoded}`;
 }
 
-function sendRawStream(reply: FastifyReply, content: Readable, cleanup?: () => void): void {
+function sendRawStream(reply: FastifyReply, content: Readable, onClose?: () => void): void {
   const headers = reply.getHeaders();
   // hijack() answers on reply.raw, which keeps Fastify's own status handling out
   // of the picture — so a 206 set with reply.code() has to be carried across by
@@ -171,25 +278,14 @@ function sendRawStream(reply: FastifyReply, content: Readable, cleanup?: () => v
     }
   }
 
-  // A remote body is an `ssh` child process, not a file handle: it has to be reaped
-  // when the client goes away (tab closed, video seek, a cancelled fetch), or the
-  // ssh process outlives the request. Registered here because this is the one place
-  // that owns the response's lifecycle.
-  //
-  // ⚠️ Check BEFORE attaching: the guard probe that ran ahead of this is an ssh round
-  // trip, and a client that gave up during it has already closed the response, so
-  // `close` has already fired and a listener attached now would never run. The
-  // `open()` call above still spawned the body's ssh child; reap it here instead.
-  if (reply.raw.destroyed) {
-    cleanup?.();
-    content.destroy();
-    return;
-  }
-  if (cleanup) {
-    reply.raw.on('close', cleanup);
-  }
-
+  let closed = false;
+  const finish = () => {
+    if (closed) return;
+    closed = true;
+    onClose?.();
+  };
   content.on('error', (err) => {
+    finish();
     if (reply.raw.headersSent) {
       reply.raw.destroy(err);
       return;
@@ -198,6 +294,7 @@ function sendRawStream(reply: FastifyReply, content: Readable, cleanup?: () => v
     reply.raw.statusCode = 500;
     reply.raw.end('Failed to read file');
   });
+  content.once('close', finish);
   content.pipe(reply.raw);
 }
 
@@ -211,9 +308,10 @@ interface FileBodySource {
 }
 
 /** Byte source for a LOCAL file (the historical, only path). Shared with html-view-routes.ts. */
-export function localFileSource(resolvedPath: string) {
+export function localFileSource(resolvedPath: string, cleanup?: () => void) {
   return (range?: { start: number; end: number }): FileBodySource => ({
     content: createReadStream(resolvedPath, range ? { start: range.start, end: range.end } : undefined),
+    cleanup,
   });
 }
 
@@ -267,7 +365,7 @@ export function sendFileBody(
   sendRawStream(reply, content, cleanup);
 }
 
-async function serveRawFile(
+async function serveFileTargetRaw(
   reply: FastifyReply,
   target: FileTarget,
   size: number,
@@ -316,17 +414,73 @@ async function serveRawFile(
   sendFileBody(reply, size, rangeHeader, fileTargetSource(target));
 }
 
-function getAttachmentOr404(
+async function serveRawFile(
   reply: FastifyReply,
-  sessionId: string,
-  attachmentId: string
-): AttachmentRecord | undefined {
-  const record = attachmentRegistry.get(sessionId, attachmentId);
-  if (!record) {
-    reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, 'Attachment not found'));
-    return undefined;
+  resolvedPath: string,
+  fileName: string,
+  extension: string,
+  download?: boolean,
+  rangeHeader?: string | string[],
+  maxSizeBytes?: number,
+  onClose?: () => void
+): Promise<void> {
+  const stat = await fs.stat(resolvedPath);
+  // Optional per-route cap, checked BEFORE the global one: the by-id attachment
+  // raw route bounds its response (an attacker-influenceable registry id
+  // resolves to an arbitrary host file), and the xlsx browser preview bounds
+  // what it will hand the parser. The workspace-scoped file-raw route passes
+  // none and falls through to the global sanity bound below.
+  if (maxSizeBytes !== undefined && stat.size > maxSizeBytes) {
+    reply
+      .code(413)
+      .send(
+        createErrorResponse(
+          ApiErrorCode.INVALID_INPUT,
+          `File too large (${Math.round(stat.size / 1024 / 1024)}MB > ${maxSizeBytes / 1024 / 1024}MB limit)`
+        )
+      );
+    return;
   }
-  return record;
+  // Global sanity bound only (CODEMAN_MAX_DOWNLOAD_BYTES, 0 = unlimited): the
+  // body below is streamed and Range-aware, so size does not become RSS.
+  if (exceedsDownloadLimit(stat.size)) {
+    reply.code(413).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, downloadTooLargeMessage(stat.size)));
+    return;
+  }
+  // Markup is download-only: served with a renderable type on our own origin it
+  // would be stored XSS. SVG was always here; HTML/HTM join it now that the text
+  // family is servable, so widening what can be READ never widened what can RUN.
+  // The preview overlay reads these through `fetch()`, which ignores the
+  // disposition, so the source view of a clicked .html still works. Rendering it
+  // as a page is html-view-routes.ts's job (sandboxed, opaque origin), never this
+  // route's.
+  const markupOnly = extension === 'svg' || extension === 'html' || extension === 'htm';
+  if (download || markupOnly) {
+    reply.header(
+      'Content-Type',
+      markupOnly ? 'application/octet-stream' : MIME_TYPES[extension] || 'application/octet-stream'
+    );
+    reply.header('Content-Disposition', buildContentDisposition('attachment', fileName));
+    reply.header('X-Content-Type-Options', 'nosniff');
+    sendFileBody(reply, stat.size, rangeHeader, localFileSource(resolvedPath, onClose));
+    return;
+  }
+
+  // Plain text with no dedicated MIME entry (code, config, logs, csv, xml) goes
+  // out as inert text/plain rather than the octet-stream fallback, matching what
+  // the path picker already does. Never a type the browser would execute.
+  if (!MIME_TYPES[extension] && TEXT_ATTACHMENT_EXTENSIONS.has(extension)) {
+    reply.header('Content-Type', 'text/plain; charset=utf-8');
+    reply.header('Content-Disposition', buildContentDisposition('inline', fileName));
+    reply.header('X-Content-Type-Options', 'nosniff');
+    sendFileBody(reply, stat.size, rangeHeader, localFileSource(resolvedPath));
+    return;
+  }
+
+  reply.header('Content-Type', MIME_TYPES[extension] || 'application/octet-stream');
+  reply.header('Content-Disposition', buildContentDisposition('inline', fileName));
+  reply.header('X-Content-Type-Options', 'nosniff');
+  sendFileBody(reply, stat.size, rangeHeader, localFileSource(resolvedPath, onClose));
 }
 
 /**
@@ -359,35 +513,11 @@ async function resolveServableAttachmentPath(
   record: AttachmentRecord,
   scope: SessionFileScope
 ): Promise<ServableAttachment | null> {
-  if (scope.remote) {
-    return resolveServableRemoteAttachment(reply, record, scope);
-  }
-
-  let pathToCheck = record.filePath;
-  let resolved = false;
-  try {
-    pathToCheck = realpathSync(record.filePath);
-    resolved = true;
-  } catch {
-    // Fall back to the stored (already realpath-resolved at registration) path.
-  }
-
-  const guard = await loadAttachmentGuardConfig();
-
-  const blocked =
-    isBlockedAttachmentPath(pathToCheck, guard.blockedTrees) ||
-    isBlockedAttachmentPath(record.filePath, guard.blockedTrees) ||
-    (guard.confineToWorkspace && (!scope.workingDir || !validateSessionFilePath(scope.workingDir, pathToCheck)));
-
-  if (blocked) {
-    reply.code(403).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this file is blocked'));
-    return null;
-  }
-  // Serve the freshly-resolved path, not the stored one: if a path component
-  // became a symlink after registration, the guard checked the resolved target
-  // but streaming record.filePath would follow the symlink to a swapped file.
-  return { path: resolved ? pathToCheck : record.filePath };
+  if (scope.remote) return resolveServableRemoteAttachment(reply, record, scope);
+  const path = await resolveLocalServableAttachmentPath(reply, record, scope.workingDir);
+  return path ? { path } : null;
 }
+
 /**
  * Remote counterpart of {@link resolveServableAttachmentPath}.
  *
@@ -467,7 +597,7 @@ async function serveServableRaw(
       sendXlsxPreviewTooLarge(reply, size);
       return;
     }
-    await serveRawFile(reply, target, size, fileName, extension, query.download === 'true', query.range);
+    await serveFileTargetRaw(reply, target, size, fileName, extension, query.download === 'true', query.range);
   } catch (err) {
     reply
       .code(err instanceof RemoteFileAccessError ? 502 : 500)
@@ -496,7 +626,12 @@ async function serveConvertedPreview(
   try {
     const previewPath = await getOfficePreviewPdfPath(resolvedPath, extension);
     if (!previewPath) {
-      reply.code(500).send(createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Document preview conversion failed'));
+      // COD-426: distinguish "this host cannot convert anything" from "this
+      // document failed to convert". The verdict is cached by the gate the
+      // conversion itself just consulted, so this costs no extra spawn.
+      const verdict = await probeOfficeConverter();
+      const message = verdict.usable ? 'Document preview conversion failed' : verdict.reason;
+      reply.code(500).send(createErrorResponse(ApiErrorCode.OPERATION_FAILED, message));
       return;
     }
 
@@ -517,7 +652,15 @@ async function serveConvertedPreview(
   }
 }
 
-/** Generate and stream a first-page thumbnail (PNG) for a supported attachment. */
+async function sendPdfDownload(reply: FastifyReply, content: Buffer, downloadName: string): Promise<void> {
+  reply.header('Content-Type', 'application/pdf');
+  reply.header('Content-Disposition', `attachment; filename="${sanitizeDownloadName(downloadName)}"`);
+  reply.header('Cache-Control', 'no-cache');
+  reply.header('Content-Length', content.length);
+  reply.header('X-Content-Type-Options', 'nosniff');
+  reply.send(content);
+}
+
 async function serveThumbnail(reply: FastifyReply, resolvedPath: string, extension: string): Promise<void> {
   const thumbnail = await generateFirstPageThumbnail(resolvedPath, extension);
   if (!thumbnail) {
@@ -531,22 +674,90 @@ async function serveThumbnail(reply: FastifyReply, resolvedPath: string, extensi
   reply.send(thumbnail.content);
 }
 
-/**
- * Resolve a session's working dir from the live session, falling back to the
- * persisted record so preview/thumbnail requests keep working for a session
- * that has since detached. Sends a 404 and returns undefined when unknown.
- */
-function getKnownSessionWorkingDir(
-  ctx: SessionPort & ConfigPort,
-  sessionId: string,
+function getAttachmentOr404(
   reply: FastifyReply,
-  req: FastifyRequest
-): string | undefined {
-  // One implementation of the live-or-persisted lookup and its ownership rule; this
-  // wrapper exists for the callers that only need the workspace PATH.
-  return getKnownSessionFileScope(ctx, sessionId, reply, req)?.workingDir;
+  sessionId: string,
+  attachmentId: string
+): AttachmentRecord | undefined {
+  const record = attachmentRegistry.get(sessionId, attachmentId);
+  if (!record) {
+    reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, 'Attachment not found'));
+    return undefined;
+  }
+  return record;
 }
 
+/**
+ * COD-53 defense-in-depth: refuse to stream a record whose underlying path is
+ * blocked by the active attachment-guard policy, even though registration
+ * already blocks them. Guards against records that predate the guard or were
+ * crafted to point at a sensitive file. Resolves symlinks before the check so a
+ * record pointing at a symlink that now resolves to a sensitive target is also
+ * caught; if the path can't be resolved (deleted/unreadable) the check still
+ * runs on the stored path. Uses the broadened blocklist (secret locations +
+ * `/root`/`/etc` trees + operator extras); when workspace confinement is
+ * enabled it additionally rejects any record outside the session workspace.
+ *
+ * Returns the path that is SAFE to stream — the freshly realpath-resolved target
+ * when resolvable, else the stored path — or null (after sending a 403) when
+ * blocked. Streaming the resolved path closes a TOCTOU window: a path component
+ * swapped to a symlink after registration would otherwise redirect the stream to
+ * a different file than the guard checked. The metadata/preview/thumbnail routes
+ * that only need the boolean verdict treat a null result as "blocked".
+ */
+async function resolveLocalServableAttachmentPath(
+  reply: FastifyReply,
+  record: AttachmentRecord,
+  sessionWorkingDir?: string
+): Promise<string | null> {
+  let pathToCheck = record.filePath;
+  let resolved = false;
+  let trustedBoundaryValidated = false;
+  try {
+    const generatedPath = await resolveGeneratedArtifactReadPath(record);
+    if (generatedPath) {
+      pathToCheck = generatedPath;
+      resolved = true;
+      trustedBoundaryValidated = !!record.trustedUploadBoundary && !record.generatedArtifactBoundary;
+    }
+  } catch (err) {
+    if (err instanceof AttachmentRegistrationError) {
+      reply.code(err.statusCode).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, err.message));
+      return null;
+    }
+    throw err;
+  }
+
+  if (!resolved) {
+    try {
+      pathToCheck = realpathSync(record.filePath);
+      resolved = true;
+    } catch {
+      // Fall back to the stored (already realpath-resolved at registration) path.
+    }
+  }
+
+  const guard = await loadAttachmentGuardConfig();
+
+  const blocked =
+    isBlockedAttachmentPath(pathToCheck, guard.blockedTrees) ||
+    isBlockedAttachmentPath(record.filePath, guard.blockedTrees) ||
+    (guard.confineToWorkspace &&
+      !trustedBoundaryValidated &&
+      (!sessionWorkingDir || !validateSessionFilePath(sessionWorkingDir, pathToCheck)));
+
+  if (blocked) {
+    reply.code(403).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this file is blocked'));
+    return null;
+  }
+  // Serve the freshly-resolved path, not the stored one: if a path component
+  // became a symlink after registration, the guard checked the resolved target
+  // but streaming record.filePath would follow the symlink to a swapped file.
+  return resolved ? pathToCheck : record.filePath;
+}
+
+// Persisted sessions carry the private (externalPath-bearing) history under a
+// `__attachmentHistory` key so the list route can re-register external files.
 // ===== Remote (SSH) file access =====
 //
 // A remote case's `workingDir` is an absolute path on ANOTHER host
@@ -630,106 +841,6 @@ type FileTarget =
       probe: RemoteProbe;
     };
 
-/** Resolution outcome, so each route can answer in its own established style. */
-type FileTargetResolution =
-  | { ok: true; target: FileTarget }
-  | {
-      ok: false;
-      /** `unreachable` = the ssh probe failed; everything else is a refusal. */
-      reason: 'not-found' | 'unreachable';
-      status: number;
-      errorCode: ApiErrorCode;
-      message: string;
-    };
-
-/**
- * Resolve a request's `?path=` against the session's file scope.
- *
- * Never throws: a transport failure comes back as `status: 502` with the remote
- * reason, so an unreachable host reads as an infrastructure problem instead of the
- * 404 that used to make it look like user error.
- */
-async function resolveFileTarget(scope: SessionFileScope, filePath: string): Promise<FileTargetResolution> {
-  if (!scope.remote) {
-    const validated = validateSessionFilePath(scope.workingDir, filePath);
-    if (!validated) {
-      return {
-        ok: false,
-        reason: 'not-found',
-        status: 404,
-        errorCode: ApiErrorCode.NOT_FOUND,
-        message: 'File not found',
-      };
-    }
-    return { ok: true, target: { kind: 'local', ...validated } };
-  }
-
-  const remote = scope.remote;
-  // Cheap lexical reject BEFORE opening a connection: a `../` escape never needs to
-  // be asked about on the remote host.
-  const lexical = validateSessionFilePathLexical(scope.workingDir, filePath);
-  if (!lexical) {
-    return {
-      ok: false,
-      reason: 'not-found',
-      status: 404,
-      errorCode: ApiErrorCode.NOT_FOUND,
-      message: 'File not found',
-    };
-  }
-
-  let probes: Array<RemoteProbe | null>;
-  try {
-    // Both paths in one ssh round trip: the containment check below is only honest
-    // when the workspace itself is canonicalized remotely too (a symlinked
-    // `remotePath` is ordinary, and comparing a realpath'd file against a
-    // non-canonical root would refuse every read in that case).
-    probes = await remoteProbePaths(remote, [lexical.resolvedPath, scope.workingDir]);
-  } catch (err) {
-    const detail = err instanceof RemoteFileAccessError ? err.message : getErrorMessage(err);
-    return {
-      ok: false,
-      reason: 'unreachable',
-      status: 502,
-      errorCode: ApiErrorCode.OPERATION_FAILED,
-      message: detail,
-    };
-  }
-
-  const [fileProbe, rootProbe] = probes;
-  if (!fileProbe) {
-    return {
-      ok: false,
-      reason: 'not-found',
-      status: 404,
-      errorCode: ApiErrorCode.NOT_FOUND,
-      message: 'File not found',
-    };
-  }
-
-  const root = rootProbe?.realPath ?? resolve(scope.workingDir);
-  if (!isPathWithinRoot(root, fileProbe.realPath)) {
-    return {
-      ok: false,
-      reason: 'not-found',
-      status: 404,
-      errorCode: ApiErrorCode.NOT_FOUND,
-      message: 'File not found',
-    };
-  }
-
-  return {
-    ok: true,
-    target: {
-      kind: 'remote',
-      resolvedPath: fileProbe.realPath,
-      relativePath: relative(root, fileProbe.realPath),
-      remote,
-      probe: fileProbe,
-    },
-  };
-}
-
 /**
  * The bytes of a resolved target, as a Range-aware source for `sendFileBody`.
  *
@@ -746,11 +857,12 @@ function fileTargetSource(target: FileTarget) {
 
 // Persisted sessions carry the private (externalPath-bearing) history under a
 // `__attachmentHistory` key so the list route can re-register external files.
+
 type StoredSessionWithPrivateAttachmentHistory = SessionState & {
   __attachmentHistory?: SessionAttachmentHistoryItem[];
 };
 
-type AttachmentHistoryRouteItem = Omit<SessionAttachmentHistoryItem, 'externalPath'> & {
+type AttachmentHistoryRouteItem = Omit<SessionAttachmentHistoryItem, 'externalPath' | 'generatedArtifactBoundary'> & {
   missing: boolean;
   rawUrl?: string;
   url?: string;
@@ -1003,6 +1115,30 @@ function appendDownloadFlag(url: string): string {
   return `${url}${url.includes('?') ? '&' : '?'}download=true`;
 }
 
+/**
+ * Resolve a session's working dir from the live session, falling back to the
+ * persisted record so preview/thumbnail requests keep working for a session
+ * that has since detached. Sends a 404 and returns undefined when unknown.
+ */
+function getKnownSessionWorkingDir(
+  ctx: SessionPort & ConfigPort,
+  sessionId: string,
+  reply: FastifyReply,
+  req: FastifyRequest
+): string | undefined {
+  // Multi-user: a non-admin may only reach their OWN session's files. A foreign
+  // (or missing) session is reported identically as 404 so existence isn't leaked.
+  const user = getAuthUser(req);
+  const liveSession = ctx.sessions.get(sessionId);
+  if (liveSession && canAccessOwned(user, liveSession.owner)) return liveSession.workingDir;
+
+  const stored = ctx.store.getSession(sessionId) as StoredSessionWithPrivateAttachmentHistory | undefined;
+  if (stored && canAccessOwned(user, (stored as { owner?: string }).owner)) return stored.workingDir;
+
+  reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, `Session ${sessionId} not found`));
+  return undefined;
+}
+
 // ===== File Viewer edit mode (issue #212) =====
 // Policy lives in src/config/file-editing.ts; design in docs/file-viewer-edit-plan.md.
 
@@ -1026,20 +1162,6 @@ function sniffsBinary(buf: Buffer): boolean {
  * failures grep distinctly.
  */
 function throwFileEditError(statusCode: number, code: ApiErrorCode, message: string): never {
-  throwRouteError(statusCode, code, message);
-}
-
-/**
- * Throw an error the central route handler renders at `statusCode`.
- *
- * The one way to answer a NON-2xx status from a handler that otherwise RETURNS its
- * error envelope: a returned envelope is wrapped by the preSerialization hook in
- * production but arrives as a plain 200 in the `app.inject()` harness, so a status
- * asserted from a return value would be a test that cannot fail. `file-content`
- * predates that and keeps its returned envelopes for the errors it always had; every
- * NEW failure reason there (and everywhere in `file-raw`) goes through here.
- */
-function throwRouteError(statusCode: number, code: ApiErrorCode, message: string): never {
   throw Object.assign(new Error(message), {
     statusCode,
     body: createErrorResponse(code, message),
@@ -1082,22 +1204,17 @@ function decodeEditableText(buf: Buffer): string {
   return text;
 }
 
-interface SessionFileHistory {
-  scope: SessionFileScope;
-  history: SessionAttachmentHistoryItem[];
-}
-
 function getSessionAttachmentHistory(
   ctx: SessionPort & ConfigPort,
   sessionId: string,
   req: FastifyRequest
-): SessionFileHistory | undefined {
+): { workingDir: string; history: SessionAttachmentHistoryItem[] } | undefined {
   const user = getAuthUser(req);
   const liveSession = ctx.sessions.get(sessionId);
   if (liveSession) {
     if (!canAccessOwned(user, liveSession.owner)) return undefined;
     return {
-      scope: { workingDir: liveSession.workingDir, remote: liveSession.remote },
+      workingDir: liveSession.workingDir,
       history: liveSession.getAttachmentHistoryForPersist() ?? liveSession.attachmentHistory ?? [],
     };
   }
@@ -1106,120 +1223,36 @@ function getSessionAttachmentHistory(
   if (!stored || !canAccessOwned(user, (stored as { owner?: string }).owner)) return undefined;
 
   return {
-    scope: { workingDir: stored.workingDir, remote: stored.remote },
+    workingDir: stored.workingDir,
     history: stored.__attachmentHistory ?? stored.attachmentHistory ?? [],
   };
-}
-
-/**
- * The remote probes an attachment-history listing needs, resolved in ONE batch.
- *
- * The list route used to probe each entry on its own, i.e. one ssh handshake per
- * history item, up to `ATTACHMENT_HISTORY_LIMIT` (100) of them, and the attachments
- * drawer re-runs the route on every `attachment:detected` event while it is open,
- * which is exactly when an agent is writing files. OpenSSH's default
- * `MaxStartups 10:30:100` starts dropping connections at ten concurrent handshakes,
- * so most of such a burst simply failed. `remoteProbePaths` already takes an array
- * (and chunks it), so the whole history is one call, plus the global ssh limiter
- * bounding whatever is left.
- */
-interface RemoteHistoryProbes {
-  /** The workspace root, canonicalized on the remote host. */
-  root: RemoteProbe | null;
-  /** Keyed by the exact path handed to the probe (a lexical resolution or an external path). */
-  byPath: Map<string, RemoteProbe | null>;
-  /**
-   * The batch itself failed (unreachable host). Every entry is then UNKNOWN, not
-   * missing: reporting "missing" would tell the user their files are gone when the
-   * host is merely asleep.
-   */
-  unreachable: boolean;
-}
-
-async function probeRemoteAttachmentHistory(
-  scope: SessionFileScope,
-  history: readonly SessionAttachmentHistoryItem[]
-): Promise<RemoteHistoryProbes | undefined> {
-  const remote = scope.remote;
-  if (!remote || history.length === 0) return undefined;
-
-  const paths = new Set<string>();
-  for (const item of history) {
-    if (item.source === 'external') {
-      if (item.externalPath) paths.add(item.externalPath);
-    } else if (item.relativePath) {
-      const lexical = validateSessionFilePathLexical(scope.workingDir, item.relativePath);
-      if (lexical) paths.add(lexical.resolvedPath);
-    }
-  }
-
-  const list = [...paths];
-  try {
-    const [root, ...rest] = await remoteProbePaths(remote, [scope.workingDir, ...list]);
-    return { root, byPath: new Map(list.map((path, index) => [path, rest[index] ?? null])), unreachable: false };
-  } catch {
-    return { root: null, byPath: new Map(), unreachable: true };
-  }
 }
 
 // History item for a file detected inside the workspace: re-stat for live
 // size/mtime and resolve preview/thumbnail/raw routes off the relative path.
 async function buildDetectedAttachmentRouteItem(
   sessionId: string,
-  scope: SessionFileScope,
-  item: SessionAttachmentHistoryItem,
-  batch?: RemoteHistoryProbes
+  workingDir: string,
+  item: SessionAttachmentHistoryItem
 ): Promise<AttachmentHistoryRouteItem> {
   const safe = sanitizeAttachmentHistoryItem(item);
   if (!item.relativePath) {
     return { ...safe, missing: true };
   }
 
-  const workingDir = scope.workingDir;
-  let resolvedPath: string;
+  const validated = validateSessionFilePath(workingDir, item.relativePath);
+  if (!validated) {
+    return { ...safe, missing: true };
+  }
+
   let size = item.size;
   let mtimeMs = item.mtimeMs;
-
-  if (scope.remote) {
-    // Same check as the local branch (a workspace-relative entry must still resolve
-    // inside the workspace), executed on the host that owns the files.
-    const lexical = validateSessionFilePathLexical(workingDir, item.relativePath);
-    if (!lexical) return { ...safe, missing: true };
-    let probe: RemoteProbe | null;
-    let rootProbe: RemoteProbe | null;
-    if (batch) {
-      // The list route resolved the whole history in one round trip.
-      if (batch.unreachable) return { ...safe, missing: false, size, mtimeMs };
-      probe = batch.byPath.get(lexical.resolvedPath) ?? null;
-      rootProbe = batch.root;
-    } else {
-      try {
-        [probe, rootProbe] = await remoteProbePaths(scope.remote, [lexical.resolvedPath, workingDir]);
-      } catch {
-        // Unreachable host: the entry is not "missing", it is unknown. Reporting it as
-        // missing would tell the user their file is gone when its host is merely asleep.
-        return { ...safe, missing: false, size, mtimeMs };
-      }
-    }
-    if (!probe || !isPathWithinRoot(rootProbe?.realPath ?? workingDir, probe.realPath)) {
-      return { ...safe, missing: true };
-    }
-    resolvedPath = probe.realPath;
-    size = probe.size;
-    mtimeMs = probe.mtimeMs;
-  } else {
-    const validated = validateSessionFilePath(workingDir, item.relativePath);
-    if (!validated) {
-      return { ...safe, missing: true };
-    }
-    resolvedPath = validated.resolvedPath;
-    try {
-      const stat = await fs.stat(resolvedPath);
-      size = stat.size;
-      mtimeMs = stat.mtimeMs ?? mtimeMs;
-    } catch {
-      return { ...safe, missing: true };
-    }
+  try {
+    const stat = await fs.stat(validated.resolvedPath);
+    size = stat.size;
+    mtimeMs = stat.mtimeMs ?? mtimeMs;
+  } catch {
+    return { ...safe, missing: true };
   }
 
   const encodedPath = encodeURIComponent(item.relativePath);
@@ -1227,7 +1260,9 @@ async function buildDetectedAttachmentRouteItem(
   const previewUrl =
     item.extension === 'docx' || item.extension === 'pptx'
       ? `/api/sessions/${sessionId}/file-preview?path=${encodedPath}`
-      : rawUrl;
+      : item.extension === 'xlsx'
+        ? `${rawUrl}&preview=true`
+        : rawUrl;
   const thumbnailUrl = isSupportedAttachmentExtension(item.extension)
     ? buildFileThumbnailRoute(sessionId, item.relativePath)
     : undefined;
@@ -1250,25 +1285,55 @@ async function buildDetectedAttachmentRouteItem(
 async function buildExternalAttachmentRouteItem(
   sessionId: string,
   item: SessionAttachmentHistoryItem,
-  scope: SessionFileScope,
-  batch?: RemoteHistoryProbes
+  sessionWorkingDir: string | undefined,
+  authUser: AuthUser
 ): Promise<AttachmentHistoryRouteItem> {
   const safe = sanitizeAttachmentHistoryItem(item);
   if (!item.externalPath) {
     return { ...safe, missing: true };
   }
-  // Same answer as the detected branch for the same event: an unreachable host makes
-  // the entry unknown, never missing.
-  if (batch?.unreachable) {
-    return { ...safe, missing: false };
-  }
 
   try {
+    let trustedUploadBoundary: string | undefined;
+    let forceWorkspaceConfinement = false;
+    if (item.uploadProvenance === 'codeman-upload') {
+      if (!sessionWorkingDir) throw new AttachmentRegistrationError('Access to this file is blocked', 403);
+      // COD-296: resolve-only — listing history must never create the upload
+      // directory. An absent directory means the uploaded copy is gone too, so
+      // this fails closed to `missing: true` via the catch below.
+      const uploadDirectory = await resolveLocalUploadDirectory(sessionWorkingDir, authUser);
+      if (!uploadDirectory) throw new AttachmentRegistrationError('Access to this file is blocked', 403);
+      const canonicalFile = realpathSync(item.externalPath);
+      if (dirname(canonicalFile) !== uploadDirectory.canonicalDir || pathBasename(canonicalFile) !== item.fileName) {
+        throw new AttachmentRegistrationError('Access to this file is blocked', 403);
+      }
+      if (uploadDirectory.kind === 'trusted') {
+        trustedUploadBoundary = uploadDirectory.canonicalDir;
+      } else {
+        forceWorkspaceConfinement = true;
+      }
+    }
     const event = await registerExternalAttachment(sessionId, item.externalPath, {
-      sessionWorkingDir: scope.workingDir,
-      remote: scope.remote,
-      remoteProbes: batch ? [batch.byPath.get(item.externalPath) ?? null, batch.root] : undefined,
+      sessionWorkingDir,
+      generatedArtifactBoundary: item.uploadProvenance ? undefined : item.generatedArtifactBoundary,
+      trustedUploadBoundary,
+      forceWorkspaceConfinement,
     });
+    // COD-241 unit 3: expose a workspace-relative path for Codeman-uploaded
+    // copies (those inside .codeman-attachments/). The frontend gates its
+    // "Remove" affordance on `relativePath` starting with `.codeman-attachments/`
+    // and feeds that path to DELETE …/attachments/uploaded. externalPath itself
+    // stays stripped (never leaves the server); only the confined relative path
+    // is surfaced. Non-workspace published files resolve to null → no relativePath
+    // → no Remove button.
+    const validated = sessionWorkingDir ? validateSessionFilePath(sessionWorkingDir, item.externalPath) : null;
+    const ownedRelativePath = trustedUploadBoundary
+      ? pathPosix.join('.codeman-attachments', event.fileName)
+      : validated &&
+          (validated.relativePath === '.codeman-attachments' ||
+            validated.relativePath.startsWith(`.codeman-attachments${sep}`))
+        ? validated.relativePath
+        : undefined;
     return {
       ...safe,
       fileName: event.fileName,
@@ -1277,6 +1342,7 @@ async function buildExternalAttachmentRouteItem(
       size: event.size,
       missing: false,
       attachmentId: event.attachmentId,
+      relativePath: ownedRelativePath,
       rawUrl: event.rawUrl,
       url: event.rawUrl,
       previewUrl: event.previewUrl,
@@ -1285,12 +1351,147 @@ async function buildExternalAttachmentRouteItem(
     };
   } catch (err) {
     if (err instanceof AttachmentRegistrationError) {
-      // 502 is the transport, not the file (see resolveRemoteAttachment): unknown,
-      // like the detected branch. Anything else (404, 403, wrong kind) is missing.
-      return { ...safe, missing: err.statusCode === 502 ? false : true };
+      return { ...safe, missing: true };
     }
     throw err;
   }
+}
+
+/**
+ * Snapshot a document into the version store if it changed (COD-59/COD-66).
+ * Called off the live-preview poll and the document endpoints, so the authoring
+ * loop accumulates a diffable history without a file watcher. Text docs (md/txt)
+ * store their UTF-8 content; binary docs (docx) store raw bytes for byte-perfect
+ * rollback plus pandoc-extracted text for the word diff.
+ */
+async function captureDocumentVersion(sessionId: string, filePath: string, extension: string): Promise<void> {
+  if (!isDiffableDocExtension(extension)) return;
+  try {
+    const stat = await fs.stat(filePath);
+    // Over the per-file history budget: the store would refuse it anyway, so do
+    // not read (and, for docx, convert) it on every 1.5s poll (COD-457).
+    if (stat.size > documentVersionStore.maxVersionBytes) return;
+    const latest = documentVersionStore.latest(sessionId, filePath);
+    if (latest && latest.mtimeMs === (stat.mtimeMs ?? 0) && latest.size === stat.size) return;
+    if (isBinaryDocExtension(extension)) {
+      const raw = await fs.readFile(filePath); // Buffer
+      const text = await extractDocumentText(filePath, extension);
+      documentVersionStore.record(sessionId, filePath, text, stat.mtimeMs ?? 0, stat.size, raw);
+    } else {
+      const content = await fs.readFile(filePath, 'utf-8');
+      documentVersionStore.record(sessionId, filePath, content, stat.mtimeMs ?? 0, stat.size);
+    }
+  } catch {
+    // File mid-write or unreadable — skip this capture.
+  }
+}
+
+interface DocumentTarget {
+  filePath: string;
+  extension: string;
+}
+
+/**
+ * Resolve a document request (by attachmentId or workspace-relative path) to an
+ * absolute file path + extension, or send an error response and return undefined.
+ */
+async function resolveDocumentTarget(
+  ctx: SessionPort & ConfigPort,
+  reply: FastifyReply,
+  sessionId: string,
+  target: { attachmentId?: string; path?: string },
+  req: FastifyRequest
+): Promise<DocumentTarget | undefined> {
+  if (target.attachmentId) {
+    const record = attachmentRegistry.get(sessionId, target.attachmentId);
+    if (!record) {
+      reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, 'Attachment not found'));
+      return undefined;
+    }
+    const workingDir = getKnownSessionWorkingDir(ctx, sessionId, reply, req);
+    if (!workingDir) return undefined;
+    const servePath = await resolveLocalServableAttachmentPath(reply, record, workingDir);
+    if (!servePath) return undefined;
+    return { filePath: servePath, extension: record.extension };
+  }
+  if (target.path) {
+    const workingDir = getKnownSessionWorkingDir(ctx, sessionId, reply, req);
+    if (!workingDir) return undefined;
+    const validated = validateSessionFilePath(workingDir, target.path);
+    if (!validated) {
+      reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, 'File not found'));
+      return undefined;
+    }
+    const extension = target.path.split('.').pop()?.toLowerCase() || '';
+    return { filePath: validated.resolvedPath, extension };
+  }
+  reply.code(400).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Missing attachmentId or path'));
+  return undefined;
+}
+
+// Per-(IP, sessionId) token bucket for document upload. 20 requests/minute.
+// Distinct from the paste-image bucket (session-routes.ts) — a private module
+// bucket here so the two disk-fill surfaces are rate-limited independently.
+// Entries are pruned when they drift > 1h stale to bound memory against a flood
+// of unique IP keys.
+const UPLOAD_RATE_TOKENS = 20;
+const UPLOAD_RATE_REFILL_PER_MS = UPLOAD_RATE_TOKENS / 60_000;
+const UPLOAD_BUCKET_TTL_MS = 60 * 60 * 1000;
+const UPLOAD_BUCKET_GC_THRESHOLD = 1000;
+const uploadRateBuckets = new Map<string, { tokens: number; lastRefill: number }>();
+
+function consumeUploadToken(key: string, now: number = Date.now()): boolean {
+  if (uploadRateBuckets.size > UPLOAD_BUCKET_GC_THRESHOLD) {
+    for (const [k, b] of uploadRateBuckets) {
+      if (now - b.lastRefill > UPLOAD_BUCKET_TTL_MS) uploadRateBuckets.delete(k);
+    }
+  }
+  let b = uploadRateBuckets.get(key);
+  if (!b) {
+    b = { tokens: UPLOAD_RATE_TOKENS, lastRefill: now };
+    uploadRateBuckets.set(key, b);
+  }
+  const delta = (now - b.lastRefill) * UPLOAD_RATE_REFILL_PER_MS;
+  b.tokens = Math.min(UPLOAD_RATE_TOKENS, b.tokens + delta);
+  b.lastRefill = now;
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+
+/** Test hook: reset the upload rate buckets between runs. */
+export function _resetUploadRateBuckets(): void {
+  uploadRateBuckets.clear();
+}
+
+// Per-(IP, sessionId) token bucket for file-manager uploads. 20/min, isolated
+// from document uploads so the two surfaces are rate-limited independently.
+const FILE_MANAGER_UPLOAD_RATE_TOKENS = 20;
+const FILE_MANAGER_UPLOAD_RATE_REFILL_PER_MS = FILE_MANAGER_UPLOAD_RATE_TOKENS / 60_000;
+const fileManagerUploadRateBuckets = new Map<string, { tokens: number; lastRefill: number }>();
+
+function consumeFileManagerUploadToken(key: string, now: number = Date.now()): boolean {
+  if (fileManagerUploadRateBuckets.size > UPLOAD_BUCKET_GC_THRESHOLD) {
+    for (const [k, b] of fileManagerUploadRateBuckets) {
+      if (now - b.lastRefill > UPLOAD_BUCKET_TTL_MS) fileManagerUploadRateBuckets.delete(k);
+    }
+  }
+  let b = fileManagerUploadRateBuckets.get(key);
+  if (!b) {
+    b = { tokens: FILE_MANAGER_UPLOAD_RATE_TOKENS, lastRefill: now };
+    fileManagerUploadRateBuckets.set(key, b);
+  }
+  const delta = (now - b.lastRefill) * FILE_MANAGER_UPLOAD_RATE_REFILL_PER_MS;
+  b.tokens = Math.min(FILE_MANAGER_UPLOAD_RATE_TOKENS, b.tokens + delta);
+  b.lastRefill = now;
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+
+/** Test hook: reset the file-manager upload rate buckets between runs. */
+export function _resetFileManagerUploadRateBuckets(): void {
+  fileManagerUploadRateBuckets.clear();
 }
 
 /**
@@ -1379,6 +1580,7 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       let type: FilesystemBrowseEntry['type'];
       let size: number | undefined;
       let mtimeMs: number | undefined;
+      let targetStat: Awaited<ReturnType<typeof fs.stat>> | undefined;
       const symlink = entry.isSymbolicLink();
       if (entry.isDirectory()) {
         type = 'directory';
@@ -1386,10 +1588,8 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
         type = 'file';
       } else if (symlink) {
         try {
-          const targetStat = await fs.stat(targetPath);
+          targetStat = await fs.stat(targetPath);
           type = targetStat.isDirectory() ? 'directory' : 'file';
-          if (type === 'file') size = targetStat.size;
-          mtimeMs = targetStat.mtimeMs;
         } catch {
           continue;
         }
@@ -1398,16 +1598,16 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       }
 
       if (isBlockedPickerPath(targetPath, blockedTrees, type === 'directory')) continue;
-      if (mtimeMs === undefined) {
-        // One stat per entry: the modified time lets the picker sort by date, and
-        // a file's size rides along on the same call.
+      if (!targetStat) {
         try {
-          const targetStat = await fs.stat(targetPath);
-          mtimeMs = targetStat.mtimeMs;
-          if (type === 'file') size = targetStat.size;
+          targetStat = await fs.stat(targetPath);
         } catch {
-          // The path is still selectable even when a stat races a change.
+          // The path is still selectable when metadata lookup races a change.
         }
+      }
+      if (targetStat) {
+        mtimeMs = Number(targetStat.mtimeMs);
+        if (type === 'file') size = Number(targetStat.size);
       }
       entries.push({
         name: entry.name,
@@ -1494,28 +1694,77 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       await serveConvertedPreview(reply, resolvedPath, fileName, extension);
       return;
     }
-    await serveRawFile(
-      reply,
-      { kind: 'local', resolvedPath, relativePath: '' },
-      stat.size,
-      fileName,
-      extension,
-      false,
-      req.headers.range
-    );
+    await serveRawFile(reply, resolvedPath, fileName, extension, false, req.headers.range);
   });
 
-  // File tree listing
-  app.get('/api/sessions/:id/files', async (req) => {
+  // File tree listing (tree mode) + server-side search (search mode, COD-236).
+  // Remote workspaces are listed lazily via the saved SFTP connection.
+  app.get('/api/sessions/:id/files', async (req, reply) => {
     const { id } = req.params as { id: string };
-    const { depth, showHidden, q } = req.query as { depth?: string; showHidden?: string; q?: string };
+    const {
+      depth,
+      showHidden,
+      q,
+      path: requestedPath,
+    } = req.query as {
+      depth?: string;
+      showHidden?: string;
+      q?: string;
+      path?: string;
+    };
     const session = findSessionOrFail(ctx, id, req);
+
+    // Remote workspaces cannot be walked through this server's filesystem. List
+    // one directory at a time via the saved SSH/SFTP connection; the client
+    // expands these lazy nodes on demand.
+    if (session.remote) {
+      if (q?.trim()) {
+        return reply
+          .code(400)
+          .send(
+            createErrorResponse(
+              ApiErrorCode.INVALID_INPUT,
+              'Remote file search is limited to folders already loaded in the File Viewer'
+            )
+          );
+      }
+      const relativePath = requestedPath ?? '';
+      try {
+        remoteWorkspacePath(session.remote, relativePath);
+      } catch (err) {
+        return reply.code(400).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, getErrorMessage(err)));
+      }
+      try {
+        const entries = await listRemoteWorkspaceDirectory(session.remote, relativePath);
+        const tree = entries.map((entry) => ({
+          ...entry,
+          ...(entry.type === 'directory'
+            ? { children: [] }
+            : { extension: entry.name.includes('.') ? entry.name.split('.').pop()?.toLowerCase() : undefined }),
+        }));
+        return {
+          success: true,
+          data: {
+            root: session.remote.remotePath,
+            tree,
+            totalFiles: entries.filter((entry) => entry.type === 'file').length,
+            totalDirectories: entries.filter((entry) => entry.type === 'directory').length,
+            truncated: false,
+            lazy: true,
+          },
+        };
+      } catch (err) {
+        throw Object.assign(new Error(`Failed to list remote files: ${getErrorMessage(err)}`), { statusCode: 500 });
+      }
+    }
 
     const maxDepth = Math.min(parseInt(depth || '5', 10), 10);
     const includeHidden = showHidden === 'true';
     const workingDir = session.workingDir;
-    // null for an empty/whitespace query, which is what keeps the default
-    // tree response byte-identical when no search is requested.
+    // Normalize the root prefix ONCE so relative-path computation is
+    // trailing-separator-safe (COD-243): a workingDir ending in `sep` made the
+    // old `slice(len + 1)` chop the first char of every relative path.
+    const rootPrefix = workingDir.endsWith(sep) ? workingDir : workingDir + sep;
     const matcher = compileFileQuery(q ?? '');
 
     // Default excludes - large/generated directories
@@ -1549,13 +1798,21 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
     let totalDirectories = 0;
     let truncated = false;
     const maxFiles = 5000;
+    // Bounded-concurrency stat pool: stat file nodes in batches so the walk
+    // isn't serialized on one fs.stat at a time (Direction 3, AC1).
+    const STAT_CONCURRENCY = 16;
+    const extensionOf = (name: string): string | undefined =>
+      name.includes('.') ? name.split('.').pop()?.toLowerCase() : undefined;
 
-    // ===== Search mode =====
-    // A query turns this endpoint into a FLAT match list rather than a nested
-    // tree. It recurses past non-matching directories on purpose — the whole
-    // point of searching is to reach a file whose ancestors do not match — so
-    // it is bounded independently by maxMatches on top of the shared maxFiles
-    // and maxDepth caps, and reports `truncated` when it stops early.
+    const sortEntriesDirsFirst = (entries: import('node:fs').Dirent[]): void => {
+      entries.sort((a, b) => {
+        if (a.isDirectory() && !b.isDirectory()) return -1;
+        if (!a.isDirectory() && b.isDirectory()) return 1;
+        return a.name.localeCompare(b.name);
+      });
+    };
+
+    // ===== Search mode: collect a FLAT match list, recursing everywhere. =====
     if (matcher) {
       const matches: FileTreeNode[] = [];
       const maxMatches = 1000;
@@ -1573,11 +1830,7 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
           // Can't read directory (permission denied, etc.)
           return;
         }
-        entries.sort((a, b) => {
-          if (a.isDirectory() && !b.isDirectory()) return -1;
-          if (!a.isDirectory() && b.isDirectory()) return 1;
-          return a.name.localeCompare(b.name);
-        });
+        sortEntriesDirsFirst(entries);
 
         for (const entry of entries) {
           if (totalFiles + totalDirectories > maxFiles || matches.length >= maxMatches) {
@@ -1588,14 +1841,14 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
           if (entry.isDirectory() && excludeDirs.has(entry.name)) continue;
 
           const fullPath = join(dirPath, entry.name);
-          const relativePath = relative(workingDir, fullPath);
+          const relativePath = fullPath.slice(rootPrefix.length);
 
           if (entry.isDirectory()) {
             totalDirectories++;
             if (matcher(entry.name, relativePath)) {
               matches.push({ name: entry.name, path: relativePath, type: 'directory' });
             }
-            // Always recurse, even when this directory does not match.
+            // Always recurse so deeper matches are found.
             await searchDirectory(fullPath, currentDepth + 1);
           } else {
             totalFiles++;
@@ -1611,7 +1864,7 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
                 path: relativePath,
                 type: 'file',
                 size,
-                extension: entry.name.includes('.') ? entry.name.split('.').pop()?.toLowerCase() : undefined,
+                extension: extensionOf(entry.name),
               });
             }
           }
@@ -1636,6 +1889,7 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       };
     }
 
+    // ===== Tree mode: nested tree, sizes filled via a bounded stat pool. =====
     const scanDirectory = async (dirPath: string, currentDepth: number): Promise<FileTreeNode[]> => {
       if (currentDepth > maxDepth || totalFiles + totalDirectories > maxFiles) {
         truncated = true;
@@ -1644,14 +1898,11 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
 
       try {
         const entries = await fs.readdir(dirPath, { withFileTypes: true });
-        const nodes: FileTreeNode[] = [];
+        sortEntriesDirsFirst(entries);
 
-        // Sort: directories first, then alphabetically
-        entries.sort((a, b) => {
-          if (a.isDirectory() && !b.isDirectory()) return -1;
-          if (!a.isDirectory() && b.isDirectory()) return 1;
-          return a.name.localeCompare(b.name);
-        });
+        const nodes: FileTreeNode[] = [];
+        // File nodes awaiting a size — filled in bounded batches after the loop.
+        const pendingSize: { node: FileTreeNode; fullPath: string }[] = [];
 
         for (const entry of entries) {
           if (totalFiles + totalDirectories > maxFiles) {
@@ -1666,7 +1917,7 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
           if (entry.isDirectory() && excludeDirs.has(entry.name)) continue;
 
           const fullPath = join(dirPath, entry.name);
-          const relativePath = fullPath.slice(workingDir.length + 1);
+          const relativePath = fullPath.slice(rootPrefix.length);
 
           if (entry.isDirectory()) {
             totalDirectories++;
@@ -1679,22 +1930,29 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
             });
           } else {
             totalFiles++;
-            const ext = entry.name.includes('.') ? entry.name.split('.').pop()?.toLowerCase() : undefined;
-            let size: number | undefined;
-            try {
-              const stat = await fs.stat(fullPath);
-              size = stat.size;
-            } catch {
-              // Skip if can't stat
-            }
-            nodes.push({
+            const node: FileTreeNode = {
               name: entry.name,
               path: relativePath,
               type: 'file',
-              size,
-              extension: ext,
-            });
+              extension: extensionOf(entry.name),
+            };
+            nodes.push(node);
+            pendingSize.push({ node, fullPath });
           }
+        }
+
+        // Fill file sizes with bounded concurrency (Direction 3, AC1).
+        for (let i = 0; i < pendingSize.length; i += STAT_CONCURRENCY) {
+          const batch = pendingSize.slice(i, i + STAT_CONCURRENCY);
+          await Promise.all(
+            batch.map(async ({ node, fullPath }) => {
+              try {
+                node.size = (await fs.stat(fullPath)).size;
+              } catch {
+                // Skip if can't stat
+              }
+            })
+          );
         }
 
         return nodes;
@@ -1727,33 +1985,35 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       raw,
       edit,
     } = req.query as { path?: string; lines?: string; raw?: string; edit?: string };
-    const session = findSessionOrFail(ctx, id, req);
+    const liveSession = ctx.sessions.get(id);
+    const remote = liveSession?.remote;
+    // Keep stored/local attachment-history previews on their existing path. A
+    // remote workspace must be live so its saved connection configuration is
+    // available, and findSessionOrFail preserves ownership checks.
+    if (remote) findSessionOrFail(ctx, id, req);
+    const workingDir =
+      getSessionAttachmentHistory(ctx, id, req)?.workingDir ?? findSessionOrFail(ctx, id, req).workingDir;
 
     if (!filePath) {
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Missing path parameter');
     }
 
-    // Validate path is within working directory (security: resolve symlinks to prevent traversal)
-    // For a remote (SSH) case the same boundary is resolved on the remote host (#415),
-    // where the path actually lives.
-    const resolution = await resolveFileTarget({ workingDir: session.workingDir, remote: session.remote }, filePath);
-    if (!resolution.ok) {
-      // An unreachable remote is thrown so the shared handler answers a real 502 (and
-      // the test can assert it); a refusal keeps this route's historical returned
-      // envelope, which its existing tests pin as 200 + success:false.
-      if (resolution.reason === 'unreachable') {
-        throwRouteError(resolution.status, resolution.errorCode, resolution.message);
+    let resolvedPath: string | undefined;
+    let relativePath: string | undefined;
+    if (remote) {
+      try {
+        remoteWorkspacePath(remote, filePath);
+      } catch {
+        return createErrorResponse(ApiErrorCode.NOT_FOUND, 'File not found');
       }
-      return createErrorResponse(resolution.errorCode, resolution.message);
-    }
-    const target = resolution.target;
-    const { resolvedPath, relativePath } = target;
-
-    // Remote WRITES are out of scope by design (docs/file-viewer-edit-plan.md §6: "do
-    // not attempt an SFTP path"). Say so instead of returning the misleading 404 the
-    // pre-#415 code produced, and never offer the editor: `editable` stays false below.
-    if ((edit === '1' || edit === 'true') && target.kind === 'remote') {
-      throwRouteError(400, ApiErrorCode.INVALID_INPUT, 'Editing is not supported for files in a remote (SSH) case');
+    } else {
+      // Validate path is within working directory (security: resolve symlinks to prevent traversal)
+      const validated = validateSessionFilePath(workingDir, filePath);
+      if (!validated) {
+        return createErrorResponse(ApiErrorCode.NOT_FOUND, 'File not found');
+      }
+      resolvedPath = validated.resolvedPath;
+      relativePath = validated.relativePath;
     }
 
     // Read-for-edit: never truncated (a truncated buffer must never become an
@@ -1762,6 +2022,10 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
     // its structured errors keep their status codes instead of collapsing into
     // OPERATION_FAILED.
     if (edit === '1' || edit === 'true') {
+      // Edit mode reads real local bytes; a remote workspace has no local path.
+      if (remote || !resolvedPath || relativePath === undefined) {
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Editing remote workspace files is not supported');
+      }
       const guard = await loadAttachmentGuardConfig();
       assertEditableTarget(resolvedPath, relativePath, guard.blockedTrees);
 
@@ -1802,12 +2066,8 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
     }
 
     try {
-      // Local: one stat. Remote: the resolution's probe already carries the size and
-      // mtime, so the read path adds no second ssh round trip.
-      const stat =
-        target.kind === 'local'
-          ? await fs.stat(target.resolvedPath)
-          : { size: target.probe.size, mtimeMs: target.probe.mtimeMs };
+      const remoteInfo = remote ? await getRemoteWorkspaceFileInfo(remote, filePath) : null;
+      const stat = remoteInfo ?? (await fs.stat(resolvedPath!));
 
       // Classify by extension. Known media types render with a dedicated player;
       // other known-binary types are flagged so the client offers a download
@@ -1869,17 +2129,42 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       const fileRawUrl = `/api/sessions/${id}/file-raw?path=${encodeURIComponent(filePath)}`;
 
       if (raw === 'true' || mediaType || otherBinaryExts.has(ext)) {
-        // Return metadata for media/binary files (no text body). XLSX is still a
-        // binary here (no text body); `spreadsheet` tells the overlay it can parse
-        // it client-side from `url`. xls/ods stay plain binary (download only).
+        // Return metadata for media/binary files (no text body). COD-58: docx/pptx
+        // expose a server-converted PDF previewUrl + a thumbnailUrl so the document
+        // preview overlay can render them inline rather than dumping raw bytes.
+        const type =
+          mediaType ??
+          (ext === 'pdf'
+            ? 'pdf'
+            : ext === 'xlsx'
+              ? 'spreadsheet'
+              : !remote && ext === 'docx'
+                ? 'document'
+                : !remote && ext === 'pptx'
+                  ? 'presentation'
+                  : 'binary');
+        // DOCX/PPTX conversion and thumbnails read server-local paths. Remote
+        // workspaces therefore expose those files as safe raw downloads instead
+        // of handing the browser an endpoint that cannot access the SSH host.
+        const previewUrl =
+          !remote && (ext === 'docx' || ext === 'pptx')
+            ? `/api/sessions/${id}/file-preview?path=${encodeURIComponent(filePath)}`
+            : ext === 'xlsx'
+              ? `${fileRawUrl}&preview=true`
+              : fileRawUrl;
+        const thumbnailUrl =
+          !remote && isSupportedAttachmentExtension(ext) ? buildFileThumbnailRoute(id, filePath) : undefined;
         return {
           success: true,
           data: {
             path: filePath,
             size: stat.size,
-            type: mediaType ?? (ext === 'xlsx' ? 'spreadsheet' : 'binary'),
+            mtimeMs: stat.mtimeMs,
+            type,
             extension: ext,
             url: fileRawUrl,
+            previewUrl,
+            thumbnailUrl,
           },
         };
       }
@@ -1898,10 +2183,8 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       // is actually binary would otherwise be dumped to the viewer as UTF-8
       // mojibake; a NUL byte in the first 8KB is a reliable binary signal that
       // (unlike a static extension list) catches arbitrary binary formats.
-      const fileBuffer =
-        target.kind === 'local'
-          ? await fs.readFile(target.resolvedPath)
-          : await remoteReadFile(target.remote, target.resolvedPath, MAX_TEXT_FILE_SIZE);
+      const remoteBuffer = remote ? await readRemoteWorkspaceFile(remote, filePath, MAX_TEXT_FILE_SIZE) : null;
+      const fileBuffer = remoteBuffer ?? (await fs.readFile(resolvedPath!));
       const buf = Buffer.isBuffer(fileBuffer) ? fileBuffer : Buffer.from(String(fileBuffer));
       const sniffLength = Math.min(buf.length, 8192);
       let looksBinary = false;
@@ -1933,25 +2216,29 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       const truncatedContent = allLines.length > maxLines;
       const displayContent = truncatedContent ? allLines.slice(0, maxLines).join('\n') : content;
 
+      // COD-234: classify text vs. markdown so the shared document viewer renders
+      // markdown as rich prose (outline, reading view, export) instead of a raw
+      // <pre> dump, matching the attachment viewer. Markdown family aligns with the
+      // PDF-export renderer (isMarkdownExtension: md/markdown/mdown) for consistency.
+      const markdownExts = new Set(['md', 'markdown', 'mdown']);
+      const textType = markdownExts.has(ext) ? 'markdown' : 'text';
+
       // Additive edit-mode advertisement: whether an edit=1 re-fetch would
       // succeed. The UTF-8 round-trip compare is a cheap memcmp and mirrors
       // decodeEditableText; no hash here — the Edit action re-fetches with
-      // edit=1, which is where the baseHash comes from.
-      //
-      // A remote case is false by construction: the advertisement is a promise the
-      // PUT route cannot keep over ssh, and the viewer keys its Edit affordance off
-      // this flag.
-      let editable = false;
-      if (target.kind === 'local') {
-        const guard = await loadAttachmentGuardConfig();
-        editable =
-          isEditableFileName(pathBasename(target.resolvedPath)) &&
-          !isDeniedEditRelativePath(relativePath) &&
-          !isSensitivePath(target.resolvedPath) &&
-          !isBlockedAttachmentPath(target.resolvedPath, guard.blockedTrees) &&
-          stat.size <= MAX_EDITABLE_BYTES &&
-          Buffer.from(content, 'utf8').equals(buf);
-      }
+      // edit=1, which is where the baseHash comes from. Remote workspaces have
+      // no local path, so they are never advertised as editable.
+      const guard = await loadAttachmentGuardConfig();
+      const editable =
+        !remote &&
+        resolvedPath !== undefined &&
+        relativePath !== undefined &&
+        isEditableFileName(pathBasename(resolvedPath)) &&
+        !isDeniedEditRelativePath(relativePath) &&
+        !isSensitivePath(resolvedPath) &&
+        !isBlockedAttachmentPath(resolvedPath, guard.blockedTrees) &&
+        stat.size <= MAX_EDITABLE_BYTES &&
+        Buffer.from(content, 'utf8').equals(buf);
 
       return {
         success: true,
@@ -1959,9 +2246,11 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
           path: filePath,
           content: displayContent,
           size: stat.size,
+          mtimeMs: stat.mtimeMs,
           totalLines: allLines.length,
           truncated: truncatedContent,
           extension: ext,
+          type: textType,
           editable,
         },
       };
@@ -1986,20 +2275,6 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
     async (req): Promise<ApiResponse<FileWriteData>> => {
       const { id } = req.params as { id: string };
       const session = findSessionOrFail(ctx, id, req);
-      // Remote WRITES are out of scope by design (docs/file-viewer-edit-plan.md §6),
-      // and this guard must sit ahead of `validateSessionFilePath`: that helper
-      // resolves against the LOCAL filesystem, so with a directory of the same
-      // absolute name on this host (an sshfs mount of the remote tree, `/srv/case`,
-      // a same-named home) the write would land on the local twin while the viewer
-      // believes it edited the remote file. The read-remote/write-local split is
-      // exactly what the no-local-fallback rule exists to prevent.
-      if (session.remote) {
-        throwFileEditError(
-          400,
-          ApiErrorCode.INVALID_INPUT,
-          'Editing is not supported for files in a remote (SSH) case'
-        );
-      }
       const body = parseBody(FileWriteSchema, req.body);
 
       // Exact byte cap — the schema's .max() counts UTF-16 code units and is
@@ -2099,102 +2374,97 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
     }
   );
 
-  // Serve raw file content (for images/binary files)
-  app.get('/api/sessions/:id/file-raw', async (req, reply) => {
+  // Resolve a Codex terminal file:// URI through the generated-artifact guard
+  // and return only the registry's opaque, sanitized attachment event.
+  app.post('/api/sessions/:id/file-uri-preview', async (req, reply) => {
     const { id } = req.params as { id: string };
-    const { path: filePath, download, preview } = req.query as { path?: string; download?: string; preview?: string };
     const session = findSessionOrFail(ctx, id, req);
-
-    if (!filePath) {
-      reply.code(400).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Missing path parameter'));
-      return;
-    }
-
-    // Validate path is within working directory (security: resolve symlinks to prevent traversal)
-    const resolution = await resolveFileTarget({ workingDir: session.workingDir, remote: session.remote }, filePath);
-    if (!resolution.ok) {
-      reply.code(resolution.status).send(createErrorResponse(resolution.errorCode, resolution.message));
-      return;
-    }
-    const target = resolution.target;
-    if (target.kind === 'remote' && target.probe.kind !== 'file') {
-      reply.code(400).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Path is not a file'));
+    if (session.mode !== 'codex') {
+      reply
+        .code(403)
+        .send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'File URI preview is only available for Codex sessions'));
       return;
     }
 
     try {
-      // Sanity bound only: the body below is streamed and Range-aware, so size
-      // does not translate into resident memory. Configurable, 0 = unlimited.
-      const size = target.kind === 'local' ? (await fs.stat(target.resolvedPath)).size : target.probe.size;
-      if (exceedsDownloadLimit(size)) {
-        reply.code(413).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, downloadTooLargeMessage(size)));
-        return;
+      const body: { uri?: unknown; allowUnlistedPath?: unknown } =
+        req.body && typeof req.body === 'object' ? (req.body as { uri?: unknown; allowUnlistedPath?: unknown }) : {};
+      const allowUnlistedPath = body.allowUnlistedPath === true;
+      if (allowUnlistedPath) {
+        const reqHost = req.headers.host;
+        const origin = req.headers.origin;
+        const referer = req.headers.referer;
+        let csrfOk = false;
+        if (origin) {
+          try {
+            csrfOk = new URL(origin).host === reqHost;
+          } catch {
+            /* invalid Origin → not ok */
+          }
+        } else if (referer) {
+          try {
+            csrfOk = new URL(referer).host === reqHost;
+          } catch {
+            /* invalid Referer → not ok */
+          }
+        } else {
+          csrfOk = !!req.headers['x-codeman-csrf'];
+        }
+        if (!csrfOk) {
+          reply.code(403);
+          return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'CSRF check failed');
+        }
       }
 
-      const ext = filePath.split('.').pop()?.toLowerCase() || '';
-      if (exceedsXlsxPreviewLimit(ext, { preview, download }, size)) {
-        sendXlsxPreviewTooLarge(reply, size);
-        return;
-      }
-      const mimeTypes: Record<string, string> = {
-        png: 'image/png',
-        jpg: 'image/jpeg',
-        jpeg: 'image/jpeg',
-        gif: 'image/gif',
-        webp: 'image/webp',
-        avif: 'image/avif',
-        ico: 'image/x-icon',
-        bmp: 'image/bmp',
-        mp4: 'video/mp4',
-        webm: 'video/webm',
-        mov: 'video/quicktime',
-        m4v: 'video/mp4',
-        ogv: 'video/ogg',
-        mp3: 'audio/mpeg',
-        wav: 'audio/wav',
-        ogg: 'audio/ogg',
-        oga: 'audio/ogg',
-        opus: 'audio/ogg',
-        m4a: 'audio/mp4',
-        aac: 'audio/aac',
-        flac: 'audio/flac',
-        pdf: 'application/pdf',
-        json: 'application/json',
-      };
+      const uri = body.uri;
+      const filePath = parsePreviewFileUri(uri);
+      const registered = await registerGeneratedArtifactAttachment({
+        sessionId: id,
+        filePath,
+        sessionWorkingDir: session.workingDir,
+        remote: session.remote,
+        allowUnlistedPath,
+      });
+      const record = attachmentRegistry.get(id, registered.attachmentId);
+      if (!record) throw new Error('Registered attachment record is unavailable');
 
-      const rawBasename = filePath!.split('/').pop() || 'download';
-      // Sanitize filename for Content-Disposition header (prevent header injection)
-      const basename = rawBasename.replace(/["\\\r\n]/g, '_');
-      if (download === 'true' || ext === 'svg') {
-        reply.header(
-          'Content-Type',
-          ext === 'svg' ? 'application/octet-stream' : mimeTypes[ext] || 'application/octet-stream'
-        );
-        reply.header('Content-Disposition', `attachment; filename="${basename}"`);
-        reply.header('X-Content-Type-Options', 'nosniff');
-        sendFileBody(reply, size, req.headers.range, fileTargetSource(target));
-        return;
-      }
-      reply.header('Content-Type', mimeTypes[ext] || 'application/octet-stream');
-      reply.header('X-Content-Type-Options', 'nosniff');
-      // Streamed, range-aware: this is the <video>/<audio> source the file
-      // viewer points at, and a 200-only response makes the media unseekable.
-      sendFileBody(reply, size, req.headers.range, fileTargetSource(target));
+      session.upsertAttachmentHistory(
+        buildExternalAttachmentHistoryItem({
+          sessionId: id,
+          externalPath: record.filePath,
+          fileName: record.fileName,
+          extension: record.extension,
+          size: record.size,
+          mtimeMs: record.mtimeMs,
+          timestamp: record.timestamp,
+          generatedArtifactBoundary: record.generatedArtifactBoundary,
+        })
+      );
+      ctx.persistSessionState(session);
+
+      const event = attachmentRecordToEvent(record);
+      ctx.broadcast(SseEvent.AttachmentDetected, event);
+      return { success: true, data: event };
     } catch (err) {
-      // A failure of the remote read is an infrastructure answer, not a 500 with a
-      // stack: the case points at a host this server could not reach.
-      reply
-        .code(err instanceof RemoteFileAccessError ? 502 : 500)
-        .send(createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to read file: ${getErrorMessage(err)}`));
+      if (err instanceof AttachmentRegistrationError) {
+        reply.code(err.statusCode).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, err.message));
+        return;
+      }
+      req.log.warn(
+        {
+          category: 'file-uri-preview',
+          code: session.remote ? 'remote-unavailable' : 'local-unavailable',
+          sessionId: id,
+          remote: Boolean(session.remote),
+        },
+        'File URI preview registration failed'
+      );
+      reply.code(500).send(createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'File is unavailable'));
+      return;
     }
   });
 
-  // ===== Live external attachments =====
-  // Register an explicit, live external file (absolute host path) as an
-  // attachment with a stable id so browser requests never carry arbitrary
-  // paths. Registration enforces the COD-53 attachment-guard policy. Serving is
-  // by id via the /raw route below; document previews/thumbnails and the
-  // attachment-history list are layered on separately.
+  // Register a live external file as an explicit attachment card.
   app.post('/api/sessions/:id/attachments', async (req, reply) => {
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id, req);
@@ -2210,13 +2480,7 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
     }
 
     try {
-      // A remote case registers a path that lives on the REMOTE host: the guard and
-      // the reachability check happen there (#415 — this is the path a clicked
-      // terminal link takes when the file is OUTSIDE the case directory).
-      const event = await registerExternalAttachment(id, body.path, {
-        sessionWorkingDir: session.workingDir,
-        remote: session.remote,
-      });
+      const event = await registerExternalAttachment(id, body.path, { sessionWorkingDir: session.workingDir });
       // `notify: false` registers QUIETLY. The file-preview overlay uses it to
       // mint an id for a path the user just clicked (a terminal or response-viewer
       // link pointing outside the workspace): it is already opening the file, so
@@ -2224,6 +2488,22 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       // filling the screen. Default stays true — every other caller (the
       // `codeman attach` CLI, codeman-publish) wants the card.
       if (body.notify !== false) {
+        const record = attachmentRegistry.get(id, event.attachmentId);
+        if (record) {
+          session.upsertAttachmentHistory(
+            buildExternalAttachmentHistoryItem({
+              sessionId: id,
+              externalPath: record.filePath,
+              fileName: record.fileName,
+              extension: record.extension,
+              size: record.size,
+              mtimeMs: record.mtimeMs,
+              timestamp: event.timestamp,
+              generatedArtifactBoundary: record.generatedArtifactBoundary,
+            })
+          );
+          ctx.persistSessionState(session);
+        }
         ctx.broadcast(SseEvent.AttachmentDetected, event);
       }
       return { success: true, data: event };
@@ -2240,8 +2520,1162 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
     }
   });
 
+  // COD-241 unit 1: upload a document file (multipart) into the session
+  // workspace's .codeman-attachments/ dir and register it as an 'upload'
+  // attachment. LOCAL sessions only — remote byte transfer is a later unit.
+  // Structure mirrors the paste-image route (session-routes.ts): explicit CSRF
+  // Origin/Referer==Host check, per-(IP, sessionId) token bucket, byte-signature
+  // validation over the attacker-controlled filename/Content-Type, and the same
+  // symlink-safe (lstat + non-recursive mkdir + O_EXCL|O_NOFOLLOW) write.
+  app.post('/api/sessions/:id/attachments/upload', async (req, reply) => {
+    // CSRF defense: multipart/form-data is a "simple" CORS request (no
+    // preflight), so a cross-origin form submit would attach the session cookie.
+    // Reject unless Origin/Referer host matches req.host; non-browser clients
+    // (no Origin AND no Referer) must supply X-Codeman-CSRF (a header browsers
+    // cannot add cross-origin without a preflight our CORS config disallows).
+    const reqHost = req.headers.host;
+    const origin = req.headers.origin;
+    const referer = req.headers.referer;
+    let csrfOk = false;
+    if (origin) {
+      try {
+        csrfOk = new URL(origin).host === reqHost;
+      } catch {
+        /* invalid Origin → not ok */
+      }
+    } else if (referer) {
+      try {
+        csrfOk = new URL(referer).host === reqHost;
+      } catch {
+        /* invalid Referer → not ok */
+      }
+    } else {
+      csrfOk = !!req.headers['x-codeman-csrf'];
+    }
+    if (!csrfOk) {
+      reply.code(403);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'CSRF check failed');
+    }
+
+    const { id } = req.params as { id: string };
+    const session = findSessionOrFail(ctx, id, req);
+
+    // Rate limit per (IP, sessionId): 20/min. Defends against disk-fill DoS.
+    if (!consumeUploadToken(`${req.ip}:${id}`)) {
+      reply.code(429);
+      reply.header('Retry-After', '60');
+      return createErrorResponse(ApiErrorCode.RATE_LIMITED, 'Rate limit exceeded (20 uploads/min per session)');
+    }
+
+    if (!req.isMultipart()) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Expected multipart/form-data');
+    }
+
+    // Read the single file part. @fastify/multipart enforces the per-file size
+    // cap (MAX_PASTE_IMAGE_BYTES) and the 1-file/4-field count limits (server.ts).
+    let part: import('@fastify/multipart').MultipartFile | undefined;
+    try {
+      part = await req.file();
+    } catch (err: unknown) {
+      reply.code(413);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, getErrorMessage(err) || 'Invalid multipart payload');
+    }
+    if (!part) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'No document uploaded');
+    }
+    if (part.fieldname !== 'document') {
+      reply.code(400);
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        `Unexpected field "${part.fieldname}", expected "document"`
+      );
+    }
+
+    let bytes: Buffer;
+    try {
+      bytes = await part.toBuffer();
+    } catch (err: unknown) {
+      reply.code(413);
+      const maxMb = Math.round(MAX_PASTE_IMAGE_BYTES / (1024 * 1024));
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, getErrorMessage(err) || `File too large (max ${maxMb}MB)`);
+    }
+    if (bytes.length === 0) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Empty file');
+    }
+
+    // Extension from the (attacker-controlled) filename — lowercased, no dot.
+    const rawName = part.filename || '';
+    const ext = extname(rawName).toLowerCase().replace(/^\./, '');
+    if (!isAllowedUploadExtension(ext)) {
+      reply.code(415);
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        `Unsupported document type: ${ext || '(none)'}. Allowed: ${[...UPLOAD_ALLOWED_EXTENSIONS].join(', ')}`
+      );
+    }
+
+    // Byte-signature check — filename/Content-Type are attacker-supplied, bytes
+    // are not (mirrors paste-image's imageMagicMatchesExt).
+    if (!documentMagicMatchesExt(bytes, ext)) {
+      reply.code(415);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'File content does not match its type');
+    }
+
+    // Display base name (card label) preserves the user's original filename;
+    // the on-disk name adds a random suffix so it is collision- and traversal-safe.
+    // Computed BEFORE the local/remote split — the names are host-independent.
+    const displayName = sanitizeUploadFilename(rawName);
+    const diskBase = sanitizeUploadFilename(rawName.replace(/\.[^.]*$/, ''));
+    const diskName = `${diskBase}-${Date.now()}-${randomBytes(4).toString('hex')}.${ext}`;
+
+    // ── Remote sessions (COD-241 final unit) ──────────────────────────────────
+    // The agent runs ON the remote host, so the bytes must land in the remote
+    // workspace's .codeman-attachments/ and the inserted `[Attachments: "…"]`
+    // reference must be the REMOTE path. All validation above (extension, byte
+    // signature, sanitization, empty-file) already ran on the uploaded bytes —
+    // it is host-independent, so it happens before any transfer.
+    const remote = session.remote;
+    if (remote) {
+      // 1) Push the bytes to the remote host FIRST (the primary deliverable),
+      //    reusing the exact symlink-safe, atomic, umask-077 remote-write path as
+      //    paste-image (shared remote-file-transfer.ts). A transfer failure returns
+      //    a specific 502 and leaves nothing behind locally.
+      const remoteAttachmentsDir = pathPosix.join(remote.remotePath, '.codeman-attachments');
+      const remoteFilePath = pathPosix.join(remoteAttachmentsDir, diskName);
+      const agentPath = pathPosix.join('.codeman-attachments', diskName);
+      try {
+        await writeRemoteFileBytes(remote, {
+          dir: remoteAttachmentsDir,
+          filePath: remoteFilePath,
+          bytes,
+          timeoutMs: REMOTE_ATTACHMENT_SSH_TIMEOUT_MS,
+          transferLabel: 'remote document upload',
+          notADirectoryMessage: '.codeman-attachments is not a regular directory',
+        });
+      } catch (err) {
+        req.log.warn({ category: 'attachment-upload', code: 'remote-transfer-failed', sessionId: id, err });
+        reply.code(502);
+        return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Failed to transfer document to remote host');
+      }
+
+      // 2) Cache a local copy so the attachment registry can serve preview /
+      //    thumbnail / raw for the remote file — mirroring generated-artifact-
+      //    attachments.ts, which materializes remote bytes locally before
+      //    registering. We already hold the bytes in memory (no extra ssh fetch).
+      const cacheDir = dataPath('remote-attachment-uploads', id);
+      const localCachePath = join(cacheDir, diskName);
+      try {
+        await fs.mkdir(cacheDir, { recursive: true });
+        await fs.writeFile(localCachePath, bytes, { mode: 0o600 });
+      } catch (err) {
+        // The remote file is already in place (the agent can use it); we just
+        // cannot serve a local preview. Surface it rather than half-register.
+        req.log.warn({ category: 'attachment-upload', code: 'remote-cache-failed', sessionId: id, err });
+        reply.code(500);
+        return createErrorResponse(
+          ApiErrorCode.OPERATION_FAILED,
+          'Uploaded document could not be prepared for preview'
+        );
+      }
+
+      // 3) Register the local cache copy as an 'upload' attachment, then history
+      //    + SSE (same tail as the local path). Confinement is OFF here: the cache
+      //    lives under the instance data dir, outside the remote workspace.
+      let remoteAttachmentId: string;
+      try {
+        const event = await registerExternalAttachment(id, localCachePath, {
+          sessionWorkingDir: session.workingDir,
+          source: 'upload',
+        });
+        remoteAttachmentId = event.attachmentId;
+        const record = attachmentRegistry.get(id, event.attachmentId);
+        if (record) {
+          session.upsertAttachmentHistory(
+            buildExternalAttachmentHistoryItem({
+              sessionId: id,
+              externalPath: record.filePath,
+              fileName: record.fileName,
+              extension: record.extension,
+              size: record.size,
+              mtimeMs: record.mtimeMs,
+              timestamp: event.timestamp,
+              generatedArtifactBoundary: record.generatedArtifactBoundary,
+            })
+          );
+          ctx.persistSessionState(session);
+        }
+        ctx.broadcast(SseEvent.AttachmentDetected, event);
+      } catch (err) {
+        await fs.rm(localCachePath, { force: true }).catch(() => {});
+        if (err instanceof AttachmentRegistrationError) {
+          reply.code(err.statusCode);
+          return createErrorResponse(ApiErrorCode.INVALID_INPUT, err.message);
+        }
+        req.log.warn({ category: 'attachment-upload', code: 'remote-registration-failed', sessionId: id, err });
+        reply.code(500);
+        return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Failed to register upload');
+      }
+
+      const remoteRoutes = buildAttachmentRoutes(id, remoteAttachmentId, ext);
+      return {
+        success: true,
+        data: {
+          attachmentId: remoteAttachmentId,
+          fileName: displayName,
+          agentPath,
+          size: bytes.length,
+          extension: ext,
+          attachmentType: getAttachmentType(ext),
+          ...remoteRoutes,
+        },
+      };
+    }
+
+    // ── Local sessions ────────────────────────────────────────────────────────
+    // Destination: {workingDir}/.codeman-attachments/. Refuse a symlinked dir
+    // (an agent could plant `.codeman-attachments -> ~/.ssh/`). lstat (not stat)
+    // so we see the symlink itself; non-recursive mkdir + O_EXCL|O_NOFOLLOW on
+    // the file open keep both dir-leaf creation and the write symlink-safe.
+    let uploadDirectory;
+    try {
+      // COD-296: the upload path is the ONLY one allowed to create the directory.
+      uploadDirectory = await ensureLocalUploadDirectory(session.workingDir, getAuthUser(req));
+    } catch (err) {
+      if (err instanceof UploadDirectoryResolutionError) {
+        reply.code(err.statusCode);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, err.message);
+      }
+      req.log.warn({ category: 'attachment-upload', code: 'directory-resolution-failed', sessionId: id, err });
+      reply.code(500);
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Upload directory is unavailable');
+    }
+
+    const dest = join(uploadDirectory.canonicalDir, diskName);
+
+    try {
+      if ((await fs.realpath(uploadDirectory.canonicalDir)) !== uploadDirectory.canonicalDir) {
+        throw new Error('upload directory changed');
+      }
+      const fh = await fs.open(
+        dest,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+        0o600
+      );
+      try {
+        await fh.writeFile(bytes);
+      } finally {
+        await fh.close();
+      }
+    } catch (err: unknown) {
+      req.log.warn({ category: 'attachment-upload', code: 'write-failed', sessionId: id, err });
+      reply.code(500);
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Failed to write upload');
+    }
+
+    // Register as an 'upload' attachment (workspace-confined), then surface it
+    // in the session's attachment history and broadcast AttachmentDetected so
+    // the paperclip drawer + attachment cards update live — mirroring the tail
+    // of the external-path route above (COD-241 unit 2).
+    let attachmentId: string;
+    try {
+      const event = await registerExternalAttachment(id, dest, {
+        sessionWorkingDir: session.workingDir,
+        forceWorkspaceConfinement: uploadDirectory.kind === 'workspace',
+        trustedUploadBoundary: uploadDirectory.kind === 'trusted' ? uploadDirectory.canonicalDir : undefined,
+        source: 'upload',
+      });
+      attachmentId = event.attachmentId;
+      const record = attachmentRegistry.get(id, event.attachmentId);
+      if (record) {
+        session.upsertAttachmentHistory(
+          buildExternalAttachmentHistoryItem({
+            sessionId: id,
+            externalPath: record.filePath,
+            fileName: record.fileName,
+            extension: record.extension,
+            size: record.size,
+            mtimeMs: record.mtimeMs,
+            timestamp: event.timestamp,
+            generatedArtifactBoundary: record.generatedArtifactBoundary,
+            uploadProvenance: 'codeman-upload',
+          })
+        );
+        ctx.persistSessionState(session);
+      }
+      ctx.broadcast(SseEvent.AttachmentDetected, event);
+    } catch (err) {
+      // Roll back the written file so a rejected registration leaves no orphan.
+      await fs.rm(dest, { force: true }).catch(() => {});
+      if (err instanceof AttachmentRegistrationError) {
+        reply.code(err.statusCode);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, err.message);
+      }
+      req.log.warn({ category: 'attachment-upload', code: 'registration-failed', sessionId: id, err });
+      reply.code(500);
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Failed to register upload');
+    }
+
+    const agentPath = pathPosix.join('.codeman-attachments', diskName);
+    const routes = buildAttachmentRoutes(id, attachmentId, ext);
+    return {
+      success: true,
+      data: {
+        attachmentId,
+        fileName: displayName,
+        agentPath,
+        size: bytes.length,
+        extension: ext,
+        attachmentType: getAttachmentType(ext),
+        ...routes,
+      },
+    };
+  });
+
+  // COD-317: File Manager upload — write an arbitrary workspace file.
+  // Unlike the attachment upload (which always targets .codeman-attachments/ and
+  // registers an attachment), this writes to `?path=<relativeDir>` inside the
+  // session's workingDir (or remote workspace) and does NOT create an attachment
+  // record. Security mirrors the attachment route: CSRF, per-(IP,session) token
+  // bucket, multipart limits, sanitize, confinement, sensitive/blocked guards,
+  // symlink-safe lstat + O_EXCL|O_NOFOLLOW, remote via writeRemoteFileBytes.
+  app.post('/api/sessions/:id/files/upload', async (req, reply) => {
+    const reqHost = req.headers.host;
+    const origin = req.headers.origin;
+    const referer = req.headers.referer;
+    let csrfOk = false;
+    if (origin) {
+      try {
+        csrfOk = new URL(origin).host === reqHost;
+      } catch {
+        /* invalid Origin → not ok */
+      }
+    } else if (referer) {
+      try {
+        csrfOk = new URL(referer).host === reqHost;
+      } catch {
+        /* invalid Referer → not ok */
+      }
+    } else {
+      csrfOk = !!req.headers['x-codeman-csrf'];
+    }
+    if (!csrfOk) {
+      reply.code(403);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'CSRF check failed');
+    }
+
+    const { id } = req.params as { id: string };
+    if (!consumeFileManagerUploadToken(`${req.ip}:${id}`)) {
+      reply.code(429);
+      reply.header('Retry-After', '60');
+      return createErrorResponse(ApiErrorCode.RATE_LIMITED, 'Rate limit exceeded (20 uploads/min per session)');
+    }
+
+    const session = findSessionOrFail(ctx, id, req);
+
+    if (!req.isMultipart()) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Expected multipart/form-data');
+    }
+
+    let part: import('@fastify/multipart').MultipartFile | undefined;
+    try {
+      part = await req.file();
+    } catch (err: unknown) {
+      reply.code(413);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, getErrorMessage(err) || 'Invalid multipart payload');
+    }
+    if (!part) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'No file uploaded');
+    }
+    if (part.fieldname !== 'file') {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Unexpected field "${part.fieldname}", expected "file"`);
+    }
+
+    let bytes: Buffer;
+    try {
+      bytes = await part.toBuffer();
+    } catch (err: unknown) {
+      reply.code(413);
+      const maxMb = Math.round(MAX_PASTE_IMAGE_BYTES / (1024 * 1024));
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, getErrorMessage(err) || `File too large (max ${maxMb}MB)`);
+    }
+    if (bytes.length === 0) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Empty file');
+    }
+
+    const rawName = part.filename || '';
+    const fileName = sanitizeUploadFilename(rawName);
+    const ext = extname(fileName).slice(1).toLowerCase();
+    const rawTargetDir = ((req.query as { path?: string }).path ?? '').trim();
+
+    // Normalize target dir: empty => workspace root. Validate confinement before
+    // any IO. For remote, use posix validation; for local, use realpath confinement.
+    const normalizedTargetDir = rawTargetDir.replace(/^\/+/, '').replace(/\\/g, '/');
+    if (
+      normalizedTargetDir.includes('\0') ||
+      normalizedTargetDir.includes('\r') ||
+      normalizedTargetDir.includes('\n')
+    ) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid path');
+    }
+    // Reject path traversal segments in the query dir itself.
+    if (normalizedTargetDir.split('/').some((s) => s === '..')) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid path');
+    }
+
+    const guard = await loadAttachmentGuardConfig();
+
+    // ── Remote sessions ───────────────────────────────────────────────────
+    if (session.remote) {
+      let remoteDir: string;
+      let remoteFilePath: string;
+      try {
+        const posixDir = normalizedTargetDir ? normalizedTargetDir : '';
+        remoteDir = posixDir ? remoteWorkspacePath(session.remote, posixDir) : session.remote.remotePath;
+        // Validate filename does not carry path segments after sanitization (sanitize strips dirs)
+        remoteFilePath = pathPosix.join(remoteDir, fileName);
+        remoteWorkspacePath(session.remote, normalizedTargetDir ? `${normalizedTargetDir}/${fileName}` : fileName);
+      } catch {
+        reply.code(400);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid path');
+      }
+
+      const relativePosix = normalizedTargetDir ? `${normalizedTargetDir}/${fileName}` : fileName;
+      const resolvedPosix = relativePosix.replace(/\\/g, '/');
+
+      if (isSensitivePath(remoteFilePath) || isBlockedAttachmentPath(remoteFilePath, guard.blockedTrees)) {
+        reply.code(403);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this path is blocked');
+      }
+      if (isDeniedEditRelativePath(resolvedPosix)) {
+        reply.code(403);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Files under .git cannot be written');
+      }
+
+      // 409 if already exists — check via SFTP listing without transferring bytes
+      try {
+        await getRemoteWorkspaceFileInfo(session.remote, relativePosix);
+        reply.code(409);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'File already exists');
+      } catch {
+        // not found → proceed to write
+      }
+
+      try {
+        await writeRemoteFileBytes(session.remote, {
+          dir: remoteDir,
+          filePath: remoteFilePath,
+          bytes,
+          timeoutMs: REMOTE_ATTACHMENT_SSH_TIMEOUT_MS,
+          transferLabel: 'remote file manager upload',
+          notADirectoryMessage: 'Target is not a regular directory',
+        });
+      } catch (err) {
+        const msg = getErrorMessage(err);
+        if (msg.includes('File already exists') || msg.includes('not a regular directory')) {
+          reply.code(409);
+          return createErrorResponse(ApiErrorCode.INVALID_INPUT, msg);
+        }
+        reply.code(502);
+        return createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to transfer file to remote host: ${msg}`);
+      }
+
+      return {
+        success: true as const,
+        data: {
+          path: relativePosix,
+          fileName,
+          size: bytes.length,
+          extension: ext,
+        },
+      };
+    }
+
+    // ── Local sessions ────────────────────────────────────────────────────
+    // Resolve target dir inside workspace (symlink-safe)
+    let destDirResolved: string;
+    let destDirRelative: string;
+    if (!normalizedTargetDir) {
+      destDirResolved = session.workingDir;
+      destDirRelative = '';
+    } else {
+      // Use validateSessionFilePath for confinement when dir already exists
+      const validated = validateSessionFilePath(session.workingDir, normalizedTargetDir);
+      if (validated) {
+        try {
+          const st = await fs.stat(validated.resolvedPath);
+          if (!st.isDirectory()) {
+            reply.code(400);
+            return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Target path is not a directory');
+          }
+          destDirResolved = validated.resolvedPath;
+          destDirRelative = validated.relativePath;
+        } catch {
+          // Dir does not exist yet — will be created below. Keep validated path as base?
+          // validated may point to non-existent; fall through to creation logic.
+          destDirResolved = validated.resolvedPath;
+          destDirRelative = validated.relativePath;
+        }
+      } else {
+        // Path does not exist yet but is confined (relative check without realpath)?
+        // Do lexical confinement: ensure it stays under workingDir without escaping.
+        // Reject if it would escape.
+        const lexical = resolve(session.workingDir, normalizedTargetDir);
+        const rel = relative(session.workingDir, lexical);
+        if (isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) {
+          reply.code(400);
+          return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid path');
+        }
+        destDirResolved = lexical;
+        destDirRelative = normalizedTargetDir;
+      }
+    }
+
+    // Ensure intermediate directories exist safely (non-recursive, symlink-checked)
+    if (normalizedTargetDir) {
+      const segments = normalizedTargetDir.split('/').filter(Boolean);
+      let cur = session.workingDir;
+      for (const seg of segments) {
+        const next = join(cur, seg);
+        try {
+          const st = await fs.lstat(next);
+          if (st.isSymbolicLink() || !st.isDirectory()) {
+            reply.code(403);
+            return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Target is not a regular directory');
+          }
+        } catch (err: unknown) {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+          try {
+            await fs.mkdir(next);
+          } catch (mkErr: unknown) {
+            if ((mkErr as NodeJS.ErrnoException).code !== 'EEXIST') throw mkErr;
+            const raceSt = await fs.lstat(next);
+            if (raceSt.isSymbolicLink() || !raceSt.isDirectory()) {
+              reply.code(403);
+              return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Target is not a regular directory');
+            }
+          }
+        }
+        cur = next;
+      }
+      // Re-resolve final dest dir through realpath for sensitive checks
+      try {
+        destDirResolved = realpathSync(join(session.workingDir, normalizedTargetDir));
+      } catch {
+        destDirResolved = join(session.workingDir, normalizedTargetDir);
+      }
+    }
+
+    const destPath = join(destDirResolved, fileName);
+    const relativePath = destDirRelative ? `${destDirRelative}/${fileName}`.replace(/\\/g, '/') : fileName;
+
+    // Defense-in-depth checks on the final resolved path
+    let finalResolved: string;
+    try {
+      // If file does not exist yet, realpathSync will fail — use destPath for check
+      finalResolved = realpathSync(destPath);
+    } catch {
+      finalResolved = destPath;
+    }
+    if (isSensitivePath(finalResolved) || isBlockedAttachmentPath(finalResolved, guard.blockedTrees)) {
+      reply.code(403);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this path is blocked');
+    }
+    if (isSensitivePath(destPath) || isBlockedAttachmentPath(destPath, guard.blockedTrees)) {
+      reply.code(403);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this path is blocked');
+    }
+    if (isDeniedEditRelativePath(relativePath)) {
+      reply.code(403);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Files under .git cannot be written');
+    }
+    // Final confinement: ensure dest stays inside workingDir (lexical + realpath)
+    const finalRel = relative(session.workingDir, destPath);
+    if (isAbsolute(finalRel) || finalRel === '..' || finalRel.startsWith(`..${sep}`)) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid path');
+    }
+
+    try {
+      const fh = await fs.open(
+        destPath,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+        0o600
+      );
+      try {
+        await fh.writeFile(bytes);
+      } finally {
+        await fh.close();
+      }
+    } catch (err: unknown) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST') {
+        reply.code(409);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'File already exists');
+      }
+      reply.code(500);
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to write file: ${getErrorMessage(err)}`);
+    }
+
+    return {
+      success: true as const,
+      data: {
+        path: relativePath,
+        fileName,
+        size: bytes.length,
+        extension: ext,
+      },
+    };
+  });
+
+  // ── COD-318: File Manager directory/file operations ─────────────────
+  // mkdir: create a directory inside the workspace (local or remote)
+  app.post('/api/sessions/:id/files/mkdir', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!consumeFileManagerUploadToken(`${req.ip}:${id}`)) {
+      reply.code(429);
+      reply.header('Retry-After', '60');
+      return createErrorResponse(ApiErrorCode.RATE_LIMITED, 'Rate limit exceeded (20 ops/min per session)');
+    }
+    const session = findSessionOrFail(ctx, id, req);
+    const body = (req.body ?? {}) as { path?: string };
+    const rawPath = (body.path ?? '').trim();
+    if (!rawPath) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Missing path');
+    }
+    const normalized = rawPath.replace(/^\/+/, '').replace(/\\/g, '/');
+    if (normalized.includes('\0') || normalized.includes('\r') || normalized.includes('\n')) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid path');
+    }
+    if (normalized.split('/').some((s) => !s || s === '.' || s === '..')) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid path');
+    }
+    const segments = normalized.split('/').filter(Boolean);
+    // Sanitize each segment and ensure it remains meaningful
+    const sanitizedSegments = segments.map((seg) => sanitizeUploadFilename(seg));
+    if (sanitizedSegments.some((s) => !s || s === '.' || s === '..')) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid path');
+    }
+    const sanitizedPath = sanitizedSegments.join('/');
+    // If sanitization changed the path, reject to avoid silent renames
+    if (sanitizedSegments.some((s, i) => s !== segments[i])) {
+      // Allow only control-char stripping and device-prefix; otherwise treat as mismatch
+      // For mkdir we are lenient: use sanitized version
+    }
+    const guard = await loadAttachmentGuardConfig();
+    const finalRelative = sanitizedPath;
+
+    if (session.remote) {
+      if (isDeniedEditRelativePath(finalRelative)) {
+        reply.code(403);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Files under .git cannot be written');
+      }
+      const remoteAbs = remoteWorkspacePath(session.remote, finalRelative);
+      if (isSensitivePath(remoteAbs) || isBlockedAttachmentPath(remoteAbs, guard.blockedTrees)) {
+        reply.code(403);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this path is blocked');
+      }
+      // 409 if already exists
+      try {
+        await getRemoteWorkspaceFileInfo(session.remote, finalRelative);
+        reply.code(409);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Path already exists');
+      } catch (_e) {
+        // not found -> proceed
+      }
+      // Also check if it's an existing directory
+      try {
+        const entries = await listRemoteWorkspaceDirectory(session.remote, finalRelative);
+        // If we got listing without error, it exists as directory
+        if (entries) {
+          reply.code(409);
+          return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Path already exists');
+        }
+      } catch (_e) {
+        // not found -> proceed
+      }
+      try {
+        await createRemoteWorkspaceDirectory(session.remote, finalRelative);
+      } catch (err) {
+        const msg = getErrorMessage(err);
+        if (msg.includes('already exists') || msg.includes('Path exists')) {
+          reply.code(409);
+          return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Path already exists');
+        }
+        reply.code(500);
+        return createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to create directory: ${msg}`);
+      }
+      return { success: true as const, data: { path: finalRelative } };
+    }
+
+    // Local: lexical confinement + blocked checks before IO
+    const lexical = resolve(session.workingDir, finalRelative);
+    const rel = relative(session.workingDir, lexical);
+    if (isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid path');
+    }
+    if (isSensitivePath(lexical) || isBlockedAttachmentPath(lexical, guard.blockedTrees)) {
+      reply.code(403);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this path is blocked');
+    }
+    if (isDeniedEditRelativePath(finalRelative)) {
+      reply.code(403);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Files under .git cannot be written');
+    }
+    // Check existence
+    try {
+      const st = await fs.stat(lexical);
+      if (st) {
+        reply.code(409);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Path already exists');
+      }
+    } catch (e: unknown) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+    }
+    // Ensure parent exists and is directory, then create with symlink-safe loop
+    const parts = finalRelative.split('/').filter(Boolean);
+    let cur = session.workingDir;
+    for (let i = 0; i < parts.length; i++) {
+      const seg = parts[i];
+      const next = join(cur, seg);
+      try {
+        const st = await fs.lstat(next);
+        if (st.isSymbolicLink() || !st.isDirectory()) {
+          reply.code(403);
+          return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Target is not a regular directory');
+        }
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+        try {
+          await fs.mkdir(next);
+        } catch (mkErr: unknown) {
+          if ((mkErr as NodeJS.ErrnoException).code !== 'EEXIST') throw mkErr;
+          const raceSt = await fs.lstat(next);
+          if (raceSt.isSymbolicLink() || !raceSt.isDirectory()) {
+            reply.code(403);
+            return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Target is not a regular directory');
+          }
+        }
+      }
+      cur = next;
+    }
+    return { success: true as const, data: { path: finalRelative } };
+  });
+
+  app.post('/api/sessions/:id/files/rename', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!consumeFileManagerUploadToken(`${req.ip}:${id}`)) {
+      reply.code(429);
+      reply.header('Retry-After', '60');
+      return createErrorResponse(ApiErrorCode.RATE_LIMITED, 'Rate limit exceeded (20 ops/min per session)');
+    }
+    const session = findSessionOrFail(ctx, id, req);
+    const body = (req.body ?? {}) as { from?: string; to?: string };
+    const rawFrom = (body.from ?? '').trim();
+    const rawTo = (body.to ?? '').trim();
+    if (!rawFrom || !rawTo) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Missing from or to');
+    }
+    const normFrom = rawFrom.replace(/^\/+/, '').replace(/\\/g, '/');
+    const normTo = rawTo.replace(/^\/+/, '').replace(/\\/g, '/');
+    for (const p of [normFrom, normTo]) {
+      if (
+        p.includes('\0') ||
+        p.includes('\r') ||
+        p.includes('\n') ||
+        p.split('/').some((s) => !s || s === '.' || s === '..')
+      ) {
+        reply.code(400);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid path');
+      }
+    }
+    const guard = await loadAttachmentGuardConfig();
+
+    if (session.remote) {
+      for (const p of [normFrom, normTo]) {
+        if (isDeniedEditRelativePath(p)) {
+          reply.code(403);
+          return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Files under .git cannot be renamed');
+        }
+        const abs = remoteWorkspacePath(session.remote, p);
+        if (isSensitivePath(abs) || isBlockedAttachmentPath(abs, guard.blockedTrees)) {
+          reply.code(403);
+          return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this path is blocked');
+        }
+      }
+      // Check from exists, to not exists
+      let fromExists = false;
+      try {
+        await getRemoteWorkspaceFileInfo(session.remote, normFrom);
+        fromExists = true;
+      } catch {
+        try {
+          await listRemoteWorkspaceDirectory(session.remote, normFrom);
+          fromExists = true;
+        } catch {
+          fromExists = false;
+        }
+      }
+      if (!fromExists) {
+        reply.code(404);
+        return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Source not found');
+      }
+      let toExists = false;
+      try {
+        await getRemoteWorkspaceFileInfo(session.remote, normTo);
+        toExists = true;
+      } catch {
+        try {
+          await listRemoteWorkspaceDirectory(session.remote, normTo);
+          toExists = true;
+        } catch {
+          toExists = false;
+        }
+      }
+      if (toExists) {
+        reply.code(409);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Destination already exists');
+      }
+      try {
+        await renameRemoteWorkspacePath(session.remote, normFrom, normTo);
+      } catch (err) {
+        reply.code(500);
+        return createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to rename: ${getErrorMessage(err)}`);
+      }
+      return { success: true as const, data: { from: normFrom, to: normTo } };
+    }
+
+    // Local
+    for (const p of [normFrom, normTo]) {
+      const lexical = resolve(session.workingDir, p);
+      const rel = relative(session.workingDir, lexical);
+      if (isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) {
+        reply.code(400);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid path');
+      }
+      if (isSensitivePath(lexical) || isBlockedAttachmentPath(lexical, guard.blockedTrees)) {
+        reply.code(403);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this path is blocked');
+      }
+      if (isDeniedEditRelativePath(p)) {
+        reply.code(403);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Files under .git cannot be renamed');
+      }
+    }
+    const fromAbs = join(session.workingDir, normFrom);
+    const toAbs = join(session.workingDir, normTo);
+    // Validate source exists and is not a symlink outside
+    const fromValidated = validateSessionFilePath(session.workingDir, normFrom);
+    // For rename we need to handle both files and directories; if from is a file that doesn't exist yet
+    // validateSessionFilePath will return null when it doesn't resolve. So also check via lstat.
+    try {
+      const st = await fs.lstat(fromAbs);
+      if (st.isSymbolicLink()) {
+        // Allow renaming symlink itself, but ensure its resolved target is inside workspace if it points inside?
+        // For safety, block symlink rename to avoid escaping via symlink swap?
+        // We'll allow but ensure both paths are inside workspace lexically (already checked).
+      }
+    } catch (_e) {
+      reply.code(404);
+      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Source not found');
+    }
+    // Check dest parent exists or create? For rename we require parent exists
+    const toParent = dirname(toAbs);
+    try {
+      const pst = await fs.stat(toParent);
+      if (!pst.isDirectory()) {
+        reply.code(400);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Destination parent is not a directory');
+      }
+    } catch (_e) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Destination parent does not exist');
+    }
+    // dest must not exist
+    try {
+      await fs.lstat(toAbs);
+      reply.code(409);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Destination already exists');
+    } catch (e: unknown) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e;
+    }
+    // Guard: ensure from and to are not the same
+    if (normFrom === normTo) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Source and destination are the same');
+    }
+    // Ensure from and to remain within workspace after realpath resolution
+    // For from we already have resolved path if it exists; ensure it is inside
+    if (fromValidated) {
+      // Check sensitive/blocked on resolved
+      if (
+        isSensitivePath(fromValidated.resolvedPath) ||
+        isBlockedAttachmentPath(fromValidated.resolvedPath, guard.blockedTrees)
+      ) {
+        reply.code(403);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this path is blocked');
+      }
+    }
+    try {
+      await fs.rename(fromAbs, toAbs);
+    } catch (err) {
+      reply.code(500);
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to rename: ${getErrorMessage(err)}`);
+    }
+    return { success: true as const, data: { from: normFrom, to: normTo } };
+  });
+
+  app.delete('/api/sessions/:id/files', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    if (!consumeFileManagerUploadToken(`${req.ip}:${id}`)) {
+      reply.code(429);
+      reply.header('Retry-After', '60');
+      return createErrorResponse(ApiErrorCode.RATE_LIMITED, 'Rate limit exceeded (20 ops/min per session)');
+    }
+    const session = findSessionOrFail(ctx, id, req);
+    const rawPath = ((req.query as { path?: string }).path ?? '').trim();
+    if (!rawPath) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Missing path');
+    }
+    const normalized = rawPath.replace(/^\/+/, '').replace(/\\/g, '/');
+    if (
+      normalized.includes('\0') ||
+      normalized.includes('\r') ||
+      normalized.includes('\n') ||
+      normalized.split('/').some((s) => !s || s === '.' || s === '..')
+    ) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid path');
+    }
+    const guard = await loadAttachmentGuardConfig();
+
+    if (session.remote) {
+      if (isDeniedEditRelativePath(normalized)) {
+        reply.code(403);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Files under .git cannot be deleted');
+      }
+      const abs = remoteWorkspacePath(session.remote, normalized);
+      if (isSensitivePath(abs) || isBlockedAttachmentPath(abs, guard.blockedTrees)) {
+        reply.code(403);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this path is blocked');
+      }
+      // Verify exists
+      let exists = false;
+      try {
+        await getRemoteWorkspaceFileInfo(session.remote, normalized);
+        exists = true;
+      } catch {
+        try {
+          await listRemoteWorkspaceDirectory(session.remote, normalized);
+          exists = true;
+        } catch {
+          exists = false;
+        }
+      }
+      if (!exists) {
+        reply.code(404);
+        return createErrorResponse(ApiErrorCode.NOT_FOUND, 'File not found');
+      }
+      try {
+        await deleteRemoteWorkspacePath(session.remote, normalized);
+      } catch (err) {
+        reply.code(500);
+        return createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to delete: ${getErrorMessage(err)}`);
+      }
+      return { success: true as const, data: { path: normalized } };
+    }
+
+    const lexical = resolve(session.workingDir, normalized);
+    const rel = relative(session.workingDir, lexical);
+    if (isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid path');
+    }
+    if (isSensitivePath(lexical) || isBlockedAttachmentPath(lexical, guard.blockedTrees)) {
+      reply.code(403);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this path is blocked');
+    }
+    if (isDeniedEditRelativePath(normalized)) {
+      reply.code(403);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Files under .git cannot be deleted');
+    }
+    // Use lstat to check existence; rm on symlink removes link itself not target
+    try {
+      await fs.lstat(lexical);
+    } catch {
+      reply.code(404);
+      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'File not found');
+    }
+    try {
+      await fs.rm(lexical, { recursive: true, force: false });
+    } catch (err) {
+      reply.code(500);
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to delete: ${getErrorMessage(err)}`);
+    }
+    return { success: true as const, data: { path: normalized } };
+  });
+
   // List a session's attachment history (live session or persisted), resolving
   // each entry to current metadata + routes. External entries are re-registered.
+  // COD-241 unit 3: remove a Codeman-uploaded attachment copy. Deletes ONLY
+  // files Codeman itself wrote under {workingDir}/.codeman-attachments/ — a
+  // `detected`/`external` reference to the user's own file is never in that dir,
+  // so it is refused. The ownership gate is restart-safe: it depends on the
+  // resolved path being inside the (realpath'd) attachments dir, NOT on the
+  // in-memory registry, so it holds across a server restart.
+  app.delete('/api/sessions/:id/attachments/uploaded', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const rawPath = (req.query as { path?: string }).path;
+
+    const session = findSessionOrFail(ctx, id, req);
+
+    if (!rawPath || typeof rawPath !== 'string') {
+      reply.code(400);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Missing path parameter');
+    }
+
+    let uploadDirectory;
+    try {
+      // COD-296: resolve-only — a delete must not create the directory it is
+      // about to look inside.
+      uploadDirectory = await resolveLocalUploadDirectory(session.workingDir, getAuthUser(req));
+    } catch (err) {
+      if (err instanceof UploadDirectoryResolutionError) {
+        reply.code(err.statusCode);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, err.message);
+      }
+      req.log.warn({ category: 'attachment-remove', code: 'directory-resolution-failed', sessionId: id, err });
+      reply.code(500);
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Upload directory is unavailable');
+    }
+
+    // COD-296: `null` (no .codeman-attachments/ at all) deliberately falls
+    // through to the workspace branch below rather than short-circuiting. An
+    // absent directory means "no upload can live here", NOT "the target does not
+    // exist" — the workspace branch already tells those apart correctly with the
+    // directory missing: an unresolvable path 404s, and a real workspace file
+    // outside the attachments dir still 403s. Short-circuiting to 404 here
+    // silently downgraded that 403.
+    if (uploadDirectory?.kind === 'trusted') {
+      const prefix = '.codeman-attachments/';
+      const leaf = rawPath.startsWith(prefix) ? rawPath.slice(prefix.length) : '';
+      if (!leaf || leaf === '.' || leaf === '..' || leaf.includes('/') || leaf.includes('\\') || leaf.includes(sep)) {
+        reply.code(403);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Only Codeman-uploaded files can be removed');
+      }
+
+      const target = join(uploadDirectory.canonicalDir, leaf);
+      let targetStat;
+      try {
+        if ((await fs.realpath(uploadDirectory.canonicalDir)) !== uploadDirectory.canonicalDir) {
+          throw new Error('trusted root changed');
+        }
+        targetStat = await fs.lstat(target);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          reply.code(404);
+          return createErrorResponse(ApiErrorCode.NOT_FOUND, 'File not found');
+        }
+        req.log.warn({ category: 'attachment-remove', code: 'target-validation-failed', sessionId: id, err });
+        reply.code(403);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Only Codeman-uploaded files can be removed');
+      }
+      if (targetStat.isSymbolicLink() || !targetStat.isFile()) {
+        reply.code(403);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Only Codeman-uploaded files can be removed');
+      }
+
+      const persistedHistory = session.getAttachmentHistoryForPersist() ?? [];
+      const owningHistory = persistedHistory.find((item) => {
+        if (item.uploadProvenance !== 'codeman-upload' || !item.externalPath) return false;
+        try {
+          return (
+            realpathSync(item.externalPath) === target &&
+            dirname(realpathSync(item.externalPath)) === uploadDirectory.canonicalDir
+          );
+        } catch {
+          return false;
+        }
+      });
+      if (!owningHistory) {
+        reply.code(403);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Only Codeman-uploaded files can be removed');
+      }
+
+      try {
+        await fs.unlink(target);
+      } catch (err) {
+        req.log.warn({ category: 'attachment-remove', code: 'unlink-failed', sessionId: id, err });
+        reply.code(500);
+        return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Failed to remove file');
+      }
+
+      const record = attachmentRegistry.findByFilePath(id, target);
+      if (record) attachmentRegistry.remove(id, record.attachmentId);
+      const removed = session.removeAttachmentHistory((item) => item.id === owningHistory.id);
+      if (removed > 0) ctx.persistSessionState(session);
+      return { success: true, data: { removed: true, path: pathPosix.join(prefix, leaf) } };
+    }
+
+    // Resolve (symlink-safe) and confine to the workspace. A traversal/escape or
+    // a nonexistent path returns null → 404 (also covers an already-deleted file).
+    const validated = validateSessionFilePath(session.workingDir, rawPath);
+    if (!validated) {
+      reply.code(404);
+      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'File not found');
+    }
+
+    // Ownership gate: the realpath'd target MUST sit inside the realpath'd
+    // .codeman-attachments/ dir. Comparing realpaths (not a lexical join on the
+    // raw workingDir) closes a symlinked-dir / symlinked-workingDir escape.
+    const attachmentsDir = validateSessionFilePath(session.workingDir, '.codeman-attachments');
+    const insideAttachments =
+      !!attachmentsDir &&
+      (validated.resolvedPath === attachmentsDir.resolvedPath ||
+        validated.resolvedPath.startsWith(attachmentsDir.resolvedPath + sep));
+    if (!insideAttachments) {
+      reply.code(403);
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Only Codeman-uploaded files can be removed');
+    }
+
+    // Delete the file. force:true tolerates a TOCTOU vanish between the gate and
+    // the unlink. fs.rm on a symlink removes the link itself, not its target.
+    try {
+      await fs.rm(validated.resolvedPath, { force: true });
+    } catch (err: unknown) {
+      req.log.warn({ category: 'attachment-remove', code: 'workspace-remove-failed', sessionId: id, err });
+      reply.code(500);
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Failed to remove file');
+    }
+
+    // Best-effort cleanup of the in-memory registry + persisted history so the
+    // paperclip drawer stops surfacing a file that no longer exists.
+    const record = attachmentRegistry.findByFilePath(id, validated.resolvedPath);
+    if (record) attachmentRegistry.remove(id, record.attachmentId);
+
+    const removed = session.removeAttachmentHistory(
+      (item) => item.externalPath === validated.resolvedPath || item.relativePath === validated.relativePath
+    );
+    if (removed > 0) ctx.persistSessionState(session);
+
+    return { success: true, data: { removed: true, path: validated.relativePath } };
+  });
+
   app.get('/api/sessions/:id/attachments', async (req, reply) => {
     const { id } = req.params as { id: string };
     const sessionHistory = getSessionAttachmentHistory(ctx, id, req);
@@ -2250,14 +3684,11 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       return;
     }
 
-    // Remote: every entry's realpath + stat in one batched probe, never one ssh per
-    // item (see probeRemoteAttachmentHistory). Local: undefined, each item stats itself.
-    const batch = await probeRemoteAttachmentHistory(sessionHistory.scope, sessionHistory.history);
     const items = await Promise.all(
       sessionHistory.history.map((item) =>
         (item.source === 'external'
-          ? buildExternalAttachmentRouteItem(id, item, sessionHistory.scope, batch)
-          : buildDetectedAttachmentRouteItem(id, sessionHistory.scope, item, batch)
+          ? buildExternalAttachmentRouteItem(id, item, sessionHistory.workingDir, getAuthUser(req))
+          : buildDetectedAttachmentRouteItem(id, sessionHistory.workingDir, item)
         ).catch(() => ({ ...sanitizeAttachmentHistoryItem(item), missing: true }))
       )
     );
@@ -2275,28 +3706,26 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
   // size/mtime as the underlying file is rewritten).
   app.get('/api/sessions/:id/attachments/:attachmentId', async (req, reply) => {
     const { id, attachmentId } = req.params as { id: string; attachmentId: string };
-    const scope = getKnownSessionFileScope(ctx, id, reply, req);
-    if (!scope) return;
+    const workingDir = getKnownSessionWorkingDir(ctx, id, reply, req);
+    if (!workingDir) return;
     const record = getAttachmentOr404(reply, id, attachmentId);
     if (!record) return;
-    const servable = await resolveServableAttachmentPath(reply, record, scope);
-    if (!servable) return;
+    const servePath = await resolveLocalServableAttachmentPath(reply, record, workingDir);
+    if (!servePath) return;
     const event = attachmentRecordToEvent(record);
+    // Re-stat so the live preview poller sees current size/mtime as the agent
+    // rewrites the underlying file (COD-58). Fall back to the cached record on error.
     let size = record.size;
     let mtimeMs = record.mtimeMs;
-    if (servable.probe) {
-      // Remote: the guard re-probe already stat'ed it over ssh — no second round trip.
-      size = servable.probe.size || record.size;
-      mtimeMs = servable.probe.mtimeMs || mtimeMs;
-    } else {
-      try {
-        const stat = await fs.stat(record.filePath);
-        size = stat.size;
-        mtimeMs = stat.mtimeMs ?? mtimeMs;
-      } catch {
-        // File temporarily unavailable mid-write — keep cached values.
-      }
+    try {
+      const stat = await fs.stat(servePath);
+      size = stat.size;
+      mtimeMs = stat.mtimeMs ?? mtimeMs;
+    } catch {
+      // File temporarily unavailable mid-write — keep cached values.
     }
+    // Snapshot revision history off the live-preview poll (COD-59).
+    await captureDocumentVersion(id, servePath, record.extension);
     return {
       success: true,
       data: {
@@ -2319,81 +3748,402 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
   app.get('/api/sessions/:id/attachments/:attachmentId/raw', async (req, reply) => {
     const { id, attachmentId } = req.params as { id: string; attachmentId: string };
     const { download, preview } = req.query as { download?: string; preview?: string };
-    const session = findSessionOrFail(ctx, id, req);
+    const workingDir = getKnownSessionWorkingDir(ctx, id, reply, req);
+    if (!workingDir) return;
     const record = getAttachmentOr404(reply, id, attachmentId);
     if (!record) return;
-    const servable = await resolveServableAttachmentPath(reply, record, {
-      workingDir: session.workingDir,
-      remote: session.remote,
-    });
-    if (!servable) return;
+    // Stream the freshly-resolved path (TOCTOU): a path component swapped to a
+    // symlink after registration would otherwise redirect the stream to a file
+    // the guard never checked.
+    const servePath = await resolveLocalServableAttachmentPath(reply, record, workingDir);
+    if (!servePath) return;
 
-    await serveServableRaw(reply, servable, session.remote, record.fileName, record.extension, {
-      download,
-      preview,
-      range: req.headers.range,
-    });
+    try {
+      // XLSX preview parsing is intentionally browser-local, but the preview
+      // response is capped before a stream is opened. Explicit downloads fall
+      // back to the cap that admitted the bytes in the first place (COD-297) —
+      // a hardcoded number here silently 413s a legitimately uploaded file
+      // whenever the upload knob is raised above it.
+      const maxSizeBytes =
+        record.extension === 'xlsx' && preview === 'true' && download !== 'true'
+          ? MAX_XLSX_BROWSER_PREVIEW_BYTES
+          : maxServableAttachmentBytes(record);
+      await serveRawFile(
+        reply,
+        servePath,
+        record.fileName,
+        record.extension,
+        download === 'true',
+        req.headers.range,
+        maxSizeBytes
+      );
+    } catch (err) {
+      reply
+        .code(500)
+        .send(createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to read file: ${getErrorMessage(err)}`));
+    }
   });
 
   // Serve a converted PDF preview of a registered attachment by id. Office docs
   // convert server-side; PDF/PNG/text redirect to the raw route.
   app.get('/api/sessions/:id/attachments/:attachmentId/preview', async (req, reply) => {
     const { id, attachmentId } = req.params as { id: string; attachmentId: string };
-    const scope = getKnownSessionFileScope(ctx, id, reply, req);
-    if (!scope) return;
+    const workingDir = getKnownSessionWorkingDir(ctx, id, reply, req);
+    if (!workingDir) return;
     const record = getAttachmentOr404(reply, id, attachmentId);
     if (!record) return;
-    const servable = await resolveServableAttachmentPath(reply, record, scope);
-    if (!servable) return;
+    const servePath = await resolveLocalServableAttachmentPath(reply, record, workingDir);
+    if (!servePath) return;
 
     // Only Office formats need server-side conversion; PDF/PNG and text formats
     // (md/txt) preview directly from their raw bytes.
     if (record.extension !== 'docx' && record.extension !== 'pptx') {
-      reply.redirect(`/api/sessions/${id}/attachments/${encodeURIComponent(attachmentId)}/raw`);
+      const previewQuery = record.extension === 'xlsx' ? '?preview=true' : '';
+      reply.redirect(`/api/sessions/${id}/attachments/${encodeURIComponent(attachmentId)}/raw${previewQuery}`);
       return;
     }
 
-    if (servable.probe) {
-      // Conversion needs LibreOffice reading the bytes off THIS host's disk, and a
-      // remote read must never spill remote bytes onto the server (see file-preview).
-      reply
-        .code(400)
-        .send(
-          createErrorResponse(
-            ApiErrorCode.INVALID_INPUT,
-            'Office document preview is not available for files in a remote (SSH) case'
-          )
-        );
-      return;
-    }
-
-    await serveConvertedPreview(reply, servable.path, record.fileName, record.extension);
+    await serveConvertedPreview(reply, servePath, record.fileName, record.extension);
   });
 
   // Serve a first-page thumbnail of a registered attachment by id.
   app.get('/api/sessions/:id/attachments/:attachmentId/thumbnail', async (req, reply) => {
     const { id, attachmentId } = req.params as { id: string; attachmentId: string };
-    const scope = getKnownSessionFileScope(ctx, id, reply, req);
-    if (!scope) return;
+    const workingDir = getKnownSessionWorkingDir(ctx, id, reply, req);
+    if (!workingDir) return;
     const record = getAttachmentOr404(reply, id, attachmentId);
     if (!record) return;
-    const servable = await resolveServableAttachmentPath(reply, record, scope);
-    if (!servable) return;
+    const servePath = await resolveLocalServableAttachmentPath(reply, record, workingDir);
+    if (!servePath) return;
+    await serveThumbnail(reply, servePath, record.extension);
+  });
 
-    if (servable.probe) {
-      // Same reason as the office preview: rendering needs the bytes locally.
+  // ===== Document revision history (COD-59) =====
+  // Versions are captured off the live-preview poll; these endpoints list them,
+  // diff two versions (word-level), and roll a document back to a prior version.
+  app.get('/api/sessions/:id/documents/versions', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const target = await resolveDocumentTarget(
+      ctx,
+      reply,
+      id,
+      req.query as { attachmentId?: string; path?: string },
+      req
+    );
+    if (!target) return;
+    await captureDocumentVersion(id, target.filePath, target.extension);
+    return { success: true, data: { versions: documentVersionStore.list(id, target.filePath) } };
+  });
+
+  app.get('/api/sessions/:id/documents/diff', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const query = req.query as { attachmentId?: string; path?: string; from?: string; to?: string };
+    const target = await resolveDocumentTarget(ctx, reply, id, query, req);
+    if (!target) return;
+    await captureDocumentVersion(id, target.filePath, target.extension);
+    const versions = documentVersionStore.list(id, target.filePath);
+    if (versions.length === 0) {
+      reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, 'No versions recorded for this document yet'));
+      return;
+    }
+    // Default: diff the most recent change (previous -> latest).
+    const toId = query.to || versions[versions.length - 1].id;
+    const fromId =
+      query.from || (versions.length >= 2 ? versions[versions.length - 2].id : versions[versions.length - 1].id);
+    const fromVersion = documentVersionStore.get(id, target.filePath, fromId);
+    const toVersion = documentVersionStore.get(id, target.filePath, toId);
+    if (!fromVersion || !toVersion) {
+      reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, 'Requested version not found'));
+      return;
+    }
+    return {
+      success: true,
+      data: { from: fromId, to: toId, ops: wordDiff(fromVersion.content, toVersion.content) },
+    };
+  });
+
+  app.post('/api/sessions/:id/documents/rollback', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const body = (req.body || {}) as { attachmentId?: string; path?: string; versionId?: string };
+    const target = await resolveDocumentTarget(ctx, reply, id, body, req);
+    if (!target) return;
+    if (!body.versionId) {
+      reply.code(400).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Missing versionId'));
+      return;
+    }
+    const version = documentVersionStore.get(id, target.filePath, body.versionId);
+    if (!version) {
+      reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, 'Requested version not found'));
+      return;
+    }
+    // Restores a prior snapshot of this same document. Writes only content we
+    // previously read from this path; attachment-path containment is governed
+    // separately by COD-53. Binary docs (docx) restore byte-perfect from raw.
+    try {
+      if (version.raw) {
+        await fs.writeFile(target.filePath, version.raw);
+      } else {
+        await fs.writeFile(target.filePath, version.content, 'utf-8');
+      }
+      const restoredSize = version.raw ? version.raw.length : Buffer.byteLength(version.content);
+      documentVersionStore.record(id, target.filePath, version.content, Date.now(), restoredSize, version.raw);
+      return { success: true, data: { restored: body.versionId } };
+    } catch (err) {
+      return reply
+        .code(500)
+        .send(createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to roll back: ${getErrorMessage(err)}`));
+    }
+  });
+
+  // Selectable HTML rendering of a .docx for the annotatable preview view (COD-68).
+  app.get('/api/sessions/:id/documents/html', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const target = await resolveDocumentTarget(
+      ctx,
+      reply,
+      id,
+      req.query as { attachmentId?: string; path?: string },
+      req
+    );
+    if (!target) return;
+    if (target.extension.toLowerCase().replace(/^\./, '') !== 'docx') {
+      reply.code(400).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'HTML view is only available for .docx'));
+      return;
+    }
+    try {
+      const html = await convertDocxToHtml(target.filePath);
+      return { success: true, data: { html } };
+    } catch (err) {
+      return reply
+        .code(500)
+        .send(createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to render HTML: ${getErrorMessage(err)}`));
+    }
+  });
+
+  // One-click PDF export of the open document (COD-61). GET (so a browser link
+  // can download it) + Content-Disposition: attachment, mirroring the
+  // file-raw/file-preview download pattern (the ticket said POST — deviation
+  // noted). PDF is the only supported format today (DOCX/templates deferred).
+  // docx/pptx reuse the LibreOffice preview-PDF cache; md/markdown/txt are
+  // rendered to HTML server-side (pandoc, else vendored marked) then converted
+  // HTML→PDF via the same soffice invocation.
+  app.get('/api/sessions/:id/documents/export', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const query = req.query as { attachmentId?: string; path?: string; format?: string };
+
+    if (!isSupportedExportFormat(query.format)) {
       reply
         .code(400)
-        .send(
-          createErrorResponse(
-            ApiErrorCode.INVALID_INPUT,
-            'Thumbnails are not available for files in a remote (SSH) case'
-          )
-        );
+        .send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Only PDF export is supported (format=pdf)'));
       return;
     }
 
-    await serveThumbnail(reply, servable.path, record.extension);
+    const target = await resolveDocumentTarget(ctx, reply, id, query, req);
+    if (!target) return;
+
+    // Resolve symlinks before the sensitive-path guard so a symlink pointing at
+    // a secret target is also caught (COD-53 ordering requirement).
+    let realPath = target.filePath;
+    try {
+      realPath = realpathSync(target.filePath);
+    } catch {
+      // Unreadable/deleted — check the stored path; conversion below will 500 if truly gone.
+    }
+    if (isSensitivePath(realPath)) {
+      reply.code(403).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this file is blocked'));
+      return;
+    }
+
+    const branch = classifyExportBranch(target.extension);
+    if (branch === 'unsupported') {
+      reply
+        .code(400)
+        .send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'PDF export is not supported for this file type'));
+      return;
+    }
+
+    const fileName = pathBasename(realPath);
+    const downloadName = getPreviewPdfDownloadName(fileName, target.extension);
+
+    try {
+      if (branch === 'office') {
+        // Reuse the existing docx/pptx → PDF preview cache.
+        const previewPath = await getOfficePreviewPdfPath(realPath, target.extension);
+        if (!previewPath) {
+          reply.code(500).send(createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Document conversion to PDF failed'));
+          return;
+        }
+        const content = await fs.readFile(previewPath);
+        await sendPdfDownload(reply, content, downloadName);
+        return;
+      }
+
+      // text branch: md/markdown/txt → standalone HTML → soffice HTML→PDF.
+      const raw = await fs.readFile(realPath, 'utf-8');
+      const { html } = await buildTextExportHtml(raw, target.extension, fileName);
+      const pdfPath = await convertHtmlToPdf(html);
+      if (!pdfPath) {
+        reply.code(500).send(createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Document conversion to PDF failed'));
+        return;
+      }
+      try {
+        const content = await fs.readFile(pdfPath);
+        await sendPdfDownload(reply, content, downloadName);
+      } finally {
+        // convertHtmlToPdf returns a path inside a per-call work dir; remove it.
+        await fs.rm(join(pdfPath, '..'), { recursive: true, force: true }).catch(() => {});
+      }
+    } catch (err) {
+      reply
+        .code(500)
+        .send(createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to export PDF: ${getErrorMessage(err)}`));
+    }
+  });
+
+  // Write collected annotations to a markdown review file in the workspace (COD-69).
+  app.post('/api/sessions/:id/documents/review', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const body = (req.body || {}) as {
+      attachmentId?: string;
+      path?: string;
+      annotations?: { passage?: string; note?: string }[];
+    };
+    const target = await resolveDocumentTarget(ctx, reply, id, body, req);
+    if (!target) return;
+    const annotations = Array.isArray(body.annotations) ? body.annotations.filter((a) => a && a.note) : [];
+    if (annotations.length === 0) {
+      reply.code(400).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'No annotations provided'));
+      return;
+    }
+    const workingDir = getKnownSessionWorkingDir(ctx, id, reply, req);
+    if (!workingDir) return;
+    const docName = pathBasename(target.filePath);
+    const reviewName = `codeman-review-${docName.replace(/[^a-zA-Z0-9._-]/g, '_')}.md`;
+    const md =
+      `# Review comments for ${docName}\n\n` +
+      annotations
+        .map((a, i) => `${i + 1}. In "${(a.passage || '').replace(/\s+/g, ' ').trim()}":\n   ${(a.note || '').trim()}`)
+        .join('\n\n') +
+      '\n';
+    try {
+      await fs.writeFile(join(workingDir, reviewName), md, 'utf-8');
+      return { success: true, data: { path: reviewName, count: annotations.length } };
+    } catch (err) {
+      return reply
+        .code(500)
+        .send(
+          createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to write review file: ${getErrorMessage(err)}`)
+        );
+    }
+  });
+
+  // Serve raw file content (for images/binary files)
+  app.get('/api/sessions/:id/file-raw', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const {
+      path: filePath,
+      download,
+      preview,
+    } = req.query as {
+      path?: string;
+      download?: string;
+      preview?: string;
+    };
+    const liveSession = ctx.sessions.get(id);
+    if (liveSession?.remote) {
+      // Uses the live session deliberately: remote connection details are not
+      // persisted in the detached-session record. This call enforces the same
+      // ownership rule as every other live-session file operation.
+      const session = findSessionOrFail(ctx, id, req);
+      if (!filePath) {
+        reply.code(400).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Missing path parameter'));
+        return;
+      }
+      try {
+        remoteWorkspacePath(session.remote!, filePath);
+      } catch {
+        reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, 'File not found'));
+        return;
+      }
+      try {
+        const ext = filePath.split('.').pop()?.toLowerCase() || '';
+        const remoteInfo = await probeRemoteWorkspacePath(session.remote!, filePath, 'file');
+        if (!remoteInfo) {
+          reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, 'File not found'));
+          return;
+        }
+        if (ext === 'xlsx' && preview === 'true' && download !== 'true') {
+          if (remoteInfo.size > MAX_XLSX_BROWSER_PREVIEW_BYTES) {
+            reply
+              .code(413)
+              .send(
+                createErrorResponse(
+                  ApiErrorCode.INVALID_INPUT,
+                  `File too large (${Math.round(remoteInfo.size / 1024 / 1024)}MB > 10MB limit)`
+                )
+              );
+            return;
+          }
+        }
+        const staged = await downloadRemoteWorkspaceFile(session.remote!, filePath);
+        const rawBasename = filePath.split('/').pop() || 'download';
+        let cleaned = false;
+        const cleanup = () => {
+          if (cleaned) return;
+          cleaned = true;
+          void staged.cleanup();
+        };
+        try {
+          await serveRawFile(
+            reply,
+            staged.path,
+            rawBasename,
+            ext,
+            download === 'true',
+            req.headers.range,
+            undefined,
+            cleanup
+          );
+        } catch (err) {
+          cleanup();
+          throw err;
+        }
+      } catch (err) {
+        reply
+          .code(err instanceof RemoteFileAccessError ? 502 : 500)
+          .send(
+            createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to read remote file: ${getErrorMessage(err)}`)
+          );
+      }
+      return;
+    }
+    const workingDir = getKnownSessionWorkingDir(ctx, id, reply, req);
+    if (!workingDir) return;
+
+    if (!filePath) {
+      reply.code(400).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Missing path parameter'));
+      return;
+    }
+
+    // Validate path is within working directory (security: resolve symlinks to prevent traversal)
+    const validated = validateSessionFilePath(workingDir, filePath);
+    if (!validated) {
+      reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, 'File not found'));
+      return;
+    }
+    const { resolvedPath } = validated;
+
+    try {
+      const ext = filePath.split('.').pop()?.toLowerCase() || '';
+      const rawBasename = filePath!.split('/').pop() || 'download';
+      const maxSizeBytes =
+        ext === 'xlsx' && preview === 'true' && download !== 'true' ? MAX_XLSX_BROWSER_PREVIEW_BYTES : undefined;
+      await serveRawFile(reply, resolvedPath, rawBasename, ext, download === 'true', req.headers.range, maxSizeBytes);
+    } catch (err) {
+      reply
+        .code(500)
+        .send(createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to read file: ${getErrorMessage(err)}`));
+    }
   });
 
   // ===== Folder grid =====
@@ -2577,63 +4327,48 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
   app.get('/api/sessions/:id/file-preview', async (req, reply) => {
     const { id } = req.params as { id: string };
     const { path: filePath } = req.query as { path?: string };
-    const scope = getKnownSessionFileScope(ctx, id, reply, req);
-    if (!scope) return;
+    const workingDir = getKnownSessionWorkingDir(ctx, id, reply, req);
+    if (!workingDir) return;
 
     if (!filePath) {
       reply.code(400).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Missing path parameter'));
       return;
     }
 
-    const resolution = await resolveFileTarget(scope, filePath);
-    if (!resolution.ok) {
-      reply.code(resolution.status).send(createErrorResponse(resolution.errorCode, resolution.message));
+    const validated = validateSessionFilePath(workingDir, filePath);
+    if (!validated) {
+      reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, 'File not found'));
       return;
     }
+    const { resolvedPath } = validated;
     const ext = filePath.split('.').pop()?.toLowerCase() || '';
 
+    // Only Office formats need server-side conversion; PDF/PNG and text formats
+    // (md/txt) preview directly from their raw bytes.
     if (ext !== 'docx' && ext !== 'pptx') {
-      // Everything that is not an office document IS the raw route (PDF, images,
-      // text), which is now remote-aware too — so this redirect works for both kinds
-      // of case with no extra branching here.
-      reply.redirect(`/api/sessions/${id}/file-raw?path=${encodeURIComponent(filePath)}`);
+      const previewQuery = ext === 'xlsx' ? '&preview=true' : '';
+      reply.redirect(`/api/sessions/${id}/file-raw?path=${encodeURIComponent(filePath)}${previewQuery}`);
       return;
     }
 
-    if (resolution.target.kind === 'remote') {
-      // Converting requires LibreOffice reading the bytes off THIS host's disk, so it
-      // needs a local temp copy first — deliberately not part of the read-only remote
-      // path (a remote preview must not spill remote bytes onto the server). Say what
-      // to do instead of 404-ing like the pre-#415 code did.
-      reply
-        .code(400)
-        .send(
-          createErrorResponse(
-            ApiErrorCode.INVALID_INPUT,
-            'Office document preview is not available for files in a remote (SSH) case'
-          )
-        );
-      return;
-    }
-
-    await serveConvertedPreview(reply, resolution.target.resolvedPath, filePath, ext);
+    await serveConvertedPreview(reply, resolvedPath, filePath, ext);
   });
 
   // Serve a first-page thumbnail for a workspace-relative path.
   app.get('/api/sessions/:id/file-thumbnail', async (req, reply) => {
     const { id } = req.params as { id: string };
     const { path: filePath } = req.query as { path?: string };
-    const scope = getKnownSessionFileScope(ctx, id, reply, req);
-    if (!scope) return;
+    const workingDir = getKnownSessionWorkingDir(ctx, id, reply, req);
+    if (!workingDir) return;
 
     if (!filePath) {
       reply.code(400).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Missing path parameter'));
       return;
     }
 
-    const resolution = await resolveFileTarget(scope, filePath);
-    if (!resolution.ok) {
-      reply.code(resolution.status).send(createErrorResponse(resolution.errorCode, resolution.message));
+    const validated = validateSessionFilePath(workingDir, filePath);
+    if (!validated) {
+      reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, 'File not found'));
       return;
     }
 
@@ -2645,26 +4380,14 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       return;
     }
 
-    if (resolution.target.kind === 'remote') {
-      // Same reason as the office preview above: rendering needs the bytes locally.
-      reply
-        .code(400)
-        .send(
-          createErrorResponse(
-            ApiErrorCode.INVALID_INPUT,
-            'Thumbnails are not available for files in a remote (SSH) case'
-          )
-        );
-      return;
-    }
-
-    await serveThumbnail(reply, resolution.target.resolvedPath, ext);
+    await serveThumbnail(reply, validated.resolvedPath, ext);
   });
 
   // Stream file content via tail -f (SSE endpoint)
   app.get('/api/sessions/:id/tail-file', async (req, reply) => {
     const { id } = req.params as { id: string };
     const { path: filePath, lines } = req.query as { path?: string; lines?: string };
+    // Ownership-aware lookup BEFORE any filesystem work or stream allocation (COD-294).
     const session = findSessionOrFail(ctx, id, req);
 
     if (!filePath) {
@@ -2728,14 +4451,15 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
   // malformed error envelope instead of wrapping it).
   app.delete('/api/sessions/:id/tail-file/:streamId', async (req) => {
     const { id, streamId } = req.params as { id: string; streamId: string };
-    findSessionOrFail(ctx, id, req); // Validates session exists
+    findSessionOrFail(ctx, id, req); // Validates the session exists AND is the caller's (COD-294)
     const closed = fileStreamManager.closeStream(streamId);
     return { closed };
   });
+
   // Session-scoped file download.
   // Uses the same realpath-based workspace boundary as file preview/raw routes;
-  // the shared sensitive-path blocklist (../sensitive-path.js, also used by the
-  // attachment guard) remains defense-in-depth, not the primary boundary.
+  // the sensitive-path blocklist (shared with attachment serving via
+  // ../sensitive-path.js) remains defense-in-depth, not the primary boundary.
   app.get('/api/download', async (req, reply) => {
     const { path: filePath, sessionId } = req.query as { path?: string; sessionId?: string };
 
@@ -2749,6 +4473,7 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       return;
     }
 
+    // Ownership-aware lookup BEFORE the path is resolved or the file is opened (COD-294).
     const session = findSessionOrFail(ctx, sessionId, req);
     const validated = validateSessionFilePath(session.workingDir, filePath);
     if (!validated) {
@@ -2757,7 +4482,12 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
     }
     const { resolvedPath } = validated;
 
-    // Check sensitive path blocklist
+    // Check sensitive path blocklist. NOTE (COD-53): this deliberately uses the
+    // base `isSensitivePath` blocklist, NOT the broadened attachment blocklist
+    // (which adds the /root + /etc trees). /api/download is already confined to
+    // the session workspace by validateSessionFilePath above, so the broadened
+    // trees are unnecessary here and changing this would alter download
+    // behavior. See cod-53-security-review.md "Configuration".
     if (isSensitivePath(resolvedPath)) {
       reply.code(403).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this file is blocked'));
       return;
@@ -2771,6 +4501,8 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
         return;
       }
 
+      // Sanity bound only: the body below is streamed and Range-aware, so size
+      // does not translate into resident memory. Configurable, 0 = unlimited.
       if (exceedsDownloadLimit(stat.size)) {
         reply.code(413).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, downloadTooLargeMessage(stat.size)));
         return;

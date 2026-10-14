@@ -3,14 +3,25 @@ import { describe, expect, it } from 'vitest';
 
 const appSource = readFileSync('src/web/public/app.js', 'utf8');
 const terminalUiSource = readFileSync('src/web/public/terminal-ui.js', 'utf8');
+const tabLayoutSource = readFileSync('src/web/public/tab-layout-browser.js', 'utf8');
 const helpHtml = readFileSync('src/web/public/index.html', 'utf8');
 const readme = readFileSync('README.md', 'utf8');
 
 describe('keyboard shortcuts', () => {
   it('uses physical Option+number keys so macOS special characters do not break tab switching', () => {
+    // The whole point is the PHYSICAL key: on macOS Option+1 emits "¡", so a
+    // handler reading e.key switches no tabs at all on that layout.
     expect(appSource).toContain('e.code ||');
     expect(appSource).toContain('Digit([1-9])');
-    expect(appSource).toContain('parseInt(digitMatch[1], 10) - 1');
+    expect(appSource).not.toMatch(/e\.key\.match\(\/\^Digit/);
+
+    // The matched digit is converted to an index once and resolved through the
+    // Focus-aware Alt+N order (COD-509): Focus rows, then live sessions, then
+    // open web tabs.
+    expect(appSource).toContain('const idx = parseInt(digitMatch[1], 10) - 1;');
+    expect(appSource).toContain('const target = this._tabAltRefs()[idx];');
+    expect(appSource).toContain("if (target.kind === 'session') this.selectSession(target.id);");
+    void tabLayoutSource;
   });
 
   it('provides Option+bracket shortcuts for previous and next session', () => {
@@ -53,10 +64,16 @@ describe('keyboard shortcuts', () => {
     // getShortcutRegistry() + matchesShortcutEvent() so overrides and per-shortcut
     // disables (App Settings → Shortcuts) actually take effect.
     expect(appSource).not.toContain('const SHORTCUTS = [');
-    expect(appSource).toContain('const SHORTCUT_ACTIONS = {');
+    // Downstream shape: the action indirection lives in runShortcutAction(),
+    // not upstream's inline SHORTCUT_ACTIONS map. Same registry dispatch.
+    expect(appSource).toContain('runShortcutAction(shortcut)');
     expect(appSource).toContain('for (const shortcut of this.getShortcutRegistry())');
     expect(appSource).toContain('if (this.matchesShortcutEvent(e, shortcut))');
-    expect(appSource).toContain('if (shortcut.disabled || !shortcut.action) continue;');
+    // Downstream enforces the per-shortcut disable inside matchesShortcutEvent()
+    // rather than in the dispatch loop — same effect, one place.
+    expect(appSource).toContain(
+      'if (!shortcut || shortcut.disabled || !Array.isArray(shortcut.bindings)) return false;'
+    );
   });
 
   it('keeps the interrupt when Ctrl+C copies a selection (#211)', () => {

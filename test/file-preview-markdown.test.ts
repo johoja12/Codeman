@@ -31,6 +31,15 @@
  *     hard-wrapped in the source is one paragraph, while the Response Viewer
  *     keeps a <br> per newline.
  *
+ * Downstream (Bitbucket fork) note: the File Viewer here is the downstream
+ * document viewer (metadata route first, then the raw text, rendered by
+ * `_renderFilePreviewBody`, with outline/reading view/comments/Changes), so the
+ * fetch stub answers the routes that viewer actually calls and the assertions
+ * look the rendered document up by class instead of as the body's first child
+ * (it sits inside `.document-preview-layout`). Rule 3 is restated: markdown
+ * and text are read whole through the raw route, so there is no line cap to
+ * raise for markdown.
+ *
  * Loaded via `vm` with a jsdom document injected (the technique from
  * response-viewer-file-links.test.ts): constants.js + panels-ui.js only, with
  * the app.js markdown pipeline stubbed to a fixed fragment, except for rule 7,
@@ -79,19 +88,42 @@ function jsonResponse(body: unknown) {
   return { ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) };
 }
 
-/** Answer file-content like the route does: text as JSON, an image as metadata. */
+function textResponse(text: string) {
+  return { ok: true, status: 200, text: async () => text, json: async () => JSON.parse(text) };
+}
+
+/**
+ * Answer the routes the downstream viewer calls: the attachment-history list
+ * (navigation), an attachment's metadata and raw bytes, file-content metadata
+ * (text/markdown typed, as the route does) and the workspace raw route.
+ */
 function fetchStub(url: string) {
+  const { pathname, searchParams } = new URL(url, 'http://x');
+  if (/\/attachments$/.test(pathname)) return jsonResponse({ success: true, data: { items: [] } });
   // An attachment's by-id raw route answers the bytes themselves.
-  if (url.includes('/attachments/')) return { ok: true, status: 200, text: async () => MD_CONTENT };
-  const path = decodeURIComponent(new URL(url, 'http://x').searchParams.get('path') || '');
+  if (pathname.endsWith('/raw')) return textResponse(MD_CONTENT);
+  const attachment = pathname.match(/\/attachments\/([^/]+)$/);
+  if (attachment) {
+    return jsonResponse({
+      success: true,
+      data: {
+        type: 'markdown',
+        url: `/api/sessions/s1/attachments/${attachment[1]}/raw`,
+        size: MD_CONTENT.length,
+        extension: 'md',
+      },
+    });
+  }
+  const path = decodeURIComponent(searchParams.get('path') || '');
   const ext = path.split('.').pop() || '';
+  const content = ext === 'md' ? MD_CONTENT : TXT_CONTENT;
+  if (pathname.endsWith('/file-raw')) return textResponse(content);
   if (ext === 'png') {
     return jsonResponse({
       success: true,
       data: { type: 'image', url: `/file-raw?path=${path}`, size: 5, extension: ext },
     });
   }
-  const content = ext === 'md' ? MD_CONTENT : TXT_CONTENT;
   if (url.includes('edit=1')) {
     return jsonResponse({
       success: true,
@@ -100,9 +132,23 @@ function fetchStub(url: string) {
   }
   return jsonResponse({
     success: true,
-    data: { path, content, totalLines: 3, size: content.length, truncated: false, extension: ext, editable: true },
+    data: {
+      path,
+      content,
+      totalLines: 3,
+      size: content.length,
+      truncated: false,
+      extension: ext,
+      type: ext === 'md' ? 'markdown' : 'text',
+      url: `/api/sessions/s1/file-raw?path=${encodeURIComponent(path)}`,
+      editable: true,
+    },
   });
 }
+
+/** The rendered markdown document and the plain-text <pre>, wherever the viewer nests them. */
+const mdDoc = (body: HTMLElement) => body.querySelector('.file-preview-md') as HTMLElement;
+const textPre = (body: HTMLElement) => body.querySelector('pre.file-preview-text') as HTMLElement;
 
 /** The file-preview overlay's elements, as index.html ships them. */
 function mountPreviewDom() {
@@ -133,6 +179,12 @@ function loadApp(prefs: Record<string, string> = {}) {
     MobileDetection: {},
     setTimeout,
     clearTimeout,
+    // The downstream viewer polls an open preview for rewrites (COD-58) and
+    // walks text nodes for comment highlights (COD-95).
+    setInterval: vi.fn(() => 0),
+    clearInterval: vi.fn(),
+    requestAnimationFrame: vi.fn(),
+    NodeFilter: dom.window.NodeFilter,
     confirm: () => true,
     fetch: fetchMock,
   });
@@ -170,14 +222,14 @@ describe('file viewer rendered markdown', () => {
 
     await app.openFilePreview('docs/README.md', 's1');
 
-    const doc = body.firstElementChild as HTMLElement;
+    const doc = mdDoc(body);
     expect(doc.matches('.rv-text.file-preview-md[data-i18n-skip]')).toBe(true);
     expect(doc.querySelector('h1')?.textContent).toBe('Title');
     // A file, not a chat message: source newlines inside a paragraph are not breaks.
     expect(app._renderMarkdown).toHaveBeenCalledWith(MD_CONTENT, { breaks: false });
     // Identity, not deep equality: DOM nodes are compared by reference here.
     expect(app._linkifyFilePaths.mock.calls[0][0]).toBe(doc);
-    expect(app._bindResponseViewerInteractions.mock.calls[0][0]).toBe(body);
+    expect(app._bindResponseViewerInteractions.mock.calls[0][0]).toBe(doc);
     // The source stays what Copy copies.
     expect(app.filePreviewContent).toBe(MD_CONTENT);
     // MD is the only toggle that applies to a rendered document; Edit still offered.
@@ -188,15 +240,15 @@ describe('file viewer rendered markdown', () => {
     expect(document.getElementById('filePreviewEditBtn')!.hidden).toBe(false);
   });
 
-  it('fetches the route ceiling for markdown and the 500-line cap for other text', async () => {
+  it('reads markdown and other text whole through the raw route, so no document is cut at the preview cap', async () => {
     const { app, fetchMock } = loadApp();
 
     await app.openFilePreview('docs/README.md', 's1');
     await app.openFilePreview('notes.txt', 's1');
 
-    const urls = fetchMock.mock.calls.map((c) => c[0]);
-    expect(urls[0]).toContain('lines=10000');
-    expect(urls[1]).toContain('lines=500');
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls).toContain(`/api/sessions/s1/file-raw?path=${encodeURIComponent('docs/README.md')}`);
+    expect(urls).toContain(`/api/sessions/s1/file-raw?path=${encodeURIComponent('notes.txt')}`);
   });
 
   it('rebases relative images and links onto the document directory and leaves the rest alone', async () => {
@@ -270,7 +322,7 @@ describe('file viewer rendered markdown', () => {
     // directory is unknown, so `img/a.png` must not become the workspace root's.
     await app.openFilePreview('report.md', 's1', 'att-1');
 
-    expect(fetchMock.mock.calls[0][0]).toContain('/attachments/att-1/raw');
+    expect(fetchMock.mock.calls.map((c) => String(c[0]))).toContain('/api/sessions/s1/attachments/att-1/raw');
     expect(body.innerHTML).not.toContain('file-raw');
     // Relative and root-relative images are their alt text, as a text node.
     for (const alt of ['Alt A', 'space', 'raw', 'bad', 'root']) {
@@ -314,9 +366,10 @@ describe('file viewer rendered markdown', () => {
     const { app, body, btn, fetchMock, store } = loadApp();
 
     await app.openFilePreview('docs/README.md', 's1');
-    app.toggleFilePreviewMd();
+    const fetchesAfterOpen = fetchMock.mock.calls.length;
+    await app.toggleFilePreviewMd();
 
-    const pre = body.firstElementChild as HTMLElement;
+    const pre = textPre(body);
     expect(pre.matches('pre.file-preview-text')).toBe(true);
     expect(pre.querySelectorAll('.fp-line')).toHaveLength(MD_CONTENT.split('\n').length);
     expect(pre.textContent).toBe(MD_CONTENT);
@@ -325,10 +378,10 @@ describe('file viewer rendered markdown', () => {
     expect(btn.lines.hidden).toBe(false);
     expect(btn.wrap.hidden).toBe(false);
 
-    app.toggleFilePreviewMd();
-    expect((body.firstElementChild as HTMLElement).matches('.file-preview-md')).toBe(true);
+    await app.toggleFilePreviewMd();
+    expect(mdDoc(body)).not.toBeNull();
     expect(store.get('codeman:filePreviewMdRendered')).toBe('1');
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(fetchesAfterOpen);
   });
 
   it('opens as source when the device pref says so', async () => {
@@ -336,7 +389,8 @@ describe('file viewer rendered markdown', () => {
 
     await app.openFilePreview('docs/README.md', 's1');
 
-    expect((body.firstElementChild as HTMLElement).matches('pre.file-preview-text')).toBe(true);
+    expect(textPre(body)).not.toBeNull();
+    expect(mdDoc(body)).toBeNull();
     expect(btn.md.hidden).toBe(false);
     expect(btn.md.getAttribute('aria-pressed')).toBe('false');
   });
@@ -348,7 +402,7 @@ describe('file viewer Lines and Wrap toggles', () => {
 
     await app.openFilePreview('notes.txt', 's1');
 
-    const pre = body.firstElementChild as HTMLElement;
+    const pre = textPre(body);
     expect(pre.matches('pre.file-preview-text.wrap:not(.show-lines)')).toBe(true);
     expect(pre.textContent).toBe(TXT_CONTENT);
     expect(btn.md.hidden).toBe(true);
@@ -363,7 +417,7 @@ describe('file viewer Lines and Wrap toggles', () => {
     expect(store.get('codeman:filePreviewWrap')).toBe('0');
     expect(btn.wrap.getAttribute('aria-pressed')).toBe('false');
     // Same element, no re-render: the counter gutter is CSS, not text.
-    expect(body.firstElementChild).toBe(pre);
+    expect(textPre(body)).toBe(pre);
     expect(pre.textContent).toBe(TXT_CONTENT);
   });
 
@@ -422,12 +476,23 @@ function loadShippingApp(content: string) {
     marked: loadCommonJs('vendor/marked.min.js'),
     MobileDetection: {},
     confirm: () => true,
-    fetch: vi.fn(async () =>
-      jsonResponse({
+    fetch: vi.fn(async (url: string) => {
+      const { pathname } = new URL(url, 'http://x');
+      if (pathname.endsWith('/file-raw')) return textResponse(content);
+      if (pathname.endsWith('/attachments')) return jsonResponse({ success: true, data: { items: [] } });
+      return jsonResponse({
         success: true,
-        data: { content, totalLines: 2, size: content.length, truncated: false, extension: 'md' },
-      })
-    ),
+        data: {
+          content,
+          totalLines: 2,
+          size: content.length,
+          truncated: false,
+          extension: 'md',
+          type: 'markdown',
+          url: '/api/sessions/s1/file-raw?path=docs%2FREADME.md',
+        },
+      });
+    }),
   });
   vm.runInContext(
     `${constantsJs}\n${publicFile('app.js')}\n${panelsJs}\nglobalThis.__CodemanApp = CodemanApp;`,

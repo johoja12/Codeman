@@ -10,6 +10,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   SessionWaitRegistry,
   WaitCapacityError,
+  approvalsAvailableForMode,
   hooksAvailableForMode,
   parseWaitSignals,
   resolveWaitSignals,
@@ -115,6 +116,50 @@ describe('hooksAvailableForMode', () => {
     for (const mode of ['opencode', 'codex', 'gemini', 'antigravity'] as const) {
       expect(hooksAvailableForMode(mode)).toBe(false);
     }
+  });
+});
+
+describe('approvalsAvailableForMode', () => {
+  it('accepts Claude, Codex and OpenCode without widening hook-only wait support', () => {
+    expect(approvalsAvailableForMode('claude')).toBe(true);
+    expect(approvalsAvailableForMode('codex')).toBe(true);
+    expect(approvalsAvailableForMode('opencode')).toBe(true);
+    expect(hooksAvailableForMode('codex')).toBe(false);
+  });
+
+  it('rejects modes that do not have approval ingestion', () => {
+    for (const mode of ['shell', 'gemini', 'antigravity', 'pi'] as const) {
+      expect(approvalsAvailableForMode(mode)).toBe(false);
+    }
+  });
+
+  /**
+   * COD-416: the answer moved from a three-mode `||` chain to `capabilities.approvals`.
+   * This pins EVERY stock mode rather than the four the older cases sampled, because the
+   * conversion is only safe if it is byte-identical — and the three modes the samples
+   * missed (grok, deepseek, omp) are exactly the ones added after the chain was written,
+   * i.e. the ones a stale hand-maintained list would have got wrong.
+   */
+  it('answers identically to the pre-registry mode list for every stock CLI', () => {
+    const expected: Record<string, boolean> = {
+      claude: true,
+      codex: true,
+      opencode: true,
+      shell: false,
+      gemini: false,
+      antigravity: false,
+      pi: false,
+      grok: false,
+      deepseek: false,
+      omp: false,
+    };
+    for (const [mode, want] of Object.entries(expected)) {
+      expect(approvalsAvailableForMode(mode as SessionMode), `mode ${mode}`).toBe(want);
+    }
+  });
+
+  it('treats an unregistered mode as having no approval ingestion', () => {
+    expect(approvalsAvailableForMode('not-a-cli' as SessionMode)).toBe(false);
   });
 });
 

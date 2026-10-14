@@ -15,6 +15,20 @@ const root = resolve(import.meta.dirname, '..');
  * runner (`test:browser`, `test:perf`, `test:mobile`). See config/test-suites.ts.
  */
 export default defineConfig({
+  // Vite externalizes `node:` builtins for any test declaring a non-node
+  // environment, which breaks the readFileSync-based frontend tests that build
+  // their own JSDOM window (they fail with "No such built-in module: node:").
+  // Marking them external here keeps those files runnable under both configs.
+  plugins: [
+    {
+      name: 'codeman:node-builtins-in-client',
+      enforce: 'pre' as const,
+      resolveId(id: string) {
+        if (id.startsWith('node:')) return { id, external: true };
+        return null;
+      },
+    },
+  ],
   test: {
     root,
     globals: true,

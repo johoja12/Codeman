@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { ApiErrorCode, createErrorResponse } from '../src/types.js';
+import { ApiErrorCode, createErrorResponse, createSuccessResponse } from '../src/types.js';
 
 describe('API Response Structures', () => {
   describe('SessionState Structure', () => {

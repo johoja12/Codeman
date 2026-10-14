@@ -129,7 +129,7 @@ describe('RalphLoop', () => {
     vi.useRealTimers();
   });
 
-  describe('reschedule loop (regression)', () => {
+  describe('reschedule loop (COD-49 regression)', () => {
     // tick() is the only path that calls setRalphLoopState with lastCheckAt and
     // no status field; start() carries status:'running', stop() status:'stopped'.
     const countTicks = () =>
@@ -152,9 +152,9 @@ describe('RalphLoop', () => {
       await new Promise((resolve) => setTimeout(resolve, 80)); // ~16 poll intervals
       loop.stop();
 
-      // The bug: the loopTimer handle is never nulled in the setTimeout callback,
-      // so the `loopTimer === null` reschedule guard is false after the first fire
-      // and the loop dies at exactly 2 ticks. Fixed -> many ticks.
+      // Bug (COD-49): loopTimer handle is never nulled in the setTimeout
+      // callback, so the `loopTimer === null` reschedule guard is false after
+      // the first fire and the loop dies at exactly 2 ticks. Fixed → many ticks.
       expect(countTicks()).toBeGreaterThanOrEqual(3);
     });
   });

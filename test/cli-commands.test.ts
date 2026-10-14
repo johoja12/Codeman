@@ -11,7 +11,7 @@
 
 import { describe, it, expect } from 'vitest';
 import type { Command } from 'commander';
-import { program } from '../src/cli.js';
+import { formatSessionRows, program, summarizeStatus } from '../src/cli.js';
 
 /** Resolve a subcommand the way commander does, by name or alias. */
 function find(parent: Command, name: string): Command | undefined {
@@ -185,6 +185,18 @@ describe('registered arguments', () => {
     const task = find(program, 'task')!;
     expect(find(task, 'status')!.registeredArguments.map((a) => a.name())).toEqual(['id']);
     expect(find(task, 'remove')!.registeredArguments.map((a) => a.name())).toEqual(['id']);
+  });
+});
+
+describe('CLI output formatting', () => {
+  it('formats and counts effective agent activity from live payloads', () => {
+    const sessions = [
+      { id: 'waiting1', status: 'idle', activityStatus: 'waiting_agents', workingDir: '/repo/a' },
+      { id: 'checking', status: 'idle', activityStatus: 'checking_agents', workingDir: '/repo/b' },
+    ];
+    expect(formatSessionRows(sessions)).toContain('WAITING ON AGENTS');
+    expect(formatSessionRows(sessions)).toContain('CHECKING AGENTS');
+    expect(summarizeStatus(sessions)).toMatchObject({ waitingAgents: 1, checkingAgents: 1, idle: 0 });
   });
 });
 

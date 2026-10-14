@@ -28,6 +28,7 @@ import {
 import { resolveClaudeModeForUsername } from '../../user-store.js';
 import { SseEvent } from '../sse-events.js';
 import type { SessionPort, EventPort, ConfigPort, InfraPort } from '../ports/index.js';
+import { verifyClaudeSessionStartHookCapability } from '../../hooks-config.js';
 
 export function registerPlanRoutes(app: FastifyInstance, ctx: SessionPort & EventPort & ConfigPort & InfraPort): void {
   // ═══════════════════════════════════════════════════════════════
@@ -145,6 +146,8 @@ NOW: Generate the implementation plan for the task above. Think step by step.`;
       claudeMode: planClaudeMode,
       allowedTools: planClaudeModeConfig.allowedTools,
       owner: planOwner,
+      checkpointEnabled: await ctx.getCheckpointDefaultEnabled(),
+      claudeSessionStartHookReady: await verifyClaudeSessionStartHookCapability('claude', process.cwd(), false),
     });
 
     // Use configured model for plan generation, falling back to opus
@@ -272,6 +275,7 @@ NOW: Generate the implementation plan for the task above. Think step by step.`;
       claudeMode: detailedClaudeMode,
       owner: detailedOwner,
       allowedTools: detailedClaudeModeConfig.allowedTools,
+      checkpointEnabled: await ctx.getCheckpointDefaultEnabled(),
     });
 
     // Store orchestrator for potential cancellation via API (not on disconnect)

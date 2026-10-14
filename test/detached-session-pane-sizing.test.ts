@@ -46,7 +46,7 @@ function loadTerminalMixin(): Record<string, unknown> {
     requestAnimationFrame: vi.fn(),
     CodemanApp: FakeCodemanApp,
     window: { addEventListener: vi.fn(), removeEventListener: vi.fn(), innerWidth: 1600 },
-    document: { addEventListener: vi.fn() },
+    document: { addEventListener: vi.fn(), visibilityState: 'visible' },
     fetch: (...args: unknown[]) => currentFetch(...args),
   });
   vm.runInContext(source, context);
@@ -76,11 +76,20 @@ function makeApp(overrides: Record<string, unknown> = {}) {
     getTerminalDimensions: () => ({ cols: 120, rows: 40 }),
     terminal: { cols: 120, rows: 40, resize: vi.fn() },
     fitAddon: { fit: vi.fn() },
+    activeSessionId: SESSION,
     detachedSessions: new Set<string>(),
     isSoloWindow: false,
     _lastResizeDims: null as { cols: number; rows: number } | null,
-    _wsReady: false,
-    _wsSessionId: null as string | null,
+    // ⚠️ Downstream resizes over the WEBSOCKET, never HTTP. Its sendResize has no
+    // fetch path at all: "Viewer geometry is ownership-sensitive. Only the sizing
+    // token attached to this socket may resize the shared PTY; HTTP has no
+    // equivalent identity and therefore cannot be a safe fallback." Upstream's
+    // version posts, so its assertions were written against fetch. Reinstating an
+    // HTTP resize to satisfy them would undo that ownership guarantee, so these
+    // tests assert the WS send instead — the same behaviour on this transport.
+    _wsReady: true,
+    _wsSessionId: SESSION,
+    _ws: { send: vi.fn() },
     ...overrides,
   } as Record<string, unknown> & { sendResize: (id: string, o?: object) => Promise<boolean> };
   return { app, fetchMock };
@@ -108,20 +117,20 @@ describe('detached sessions own their pane size', () => {
   });
 
   it('the solo window still sizes the session it displays', async () => {
-    const { app, fetchMock } = makeApp({ isSoloWindow: true });
+    const { app } = makeApp({ isSoloWindow: true });
     (app.detachedSessions as Set<string>).add(SESSION);
     await app.sendResize(SESSION);
 
     // The popup is the owner, so being marked detached must not stop it.
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((app._ws as { send: ReturnType<typeof vi.fn> }).send).toHaveBeenCalledTimes(1);
     expect((app.fitAddon as { fit: ReturnType<typeof vi.fn> }).fit).toHaveBeenCalled();
   });
 
   it('the dashboard resizes a session that is not detached', async () => {
-    const { app, fetchMock } = makeApp();
+    const { app } = makeApp();
     await app.sendResize(SESSION);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect((app._ws as { send: ReturnType<typeof vi.fn> }).send).toHaveBeenCalledTimes(1);
   });
 });
 

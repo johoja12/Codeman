@@ -191,236 +191,90 @@ afterEach(() => {
   document.querySelectorAll('.tab-rail-action-menu').forEach((menu) => menu.remove());
 });
 
-describe('the Focus section', () => {
-  it('draws shortcuts in stored order in its own section above the grouped list', () => {
-    makeApp();
-    const host = section()!;
-    expect(host.hidden).toBe(false);
-    expect(host.parentElement!.id).toBe('tabRail');
-    expect(host.nextElementSibling!.id).toBe('sessionTabs');
-    expect(shortcutKeys()).toEqual(['session:s2', 'webview:w1', 'session:s3']);
-    expect(shortcuts().map((item) => item.textContent)).toEqual(['Two <b>', 'Dashboard', 'Three']);
-    expect(document.getElementById('tabFocusToggle')!.textContent).toBe('Focus3');
-    expect(document.getElementById('tabFocusList')!.getAttribute('aria-labelledby')).toBe('tabFocusTitle');
+describe('the Focus section uses the fork rail projection', () => {
+  const focusGroup = () => document.querySelector<HTMLElement>('[data-tab-group-id=":focus"]');
+  const focusRows = () => [...(focusGroup()?.querySelectorAll<HTMLElement>('.session-tab') || [])];
+  const focusIds = () => focusRows().map((item) => item.dataset.webviewId || item.dataset.id);
+
+  it('draws focused sessions and web tabs first, once each, with the stored group retained', () => {
+    const app = makeApp();
+    expect(focusIds()).toEqual(['s2', 'w1', 's3']);
+    expect(rows()).toEqual(['s2', 'w1', 's3', 's1']);
+    expect(document.querySelectorAll('[data-id="s2"]')).toHaveLength(1);
+    expect(app.tabLayout.groups[0].refs.map((ref: Ref) => ref.id)).toEqual(['s2', 'w1']);
+    expect(section()?.hidden ?? true).toBe(true);
   });
 
-  it('leaves the rows, Alt+N badges, tree and drag exactly as without Focus', () => {
-    const plainApp = makeApp({
-      ...grouped(),
-      groups: grouped().groups.map((g) => ({ ...g, refs: g.refs.map(({ focus: _f, ...ref }) => ref) })),
-      ungrouped: [s('s1'), s('s3')],
-    });
-    const before = { rows: rows(), badges: badges(), html: document.getElementById('sessionTabs')!.innerHTML };
-    expect(section()?.hidden ?? true).toBe(true);
-    plainApp._tabLayoutEditor?.dispose();
+  it('uses the rail tree keyboard model and one roving tab stop', () => {
     makeApp();
-    expect(rows()).toEqual(before.rows);
-    expect(badges()).toEqual(before.badges);
-    expect(document.getElementById('sessionTabs')!.innerHTML).toBe(before.html);
-    // Shortcuts are not rows and not tree items.
-    expect(
-      document.querySelectorAll('#tabFocus .session-tab, #tabFocus [role="treeitem"], #tabFocus .tab-number')
-    ).toHaveLength(0);
     expect(document.getElementById('sessionTabs')!.getAttribute('role')).toBe('tree');
     expect(document.querySelectorAll('#sessionTabs [role="treeitem"][tabindex="0"]')).toHaveLength(1);
-    // One tab stop in the Focus list too, and no id appears twice on the page.
-    expect(shortcuts().filter((item) => item.tabIndex === 0)).toHaveLength(1);
-    const ids = [...document.querySelectorAll('[id]')].map((el) => el.id);
+    const ids = [...document.querySelectorAll('[id]')].map((element) => element.id);
     expect(ids.length).toBe(new Set(ids).size);
-    expect(shortcuts().every((item) => item.getAttribute('draggable') !== 'true')).toBe(true);
+    const first = focusRows()[0];
+    first.focus();
+    key(first, 'ArrowDown');
+    expect(document.activeElement).toBe(focusRows()[1]);
   });
 
-  it('shows above the FLAT rail too, which stays a plain tablist', () => {
+  it('shows Focus even without named groups and is absent on a horizontal strip', () => {
     makeApp(flat());
-    expect(document.getElementById('sessionTabs')!.getAttribute('role')).toBe('tablist');
-    expect(rows()).toEqual(['s1', 's2', 's3', 'w1']);
-    expect(shortcutKeys()).toEqual(['session:s2']);
-    expect(section()!.hidden).toBe(false);
-  });
-
-  it('is absent off the vertical rail and with no layout', () => {
+    expect(focusIds()).toEqual(['s2']);
     makeApp(grouped(), 'horizontal');
-    expect(section()?.hidden ?? true).toBe(true);
-    expect(shortcuts()).toHaveLength(0);
+    expect(focusGroup()).toBeNull();
     makeApp(null);
-    expect(section()?.hidden ?? true).toBe(true);
+    expect(focusGroup()).toBeNull();
   });
 
-  it('a click selects the tab, and the selected tab shortcut is aria-current', () => {
+  it('carries session status and alerts on the single Focus row', () => {
     const app = makeApp();
-    expect(shortcuts().map((item) => item.getAttribute('aria-current'))).toEqual(['true', 'false', 'false']);
-    shortcuts()[2].click();
-    expect(app.selectSession).toHaveBeenCalledWith('s3', { forceReload: true });
-    shortcuts()[1].click();
-    expect(app.openWebview).toHaveBeenCalledWith('w1');
-    app.activeSessionId = 's3';
-    app._updateActiveTabImmediate('s3');
-    expect(shortcuts().map((item) => item.getAttribute('aria-current'))).toEqual(['false', 'false', 'true']);
-    app.activeWebviewId = 'w1';
-    app._updateActiveWebviewTab();
-    expect(shortcuts().map((item) => item.getAttribute('aria-current'))).toEqual(['false', 'true', 'false']);
-  });
-
-  it('carries the tab status and alert onto the shortcut', () => {
-    const app = makeApp();
-    expect(shortcuts()[0].querySelector('.tab-status')!.className).toBe('tab-status busy');
+    expect(row('s2').querySelector('.tab-status')!.classList.contains('busy')).toBe(true);
     app.tabAlerts.set('s3', 'action');
     app._renderSessionTabsImmediate();
-    expect(shortcuts()[2].classList.contains('tab-alert-action')).toBe(true);
+    expect(row('s3').classList.contains('tab-alert-action')).toBe(true);
   });
 
-  it('a closed session drops out harmlessly, and the section hides when nothing is left', () => {
+  it('drops a closed session and hides an empty Focus section', () => {
     const app = makeApp(flat());
     app.sessions.delete('s2');
     app.sessionOrder = ['s1', 's3'];
-    app._renderSessionTabsImmediate();
-    expect(shortcuts()).toHaveLength(0);
-    expect(section()!.hidden).toBe(true);
+    app._fullRenderSessionTabs();
+    expect(focusGroup()).toBeNull();
   });
 
-  it('repaints when another device changes a flag (not a structural change)', () => {
-    const app = makeApp();
-    app._applyTabLayout({ ...grouped(9), ungrouped: [s('s1', { focus: true }), s('s3')] });
-    expect(shortcutKeys()).toEqual(['session:s2', 'webview:w1', 'session:s1']);
+  it('adopts another device focus flags without duplicating rows', () => {
+    const app = makeApp(flat());
+    app._applyTabLayout({ ...flat(9), ungrouped: [s('s1', { focus: true }), s('s2'), s('s3'), w('w1')] });
+    expect(focusIds()).toEqual(['s1']);
+    expect(rows()).toHaveLength(4);
   });
-});
 
-describe('adding and removing', () => {
-  it('row menu offers Add to Focus, and choosing it PUTs the whole layout with the flag', async () => {
+  it('offers one Focus menu entry and sends one semantic operation to add or remove it', async () => {
     const puts = installFetch();
-    const app = makeApp();
+    const app = makeApp(flat());
     app.openTabRailActionMenu({ preventDefault() {}, stopPropagation() {}, currentTarget: row('s1') }, 's1');
-    expect(menuLabels()[1]).toBe('Add to Focus');
+    expect(menuLabels().filter((label) => label === 'Add to Focus')).toHaveLength(1);
     clickMenu('Add to Focus');
-    // Optimistic, and the row did not move.
-    expect(shortcutKeys()).toEqual(['session:s2', 'webview:w1', 'session:s1', 'session:s3']);
-    expect(rows()).toEqual(['s2', 'w1', 's1', 's3']);
     await flush();
     expect(puts).toHaveLength(1);
-    expect(puts[0].baseVersion).toBe(8);
-    expect(focusedIn(puts[0].layout)).toEqual(['session:s2', 'webview:w1', 'session:s1', 'session:s3']);
+    expect(puts[0].operations).toEqual([{ type: 'setFocus', ref: s('s1'), focused: true }]);
+    app._tabLayoutEditor?.dispose();
   });
 
-  it('a focused row offers Remove from Focus', async () => {
-    const puts = installFetch();
-    const app = makeApp(flat());
+  it('offers Remove from Focus for a focused row', () => {
+    const app = makeApp();
     app.openTabRailActionMenu({ preventDefault() {}, stopPropagation() {}, currentTarget: row('s2') }, 's2');
-    expect(menuLabels()).toEqual(['Session options', 'Remove from Focus', 'Move to new group', 'Close session']);
-    clickMenu('Remove from Focus');
-    await flush();
-    expect(focusedIn(puts[0].layout)).toEqual([]);
-    expect(section()!.hidden).toBe(true);
+    expect(menuLabels()).toContain('Remove from Focus');
+    expect(menuLabels()).not.toContain('Add to Focus');
   });
 
-  it('the strip menu (horizontal) has no Focus entry', () => {
-    const app = makeApp(grouped(), 'horizontal');
-    app.openTabRailActionMenu({ preventDefault() {}, stopPropagation() {}, currentTarget: row('s1') }, 's1');
-    expect(menuLabels()).toEqual(['Session options', 'Close session']);
-  });
-
-  it('a web tab: right-click in the rail opens its menu with the Focus entry; elsewhere the native menu stays', async () => {
-    const puts = installFetch();
-    const app = makeApp(flat());
-    const web = document.querySelector<HTMLElement>('#sessionTabs .session-tab[data-webview-id="w1"]')!;
-    // The row markup wires the handler (inline handlers do not run under JSDOM;
-    // the Chromium test right-clicks for real).
-    expect(web.getAttribute('oncontextmenu')).toBe('app.handleWebviewTabContextMenu(event, "w1")');
-    const event = new win.MouseEvent('contextmenu', { bubbles: true, cancelable: true });
-    Object.defineProperty(event, 'currentTarget', { value: web });
-    app.handleWebviewTabContextMenu(event, 'w1');
-    expect(event.defaultPrevented).toBe(true);
-    expect(menuLabels()).toEqual(['Web tab settings', 'Add to Focus', 'Move to new group']);
-    clickMenu('Add to Focus');
-    await flush();
-    expect(focusedIn(puts[0].layout)).toEqual(['session:s2', 'webview:w1']);
-
-    const strip = makeApp(flat(), 'horizontal');
-    const native = new win.MouseEvent('contextmenu', { bubbles: true, cancelable: true });
-    expect(strip.handleWebviewTabContextMenu(native, 'w1')).toBe(false);
-    expect(native.defaultPrevented).toBe(false);
-    expect(document.querySelectorAll('.tab-rail-action-menu')).toHaveLength(0);
-  });
-
-  it('right-click on a shortcut offers Remove from Focus only', async () => {
-    const puts = installFetch();
-    makeApp();
-    shortcuts()[0].dispatchEvent(new win.MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
-    expect(menuLabels()).toEqual(['Remove from Focus']);
-    clickMenu('Remove from Focus');
-    await flush();
-    expect(focusedIn(puts[0].layout)).toEqual(['webview:w1', 'session:s3']);
-    // The real row is still there, in its group.
-    expect(row('s2').closest('.tab-layout-group')!.getAttribute('data-tab-group-id')).toBe('gx');
-  });
-});
-
-describe('collapse and keyboard', () => {
-  it('collapse is per-device, survives a reload, and is not a group id', () => {
+  it('persists collapse per device and keeps the active focused row visible', () => {
     const app = makeApp();
-    document.getElementById('tabFocusToggle')!.click();
-    expect(document.getElementById('tabFocusList')!.hidden).toBe(true);
-    expect(document.getElementById('tabFocusToggle')!.getAttribute('aria-expanded')).toBe('false');
-    expect(win.localStorage.getItem('codeman:tab-focus-collapsed')).toBe('true');
-    expect(JSON.parse(win.localStorage.getItem('codeman:tab-groups-collapsed') || '[]')).toEqual([]);
-    expect(app.collapsedTabGroupIds.size).toBe(0);
+    app.toggleFocusGroupCollapsed(true);
+    expect(win.localStorage.getItem('codeman:focus-group-collapsed')).toBe('true');
+    expect(focusIds()).toEqual(['s2']);
+    expect(win.localStorage.getItem('codeman:tab-groups-collapsed')).toBeNull();
     makeApp();
-    expect(document.getElementById('tabFocusList')!.hidden).toBe(true);
-    document.getElementById('tabFocusToggle')!.click();
-    expect(document.getElementById('tabFocusList')!.hidden).toBe(false);
-  });
-
-  it('Up/Down/Home/End walk the shortcuts with one tab stop; the tree is untouched', () => {
-    makeApp();
-    const treeStop = document.querySelector('#sessionTabs [role="treeitem"][tabindex="0"]');
-    shortcuts()[0].focus();
-    key(shortcuts()[0], 'ArrowDown');
-    expect(document.activeElement).toBe(shortcuts()[1]);
-    key(shortcuts()[1], 'End');
-    expect(document.activeElement).toBe(shortcuts()[2]);
-    key(shortcuts()[2], 'ArrowDown');
-    expect(document.activeElement).toBe(shortcuts()[0]);
-    key(shortcuts()[0], 'ArrowUp');
-    expect(document.activeElement).toBe(shortcuts()[2]);
-    expect(shortcuts().map((item) => item.tabIndex)).toEqual([-1, -1, 0]);
-    expect(document.querySelector('#sessionTabs [role="treeitem"][tabindex="0"]')).toBe(treeStop);
-  });
-
-  it('keeps keyboard focus on the same shortcut across a repaint', () => {
-    const app = makeApp();
-    shortcuts()[1].focus();
-    app.tabAlerts.set('s2', 'idle');
-    app._renderSessionTabsImmediate();
-    expect(document.activeElement).toBe(shortcuts()[1]);
-  });
-});
-
-describe('zh-CN', () => {
-  it('translates every Focus string, and leaves a shortcut name alone', () => {
-    const I18N = read('i18n.js');
-    const dom = new JSDOM('<!doctype html><html><body></body></html>', {
-      runScripts: 'outside-only',
-      url: 'http://localhost/',
-    });
-    vm.runInContext(I18N, dom.getInternalVMContext(), { filename: 'i18n.js' });
-    const api = (dom.window as any).CodemanI18n;
-    api.configure({ language: 'zh-CN' });
-    const strings = ['Focus', 'Add to Focus', 'Remove from Focus', 'Focus actions'];
-    const untranslated = strings.filter((text) => api.t(text) === text || /[A-Za-z]/.test(api.t(text)));
-    expect(untranslated).toEqual([]);
-    // Each is in the dictionary exactly once (a repeated key silently wins).
-    for (const text of strings) {
-      const keyPattern = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      expect((I18N.match(new RegExp(`^\\s*(?:'${keyPattern}'|${keyPattern}):`, 'gm')) ?? []).length).toBe(1);
-    }
-    // The section in the live DOM: heading translated, the user's names not.
-    makeApp();
-    dom.window.document.body.innerHTML = section()!.outerHTML;
-    api.start();
-    const translated = dom.window.document.getElementById('tabFocusTitle')!.textContent;
-    expect(translated).toBe('焦点');
-    expect(
-      [...dom.window.document.querySelectorAll('.tab-focus-item')].map((b: any) => b.getAttribute('aria-label'))
-    ).toEqual(['Two <b>', 'Dashboard', 'Three']);
-    dom.window.close();
+    expect(focusIds()).toEqual(['s2']);
   });
 });

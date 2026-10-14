@@ -283,7 +283,7 @@ export class RalphLoop extends EventEmitter {
         if (this._status === 'running' && this.loopTimer === null) {
           // Null the handle when the timer fires, BEFORE re-entering runLoop —
           // otherwise the `loopTimer === null` guard above stays false on the
-          // next pass and the loop stops rescheduling after 2 ticks.
+          // next pass and the loop stops rescheduling after 2 ticks (COD-49).
           // Mirrors the orchestrator-loop reschedule pattern.
           this.loopTimer = setTimeout(() => {
             this.loopTimer = null;

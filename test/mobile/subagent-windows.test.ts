@@ -17,15 +17,21 @@ const standardPhone = REPRESENTATIVE_DEVICES['standard-phone']; // iPhone 14 Pro
  * Inject a mock subagent window into the page DOM.
  * Registers it with app.subagentWindows if the app object is available.
  */
-async function injectMockSubagentWindow(page: Page, id: string, _index: number): Promise<void> {
-  await page.evaluate(({ windowId }) => {
-    const el = document.createElement('div');
-    el.className = 'subagent-window';
-    el.dataset.agentId = windowId;
-    el.innerHTML = `
+async function injectMockSubagentWindow(
+  page: Page,
+  agentKey: string,
+  _index: number,
+  agentId = agentKey
+): Promise<void> {
+  await page.evaluate(
+    ({ windowKey, displayId }) => {
+      const el = document.createElement('div');
+      el.className = 'subagent-window';
+      el.dataset.agentKey = windowKey;
+      el.innerHTML = `
       <div class="subagent-header">
         <span class="agent-icon">A</span>
-        <span class="agent-id">${windowId}</span>
+        <span class="agent-id">${displayId}</span>
         <span class="model-badge">sonnet</span>
         <span class="agent-status">active</span>
         <button class="minimize-btn">-</button>
@@ -34,17 +40,19 @@ async function injectMockSubagentWindow(page: Page, id: string, _index: number):
         <div class="activity-content">Working on task...</div>
       </div>
     `;
-    document.body.appendChild(el);
+      document.body.appendChild(el);
 
-    // Register with app if available
-    if ((window as any).app?.subagentWindows) {
-      (window as any).app.subagentWindows.set(windowId, {
-        element: el,
-        minimized: false,
-        hidden: false,
-      });
-    }
-  }, { windowId: id });
+      // Register with app if available
+      if ((window as any).app?.subagentWindows) {
+        (window as any).app.subagentWindows.set(windowKey, {
+          element: el,
+          minimized: false,
+          hidden: false,
+        });
+      }
+    },
+    { windowKey: agentKey, displayId: agentId }
+  );
 }
 
 /**
@@ -52,7 +60,7 @@ async function injectMockSubagentWindow(page: Page, id: string, _index: number):
  */
 async function clearMockSubagentWindows(page: Page): Promise<void> {
   await page.evaluate(() => {
-    document.querySelectorAll('.subagent-window').forEach(el => el.remove());
+    document.querySelectorAll('.subagent-window').forEach((el) => el.remove());
     if ((window as any).app?.subagentWindows) {
       (window as any).app.subagentWindows.clear();
     }
@@ -197,18 +205,21 @@ describe('Mobile Subagent Windows', () => {
         }
 
         // Manually position them from top (simulating relayoutMobileSubagentWindows)
-        await page.evaluate(({ headerHeight, stride }) => {
-          const windows = document.querySelectorAll('.subagent-window');
-          windows.forEach((win, idx) => {
-            const el = win as HTMLElement;
-            el.style.position = 'fixed';
-            el.style.top = `${headerHeight + 8 + idx * stride}px`;
-            el.style.bottom = 'auto';
-            el.style.left = '4px';
-            el.style.width = 'calc(100% - 8px)';
-            el.style.height = '110px';
-          });
-        }, { headerHeight: SUBAGENT.DEFAULT_HEADER_HEIGHT, stride: SUBAGENT.MOBILE_CARD_STRIDE });
+        await page.evaluate(
+          ({ headerHeight, stride }) => {
+            const windows = document.querySelectorAll('.subagent-window');
+            windows.forEach((win, idx) => {
+              const el = win as HTMLElement;
+              el.style.position = 'fixed';
+              el.style.top = `${headerHeight + 8 + idx * stride}px`;
+              el.style.bottom = 'auto';
+              el.style.left = '4px';
+              el.style.width = 'calc(100% - 8px)';
+              el.style.height = '110px';
+            });
+          },
+          { headerHeight: SUBAGENT.DEFAULT_HEADER_HEIGHT, stride: SUBAGENT.MOBILE_CARD_STRIDE }
+        );
 
         // Also try calling the real relayout function if available
         await triggerRelayout(page);
@@ -216,7 +227,7 @@ describe('Mobile Subagent Windows', () => {
         // Verify stacking order: each window's top should increase
         const positions = await page.evaluate(() => {
           const windows = document.querySelectorAll('.subagent-window');
-          return Array.from(windows).map(w => {
+          return Array.from(windows).map((w) => {
             const el = w as HTMLElement;
             const rect = el.getBoundingClientRect();
             return { top: rect.top, bottom: rect.bottom };
@@ -254,25 +265,28 @@ describe('Mobile Subagent Windows', () => {
         await page.waitForTimeout(WAIT.KEYBOARD_ANIMATION);
 
         // Position windows from bottom (simulating keyboard-visible layout)
-        await page.evaluate(({ toolbarOffset, stride }) => {
-          const windows = document.querySelectorAll('.subagent-window');
-          windows.forEach((win, idx) => {
-            const el = win as HTMLElement;
-            el.style.position = 'fixed';
-            el.style.top = 'auto';
-            el.style.bottom = `${toolbarOffset + idx * stride}px`;
-            el.style.left = '4px';
-            el.style.width = 'calc(100% - 8px)';
-            el.style.height = '110px';
-          });
-        }, { toolbarOffset: SUBAGENT.TOOLBAR_OFFSET, stride: SUBAGENT.MOBILE_CARD_STRIDE });
+        await page.evaluate(
+          ({ toolbarOffset, stride }) => {
+            const windows = document.querySelectorAll('.subagent-window');
+            windows.forEach((win, idx) => {
+              const el = win as HTMLElement;
+              el.style.position = 'fixed';
+              el.style.top = 'auto';
+              el.style.bottom = `${toolbarOffset + idx * stride}px`;
+              el.style.left = '4px';
+              el.style.width = 'calc(100% - 8px)';
+              el.style.height = '110px';
+            });
+          },
+          { toolbarOffset: SUBAGENT.TOOLBAR_OFFSET, stride: SUBAGENT.MOBILE_CARD_STRIDE }
+        );
 
         await triggerRelayout(page);
 
         // Verify bottom stacking: each window's bottom CSS value should increase
         const bottomValues = await page.evaluate(() => {
           const windows = document.querySelectorAll('.subagent-window');
-          return Array.from(windows).map(w => {
+          return Array.from(windows).map((w) => {
             const el = w as HTMLElement;
             return parseFloat(el.style.bottom) || 0;
           });
@@ -298,22 +312,25 @@ describe('Mobile Subagent Windows', () => {
           await injectMockSubagentWindow(page, `stack-toggle-${i}`, i);
         }
 
-        await page.evaluate(({ headerHeight, stride }) => {
-          const windows = document.querySelectorAll('.subagent-window');
-          windows.forEach((win, idx) => {
-            const el = win as HTMLElement;
-            el.style.position = 'fixed';
-            el.style.top = `${headerHeight + 8 + idx * stride}px`;
-            el.style.bottom = 'auto';
-            el.style.left = '4px';
-            el.style.width = 'calc(100% - 8px)';
-            el.style.height = '110px';
-          });
-        }, { headerHeight: SUBAGENT.DEFAULT_HEADER_HEIGHT, stride: SUBAGENT.MOBILE_CARD_STRIDE });
+        await page.evaluate(
+          ({ headerHeight, stride }) => {
+            const windows = document.querySelectorAll('.subagent-window');
+            windows.forEach((win, idx) => {
+              const el = win as HTMLElement;
+              el.style.position = 'fixed';
+              el.style.top = `${headerHeight + 8 + idx * stride}px`;
+              el.style.bottom = 'auto';
+              el.style.left = '4px';
+              el.style.width = 'calc(100% - 8px)';
+              el.style.height = '110px';
+            });
+          },
+          { headerHeight: SUBAGENT.DEFAULT_HEADER_HEIGHT, stride: SUBAGENT.MOBILE_CARD_STRIDE }
+        );
 
         // Record positions with keyboard hidden
         const posBeforeKeyboard = await page.evaluate(() => {
-          return Array.from(document.querySelectorAll('.subagent-window')).map(w => {
+          return Array.from(document.querySelectorAll('.subagent-window')).map((w) => {
             const el = w as HTMLElement;
             return { top: el.style.top, bottom: el.style.bottom };
           });
@@ -323,19 +340,22 @@ describe('Mobile Subagent Windows', () => {
         await showKeyboard(page, KEYBOARD.TYPICAL_IOS_HEIGHT);
         await page.waitForTimeout(WAIT.KEYBOARD_ANIMATION);
 
-        await page.evaluate(({ toolbarOffset, stride }) => {
-          const windows = document.querySelectorAll('.subagent-window');
-          windows.forEach((win, idx) => {
-            const el = win as HTMLElement;
-            el.style.top = 'auto';
-            el.style.bottom = `${toolbarOffset + idx * stride}px`;
-          });
-        }, { toolbarOffset: SUBAGENT.TOOLBAR_OFFSET, stride: SUBAGENT.MOBILE_CARD_STRIDE });
+        await page.evaluate(
+          ({ toolbarOffset, stride }) => {
+            const windows = document.querySelectorAll('.subagent-window');
+            windows.forEach((win, idx) => {
+              const el = win as HTMLElement;
+              el.style.top = 'auto';
+              el.style.bottom = `${toolbarOffset + idx * stride}px`;
+            });
+          },
+          { toolbarOffset: SUBAGENT.TOOLBAR_OFFSET, stride: SUBAGENT.MOBILE_CARD_STRIDE }
+        );
 
         await triggerRelayout(page);
 
         const posDuringKeyboard = await page.evaluate(() => {
-          return Array.from(document.querySelectorAll('.subagent-window')).map(w => {
+          return Array.from(document.querySelectorAll('.subagent-window')).map((w) => {
             const el = w as HTMLElement;
             return { top: el.style.top, bottom: el.style.bottom };
           });
@@ -348,19 +368,22 @@ describe('Mobile Subagent Windows', () => {
         await hideKeyboard(page);
         await page.waitForTimeout(WAIT.KEYBOARD_ANIMATION);
 
-        await page.evaluate(({ headerHeight, stride }) => {
-          const windows = document.querySelectorAll('.subagent-window');
-          windows.forEach((win, idx) => {
-            const el = win as HTMLElement;
-            el.style.top = `${headerHeight + 8 + idx * stride}px`;
-            el.style.bottom = 'auto';
-          });
-        }, { headerHeight: SUBAGENT.DEFAULT_HEADER_HEIGHT, stride: SUBAGENT.MOBILE_CARD_STRIDE });
+        await page.evaluate(
+          ({ headerHeight, stride }) => {
+            const windows = document.querySelectorAll('.subagent-window');
+            windows.forEach((win, idx) => {
+              const el = win as HTMLElement;
+              el.style.top = `${headerHeight + 8 + idx * stride}px`;
+              el.style.bottom = 'auto';
+            });
+          },
+          { headerHeight: SUBAGENT.DEFAULT_HEADER_HEIGHT, stride: SUBAGENT.MOBILE_CARD_STRIDE }
+        );
 
         await triggerRelayout(page);
 
         const posAfterHide = await page.evaluate(() => {
-          return Array.from(document.querySelectorAll('.subagent-window')).map(w => {
+          return Array.from(document.querySelectorAll('.subagent-window')).map((w) => {
             const el = w as HTMLElement;
             return { top: el.style.top, bottom: el.style.bottom };
           });
@@ -569,14 +592,39 @@ describe('Mobile Subagent Windows', () => {
         });
         expect(count).toBe(4);
 
-        // Verify each has a unique agent-id
+        // Verify each has a unique opaque browser identity.
         const ids = await page.evaluate(() => {
           return Array.from(document.querySelectorAll('.subagent-window')).map(
-            w => (w as HTMLElement).dataset.agentId ?? '',
+            (w) => (w as HTMLElement).dataset.agentKey ?? ''
           );
         });
         const uniqueIds = new Set(ids);
         expect(uniqueIds.size).toBe(4);
+      } finally {
+        await context.close();
+      }
+    });
+
+    it('keeps windows with the same display ID distinct by opaque agent key', async () => {
+      const { context, page } = await createDevicePage(standardPhone, BASE_URL, 'chromium');
+      try {
+        await page.waitForTimeout(WAIT.PAGE_SETTLE);
+        await injectMockSubagentWindow(page, 'opaque-first', 0, 'same-id');
+        await injectMockSubagentWindow(page, 'opaque-second', 1, 'same-id');
+
+        const identity = await page.evaluate(() => ({
+          mapKeys: [...((window as any).app?.subagentWindows?.keys() || [])],
+          domKeys: Array.from(document.querySelectorAll('.subagent-window')).map(
+            (node) => (node as HTMLElement).dataset.agentKey
+          ),
+          displayIds: Array.from(document.querySelectorAll('.subagent-window')).map(
+            (node) => node.querySelector('.agent-id')?.textContent
+          ),
+        }));
+
+        expect(identity.mapKeys).toEqual(expect.arrayContaining(['opaque-first', 'opaque-second']));
+        expect(identity.domKeys).toEqual(['opaque-first', 'opaque-second']);
+        expect(identity.displayIds).toEqual(['same-id', 'same-id']);
       } finally {
         await context.close();
       }
@@ -592,21 +640,24 @@ describe('Mobile Subagent Windows', () => {
         }
 
         // Position windows with proper stride
-        await page.evaluate(({ headerHeight, stride }) => {
-          const windows = document.querySelectorAll('.subagent-window');
-          windows.forEach((win, idx) => {
-            const el = win as HTMLElement;
-            el.style.position = 'fixed';
-            el.style.top = `${headerHeight + 8 + idx * stride}px`;
-            el.style.left = '4px';
-            el.style.width = 'calc(100% - 8px)';
-            el.style.height = '110px';
-          });
-        }, { headerHeight: SUBAGENT.DEFAULT_HEADER_HEIGHT, stride: SUBAGENT.MOBILE_CARD_STRIDE });
+        await page.evaluate(
+          ({ headerHeight, stride }) => {
+            const windows = document.querySelectorAll('.subagent-window');
+            windows.forEach((win, idx) => {
+              const el = win as HTMLElement;
+              el.style.position = 'fixed';
+              el.style.top = `${headerHeight + 8 + idx * stride}px`;
+              el.style.left = '4px';
+              el.style.width = 'calc(100% - 8px)';
+              el.style.height = '110px';
+            });
+          },
+          { headerHeight: SUBAGENT.DEFAULT_HEADER_HEIGHT, stride: SUBAGENT.MOBILE_CARD_STRIDE }
+        );
 
         // Check that no two windows overlap vertically
         const rects = await page.evaluate(() => {
-          return Array.from(document.querySelectorAll('.subagent-window')).map(w => {
+          return Array.from(document.querySelectorAll('.subagent-window')).map((w) => {
             const rect = w.getBoundingClientRect();
             return { top: rect.top, bottom: rect.bottom };
           });

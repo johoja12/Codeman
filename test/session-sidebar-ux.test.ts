@@ -1,4 +1,5 @@
-/** Structural and schema coverage for vertical session navigation density and actions. */
+/** @fileoverview Structural and schema coverage for COD-339 sidebar UX. */
+
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -10,9 +11,17 @@ const html = readFileSync(resolve(publicDir, 'index.html'), 'utf8');
 const settingsUi = readFileSync(resolve(publicDir, 'settings-ui.js'), 'utf8');
 const styles = readFileSync(resolve(publicDir, 'styles.css'), 'utf8');
 const i18n = readFileSync(resolve(publicDir, 'i18n.js'), 'utf8');
-const railController = readFileSync(resolve(publicDir, 'tab-rail-resize.js'), 'utf8');
 
-describe('vertical session navigation UX contract', () => {
+function expectSessionNameFontRule(selector: string) {
+  const normalizedStyles = styles.replaceAll('"', "'");
+  const matchingRule = [...normalizedStyles.matchAll(/([^{}]+)\{([^{}]*)\}/g)].find(
+    ([, selectors, declarations]) =>
+      selectors.includes(selector) && declarations.includes('font-size: var(--session-sidebar-name-font-size, 14px);')
+  );
+  expect(matchingRule).toBeDefined();
+}
+
+describe('COD-339 session sidebar UX contract', () => {
   it('accepts only integer session-name sizes from 11 through 18 pixels', () => {
     for (const value of [11, 14, 18]) {
       expect(SettingsUpdateSchema.safeParse({ sessionSidebarFontSize: value }).success).toBe(true);
@@ -22,7 +31,7 @@ describe('vertical session navigation UX contract', () => {
     }
   });
 
-  it('renders one existing action cluster through a shared placement resolver', () => {
+  it('resolves one existing action cluster through the shared inline-placement helper', () => {
     expect(app).toContain('shouldInlineSessionActions()');
     expect(app).toContain('const inlineSessionActions = this.shouldInlineSessionActions();');
     expect(app).toContain('const tabActionsHtml =');
@@ -32,41 +41,41 @@ describe('vertical session navigation UX contract', () => {
     expect(app).toContain("tab.querySelector(':scope > .tab-actions')");
   });
 
-  it('limits inline actions to expanded sidebar and expanded non-compact rail', () => {
-    expect(app).toMatch(/isSessionSidebarActive\(\)[\s\S]{0,100}!this\.isSessionSidebarCollapsed\(\)/);
-    expect(app).toMatch(/_tabOrientation\(\) === 'vertical'[\s\S]{0,120}tab-rail-compact/);
-    expect(styles).toContain("html[data-session-list='sidebar'][data-sidebar='expanded']");
-    expect(styles).toContain("html[data-tab-orientation='vertical']:not(.tab-rail-compact)");
+  it('keeps the sidebar name-row and action-cluster flex constraints', () => {
+    expect(styles).toMatch(
+      /html\[data-session-list="sidebar"\] \.session-sidebar \.tab-name-row,[\s\S]*?\{[^}]*min-width: 0;/
+    );
+    expect(styles).toMatch(
+      /html\[data-session-list="sidebar"\] \.session-sidebar \.tab-actions \{[^}]*flex-shrink: 0;/s
+    );
   });
 
-  it('opens only the existing session actions from the overflow trigger', () => {
-    expect(railController).toContain('openTabRailActionMenu(event, sessionId)');
-    expect(railController).toContain("label: 'Session options'");
-    expect(railController).toContain("label: 'Open in a new window'");
-    expect(railController).toContain("label: 'Close session'");
-    expect(railController).not.toContain('Move to group');
-  });
-
-  it('wires the name-only size through first paint, settings, defaults, and both vertical surfaces', () => {
-    expect(html).toMatch(/id="appSettingsSessionSidebarFontSize"[^>]*min="11"[^>]*max="18"[^>]*step="1"/);
+  it('wires a device-scoped 11–18px range through load, save, defaults, apply and first paint', () => {
+    expect(html).toContain('id="appSettingsSessionSidebarFontSize"');
+    expect(html).toContain('id="appSettingsSessionSidebarFontSizeValue"');
     expect(html).toContain('aria-labelledby="appSettingsSessionSidebarFontSizeLabel"');
+    expect(html).toMatch(/id="appSettingsSessionSidebarFontSize"[^>]*min="11"[^>]*max="18"[^>]*step="1"/);
+    expect(html).toContain('sessionSidebarFontSize');
     expect(html).toContain('--session-sidebar-name-font-size');
+
+    expect(settingsUi).toContain("document.getElementById('appSettingsSessionSidebarFontSize').value =");
     expect(settingsUi).toContain('sessionSidebarFontSize: this.resolveSessionSidebarFontSize(');
-    // 12 = the sidebar's historical 0.75rem name size: the default must
-    // never restyle an install whose user never touched the slider.
-    expect(settingsUi).toContain('sessionSidebarFontSize: 12,');
+    expect(settingsUi).toContain('sessionSidebarFontSize: 14,');
     expect(settingsUi).toContain("'sessionSidebarFontSize'");
+
     expect(app).toContain('resolveSessionSidebarFontSize(value)');
     expect(app).toContain('applySessionSidebarFontSize(settings = null)');
-    expect(styles).toMatch(
-      /\.session-sidebar \.tab-name[^}]*font-size: var\(--session-sidebar-name-font-size, 12px\)/s
-    );
-    expect(styles).toMatch(
-      /\.tab-rail \.session-tab \.tab-name[^}]*font-size: var\(--session-sidebar-name-font-size, 12px\)/s
-    );
+    expect(app).toContain("root.style.setProperty('--session-sidebar-name-font-size', `${size}px`);");
+    expect(app).toContain('this.applySessionSidebarFontSize();');
+
+    expectSessionNameFontRule("html[data-session-list='sidebar'] .session-sidebar .tab-name");
   });
 
-  it('labels and translates the name-only scope', () => {
+  it('applies the session-name font variable to the vertical tab rail', () => {
+    expectSessionNameFontRule("html[data-tab-orientation='vertical'] .tab-rail .session-tab .tab-name");
+  });
+
+  it('labels and translates the session-name-only scope', () => {
     expect(html).toContain('Session Name Font Size');
     expect(html).toContain('Adjust only session names in the vertical sidebar.');
     expect(i18n).toContain("'Session Name Font Size':");

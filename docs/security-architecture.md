@@ -27,6 +27,7 @@ an explicit, guided opt‑in.
 4. [Recommended remote‑access setups](#4-recommended-remoteaccess-setups)
 5. [File‑serving hardening](#5-fileserving-hardening)
 6. [tmux launch hardening](#6-tmux-launch-hardening-cod31)
+   - [Read My Mind local Codex predictor](#6a-read-my-mind-local-codex-predictor-cod-314)
 7. [Supply‑chain & build‑asset hardening](#7-supplychain--buildasset-hardening-cod28)
 8. [Multi‑instance isolation](#8-multiinstance-isolation)
 9. [Transport security headers](#9-transport-security-headers)
@@ -40,14 +41,14 @@ an explicit, guided opt‑in.
 **The security boundary is the network bind plus authentication — not the code Codeman
 runs.** Because sessions launch with `--dangerously-skip-permissions`, the web UI is by
 design a remote‑code‑execution surface for whoever is allowed to reach it. Everything
-below exists to control *who* that is.
+below exists to control _who_ that is.
 
-| Actor | Reaches the UI when… | Is granted |
-|-------|----------------------|------------|
-| Same‑machine user | Always (default loopback bind) | Full session control — the intended local‑use case. |
-| Authenticated remote client | Tunnel/LAN reachability **and** a valid password or session cookie | Full session control. |
-| Unauthenticated remote client | Only if you bind a non‑loopback host with no password | Full session control — the exact case every default and warning works to prevent. |
-| Clients behind a loopback‑connecting tunnel | A reverse tunnel terminates on `127.0.0.1` | Inherit `req.ip = 127.0.0.1`, so they hit the localhost‑only exemptions (§3) unless a password is set. |
+| Actor                                       | Reaches the UI when…                                               | Is granted                                                                                             |
+| ------------------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------ |
+| Same‑machine user                           | Always (default loopback bind)                                     | Full session control — the intended local‑use case.                                                    |
+| Authenticated remote client                 | Tunnel/LAN reachability **and** a valid password or session cookie | Full session control.                                                                                  |
+| Unauthenticated remote client               | Only if you bind a non‑loopback host with no password              | Full session control — the exact case every default and warning works to prevent.                      |
+| Clients behind a loopback‑connecting tunnel | A reverse tunnel terminates on `127.0.0.1`                         | Inherit `req.ip = 127.0.0.1`, so they hit the localhost‑only exemptions (§3) unless a password is set. |
 
 **Explicitly out of scope.** Codeman is access control for the operator console, not a
 sandbox for the code that console runs. It does **not** defend against: a compromised
@@ -59,11 +60,11 @@ deliberately open, or the breadth of filesystem a session's `workingDir` is poin
 
 ## 1. Network binding model
 
-| Setting | Default | Source |
-|---------|---------|--------|
-| Bind host | `127.0.0.1` (loopback) | `--host` / `CODEMAN_HOST` → `WebServer` ctor |
-| Port | `3000` | `--port` / `CODEMAN_PORT` |
-| TLS | off (`--https` to enable) | `--https` |
+| Setting   | Default                   | Source                                       |
+| --------- | ------------------------- | -------------------------------------------- |
+| Bind host | `127.0.0.1` (loopback)    | `--host` / `CODEMAN_HOST` → `WebServer` ctor |
+| Port      | `3000`                    | `--port` / `CODEMAN_PORT`                    |
+| TLS       | off (`--https` to enable) | `--https`                                    |
 
 ### Bind host classification
 
@@ -86,15 +87,15 @@ non‑loopback (you'll get a warning, not a silent wide‑open bind) — use
 
 At `WebServer.start()`:
 
-| Bind host | `CODEMAN_PASSWORD` | Behavior |
-|-----------|--------------------|----------|
-| loopback (default) | unset | **Start.** Safe — reachable only from this machine. |
-| loopback | set | **Start.** Auth required even locally. |
-| non‑loopback | set | **Start.** Auth protects the open bind. |
-| non‑loopback | unset | **Start + LOUD warning** listing how to secure it. |
-| non‑loopback | unset, `--allow-unauthenticated-network` | **Start + terse acknowledged note.** |
+| Bind host          | `CODEMAN_PASSWORD`                       | Behavior                                            |
+| ------------------ | ---------------------------------------- | --------------------------------------------------- |
+| loopback (default) | unset                                    | **Start.** Safe — reachable only from this machine. |
+| loopback           | set                                      | **Start.** Auth required even locally.              |
+| non‑loopback       | set                                      | **Start.** Auth protects the open bind.             |
+| non‑loopback       | unset                                    | **Start + LOUD warning** listing how to secure it.  |
+| non‑loopback       | unset, `--allow-unauthenticated-network` | **Start + terse acknowledged note.**                |
 
-> History: an earlier iteration (unreleased COD‑29) *refused to start* on a
+> History: an earlier iteration (unreleased COD‑29) _refused to start_ on a
 > non‑loopback bind without a password. That surprised setups that "just worked"
 > before, so **0.9.0 changed it to start‑and‑warn**. Loopback is still the safe
 > default; the warning (with three concrete fixes) replaces the hard failure.
@@ -322,6 +323,7 @@ TOCTOU window.
 | `file-content` | 10 MB | text preview |
 | `file-raw` | 2 GB (`CODEMAN_MAX_DOWNLOAD_BYTES`, `0` = unlimited) | inline MIME map; **`X-Content-Type-Options: nosniff` on all responses**; streamed, `Range`-aware (206 slices come from the same validated path, and the cap is checked before the range) |
 | `GET /api/download` | same cap | forced `attachment`; sensitive‑path blocklist; streamed, `Range`-aware |
+| attachment `…/:id/raw`   | 50 MB | 413 past the cap, checked before the range. Capped because an attacker‑influenceable registry id resolves to an arbitrary host file                                          |
 
 ### SVG / content‑type XSS
 
@@ -331,7 +333,7 @@ serves `.svg` as `application/octet-stream` + `Content-Disposition: attachment` 
 `nosniff`. The control here is the **`octet-stream` + `attachment` + `nosniff`
 combination**, which forces a download instead of a render — not the CSP: the
 policy's `script-src` allows `'unsafe-inline'` (§9), so a same‑origin HTML
-document *would* be able to run inline scripts if the browser ever rendered it.
+document _would_ be able to run inline scripts if the browser ever rendered it.
 By the same combination, other text types (`.html`, `.xml`, …) that fall through
 to `octet-stream` are downloaded, not executed. Trusted QR/welcome SVGs are
 injected from API JSON (`innerHTML`), not via `file-raw`, so they are unaffected.
@@ -348,8 +350,8 @@ the attachment guard below.
 
 Live external attachments (`src/attachment-registry.ts`) mint an `att_<uuid>` id
 for a host file so browser requests carry the id, never an absolute path. Serving
-is by id (`GET /api/sessions/:id/attachments/:attachmentId/raw`, same download cap,
-`nosniff`) and re‑resolves the symlink + re‑checks the **attachment guard**
+is by id (`GET /api/sessions/:id/attachments/:attachmentId/raw`, its OWN 50 MB cap
+checked before the global download bound and before the range, `nosniff`) and re‑resolves the symlink + re‑checks the **attachment guard**
 (`src/config/attachment-guard.ts`: the shared sensitive‑path blocklist **plus**
 the `/root` and `/etc` trees, extendable via `attachmentBlockedPaths` /
 `CODEMAN_ATTACHMENT_BLOCKED_PATHS`) on every request. Unlike the workspace file
@@ -390,6 +392,36 @@ In multi‑user mode a regular user is held to the filesystem path picker's rule
 resolution, must sit inside their own `userSpacePath` or the session's
 `workingDir`, else 403. User spaces live inside `homedir()`, so without it one user
 could list and read another's space.
+### Trusted attachment roots (`CODEMAN_TRUSTED_ATTACHMENT_ROOTS`)
+
+Uploads normally land in `<workspace>/.codeman-attachments`. An **admin** may
+instead make that path a **symlink** to a shared directory, but only if the
+symlink's target is on this exact allowlist — an operator knob for a shared
+document enclave, and the one case where uploaded bytes leave the workspace.
+
+- **Env‑only, and deliberately so.** It is not in `SettingsUpdateSchema`, so the
+  browser cannot add a root; a compromised session cannot widen it. Parsed **once
+  at startup** (memoized), so a change requires a restart.
+- **Exact‑root, fail‑closed matching.** The symlink's resolved target must equal a
+  listed root — not live under one. The check is repeated on every upload and
+  delete, so repointing the symlink afterwards fails closed.
+- **Each entry must survive validation, or it is dropped** (with a warning that
+  deliberately carries the entry's *index*, never the path, so a log does not leak
+  filesystem layout). An entry must be absolute; canonical (a symlinked alias is
+  refused — a trailing `/` is normalized rather than refused, COD‑295); a real
+  directory; not blocked by attachment policy (§ blocklist above); and a
+  **dedicated enclave**.
+- **The dedicated‑enclave rule (COD‑295).** `/`, `$HOME`, and any ancestor of
+  `~/.codeman`, `~/codeman-cases` or `~/codeman-users` are refused. Uploads land
+  *in* the root and everything under it becomes servable, so accepting a broad
+  ancestor would quietly turn "trusted root" into "the whole filesystem" and
+  defeat the exact‑root allowlist. A directory *inside* a managed tree
+  (`~/.codeman/shared-attachments`) is fine; the tree itself is not.
+- A bad entry is never a startup failure — it is dropped, and with no valid roots
+  the symlink form is simply unavailable.
+
+Implementation: `isDedicatedAttachmentEnclave` / `parseTrustedAttachmentRoots` /
+`resolveLocalUploadDirectory` in `src/config/attachment-guard.ts`.
 
 ### SSE log‑tail route — intentional extra read roots
 
@@ -433,13 +465,34 @@ transient mount blip at launch poisons tmux's long‑lived cwd and crashes
 - **Fail‑safe cwd:** the command is `cd "<dir>" && <cmd>` — if `cd` fails the CLI
   does **not** run in `/tmp`; the pane dies with a visible error instead.
 - **No injection:** `workingDir` passes `isValidWorkingDir` (absolute, rejects
-  `;&|$\`(){}<>'"` and newlines and `..`) and `isValidPath`, and is double‑quoted
+  `;&|$\`(){}<>'"`and newlines and`..`) and `isValidPath`, and is double‑quoted
   in the pane command. Paths with spaces work; metacharacters are rejected before
   reaching the shell.
 - It does not change which tmux socket is targeted, so instance isolation (§8) is
   preserved.
 
 ---
+
+## 6a. Read My Mind local Codex predictor (COD-314)
+
+Read My Mind may invoke an explicit, short-lived local Codex predictor for a local Codex session. It is a noninteractive
+`codex exec --ephemeral` model invocation, not a new interactive terminal or Codeman tab, and it leaves no persisted or
+resumable Codex rollout artifact. The requester cannot choose its provider, model, environment, or rollout; provider
+selection is fixed by the authorized session, and Codex never falls back to Claude.
+
+The predictor's rollout lookup accepts only a demonstrably owned rollout in the same canonical `CODEX_HOME` namespace.
+Same-working-directory or newest-file matches are not ownership proof; ambiguity, including equal history ties, fails
+closed. Recovery preserves private, versioned provider provenance without API keys. A routine Codeman process restart reads
+only `CODEX_HOME`, `OPENAI_API_KEY`, and `CODEX_API_KEY` from the exact surviving local tmux session. Retained keys remain
+runtime-only; an empty successfully-read environment heals legacy default-auth sessions; unreadable/missing tmux identity
+still fails closed rather than silently changing accounts. Remote and Docker sessions never enter this recovery path.
+
+The `codex exec` child runs from a private ephemeral cwd outside the case workspace. It ignores user config, rules, and
+global/project instructions; disables shell, web-search, and subagents; rejects approvals; uses a read-only command sandbox;
+and has schema validation plus bounded environment, output, and timeout controls. These constraints do not state that the
+CLI process is network-disabled. An incompatible CLI returns an update-required failure rather than receiving a weakened
+retry. The browser UI requires an explicit Send or Insert click; the prediction API returns text only, and packaged-agent
+policy requires explicit user authorization before a client separately calls the input API.
 
 ## 7. Supply‑chain & build‑asset hardening (COD‑28)
 
@@ -575,20 +628,21 @@ Opt-in and off by default: the server POSTs the Web Push events (permission prom
 | `CODEMAN_GESTURE=1` | Make the gesture overlay available (widens CSP) |
 | `CODEMAN_DOCKER_BRIDGE_HOOKS=1` | Serve the hook endpoints on the docker bridge gateway (host‑internal, hooks‑only, `403` elsewhere) so in‑container hooks reach a loopback‑bound server — see §10 |
 | `CODEMAN_DOCKER_BRIDGE_HOST` | Override the bridge gateway IP the hooks listener binds (default: auto‑detect) |
+| `CODEMAN_TRUSTED_ATTACHMENT_ROOTS`                                          | Comma‑separated **exact** directories an admin may point a `.codeman-attachments` symlink at. Env‑only (never browser‑settable), read once at startup — see below |
 
 **Audit log:** session lifecycle and server start are recorded in
 `~/.codeman/session-lifecycle.jsonl`.
 
 ### Key source files
 
-| Concern | File |
-|---------|------|
-| Bind‑host classification, env‑flag parsing, Host/Origin allowlist (`buildHostPolicy` / `isAllowedRequestHost` / `isAllowedRequestOrigin`) | `src/web/network-auth-policy.ts` |
-| Start‑and‑warn policy | `src/web/server.ts` (`WebServer.start()`) |
-| Auth pipeline, rate limiting, security headers, CORS, Host/Origin guard (`registerHostGuard`) | `src/web/middleware/auth.ts` |
-| File‑path containment (realpath‑before‑check) | `src/web/route-helpers.ts` (`validateSessionFilePath`) |
-| File routes, caps, SVG handling, download blocklist | `src/web/routes/file-routes.ts` |
-| Instance/socket/data‑dir scoping | `src/config/instance.ts` |
+| Concern                                                                                                                                   | File                                                   |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| Bind‑host classification, env‑flag parsing, Host/Origin allowlist (`buildHostPolicy` / `isAllowedRequestHost` / `isAllowedRequestOrigin`) | `src/web/network-auth-policy.ts`                       |
+| Start‑and‑warn policy                                                                                                                     | `src/web/server.ts` (`WebServer.start()`)              |
+| Auth pipeline, rate limiting, security headers, CORS, Host/Origin guard (`registerHostGuard`)                                             | `src/web/middleware/auth.ts`                           |
+| File‑path containment (realpath‑before‑check)                                                                                             | `src/web/route-helpers.ts` (`validateSessionFilePath`) |
+| File routes, caps, SVG handling, download blocklist                                                                                       | `src/web/routes/file-routes.ts`                        |
+| Instance/socket/data‑dir scoping                                                                                                          | `src/config/instance.ts`                               |
 
 ---
 

@@ -253,7 +253,12 @@ describe('DeepSeek status bridge', () => {
     // mode with no transcript to read. Static, because the alternative is
     // standing up a predictor and a transcript watcher to observe one `if`.
     const rmm = readFileSync(join(process.cwd(), 'src/web/routes/readmymind-routes.ts'), 'utf-8');
-    expect(rmm).toContain("session.mode !== 'claude'");
+    // Downstream COD-314 admits LOCAL codex here as well, so the gate is spelled
+    // as two explicit mode comparisons rather than one `!== 'claude'`. The
+    // invariant this test exists for is unchanged and is asserted below: the
+    // decision is made on `mode` directly, never through hooksAvailableForMode().
+    expect(rmm).toContain("session.mode === 'claude'");
+    expect(rmm).toContain("session.mode === 'codex' && !session.remote && !session.docker");
     // Comment lines dropped first: the comment above that `if` names the
     // predicate in order to explain why it is NOT the one being called there.
     const uncommented = (src: string) =>

@@ -122,8 +122,11 @@ describe('POST /api/sessions workspace hooks', () => {
     const serialized = JSON.stringify(settings.hooks);
     // The two shapes that have historically shipped dead hooks: no secret header
     // (401 once the gate went unconditional) and no -k (exit 60 on HTTPS installs).
+    // Matched on `curl -sk` alone, not the whole flag run: that is the same
+    // substring hooks-config's own staleness detector keys on, and the flags
+    // between it and -X vary by hook (some pipe a body, some discard output).
     expect(serialized).toContain('X-Codeman-Hook-Secret');
-    expect(serialized).toContain('curl -sk -X POST');
+    expect(serialized).toContain('curl -sk');
   });
 
   it('merges into a user-owned settings file without disturbing it', async () => {
@@ -380,7 +383,7 @@ describe('applyWorkspaceHooks (the shared decision core in hooks-config)', () =>
 
     const raw = await readFile(wsSettingsPath(), 'utf-8');
     expect(raw).toContain('X-Codeman-Hook-Secret');
-    expect(raw).toContain('curl -sk -X POST');
+    expect(raw).toContain('curl -sk');
   });
 
   it('never ADDS a hooks block when workspaceHooksEnabled is OFF', async () => {

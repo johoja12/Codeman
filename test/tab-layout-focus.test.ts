@@ -230,7 +230,11 @@ describe('TabLayoutService keeps focus', () => {
     const h = createService({ layouts: { '@single': base() }, live: liveFacts(), webviews: [{ id: 'w' }] });
     const current = await h.service.get('@single');
     expect(focused(current)).toEqual(['session:a', 'webview:w', 'session:c']);
-    const result = await h.service.put('@single', setTabFocus(current, session('d'), true), current.version);
+    const result = await h.service.putOperations(
+      '@single',
+      [{ type: 'setFocus', ref: session('d'), focused: true }],
+      current.version
+    );
     expect(result.status).toBe('updated');
     expect(focused(await h.service.get('@single'))).toEqual(['session:a', 'webview:w', 'session:c', 'session:d']);
   });
@@ -295,7 +299,7 @@ describe('TabLayoutService keeps focus', () => {
     await expect(
       h.service.put('bob', { ...bob, ungrouped: [session('b'), session('a', { focus: true })] }, bob.version)
     ).rejects.toThrow(/not owned/);
-    await h.service.put('bob', setTabFocus(bob, session('b'), true), bob.version);
+    await h.service.putOperations('bob', [{ type: 'setFocus', ref: session('b'), focused: true }], bob.version);
     expect(focused(h.layouts.bob)).toEqual(['session:b']);
     expect(focused(h.layouts.alice)).toEqual(['session:a']);
   });
@@ -334,7 +338,7 @@ describe('persistence and the HTTP route', () => {
       const put = await app.inject({
         method: 'PUT',
         url: '/api/tab-layout',
-        payload: { baseVersion: layout.version, layout: setTabFocus(layout, session('b'), true) },
+        payload: { baseVersion: layout.version, operations: [{ type: 'setFocus', ref: session('b'), focused: true }] },
       });
       expect(put.statusCode).toBe(200);
       expect(focused(put.json().data.layout)).toEqual(['session:b']);

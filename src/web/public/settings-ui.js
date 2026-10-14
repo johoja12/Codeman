@@ -11,6 +11,14 @@
  * @loadorder 10 of 15 — loaded after ralph-panel.js, before panels-ui.js
  */
 
+function codexAnimationsControlValue(preference) {
+  return preference === true ? 'on' : preference === false ? 'off' : 'auto';
+}
+
+function codexAnimationsPreference(value) {
+  return value === 'on' ? true : value === 'off' ? false : null;
+}
+
 Object.assign(CodemanApp.prototype, {
   // Hooks (Claude Code hook events)
   _onHookIdlePrompt(data) {
@@ -68,10 +76,9 @@ Object.assign(CodemanApp.prototype, {
   },
 
   _onHookStop(data) {
-    // Clear all pending hooks when Claude finishes responding
-    if (data.sessionId) {
-      this.clearPendingHooks(data.sessionId);
-    }
+    // Do not clear prompt state here: a stop can arrive before a newer
+    // permission/question hook. The sequenced server approval:resolved event
+    // owns the matching clear.
     this._notifySession(data.sessionId, 'info', 'hook-stop', 'Response Complete', data.reason || 'Claude has finished responding');
   },
 
@@ -369,7 +376,11 @@ Object.assign(CodemanApp.prototype, {
     return select?.value.trim() || '';
   },
 
-  openAppSettings() {
+  async openAppSettings() {
+    // The boot sync is the authoritative source for server-synced settings. If
+    // the modal is opened before it settles, stale localStorage can briefly
+    // overwrite a newer server value in the controls.
+    if (this._settingsSyncPromise) await this._settingsSyncPromise;
     // Load current settings
     const settings = this.loadAppSettingsFromStorage();
     document.getElementById('appSettingsDisplayName').value = settings.displayName || 'Codeman';
@@ -385,7 +396,9 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('appSettingsHeaderStatsStyle').value = this.resolveHeaderStatsStyle(settings);
     document.getElementById('appSettingsShowLifecycleLog').checked = settings.showLifecycleLog ?? defaults.showLifecycleLog ?? false;
     document.getElementById('appSettingsShowResponseViewer').checked = settings.showResponseViewer ?? defaults.showResponseViewer ?? false;
-    document.getElementById('appSettingsShowFileViewerButton').checked = settings.showFileViewerButton ?? defaults.showFileViewerButton ?? true;
+    document.getElementById('appSettingsShowAwayDigest').checked = settings.showAwayDigest ?? defaults.showAwayDigest ?? false;
+    const fvbEl = document.getElementById('appSettingsShowFileViewerButton');
+    if (fvbEl) fvbEl.checked = settings.showFileViewerButton ?? defaults.showFileViewerButton ?? true;
     document.getElementById('appSettingsShowAttachmentsButton').checked = settings.showAttachmentsButton ?? defaults.showAttachmentsButton ?? false;
     document.getElementById('appSettingsSkin').value = settings.skin ?? defaults.skin ?? 'daylight-blue';
     // Entrance animations. Deliberately NOT part of the settings payload: the
@@ -472,6 +485,7 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('appSettingsTunnelEnabled').checked = settings.tunnelEnabled ?? false;
     this.loadTunnelStatus();
     document.getElementById('appSettingsLocalEcho').checked = settings.localEchoEnabled ?? MobileDetection.isTouchDevice();
+    document.getElementById('appSettingsLiveMirror').checked = settings.liveMirrorEnabled ?? defaults.liveMirrorEnabled ?? true;
     // Auto Copy (copy-on-select): per-device, default OFF everywhere. It quietly
     // overwrites the system clipboard on a gesture the user may have meant only as
     // a way to read, so it is opt-in rather than a default anyone has to discover.
@@ -517,6 +531,7 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('appSettingsTileDetach').checked = settings.tileDetachEnabled === true;
     const tileDetachItem = document.getElementById('appSettingsTileDetachItem');
     if (tileDetachItem) tileDetachItem.style.display = MobileDetection.getDeviceType() === 'desktop' ? '' : 'none';
+    this.renderShortcutSettingsList(settings.shortcutOverrides || {});
     document.getElementById('appSettingsSessionListLayout').value =
       settings.sessionListLayout ?? defaults.sessionListLayout ?? 'header';
     const sessionSidebarFontSize = this.resolveSessionSidebarFontSize(
@@ -540,11 +555,22 @@ Object.assign(CodemanApp.prototype, {
     // that does have it.
     document.getElementById('appSettingsCodexDangerouslyBypassApprovals').checked =
       settings.codexDangerouslyBypassApprovals ?? false;
-    document.getElementById('appSettingsCodexAnimations').checked =
-      settings.codexAnimationsEnabled ?? false;
+    document.getElementById('appSettingsCodexAnimations').value =
+      codexAnimationsControlValue(settings.codexAnimationsEnabled);
     document.getElementById('appSettingsCodexModel').value = settings.codexModel ?? '';
     document.getElementById('appSettingsCodexReasoningEffort').value = settings.codexReasoningEffort ?? '';
     this._applyCodexSettingsVisibility();
+    // Terminal history settings
+    document.getElementById('appSettingsTerminalScrollbackLines').value =
+      settings.terminalScrollbackLines ?? defaults.terminalScrollbackLines;
+    document.getElementById('appSettingsTmuxHistoryLimit').value =
+      settings.tmuxHistoryLimit ?? defaults.tmuxHistoryLimit;
+    document.getElementById('appSettingsTerminalBufferMaxMiB').value = Math.round(
+      (settings.terminalBufferMaxBytes ?? defaults.terminalBufferMaxBytes) / (1024 * 1024)
+    );
+    document.getElementById('appSettingsTerminalBufferTrimMiB').value = Math.round(
+      (settings.terminalBufferTrimBytes ?? defaults.terminalBufferTrimBytes) / (1024 * 1024)
+    );
     // Claude Permissions settings
     document.getElementById('appSettingsAgentTeams').checked = settings.agentTeamsEnabled ?? false;
     document.getElementById('appSettingsAgentSkill').checked = settings.agentSkillEnabled ?? false;
@@ -553,8 +579,19 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('appSettingsWorkspaceHooks').checked = settings.workspaceHooksEnabled !== false;
     document.getElementById('appSettingsClaudeModel').value = settings.claudeModel ?? '';
     document.getElementById('appSettingsOpusContext1m').checked = settings.opusContext1mEnabled ?? false;
+    document.getElementById('appSettingsTruecolor').checked = settings.truecolorEnabled ?? defaults.truecolorEnabled ?? false;
+    document.getElementById('appSettingsCheckpointDefault').checked =
+      settings.checkpointDefaultEnabled ?? defaults.checkpointDefaultEnabled ?? true;
     document.getElementById('appSettingsRemoteAutoReconnect').checked = settings.remoteAutoReconnect ?? true;
+    document.getElementById('appSettingsAutoRecoverSessionsAfterReboot').checked =
+      settings.autoRecoverSessionsAfterReboot ?? false;
     document.getElementById('appSettingsThinkingEffort').value = settings.thinkingEffort ?? '';
+    document.getElementById('appSettingsHeadroomUrl').value = settings.headroomProxyUrl ?? 'http://192.168.55.175:8787';
+    document.getElementById('appSettingsHeadroomClaude').checked = settings.headroomRouteClaude ?? true;
+    document.getElementById('appSettingsHeadroomCodex').checked = settings.headroomRouteCodex ?? true;
+    this._refreshHeadroomStatus();
+    // Authoring actions editor (COD-64) — render the saved rows into the list
+    this.renderAuthoringActions(settings.authoringActions || []);
     document.getElementById('appSettingsClaudeAdvisor').value = settings.claudeAdvisorModel ?? '';
     // CPU Priority settings
     const niceSettings = settings.nice || {};
@@ -709,6 +746,10 @@ Object.assign(CodemanApp.prototype, {
     // The Shortcuts list renders lazily so it reflects the CURRENT registry
     // (defaults + overrides) every time it is reached.
     if (sectionId === 'settings-shortcuts') this.renderShortcutSettingsList?.();
+    // Skills load lazily for the same reason. This used to hang off the
+    // modal-tab click handler; the rail replaced that, so the trigger lives here
+    // now — without it the Skills section renders permanently empty.
+    if (sectionId === 'settings-skills') this.loadUserSkillsSection?.();
     const doc = document.getElementById('appSettingsDoc');
     const section = document.getElementById(sectionId);
     if (doc && section && typeof section.offsetTop === 'number') {
@@ -787,6 +828,12 @@ Object.assign(CodemanApp.prototype, {
         for (const s of sections) {
           if (s.offsetTop - doc.scrollTop <= 140) current = s.id;
         }
+        // A short LAST section can never satisfy the 140px rule: once the document
+        // bottoms out it stops scrolling while that section's top is still below the
+        // threshold, so clicking its rail entry scrolled there and then handed the
+        // highlight back to the section above. At the bottom, the last section is by
+        // definition the current one.
+        if (doc.scrollTop + doc.clientHeight >= doc.scrollHeight - 4) current = sections[sections.length - 1].id;
         this._setActiveSettingsSection(current);
       });
     });
@@ -1132,6 +1179,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   closeAppSettings() {
+    this.stopShortcutCapture?.();
     this._toggleSettingsJump(false);
     document.getElementById('appSettingsModal').classList.remove('active');
 
@@ -1164,7 +1212,7 @@ Object.assign(CodemanApp.prototype, {
   _initUpdatesSection() {
     const verEl = this.$('updateCurrentVersion');
     if (verEl) verEl.textContent = (this.$('versionDisplay')?.textContent || '').trim() || '—';
-    for (const id of ['updateResult', 'updateActionRow', 'updateNotes', 'updateProgress']) {
+    for (const id of ['updateResult', 'updateActionRow', 'updateNotes', 'updateProgress', 'repoStatusResult']) {
       const el = this.$(id);
       if (el) el.style.display = 'none';
     }
@@ -1474,6 +1522,67 @@ Object.assign(CodemanApp.prototype, {
   _setUpdateProgress(html) {
     const el = this.$('updateProgress');
     if (el) { el.style.display = 'block'; el.innerHTML = html; }
+  },
+
+  // ── Repository status (App Settings → Updates). Backend: src/web/repo-status.ts.
+
+  /** Human label for a remote's role in the status view. */
+  _repoRoleLabel(role) {
+    if (role === 'tracking') return 'Your remote';
+    if (role === 'upstream') return 'Upstream';
+    return 'Remote';
+  },
+
+  /** Render one remote's status card. */
+  _renderRepoRemoteCard(r) {
+    const label = escapeHtml(this._repoRoleLabel(r.role));
+    const name = escapeHtml(r.name || '');
+    const url = r.url ? `<div style="font-size:11px; color:var(--text-secondary); word-break:break-all">${escapeHtml(r.url)}</div>` : '';
+    const head = `<div style="display:flex; align-items:baseline; gap:6px"><strong>${label}</strong><span style="font-family:monospace; font-size:12px">${name}</span></div>${url}`;
+
+    if (r.error) {
+      return `<div style="padding:8px 10px; margin:6px 0; font-size:12px; border:1px solid var(--border); border-radius:6px">${head}<div style="margin-top:4px; color:var(--text-secondary)">${escapeHtml(r.error)}</div></div>`;
+    }
+
+    const parts = [];
+    if (r.behind > 0) parts.push(`<span style="color:#e0a030">↓ ${r.behind} behind</span>`);
+    if (r.ahead > 0) parts.push(`<span style="color:#3aa3ff">↑ ${r.ahead} ahead</span>`);
+    const counts = parts.length ? parts.join(' · ') : '<span style="color:var(--text-secondary)">Up to date</span>';
+    const cmp = r.compareRef ? ` <span style="font-size:11px; color:var(--text-secondary)">vs ${escapeHtml(r.compareRef)}</span>` : '';
+
+    let incoming = '';
+    if (Array.isArray(r.incoming) && r.incoming.length > 0) {
+      const rows = r.incoming
+        .map((c) => `<div style="font-family:monospace; font-size:11px; line-height:1.5"><span style="color:var(--text-secondary)">${escapeHtml(c.sha)}</span> ${escapeHtml(c.subject)}</div>`)
+        .join('');
+      const more = r.behind > r.incoming.length ? `<div style="font-size:11px; color:var(--text-secondary); margin-top:4px">…and ${r.behind - r.incoming.length} more</div>` : '';
+      incoming = `<details style="margin-top:6px"><summary style="cursor:pointer; font-size:12px">Incoming changes</summary><div style="margin-top:6px; max-height:180px; overflow:auto">${rows}${more}</div></details>`;
+    }
+
+    return `<div style="padding:8px 10px; margin:6px 0; font-size:13px; border:1px solid var(--border); border-radius:6px">${head}<div style="margin-top:6px">${counts}${cmp}</div>${incoming}</div>`;
+  },
+
+  /** Manual "Check repository status" — fetches + compares against each remote. */
+  async checkRepoStatus() {
+    const btn = this.$('repoStatusBtn');
+    const el = this.$('repoStatusResult');
+    if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
+    if (el) { el.style.display = 'block'; el.innerHTML = '<div style="font-size:13px; color:var(--text-secondary); padding:4px 2px">Fetching from remotes…</div>'; }
+
+    const data = await this._apiJson('/api/system/repo-status');
+
+    if (btn) { btn.disabled = false; btn.textContent = 'Check repository status'; }
+    if (!el) return;
+
+    if (!data) {
+      el.innerHTML = '<div style="font-size:13px; color:var(--text-secondary); padding:4px 2px">Could not check repository status. Try again later.</div>';
+      return;
+    }
+    if (data.error && (!data.remotes || data.remotes.length === 0)) {
+      el.innerHTML = `<div style="font-size:13px; color:var(--text-secondary); padding:4px 2px">${escapeHtml(data.error)}</div>`;
+      return;
+    }
+    el.innerHTML = (data.remotes || []).map((r) => this._renderRepoRemoteCard(r)).join('');
   },
 
   /** Manual "Check for updates" — asks the server to query GitHub. */
@@ -2489,6 +2598,73 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
+  // ── Authoring actions editor (COD-64) ────────────────────────────────────
+
+  /** Render the saved authoring actions as editable rows in the App Settings modal. */
+  renderAuthoringActions(actions) {
+    const list = document.getElementById('authoringActionsList');
+    if (!list) return;
+    list.innerHTML = '';
+    for (const action of actions || []) this._appendAuthoringActionRow(action);
+  },
+
+  /** Append one editor row (label + instruction + remove) for an action. */
+  _appendAuthoringActionRow(action = {}) {
+    const list = document.getElementById('authoringActionsList');
+    if (!list) return;
+    const row = document.createElement('div');
+    row.className = 'authoring-action-row';
+    row.dataset.id = action.id || this._newAuthoringActionId();
+    const label = document.createElement('input');
+    label.type = 'text';
+    label.className = 'authoring-action-label';
+    label.placeholder = 'Label (e.g. Tighten prose)';
+    label.maxLength = 60;
+    label.value = action.label || '';
+    const instruction = document.createElement('input');
+    instruction.type = 'text';
+    instruction.className = 'authoring-action-instruction';
+    instruction.placeholder = 'Instruction (use {path} for the document path)';
+    instruction.maxLength = 2000;
+    instruction.value = action.instruction || '';
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'btn-icon-sm authoring-action-remove';
+    remove.textContent = '×';
+    remove.title = 'Remove action';
+    remove.onclick = () => row.remove();
+    row.append(label, instruction, remove);
+    list.appendChild(row);
+  },
+
+  /** Add a fresh blank authoring-action row. */
+  addAuthoringActionRow() {
+    this._appendAuthoringActionRow({});
+  },
+
+  /** Generate a stable id for a new authoring action (delegates to the shared helper). */
+  _newAuthoringActionId() {
+    try {
+      const uuid = globalThis.crypto?.randomUUID?.();
+      if (uuid) return `act-${uuid.slice(0, 8)}`;
+    } catch {
+      /* ignore */
+    }
+    return `act-${Math.random().toString(36).slice(2, 10)}`;
+  },
+
+  /** Read the editor rows back and normalize them (drop blanks, trim, cap 20). */
+  readAuthoringActionsFromEditor() {
+    const list = document.getElementById('authoringActionsList');
+    if (!list) return [];
+    const rows = Array.from(list.querySelectorAll('.authoring-action-row')).map((row) => ({
+      id: row.dataset.id,
+      label: row.querySelector('.authoring-action-label')?.value || '',
+      instruction: row.querySelector('.authoring-action-instruction')?.value || '',
+    }));
+    return this.normalizeAuthoringActions(rows);
+  },
+
   /**
    * Paint both Voice status rows: which provider a mic press would use, and what
    * the server reports about its Claude login. Called on open and again once the
@@ -2568,7 +2744,8 @@ Object.assign(CodemanApp.prototype, {
       headerStatsStyle: document.getElementById('appSettingsHeaderStatsStyle').value,
       showLifecycleLog: document.getElementById('appSettingsShowLifecycleLog').checked,
       showResponseViewer: document.getElementById('appSettingsShowResponseViewer').checked,
-      showFileViewerButton: document.getElementById('appSettingsShowFileViewerButton').checked,
+      showAwayDigest: document.getElementById('appSettingsShowAwayDigest').checked,
+      showFileViewerButton: !!document.getElementById('appSettingsShowFileViewerButton')?.checked,
       showAttachmentsButton: document.getElementById('appSettingsShowAttachmentsButton').checked,
       showMonitor: document.getElementById('appSettingsShowMonitor').checked,
       showProjectInsights: document.getElementById('appSettingsShowProjectInsights').checked,
@@ -2604,6 +2781,7 @@ Object.assign(CodemanApp.prototype, {
       imageWatcherEnabled: document.getElementById('appSettingsImageWatcherEnabled').checked,
       tunnelEnabled: document.getElementById('appSettingsTunnelEnabled').checked,
       localEchoEnabled: document.getElementById('appSettingsLocalEcho').checked,
+      liveMirrorEnabled: document.getElementById('appSettingsLiveMirror').checked,
       autoCopySelection: document.getElementById('appSettingsAutoCopySelection').checked,
       copyStripMargin: document.getElementById('appSettingsCopyStripMargin').checked,
       terminalFontFamily: document.getElementById('appSettingsTerminalFont').value.trim(),
@@ -2619,6 +2797,7 @@ Object.assign(CodemanApp.prototype, {
       showTabCliLogos: document.getElementById('appSettingsShowTabCliLogos').checked,
       tabOrientation: document.getElementById('appSettingsTabOrientation').value,
       tabRailWidth: this.readTabRailWidthSetting?.() ?? 256,
+      shortcutOverrides: this.readShortcutOverridesFromSettings(),
       tabRailDetail: document.getElementById('appSettingsTabRailDetail').value,
       tabRailSort: document.getElementById('appSettingsTabRailSort').value,
       tabArrangement: document.getElementById('appSettingsTabArrangement').value,
@@ -2637,7 +2816,16 @@ Object.assign(CodemanApp.prototype, {
       codexModel: document.getElementById('appSettingsCodexModel').value.trim(),
       codexReasoningEffort: document.getElementById('appSettingsCodexReasoningEffort').value,
       codexDangerouslyBypassApprovals: document.getElementById('appSettingsCodexDangerouslyBypassApprovals').checked,
-      codexAnimationsEnabled: document.getElementById('appSettingsCodexAnimations').checked,
+      // Terminal history settings
+      terminalScrollbackLines: parseInt(document.getElementById('appSettingsTerminalScrollbackLines').value, 10) || 100000,
+      tmuxHistoryLimit: parseInt(document.getElementById('appSettingsTmuxHistoryLimit').value, 10) || 100000,
+      terminalBufferMaxBytes:
+        (parseInt(document.getElementById('appSettingsTerminalBufferMaxMiB').value, 10) || 32) * 1024 * 1024,
+      terminalBufferTrimBytes:
+        (parseInt(document.getElementById('appSettingsTerminalBufferTrimMiB').value, 10) || 24) * 1024 * 1024,
+      codexAnimationsEnabled: codexAnimationsPreference(
+        document.getElementById('appSettingsCodexAnimations').value
+      ),
       // Claude Permissions settings
       agentTeamsEnabled: document.getElementById('appSettingsAgentTeams').checked,
       agentSkillEnabled: document.getElementById('appSettingsAgentSkill').checked,
@@ -2645,14 +2833,22 @@ Object.assign(CodemanApp.prototype, {
       claudeVoiceEnabled: document.getElementById('appSettingsClaudeVoice').checked,
       claudeModel: document.getElementById('appSettingsClaudeModel').value,
       opusContext1mEnabled: document.getElementById('appSettingsOpusContext1m').checked,
+      truecolorEnabled: document.getElementById('appSettingsTruecolor').checked,
+      checkpointDefaultEnabled: document.getElementById('appSettingsCheckpointDefault').checked,
       remoteAutoReconnect: document.getElementById('appSettingsRemoteAutoReconnect').checked,
+      autoRecoverSessionsAfterReboot: document.getElementById('appSettingsAutoRecoverSessionsAfterReboot').checked,
       thinkingEffort: document.getElementById('appSettingsThinkingEffort').value,
+      headroomProxyUrl: document.getElementById('appSettingsHeadroomUrl').value.trim(),
+      headroomRouteClaude: document.getElementById('appSettingsHeadroomClaude').checked,
+      headroomRouteCodex: document.getElementById('appSettingsHeadroomCodex').checked,
       claudeAdvisorModel: document.getElementById('appSettingsClaudeAdvisor').value,
       // CPU Priority settings
       nice: {
         enabled: document.getElementById('appSettingsNiceEnabled').checked,
         niceValue: parseInt(document.getElementById('appSettingsNiceValue').value) || 10,
       },
+      // Authoring actions (COD-64) — read editor rows, drop blanks, cap 20
+      authoringActions: this.readAuthoringActionsFromEditor(),
     };
 
     // SettingsUpdateSchema is .strict() and checks codexModel with this same
@@ -2679,7 +2875,9 @@ Object.assign(CodemanApp.prototype, {
 
     // Save to localStorage
     this.saveAppSettingsToStorage(settings);
+    localStorage.setItem('codeman-scrollback', String(settings.terminalScrollbackLines));
     this._updateLocalEchoState();
+    this._applyLiveMirrorSetting?.(settings.liveMirrorEnabled); // COD-187
     this.applyTerminalFontFamily?.(settings.terminalFontFamily);
     this.applyTerminalFontWeights?.(settings);
 
@@ -2792,8 +2990,10 @@ Object.assign(CodemanApp.prototype, {
     this.applyLocalization();
     // Re-parents #sessionTabs between header host and sidebar if the layout
     // changed, then calls applyTabWrapSettings() itself — do not call both.
+    // Runs FIRST so the vertical rail below sees the settled sidebar state and
+    // yields to it (applyTabOrientation no-ops while the sidebar is active).
     this.applySessionListLayout();
-    this.applyTabOrientation({ settleRailWidth: true });
+    this.applyTabOrientation({ settleRailWidth: true });  // COD-286/299 — one settled terminal resize
     this.applyLineageLineSettings?.();
     this._updateTokensImmediate();  // Re-render token display (picks up showCost change)
     this.applyMonitorVisibility();
@@ -2837,7 +3037,9 @@ Object.assign(CodemanApp.prototype, {
       skin: _skin,
       language: _language,
       showPlanUsageLimits: _pul,
+      showAwayDigest: _sad,
       showAttachmentsButton: _ahb,
+      liveMirrorEnabled: _lmr,
       showFileViewerButton: _fvb,
       // Desktop-only header button, per-device, and absent from
       // SettingsUpdateSchema (.strict()) — sending it 400s the whole PUT
@@ -2879,19 +3081,15 @@ Object.assign(CodemanApp.prototype, {
       // Detach Tiles: what a tile drag does is a property of this device's
       // windows, and the key is absent from the .strict() SettingsUpdateSchema.
       tileDetachEnabled: _tde,
+      // COD-299: rail width is a device-local display preference. Never sync a
+      // wide-monitor choice onto a smaller browser.
+      tabRailWidth: _trw,
       // Phone-only home surface, and absent from SettingsUpdateSchema (.strict()).
       mobileOverviewEnabled: _mov,
       // Desktop-only tab decoration, per-device, and likewise absent from the
       // .strict() schema — syncing it would push a desktop-shaped choice onto
       // devices that cannot render it at all.
       sessionLineageLines: _sll,
-      // Keyboard shortcut overrides are per-device (bindings follow the keyboard
-      // and the OS: Cmd on macOS, Ctrl elsewhere) and absent from the .strict()
-      // SettingsUpdateSchema. They used to ride along here, so the first
-      // Shortcuts change on a device (even a Reset, which leaves an empty {})
-      // made EVERY later App Settings save a 400, and every synced key stopped
-      // reaching the server while the toast still said "Settings saved".
-      shortcutOverrides: _sco,
       ...serverSettings
     } = settings;
     let webhookError = '';
@@ -3560,14 +3758,102 @@ Object.assign(CodemanApp.prototype, {
     return isHandheld ? 'codeman-app-settings-mobile' : 'codeman-app-settings';
   },
 
+  async _refreshHeadroomStatus() {
+    const dot = document.getElementById('appSettingsHeadroomDot');
+    const health = document.getElementById('appSettingsHeadroomHealth');
+    const savings = document.getElementById('appSettingsHeadroomSavings');
+    const sessions = document.getElementById('appSettingsHeadroomSessions');
+    if (!dot) return;
+    try {
+      const res = await fetch('/api/headroom/status');
+      const env = await res.json();
+      const s = env?.success === true ? env.data : env;
+      dot.style.background = !s.enabled ? '#64748b' : s.healthy ? '#4ade80' : '#f87171';
+      health.textContent = !s.enabled
+        ? 'Disabled'
+        : s.healthy
+          ? `Proxy healthy${s.version ? ' · ' + s.version : ''}${s.latencyMs != null ? ' · ' + s.latencyMs + 'ms' : ''}`
+          : 'Proxy unreachable';
+      if (!s.stats) {
+        savings.innerHTML = '<span style="color:var(--text-secondary)">\u2014</span>';
+      } else {
+        const st = s.stats;
+        const pct = Math.max(0, Math.min(100, Number(st.compressedPct) || 0));
+        const renderBuckets = (buckets) =>
+          Object.entries(buckets || {})
+            .map(([name, count]) => `${String(name).replace(/[<&]/g, '')}: ${Number(count).toLocaleString()}`)
+            .join(' · ');
+        const agents = (st.attribution?.agents || [])
+          .map((agent) => {
+            const label = String(agent.label || agent.agent || 'Unknown').replace(/[<&]/g, '');
+            const requests = Number(agent.requests) || 0;
+            const saved = Number(agent.tokensSaved) || 0;
+            return `${label}: ${requests.toLocaleString()} requests · ${saved.toLocaleString()} tokens saved`;
+          })
+          .join('<br>');
+        const providers = renderBuckets(st.attribution?.providers);
+        savings.innerHTML =
+          '<div style="display:flex;align-items:baseline;gap:8px;margin-top:4px;">' +
+          '<span style="font-size:1.9rem;font-weight:700;color:#4ade80;line-height:1;">' +
+          Number(st.tokensSaved).toLocaleString() +
+          '</span><span style="color:var(--text-secondary);">tokens saved</span></div>' +
+          '<div style="font-size:0.85rem;margin:3px 0 8px;">' + st.compressedPct +
+          '% avg compression \u00b7 ' + st.compressed + ' / ' + st.requests + ' requests routed</div>' +
+          '<div style="position:relative;height:14px;border-radius:7px;background:rgba(148,163,184,0.18);overflow:hidden;">' +
+          '<div style="position:absolute;left:0;top:0;bottom:0;width:' + pct + '%;background:#4ade80;"></div></div>' +
+          '<div style="font-size:0.72rem;color:var(--text-secondary);margin-top:6px;">Cost saved $' +
+          st.costSavedUsd + ' (' + st.savingsPct + '%) \u00b7 cache $' + st.cacheSavedUsd + ' \u00b7 best ' + st.bestPct + '%</div>' +
+          (agents || providers
+            ? '<div style="font-size:0.72rem;color:var(--text-secondary);margin-top:8px;"><strong>Agent usage</strong>' +
+              (agents ? '<br>' + agents : '') +
+              (providers ? '<br><strong>Providers</strong> · ' + providers : '') +
+              '</div>'
+            : '');
+      }
+      sessions.innerHTML = (s.routedSessions || [])
+        .map((x) => {
+          const name = (x.name ?? '(unnamed)').replace(/[<&]/g, '');
+          const mode = (x.mode ?? '').replace(/[<&]/g, '');
+          const modeColor = mode === 'claude' ? '#d97757' : mode === 'codex' ? '#2dc4a0' : 'var(--text-secondary)';
+          const state = x.routed === null ? 'n/a' : x.routed ? 'routed' : 'direct';
+          const stateColor = state === 'routed' ? '#4ade80' : state === 'direct' ? '#fbbf24' : 'var(--text-secondary)';
+          const stateWeight = state === 'routed' ? '600' : '400';
+          const hasTimestamp = x.routedAt !== null && x.routedAt !== undefined;
+          const timestamp = Number(x.routedAt);
+          const recordedAt = hasTimestamp && Number.isFinite(timestamp)
+            ? new Date(timestamp).toLocaleString()
+            : x.routed === null
+              ? 'not applicable'
+              : 'recorded before timestamps';
+          return `<div style="display:flex;gap:10px;align-items:baseline;padding:2px 0;"><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${name}</span><span style="width:60px;flex-shrink:0;font-weight:600;color:${modeColor};">${mode}</span><span style="width:54px;flex-shrink:0;font-weight:${stateWeight};color:${stateColor};">${state}</span><span style="flex-shrink:0;color:var(--text-secondary);">snapshot ${recordedAt}</span></div>`;
+        })
+        .join('');
+    } catch {
+      dot.style.background = '#f87171';
+      health.textContent = 'Status unavailable';
+      savings.textContent = '—';
+      if (sessions) sessions.innerHTML = '';
+    }
+  },
+
   // Get default settings based on device type
   // Note: Notification prefs are handled separately by NotificationManager
   getDefaultSettings() {
+    const terminalDefaults = {
+      terminalScrollbackLines: 100000,
+      tmuxHistoryLimit: 100000,
+      terminalBufferMaxBytes: 32 * 1024 * 1024,
+      terminalBufferTrimBytes: 24 * 1024 * 1024,
+      checkpointDefaultEnabled: true,
+      tabRailWidth: 256,
+      sessionSidebarFontSize: 14,
+    };
     const isHandheld =
       MobileDetection.isHandheldDevice?.() ?? MobileDetection.getDeviceType() === 'mobile';
     if (isHandheld) {
       // Mobile defaults: minimal UI for small screens
       return {
+        ...terminalDefaults,
         // Header visibility - hide everything on mobile
         showFontControls: false,
         showSystemStats: false,
@@ -3588,6 +3874,7 @@ Object.assign(CodemanApp.prototype, {
         // policy guard keeps passing.
         showPlanUsageLimits: false,
         showAttachmentsButton: false,
+        liveMirrorEnabled: true, // COD-187 live mirror for codex/gemini terminals
         showFileViewerButton: false,
         showRedrawButton: false,
         showSessionButton: false,
@@ -3597,17 +3884,17 @@ Object.assign(CodemanApp.prototype, {
         // welcome screen. ON by default here, and the escape hatch if it ever
         // misbehaves on a device (the gate treats only an explicit false as off).
         mobileOverviewEnabled: true,
-        // Remote auto-reconnect (COD-108) — on by default
-        remoteAutoReconnect: true,
         // Input
         gestureControlEnabled: false,
-        // Feature toggles - keep tracking on even on mobile
-        subagentTrackingEnabled: true,
+        // Feature toggles - keep background-heavy tracking off on mobile
+        subagentTrackingEnabled: false,
         subagentActiveTabOnly: true, // Only show subagents for active tab
         imageWatcherEnabled: false,
         ralphTrackerEnabled: false,
         tabTwoRows: false,
         showTabCliLogos: true,
+        // COD-286: phones are forced horizontal by resolveTabOrientation anyway;
+        // this keeps the picker honest if the layout ever reaches a tablet width.
         tabOrientation: 'horizontal',
         tabRailWidth: 256,
         tabRailDetail: 'rich',
@@ -3631,7 +3918,7 @@ Object.assign(CodemanApp.prototype, {
     // touchscreen laptop too (fine primary pointer: the desktop default stays).
     const coarsePrimaryPointer =
       typeof window !== 'undefined' && window.matchMedia?.('(pointer: coarse)')?.matches === true;
-    return coarsePrimaryPointer ? { showTileGridButton: false } : {};
+    return coarsePrimaryPointer ? { ...terminalDefaults, showTileGridButton: false } : terminalDefaults;
   },
 
   loadAppSettingsFromStorage() {
@@ -3668,6 +3955,90 @@ Object.assign(CodemanApp.prototype, {
       localStorage.setItem(key, JSON.stringify(settings));
     } catch (err) {
       console.error('Failed to save app settings:', err);
+    }
+  },
+
+  stopShortcutCapture() {
+    if (this._shortcutCaptureHandler) {
+      document.removeEventListener('keydown', this._shortcutCaptureHandler, true);
+      this._shortcutCaptureHandler = null;
+    }
+    if (this._capturingShortcutId) {
+      const row = document.querySelector(`.shortcut-setting-row[data-shortcut-id="${CSS.escape(this._capturingShortcutId)}"]`);
+      row?.classList.remove('capturing');
+    }
+    this._capturingShortcutId = null;
+  },
+
+  resetShortcutSetting(shortcutId) {
+    const row = document.querySelector(`.shortcut-setting-row[data-shortcut-id="${CSS.escape(shortcutId)}"]`);
+    if (!row) return;
+    const defaultBindings = this._parseShortcutBindingsJson(row.dataset.defaultBindings);
+    const input = row.querySelector('.shortcut-binding-input');
+    const checkbox = row.querySelector('.shortcut-enabled-checkbox');
+    if (input) input.value = defaultBindings.map((binding) => this.formatShortcutBinding(binding)).join(', ');
+    if (checkbox) checkbox.checked = true;
+  },
+
+  shortcutBindingFromEvent(ev) {
+    const key = this.shortcutKeyFromEvent(ev);
+    const modifiers = [];
+    if (ev.ctrlKey) modifiers.push('ctrl');
+    if (ev.metaKey) modifiers.push('meta');
+    if (ev.altKey) modifiers.push('alt');
+    if (ev.shiftKey && !['?', '+', '{', '}'].includes(key)) modifiers.push('shift');
+    return {
+      modifiers,
+      key,
+      code: ev.code || undefined,
+    };
+  },
+
+  shortcutKeyFromEvent(ev) {
+    const shiftedCodeKeys = {
+      Slash: '?',
+      Equal: '+',
+      BracketLeft: '{',
+      BracketRight: '}',
+    };
+    if (ev.shiftKey && shiftedCodeKeys[ev.code]) return shiftedCodeKeys[ev.code];
+    return ev.key || '';
+  },
+
+  parseShortcutBindingList(value) {
+    return String(value || '')
+      .split(',')
+      .map((part) => this.parseShortcutBindingText(part.trim()))
+      .filter(Boolean);
+  },
+
+  parseShortcutBindingText(value) {
+    if (!value) return null;
+    const parts = value.split('+').map((part) => part.trim()).filter(Boolean);
+    if (parts.length === 0) return null;
+    const modifiers = [];
+    let key = parts.pop();
+    for (const part of parts) {
+      const normalized = part.toLowerCase();
+      if (['ctrl', 'control', 'cmd', 'command'].includes(normalized)) {
+        modifiers.push(normalized === 'cmd' || normalized === 'command' ? 'meta' : 'ctrl');
+      } else if (['alt', 'option', 'alt/option'].includes(normalized)) {
+        modifiers.push('alt');
+      } else if (normalized === 'shift') {
+        modifiers.push('shift');
+      }
+    }
+    if (!key) return null;
+    const code = key.length === 1 && /^[a-z0-9]$/i.test(key) ? `${/^\d$/.test(key) ? 'Digit' : 'Key'}${key.toUpperCase()}` : undefined;
+    return { modifiers, key, code };
+  },
+
+  _parseShortcutBindingsJson(value) {
+    try {
+      const parsed = JSON.parse(value || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
     }
   },
 
@@ -3952,6 +4323,12 @@ Object.assign(CodemanApp.prototype, {
       planUsageChip.classList.toggle('header-plan-usage--hidden', !showPlanUsageLimits);
     }
 
+    const showAwayDigest = settings.showAwayDigest ?? defaults.showAwayDigest ?? false;
+    const awayDigestBtn = document.getElementById('awayDigestBtn');
+    if (awayDigestBtn) {
+      awayDigestBtn.classList.toggle('btn-away-digest--hidden', !showAwayDigest);
+    }
+
     const showRedrawButton = settings.showRedrawButton ?? defaults.showRedrawButton ?? false;
     const redrawBtn = document.querySelector('.btn-redraw-terminal');
     if (redrawBtn) {
@@ -3965,13 +4342,6 @@ Object.assign(CodemanApp.prototype, {
     const sessionBtn = document.querySelector('.btn-session-manager');
     if (sessionBtn) {
       sessionBtn.classList.toggle('btn-session-manager--hidden', !showSessionButton);
-    }
-
-    // Away Digest button — opt-in, hidden by default. Same marker pattern.
-    const showAwayDigestButton = settings.showAwayDigestButton ?? defaults.showAwayDigestButton ?? false;
-    const awayDigestBtn = document.querySelector('.btn-away-digest');
-    if (awayDigestBtn) {
-      awayDigestBtn.classList.toggle('btn-away-digest--hidden', !showAwayDigestButton);
     }
 
     // Cron button (footer toolbar) — opt-in, hidden by default. Same marker pattern.
@@ -3999,15 +4369,27 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
+  // COD-286 — horizontal strip vs vertical rail.
+  //
+  // There is exactly ONE #sessionTabs element and it MOVES between its two homes
+  // (the header, and #tabRail inside .main). Cloning it would fork every alert
+  // badge, drag handler and inline rename between two copies; moving keeps all of
+  // app.js's getElementById('sessionTabs') paths working untouched.
   applyTabOrientation(options = {}) {
     const settings = this.loadAppSettingsFromStorage();
     const defaults = this.getDefaultSettings();
+    const setting = settings.tabOrientation ?? defaults.tabOrientation ?? 'horizontal';
+    // The upstream sidebar layout re-parents the SAME #sessionTabs node
+    // (applySessionListLayout in app.js). Two movers fighting over one element
+    // would each undo the other on every settings save and every resize, so the
+    // COD-286 rail yields entirely whenever the sidebar layout is the active one
+    // — same precedence the home rail's gate uses (home-sessions.js).
     const sidebarOwnsTabs = this.isSessionSidebarActive?.() === true;
     const orientation =
       !this.isSoloWindow && !sidebarOwnsTabs && window.CodemanTabOverflow?.resolveTabOrientation
         ? window.CodemanTabOverflow.resolveTabOrientation({
             deviceType: MobileDetection.getDeviceType(),
-            setting: settings.tabOrientation ?? defaults.tabOrientation ?? 'horizontal',
+            setting,
           })
         : 'horizontal';
 
@@ -4058,12 +4440,23 @@ Object.assign(CodemanApp.prototype, {
 
     const tabsEl = document.getElementById('sessionTabs');
     const rail = document.getElementById('tabRail');
+    const header = document.querySelector('.header');
+    const headerRight = document.getElementById('headerRight');
+    // #sessionTabsHost is the strip's markup home (index.html) and what
+    // applySessionListLayout() restores it to; moving it to .header directly
+    // would strand it outside the host every sidebar consumer keys off.
     const headerHost = document.getElementById('sessionTabsHost');
-    if (!sidebarOwnsTabs && tabsEl && rail && headerHost) {
+    if (!sidebarOwnsTabs && tabsEl && rail && header) {
       if (orientation === 'vertical') {
         if (tabsEl.parentElement !== rail) rail.appendChild(tabsEl);
-      } else if (tabsEl.parentElement !== headerHost) {
-        headerHost.appendChild(tabsEl);
+      } else if (headerHost) {
+        if (tabsEl.parentElement !== headerHost) headerHost.appendChild(tabsEl);
+      } else if (tabsEl.parentElement !== header) {
+        // Back to its original slot: after the brand, before the mobile utility
+        // toggle (which precedes headerRight in the source order).
+        const anchor = header.querySelector('.mobile-header-utility-toggle') || headerRight;
+        if (anchor) header.insertBefore(tabsEl, anchor);
+        else header.appendChild(tabsEl);
       }
     }
     if (tabsEl) {
@@ -4153,6 +4546,7 @@ Object.assign(CodemanApp.prototype, {
       tabsEl.classList.toggle('tabs-two-rows', twoRows);
       tabsEl.classList.toggle('tabs-show-folder', showFolder);
     }
+    this.updateTabOverflowMode?.();
     // Re-render tabs if folder visibility changed (folder spans are generated in JS)
     if (prevTallTabs !== undefined && prevTallTabs !== showFolder) {
       this._fullRenderSessionTabs();
@@ -4171,6 +4565,10 @@ Object.assign(CodemanApp.prototype, {
       monitorPanel.style.display = showMonitor ? '' : 'none';
       if (showMonitor) {
         monitorPanel.classList.add('open');
+        // COD-97: the Monitor is shown via the setting (not a manual toggle), so
+        // its mux list would otherwise stay empty/stale until the first toggle.
+        // Load it now so it matches the open tabs from the start.
+        this.loadMuxSessions?.();
       } else {
         monitorPanel.classList.remove('open');
       }
@@ -4206,34 +4604,17 @@ Object.assign(CodemanApp.prototype, {
       this.removeAllUltracodeWindows();
     }
 
-    // File browser panel visibility
+    // File browser panel visibility. The `showFileBrowser` setting only gates whether
+    // we reveal on settings-apply; the actual reveal (add .visible + load + drag wiring)
+    // lives in the canonical `showFileBrowserPanel` helper (panels-ui.js), shared with
+    // the Session Manager → ⋯ → Open folder action.
     const fileBrowserPanel = document.getElementById('fileBrowserPanel');
     if (fileBrowserPanel) {
       if (showFileBrowser && this.activeSessionId) {
-        fileBrowserPanel.classList.add('visible');
-        this.loadFileBrowser(this.activeSessionId);
-        // Attach drag listeners if not already attached
-        if (!this.fileBrowserDragListeners) {
-          const header = fileBrowserPanel.querySelector('.file-browser-header');
-          if (header) {
-            // Convert right-positioned to left/top before drag so makeWindowDraggable works
-            const onFirstDrag = () => {
-              if (!fileBrowserPanel.style.left) {
-                const rect = fileBrowserPanel.getBoundingClientRect();
-                fileBrowserPanel.style.left = `${rect.left}px`;
-                fileBrowserPanel.style.top = `${rect.top}px`;
-                fileBrowserPanel.style.right = 'auto';
-              }
-            };
-            header.addEventListener('mousedown', onFirstDrag);
-            header.addEventListener('touchstart', onFirstDrag, { passive: true });
-            this.fileBrowserDragListeners = this.makeWindowDraggable(fileBrowserPanel, header);
-            this.fileBrowserDragListeners._onFirstDrag = onFirstDrag;
-          }
-        }
-      } else if (fileBrowserPanel.classList.contains('visible')) {
-        this._resetFileBrowserForHide?.();
+        this.showFileBrowserPanel(this.activeSessionId);
+      } else {
         fileBrowserPanel.classList.remove('visible');
+        this.updateFileBrowserHeaderButton?.();
       }
     }
   },
@@ -4266,37 +4647,106 @@ Object.assign(CodemanApp.prototype, {
   },
 
   async clearAllSubagents() {
-    const count = this.subagents.size;
+    const count = Array.from(this.subagents.values()).filter(agent => agent.status === 'completed').length;
     if (count === 0) {
-      this.showToast('No subagents to clear', 'info');
+      this.showToast('No completed subagent history to clear', 'info');
       return;
     }
 
-    if (!confirm(`Clear all ${count} tracked subagent(s)? This removes them from the UI but does not affect running processes.`)) {
+    if (!confirm(`Clear ${count} completed subagent${count === 1 ? '' : 's'} from history? Live agents will remain.`)) {
       return;
     }
 
+    const clearGeneration = (this._subagentClearGeneration || 0) + 1;
+    this._subagentClearGeneration = clearGeneration;
+    const eventWatermark = new Map(this._subagentEventVersions || []);
     try {
       const res = await fetch('/api/subagents', { method: 'DELETE' });
       const data = await res.json();
+      if (clearGeneration !== this._subagentClearGeneration) return;
       if (data.success) {
-        // Clear local state
-        this.subagents.clear();
-        this.subagentActivity.clear();
-        this.subagentToolResults.clear();
-        // Close any open subagent windows
-        this.cleanupAllFloatingWindows();
+        if (!Array.isArray(data.data?.remaining)) {
+          this.showToast('Failed to clear subagents: invalid server snapshot', 'error');
+          return;
+        }
+        await this._reconcileSubagentSnapshot(data.data.remaining, eventWatermark);
+        if (clearGeneration !== this._subagentClearGeneration) return;
         // Update UI
         this.renderSubagentPanel();
         this.renderMonitorSubagents();
         this.updateSubagentBadge();
-        this.showToast(`Cleared ${data.data.cleared} subagent(s)`, 'success');
+        const cleared = data.data.cleared || 0;
+        this.showToast(`Cleared ${cleared} completed subagent${cleared === 1 ? '' : 's'}`, 'success');
       } else {
         this.showToast('Failed to clear subagents: ' + data.error, 'error');
       }
     } catch (err) {
       this.showToast('Failed to clear subagents', 'error');
     }
+  },
+
+  async _reconcileSubagentSnapshot(remaining, eventWatermark = new Map(this._subagentEventVersions || [])) {
+    const nextSubagents = new Map();
+    for (const [agentKey, record] of this.subagents) {
+      const changedSinceRequest = (this._subagentEventVersions?.get(agentKey) || 0) !== (eventWatermark.get(agentKey) || 0);
+      if (changedSinceRequest) nextSubagents.set(agentKey, record);
+    }
+    for (const record of Array.isArray(remaining) ? remaining : []) {
+      if (typeof record?.agentKey !== 'string' || record.agentKey.length === 0) continue;
+      const changedSinceRequest =
+        (this._subagentEventVersions?.get(record.agentKey) || 0) !== (eventWatermark.get(record.agentKey) || 0);
+      if (changedSinceRequest) continue;
+      const existing = this.subagents.get(record.agentKey);
+      if (existing) {
+        Object.assign(existing, record);
+        nextSubagents.set(record.agentKey, existing);
+      } else {
+        nextSubagents.set(record.agentKey, record);
+      }
+    }
+
+    for (const agentKey of this.subagents.keys()) {
+      if (nextSubagents.has(agentKey)) continue;
+      const renderTimer = this._subagentWindowRenderTimeouts?.get(agentKey);
+      if (renderTimer) clearTimeout(renderTimer);
+      this._subagentWindowRenderTimeouts?.delete(agentKey);
+      for (const timer of this._subagentCompletionTimers?.get(agentKey) || []) clearTimeout(timer);
+      this._subagentCompletionTimers?.delete(agentKey);
+      this.subagentActivity.delete(agentKey);
+      this.subagentToolResults.delete(agentKey);
+      this.subagentParentMap.delete(agentKey);
+      if (this.subagentWindows.has(agentKey)) this.forceCloseSubagentWindow(agentKey);
+      for (const [sessionId, minimized] of this.minimizedSubagents) {
+        minimized.delete(agentKey);
+        if (minimized.size === 0) this.minimizedSubagents.delete(sessionId);
+      }
+    }
+
+    this.subagents = nextSubagents;
+    if (this.activeSubagentKey && !nextSubagents.has(this.activeSubagentKey)) this.activeSubagentKey = null;
+    await Promise.all([this.saveSubagentParentMap(), this.saveSubagentWindowStates()]);
+  },
+
+  _reportSubagentPersistenceFailure(kind, err) {
+    if (!this._subagentIdentityDiagnostics) this._subagentIdentityDiagnostics = new Set();
+    const diagnosticKey = `persistence:${kind}`;
+    if (this._subagentIdentityDiagnostics.has(diagnosticKey)) return;
+    this._subagentIdentityDiagnostics.add(diagnosticKey);
+    console.warn(`Failed to persist subagent ${kind}:`, err);
+  },
+
+  _queueSubagentPersistence(kind, operation) {
+    if (!this._subagentPersistenceQueues) this._subagentPersistenceQueues = new Map();
+    if (!this._subagentPersistenceGenerations) this._subagentPersistenceGenerations = new Map();
+    const generation = (this._subagentPersistenceGenerations.get(kind) || 0) + 1;
+    this._subagentPersistenceGenerations.set(kind, generation);
+    const previous = this._subagentPersistenceQueues.get(kind) || Promise.resolve();
+    const queued = previous
+      .catch(() => {})
+      .then(() => operation(generation))
+      .catch(err => this._reportSubagentPersistenceFailure(kind, err));
+    this._subagentPersistenceQueues.set(kind, queued);
+    return queued;
   },
 
   toggleSubagentsPanel() {
@@ -4369,6 +4819,7 @@ Object.assign(CodemanApp.prototype, {
           'showSessionButton', 'showAwayDigestButton', 'showCronButton', 'showGitStatus', 'gitStatusTree', 'gitStatusMaxRepos', 'gitStatusTimeoutSeconds',
           'showTabDetachButton',
           'mobileOverviewEnabled',
+          'liveMirrorEnabled',
           'sessionLineageLines',
           'showSplitButton',
           'showTileGridButton',
@@ -4400,6 +4851,10 @@ Object.assign(CodemanApp.prototype, {
           }
         }
         this.saveAppSettingsToStorage(merged);
+        this._applyLiveMirrorSetting?.(merged.liveMirrorEnabled); // COD-187
+        if (merged.terminalScrollbackLines) {
+          localStorage.setItem('codeman-scrollback', String(merged.terminalScrollbackLines));
+        }
 
         // Apply notification prefs from server if present (only if localStorage has none)
         if (notificationPreferences && this.notificationManager) {
@@ -4456,17 +4911,46 @@ Object.assign(CodemanApp.prototype, {
    * Load subagent window states from server (or localStorage fallback).
    * Called on page load to restore minimized/open window states.
    */
-  async loadSubagentWindowStates() {
+  _normalizeSubagentWindowStates(value) {
+    const normalized = { minimized: {}, open: [] };
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return normalized;
+
+    if (value.minimized && typeof value.minimized === 'object' && !Array.isArray(value.minimized)) {
+      for (const [sessionId, persistedKeys] of Object.entries(value.minimized)) {
+        if (typeof sessionId !== 'string' || sessionId.length === 0 || !Array.isArray(persistedKeys)) continue;
+        const validKeys = persistedKeys.filter(key => typeof key === 'string' && key.length > 0);
+        if (validKeys.length > 0) normalized.minimized[sessionId] = validKeys;
+      }
+    }
+
+    if (Array.isArray(value.open)) {
+      normalized.open = value.open.filter(record => {
+        if (!record || typeof record !== 'object' || Array.isArray(record)) return false;
+        const persistedKey = record.agentKey || record.agentId;
+        return typeof persistedKey === 'string' && persistedKey.length > 0;
+      });
+    }
+
+    return normalized;
+  },
+
+  async loadSubagentWindowStates(initGeneration = this._initGeneration) {
     let states = null;
 
     // Try server first for cross-browser sync
     try {
       const res = await fetch('/api/subagent-window-states');
+      if (initGeneration !== this._initGeneration) return null;
       if (res.ok) {
         const env = await res.json();
-        states = env?.success === true ? env.data : env;
+        if (initGeneration !== this._initGeneration) return null;
+        states = this._normalizeSubagentWindowStates(env?.success === true ? env.data : env);
         // Also update localStorage
-        localStorage.setItem('codeman-subagent-window-states', JSON.stringify(states));
+        try {
+          localStorage.setItem('codeman-subagent-window-states', JSON.stringify(states));
+        } catch (err) {
+          this._reportSubagentPersistenceFailure('window state cache', err);
+        }
       }
     } catch (err) {
       console.error('Failed to load subagent window states from server:', err);
@@ -4477,14 +4961,15 @@ Object.assign(CodemanApp.prototype, {
       try {
         const saved = localStorage.getItem('codeman-subagent-window-states');
         if (saved) {
-          states = JSON.parse(saved);
+          states = this._normalizeSubagentWindowStates(JSON.parse(saved));
         }
       } catch (err) {
         console.error('Failed to load subagent window states from localStorage:', err);
       }
     }
 
-    return states || { minimized: {}, open: [] };
+    if (initGeneration !== this._initGeneration) return null;
+    return this._normalizeSubagentWindowStates(states);
   },
 
 
@@ -4498,43 +4983,48 @@ Object.assign(CodemanApp.prototype, {
    * Save the subagent parent map to localStorage and server.
    * Called whenever a new parent association is discovered.
    */
-  async saveSubagentParentMap() {
+  saveSubagentParentMap(initGeneration = this._initGeneration) {
     const mapData = Object.fromEntries(this.subagentParentMap);
-
-    // Save to localStorage for instant recovery
-    try {
-      localStorage.setItem('codeman-subagent-parents', JSON.stringify(mapData));
-    } catch (err) {
-      console.error('Failed to save subagent parents to localStorage:', err);
-    }
-
-    // Save to server for cross-browser/session persistence
-    try {
-      await fetch('/api/subagent-parents', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(mapData)
-      });
-    } catch (err) {
-      console.error('Failed to save subagent parents to server:', err);
-    }
+    return this._queueSubagentPersistence('parents', async () => {
+      if (initGeneration !== this._initGeneration) return;
+      try {
+        localStorage.setItem('codeman-subagent-parents', JSON.stringify(mapData));
+      } catch (err) {
+        this._reportSubagentPersistenceFailure('parent cache', err);
+      }
+      try {
+        await fetch('/api/subagent-parents', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(mapData)
+        });
+      } catch (err) {
+        this._reportSubagentPersistenceFailure('parent server state', err);
+      }
+    });
   },
 
   /**
    * Load the subagent parent map from server (or localStorage fallback).
    * Called once on page load, before any agents are discovered.
    */
-  async loadSubagentParentMap() {
+  async loadSubagentParentMap(initGeneration = this._initGeneration) {
     let mapData = null;
 
     // Try server first (most authoritative)
     try {
       const res = await fetch('/api/subagent-parents');
+      if (initGeneration !== this._initGeneration) return;
       if (res.ok) {
         const env = await res.json();
+        if (initGeneration !== this._initGeneration) return;
         mapData = env?.success === true ? env.data : env;
         // Update localStorage as cache
-        localStorage.setItem('codeman-subagent-parents', JSON.stringify(mapData));
+        try {
+          localStorage.setItem('codeman-subagent-parents', JSON.stringify(mapData));
+        } catch (err) {
+          this._reportSubagentPersistenceFailure('parent cache', err);
+        }
       }
     } catch (err) {
       console.error('Failed to load subagent parents from server:', err);
@@ -4542,6 +5032,7 @@ Object.assign(CodemanApp.prototype, {
 
     // Fallback to localStorage
     if (!mapData) {
+      if (initGeneration !== this._initGeneration) return;
       try {
         const saved = localStorage.getItem('codeman-subagent-parents');
         if (saved) {
@@ -4554,46 +5045,65 @@ Object.assign(CodemanApp.prototype, {
 
     // Populate the map (prune stale entries: require both session and agent to exist)
     if (mapData && typeof mapData === 'object') {
-      for (const [agentId, sessionId] of Object.entries(mapData)) {
-        if (this.sessions.has(sessionId) && this.subagents.has(agentId)) {
-          this.subagentParentMap.set(agentId, sessionId);
+      if (initGeneration !== this._initGeneration) return;
+      let migrationChanged = false;
+      for (const [persistedKey, sessionId] of Object.entries(mapData)) {
+        if (initGeneration !== this._initGeneration) return;
+        const agentKey = this._resolvePersistedSubagentKey(persistedKey);
+        if (agentKey && this.sessions.has(sessionId)) {
+          this.subagentParentMap.set(agentKey, sessionId);
+          if (agentKey !== persistedKey) migrationChanged = true;
+        } else {
+          migrationChanged = true;
         }
       }
+      if (migrationChanged) await this.saveSubagentParentMap(initGeneration);
     }
+  },
+
+  _resolvePersistedSubagentKey(persistedKey) {
+    if (typeof persistedKey !== 'string' || persistedKey.length === 0) return null;
+    if (this.subagents.has(persistedKey)) return persistedKey;
+    const matches = [];
+    for (const [agentKey, agent] of this.subagents) {
+      if (agent?.agentId === persistedKey) matches.push(agentKey);
+      if (matches.length > 1) return null;
+    }
+    return matches.length === 1 ? matches[0] : null;
   },
 
   /**
    * Get the parent session ID for an agent from the persistent map.
    * This is the ONLY source of truth for connection lines.
    */
-  getAgentParentSessionId(agentId) {
-    return this.subagentParentMap.get(agentId) || null;
+  getAgentParentSessionId(agentKey) {
+    return this.subagentParentMap.get(agentKey) || null;
   },
 
   /**
    * Set and persist the parent session ID for an agent.
    * Once set, this association is PERMANENT and never recalculated.
    */
-  setAgentParentSessionId(agentId, sessionId) {
-    if (!agentId || !sessionId) return;
+  setAgentParentSessionId(agentKey, sessionId) {
+    if (!agentKey || !sessionId) return;
 
     // Only set if not already set (first association wins)
-    if (this.subagentParentMap.has(agentId)) {
+    if (this.subagentParentMap.has(agentKey)) {
       return; // Already has a parent, don't override
     }
 
-    this.subagentParentMap.set(agentId, sessionId);
+    this.subagentParentMap.set(agentKey, sessionId);
     this.saveSubagentParentMap(); // Persist immediately
 
     // Also update the agent object for consistency
-    const agent = this.subagents.get(agentId);
+    const agent = this.subagents.get(agentKey);
     if (agent) {
       agent.parentSessionId = sessionId;
       const session = this.sessions.get(sessionId);
       if (session) {
         agent.parentSessionName = this.getSessionName(session);
       }
-      this.subagents.set(agentId, agent);
+      this.subagents.set(agentKey, agent);
     }
   },
 
@@ -4649,10 +5159,24 @@ Object.assign(CodemanApp.prototype, {
         <button type="button" class="shortcut-reset-btn" data-shortcut-action="reset" title="Reset to default"${overridden ? '' : ' disabled'}>Reset</button>
         <input class="shortcut-enabled-checkbox" type="checkbox" ${shortcut.disabled ? '' : 'checked'} data-shortcut-action="toggle" title="Enable/disable">`
           : '';
+        let paletteHtml = '';
+        if (shortcut.id === 'command-palette') {
+          const allModes = ['claude', 'codex', 'opencode', 'gemini', 'antigravity', 'pi', 'shell'];
+          const labels = { claude: 'Claude', codex: 'Codex', opencode: 'OpenCode', gemini: 'Gemini', antigravity: 'Antigravity', pi: 'Pi', shell: 'Shell' };
+          const current = Array.isArray(shortcut.paletteAgentModes) && shortcut.paletteAgentModes.length ? shortcut.paletteAgentModes : ['claude', 'codex', 'opencode'];
+          const chips = allModes
+            .map((m) => {
+              const checked = current.includes(m) ? ' checked' : '';
+              return `<label class="shortcut-palette-chip"><input type="checkbox" data-palette-agent="${escapeHtml(m)}"${checked}> ${escapeHtml(labels[m] || m)}</label>`;
+            })
+            .join('');
+          paletteHtml = `<div class="shortcut-palette-modes"><span class="shortcut-palette-label">Agents for ←/→:</span> ${chips}</div>`;
+        }
         return `<div class="shortcut-setting-row${configurable ? '' : ' shortcut-setting-row--fixed'}" data-shortcut-id="${escapeHtml(shortcut.id)}">
         <label class="shortcut-setting-label">${escapeHtml(shortcut.label)}</label>
         <input class="shortcut-binding-input" type="text" readonly value="${escapeHtml(bindingLabel)}" placeholder="(none)" data-id="${escapeHtml(shortcut.id)}">
         ${controls}
+        ${paletteHtml}
       </div>`;
       })
       .join('');
@@ -4674,10 +5198,56 @@ Object.assign(CodemanApp.prototype, {
     });
     list.addEventListener('change', (e) => {
       const box = e.target;
-      if (!box?.matches?.('[data-shortcut-action="toggle"]')) return;
-      const id = box.closest?.('[data-shortcut-id]')?.dataset?.shortcutId;
-      if (id) this.toggleShortcutEnabled(id, box.checked);
+      if (box?.matches?.('[data-shortcut-action="toggle"]')) {
+        const id = box.closest?.('[data-shortcut-id]')?.dataset?.shortcutId;
+        if (id) this.toggleShortcutEnabled(id, box.checked);
+        return;
+      }
+      if (box?.matches?.('[data-palette-agent]')) {
+        const mode = box.dataset.paletteAgent;
+        const row = box.closest?.('[data-shortcut-id]');
+        const id = row?.dataset?.shortcutId;
+        if (id) this.togglePaletteAgentMode(id, mode, box.checked);
+      }
     });
+  },
+
+  togglePaletteAgentMode(shortcutId, mode, checked) {
+    const valid = ['claude', 'shell', 'opencode', 'codex', 'gemini', 'antigravity', 'pi'];
+    if (!valid.includes(mode)) return;
+    const settings = this.loadAppSettingsFromStorage();
+    const shortcutOverrides = { ...(settings.shortcutOverrides || {}) };
+    const current = shortcutOverrides[shortcutId] || {};
+    const existing = Array.isArray(current.paletteAgentModes) && current.paletteAgentModes.length ? [...current.paletteAgentModes] : null;
+    // Use registry default when no override exists
+    const fallback = typeof this.getPaletteAgentModes === 'function' ? null : ['claude', 'codex', 'opencode'];
+    let modes;
+    if (existing) modes = existing;
+    else if (typeof this.getShortcutRegistry === 'function') {
+      const reg = this.getShortcutRegistry().find((s) => s.id === shortcutId);
+      modes = Array.isArray(reg?.paletteAgentModes) && reg.paletteAgentModes.length ? [...reg.paletteAgentModes] : ['claude', 'codex', 'opencode'];
+    } else {
+      modes = [...(fallback || ['claude', 'codex', 'opencode'])];
+    }
+    const set = new Set(modes);
+    if (checked) set.add(mode);
+    else set.delete(mode);
+    if (set.size === 0) {
+      this.showToast?.('At least one agent must be selected', 'error');
+      // revert checkbox
+      const input = document.querySelector(`[data-shortcut-id="${shortcutId}"] [data-palette-agent="${mode}"]`);
+      if (input) input.checked = true;
+      return;
+    }
+    // Preserve a stable order: follow allModes order, not insertion order
+    const allModes = ['claude', 'codex', 'opencode', 'gemini', 'antigravity', 'pi', 'shell'];
+    const ordered = allModes.filter((m) => set.has(m));
+    shortcutOverrides[shortcutId] = { ...current, paletteAgentModes: ordered };
+    settings.shortcutOverrides = shortcutOverrides;
+    this.saveAppSettingsToStorage(settings);
+    // Sync to server for cross-device persistence (shortcutOverrides is synced)
+    try { this._apiPut?.('/api/settings', { shortcutOverrides }); } catch {}
+    // No full re-render to preserve focus; the palette will pick up on next open
   },
 
   readShortcutOverridesFromSettings() {
@@ -4758,6 +5328,11 @@ Object.assign(CodemanApp.prototype, {
     this.closeAppSettings();
     this.cancelCloseSession();
     this.closeTokenStats();
+    this.closeShortcutOverlay?.();
+    // Mobile header utility tray closes alongside the other overlays so Escape
+    // (and any future closeAllPanels caller) dismisses it like every other panel
+    // instead of leaving it pinned open with only its toggle to close it.
+    this.closeMobileHeaderUtilities?.();
     document.getElementById('monitorPanel').classList.remove('open');
     // Collapse subagents panel (don't hide it permanently)
     const subagentsPanel = document.getElementById('subagentsPanel');
@@ -4765,6 +5340,396 @@ Object.assign(CodemanApp.prototype, {
       subagentsPanel.classList.remove('open');
     }
     this.subagentPanelVisible = false;
+  },
+
+  // ───────────────────────────────────────────────────────────────
+  // User-scope skills (App Settings → Skills tab)
+  // ───────────────────────────────────────────────────────────────
+
+  async loadUserSkillsSection() {
+    const list = document.getElementById('userSkillsList');
+    const warning = document.getElementById('userSkillsWarning');
+    if (!list) return;
+    list.textContent = '';
+    const placeholder = document.createElement('span');
+    placeholder.style.cssText = 'opacity:0.5;font-size:0.8rem;';
+    placeholder.textContent = 'Loading…';
+    list.appendChild(placeholder);
+    try {
+      const res = await fetch('/api/skills/user', { credentials: 'include' });
+      const body = await res.json();
+      if (!body.success) {
+        list.textContent = '';
+        const errSpan = document.createElement('span');
+        errSpan.style.color = 'var(--error)';
+        errSpan.textContent = `Error: ${body.error}`;
+        list.appendChild(errSpan);
+        return;
+      }
+      const { hasManifest, entries } = body.data;
+      const refreshList = () => this.loadUserSkillsSection();
+      this._renderUserSkillsInto(list, entries, hasManifest, refreshList);
+      if (warning) warning.style.display = entries.length > 10 ? '' : 'none';
+    } catch {
+      list.textContent = '';
+      const errSpan = document.createElement('span');
+      errSpan.style.cssText = 'opacity:0.5;font-size:0.8rem;';
+      errSpan.textContent = 'Failed to load user skills.';
+      list.appendChild(errSpan);
+    }
+  },
+
+  async _openAdoptWizard(section, entry, refreshList) {
+    // Replace the "Adopt to repo…" button with the wizard form
+    section.textContent = '';
+    section.classList.add('skill-adopt-wizard');
+
+    const status = document.createElement('div');
+    status.className = 'skill-adopt-status';
+    status.textContent = 'Loading sources…';
+    section.appendChild(status);
+
+    let adoptSources = [];
+    try {
+      const res = await fetch('/api/skills/adopt-sources', { credentials: 'include' });
+      const body = await res.json();
+      if (!body.success) throw new Error(body.error);
+      adoptSources = body.data.sources;
+    } catch (e) {
+      status.textContent = `Failed to load sources: ${e.message}`;
+      return;
+    }
+
+    if (!adoptSources.length) {
+      status.textContent = 'No eligible sources found. Ensure at least one source in sources.d/ has a skills directory.';
+      return;
+    }
+    section.removeChild(status);
+
+    // Source selector
+    const sourceRow = document.createElement('div');
+    sourceRow.className = 'skill-adopt-row';
+    const sourceLabel = document.createElement('label');
+    sourceLabel.textContent = 'Target source';
+    const sourceSelect = document.createElement('select');
+    sourceSelect.className = 'skill-adopt-select';
+    for (const src of adoptSources) {
+      const opt = document.createElement('option');
+      opt.value = src.name;
+      opt.textContent = `${src.name}`;
+      sourceSelect.appendChild(opt);
+    }
+    sourceRow.append(sourceLabel, sourceSelect);
+
+    // Resolved destination path display
+    const destRow = document.createElement('div');
+    destRow.className = 'skill-adopt-row skill-adopt-dest';
+    const destLabel = document.createElement('span');
+    destLabel.className = 'skill-adopt-dest-label';
+    destLabel.textContent = 'Destination';
+    const destPath = document.createElement('span');
+    destPath.className = 'skill-adopt-dest-path';
+    destRow.append(destLabel, destPath);
+
+    function updateDest() {
+      const src = adoptSources.find((s) => s.name === sourceSelect.value);
+      destPath.textContent = src ? `${src.skillsDir}/${entry.name}/` : '';
+    }
+    sourceSelect.addEventListener('change', updateDest);
+    updateDest();
+
+    // Codex support toggle
+    const codexRow = document.createElement('div');
+    codexRow.className = 'skill-adopt-row';
+    const codexLabel = document.createElement('label');
+    codexLabel.className = 'skill-adopt-codex-label';
+    const codexCheck = document.createElement('input');
+    codexCheck.type = 'checkbox';
+    codexCheck.className = 'skill-adopt-codex-check';
+    codexLabel.append(codexCheck, document.createTextNode(' Add Codex support (agents/openai.yaml)'));
+    codexRow.appendChild(codexLabel);
+
+    // YAML textarea (hidden until codex toggled on)
+    const yamlRow = document.createElement('div');
+    yamlRow.className = 'skill-adopt-yaml-row';
+    const yamlLabel = document.createElement('div');
+    yamlLabel.className = 'skill-adopt-yaml-label';
+    yamlLabel.textContent = 'agents/openai.yaml — review and edit before adopting:';
+    const yamlArea = document.createElement('textarea');
+    yamlArea.className = 'skill-adopt-yaml';
+    yamlArea.rows = 6;
+    // Generate skeleton from skill entry
+    const displayName = entry.name.replace(/-/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+    const shortDesc = entry.description || `Use this skill to perform ${entry.name} tasks.`;
+    yamlArea.value = `interface:\n  display_name: "${displayName}"\n  short_description: "${shortDesc.slice(0, 100)}"\n  default_prompt: "Use $${entry.name} to ..."`;
+    yamlRow.append(yamlLabel, yamlArea);
+
+    codexCheck.addEventListener('change', () => { yamlRow.style.display = codexCheck.checked ? 'flex' : 'none'; });
+
+    // Action buttons
+    const btnRow = document.createElement('div');
+    btnRow.className = 'skill-adopt-btn-row';
+    const confirmBtn = document.createElement('button');
+    confirmBtn.className = 'skill-adopt-confirm';
+    confirmBtn.textContent = 'Adopt';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'skill-adopt-cancel';
+    cancelBtn.textContent = 'Cancel';
+    const errMsg = document.createElement('span');
+    errMsg.className = 'skill-adopt-error';
+    btnRow.append(confirmBtn, cancelBtn, errMsg);
+
+    cancelBtn.addEventListener('click', () => {
+      section.classList.remove('skill-adopt-wizard');
+      section.textContent = '';
+      const btn = document.createElement('button');
+      btn.className = 'skill-adopt-btn';
+      btn.textContent = 'Adopt to repo…';
+      btn.addEventListener('click', () => this._openAdoptWizard(section, entry, refreshList));
+      section.appendChild(btn);
+    });
+
+    async function doAdopt(forceOverwrite = false) {
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = 'Adopting…';
+      errMsg.textContent = '';
+      try {
+        const res = await fetch('/api/skills/user/adopt', {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            skillName: entry.name,
+            sourceName: sourceSelect.value,
+            forceOverwrite,
+            codexSupport: codexCheck.checked,
+            codexYaml: codexCheck.checked ? yamlArea.value : undefined,
+          }),
+        });
+        const body = await res.json();
+        if (!body.success) {
+          if (body.error && body.error.includes('already exists') && !forceOverwrite) {
+            errMsg.textContent = `${body.error}. `;
+            const overBtn = document.createElement('button');
+            overBtn.textContent = 'Overwrite';
+            overBtn.className = 'skill-adopt-overwrite';
+            overBtn.addEventListener('click', () => { overBtn.remove(); doAdopt(true); });
+            errMsg.appendChild(overBtn);
+            confirmBtn.disabled = false;
+            confirmBtn.textContent = 'Adopt';
+          } else {
+            errMsg.textContent = body.error;
+            confirmBtn.disabled = false;
+            confirmBtn.textContent = 'Adopt';
+          }
+          return;
+        }
+        // Success — refresh the list
+        if (refreshList) refreshList();
+      } catch (e) {
+        errMsg.textContent = `Error: ${e.message}`;
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = 'Adopt';
+      }
+    }
+
+    confirmBtn.addEventListener('click', () => doAdopt(false));
+    section.append(sourceRow, destRow, codexRow, yamlRow, btnRow);
+  },
+
+  _renderUserSkillsInto(container, entries, hasManifest, refreshList = null) {
+    const self = this;
+    container.textContent = '';
+    if (!hasManifest || !entries.length) {
+      const msg = document.createElement('span');
+      msg.style.cssText = 'opacity:0.5;font-size:0.8rem;';
+      msg.textContent = !hasManifest
+        ? 'No skill-install manifest found (run: skill-install --user --sync).'
+        : 'No user-scope skills configured.';
+      container.appendChild(msg);
+      return;
+    }
+    // Column header
+    const header = document.createElement('div');
+    header.className = 'user-skill-entry user-skill-header';
+    const hIcon = document.createElement('span'); hIcon.className = 'skill-icon'; hIcon.textContent = '';
+    const hKind = document.createElement('span'); hKind.className = 'skill-kind-badge'; hKind.textContent = '';
+    const hName = document.createElement('span'); hName.className = 'skill-name'; hName.textContent = 'name';
+    const hClaude = document.createElement('span'); hClaude.className = 'skill-platform-col'; hClaude.textContent = 'Claude';
+    const hCodex = document.createElement('span'); hCodex.className = 'skill-platform-col'; hCodex.textContent = 'Codex';
+    const hSrc = document.createElement('span'); hSrc.className = 'skill-source'; hSrc.textContent = 'source';
+    header.append(hIcon, hKind, hName, hClaude, hCodex, hSrc);
+    container.appendChild(header);
+
+    const iconMap = { 'linked-managed': '[*]', real: '[F]', foreign: '[?]', dangling: '[!]', 'available-managed': '[ ]' };
+    let openDetail = null;
+    let openName = null;
+    for (const e of entries) {
+      const isReal = e.klass === 'real';
+      const row = document.createElement('div');
+      row.className = 'user-skill-entry';
+
+      const icon = document.createElement('span');
+      icon.className = 'skill-icon';
+      icon.textContent = iconMap[e.klass] ?? '[ ]';
+      if (isReal) icon.title = 'Direct file — not managed by skill-install';
+
+      const kind = document.createElement('span');
+      kind.className = 'skill-kind-badge';
+      kind.textContent = e.kind;
+
+      const name = document.createElement('span');
+      name.className = 'skill-name skill-name--clickable';
+      name.textContent = e.name;
+      name.title = 'Click for details';
+
+      // Claude column — always present if in this list
+      const claudeCol = document.createElement('span');
+      claudeCol.className = 'skill-platform-col';
+      claudeCol.innerHTML = '<span class="platform-dot platform-dot--yes" title="Installed in ~/.claude/skills">●</span>';
+
+      // Codex column — only skills get a mirror; null = N/A
+      const codexCol = document.createElement('span');
+      codexCol.className = 'skill-platform-col';
+      if (e.mirrorInstalled === null) {
+        codexCol.innerHTML = '<span class="platform-dot platform-dot--na" title="Not applicable for this kind">—</span>';
+      } else if (e.mirrorInstalled) {
+        codexCol.innerHTML = '<span class="platform-dot platform-dot--yes" title="Installed in ~/.agents/skills">●</span>';
+      } else {
+        codexCol.innerHTML = '<span class="platform-dot platform-dot--missing" title="Missing from ~/.agents/skills — run skill-install --user --sync">○</span>';
+      }
+
+      const src = document.createElement('span');
+      src.className = 'skill-source';
+      src.style.cssText = 'opacity:0.55;font-size:0.75rem;';
+      src.textContent = isReal ? '(not a symlink)' : (e.source || '');
+      if (isReal) src.title = 'Remove manually from ~/.claude/skills or ~/.agents/skills';
+
+      if (isReal) {
+        row.append(icon, kind, name, claudeCol, codexCol, src);
+      } else {
+        const rmBtn = document.createElement('button');
+        rmBtn.className = 'btn-remove-user-skill';
+        rmBtn.title = 'Remove from user scope';
+        rmBtn.textContent = '×';
+        rmBtn.dataset.skillId = e.name + (e.pack ? ':' + e.pack : '');
+        row.append(icon, kind, name, claudeCol, codexCol, src, rmBtn);
+      }
+      // Detail panel — toggled on name click (accordion: only one open at a time)
+      const detail = document.createElement('div');
+      detail.className = 'user-skill-detail';
+      const rows = [];
+      if (e.description) rows.push(['Description', e.description]);
+      if (e.pack) rows.push(['Pack', e.pack]);
+      if (e.source) rows.push(['Source', e.source]);
+      rows.push(['Claude path', e.claudePath]);
+      if (e.target) rows.push(['→ target', e.target]);
+      if (e.mirrorPath) rows.push(['Codex mirror', e.mirrorPath + (e.mirrorInstalled ? '' : ' (missing)')]);
+      rows.push(['Type', e.klass]);
+      for (const [label, value] of rows) {
+        const dl = document.createElement('div');
+        dl.className = 'skill-detail-row';
+        const dt = document.createElement('span');
+        dt.className = 'skill-detail-label';
+        dt.textContent = label;
+        const dd = document.createElement('span');
+        dd.className = 'skill-detail-value';
+        dd.textContent = value;
+        dl.append(dt, dd);
+        detail.appendChild(dl);
+      }
+      // Adopt wizard — appended to detail panel for real entries
+      if (isReal) {
+        const adoptSection = document.createElement('div');
+        adoptSection.className = 'skill-adopt-section';
+        const adoptBtn = document.createElement('button');
+        adoptBtn.className = 'skill-adopt-btn';
+        adoptBtn.textContent = 'Adopt to repo…';
+        adoptBtn.addEventListener('click', () => self._openAdoptWizard(adoptSection, e, refreshList));
+        adoptSection.appendChild(adoptBtn);
+        detail.appendChild(adoptSection);
+      }
+
+      name.addEventListener('click', () => {
+        const isOpen = detail.classList.contains('is-open');
+        if (openDetail) { openDetail.classList.remove('is-open'); openName.classList.remove('skill-name--expanded'); }
+        if (!isOpen) { detail.classList.add('is-open'); name.classList.add('skill-name--expanded'); openDetail = detail; openName = name; }
+        else { openDetail = null; openName = null; }
+      });
+
+      container.appendChild(row);
+      container.appendChild(detail);
+    }
+
+    // Legend
+    const legend = document.createElement('div');
+    legend.className = 'user-skill-legend';
+    legend.innerHTML = [
+      '<strong>Icons:</strong>',
+      '<span title="Managed symlink">[*] managed symlink</span>',
+      '<span title="Direct file, not managed">[F] direct file</span>',
+      '<span title="Foreign symlink pointing outside known sources">[?] foreign symlink</span>',
+      '<span title="Dangling symlink — target missing">[!] dangling</span>',
+      '<span title="Available to install but not installed">[ ] available</span>',
+      '<span class="legend-sep">|</span>',
+      '<strong>Dots:</strong>',
+      '<span><span class="platform-dot platform-dot--yes">●</span> installed</span>',
+      '<span><span class="platform-dot platform-dot--missing">○</span> missing (run --sync)</span>',
+      '<span><span class="platform-dot platform-dot--na">—</span> n/a for this kind</span>',
+    ].join(' ');
+    container.appendChild(legend);
+    container.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('.btn-remove-user-skill');
+      if (btn) this.removeUserSkill(btn.dataset.skillId);
+    }, { once: true });
+  },
+
+  async removeUserSkill(skillId) {
+    const list = document.getElementById('userSkillsList');
+    const warning = document.getElementById('userSkillsWarning');
+    const btn = list?.querySelector(`.btn-remove-user-skill[data-skill-id="${CSS.escape(skillId)}"]`);
+    if (btn) { btn.disabled = true; btn.textContent = '…'; }
+    try {
+      const res = await fetch('/api/skills/user/remove', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ skillId }),
+      });
+      const body = await res.json();
+      if (body.success && list) {
+        this._renderUserSkillsInto(list, body.data.entries, body.data.hasManifest);
+        if (warning) warning.style.display = body.data.entries.length > 10 ? '' : 'none';
+      }
+    } catch {
+      if (btn) { btn.disabled = false; btn.textContent = '×'; }
+    }
+  },
+
+  async addUserSkill() {
+    const input = document.getElementById('userSkillAddInput');
+    const addBtn = document.getElementById('userSkillAddBtn');
+    const target = input?.value.trim();
+    if (!target) return;
+    if (addBtn) { addBtn.disabled = true; addBtn.textContent = 'Adding…'; }
+    try {
+      const res = await fetch('/api/skills/user/add', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target }),
+      });
+      const body = await res.json();
+      const list = document.getElementById('userSkillsList');
+      const warning = document.getElementById('userSkillsWarning');
+      if (body.success && list) {
+        if (input) input.value = '';
+        this._renderUserSkillsInto(list, body.data.entries, body.data.hasManifest);
+        if (warning) warning.style.display = body.data.entries.length > 10 ? '' : 'none';
+      }
+    } finally {
+      if (addBtn) { addBtn.disabled = false; addBtn.textContent = 'Add'; }
+    }
   },
 });
 

@@ -88,12 +88,14 @@ describe('the client never queues or keeps an undeliverable frame', () => {
     expect(sendAsync).toContain('showToast');
   });
 
-  it('drops a POST the server refused as invalid instead of retrying it forever', () => {
+  // Downstream: the drain has no HTTP POST fallback (browser input must not
+  // bypass viewer ownership), so a refused frame can only come back as a WS
+  // error ACK. Pin that the POST path stays gone rather than its 400/413 drop.
+  it('never falls back to POSTing queued input from the drain', () => {
     const drain = appSource.slice(appSource.indexOf('_drainSession(sessionId) {'));
     const body = drain.slice(0, drain.indexOf('_dropRejectedInput(sessionId, rec) {'));
-    expect(body).toMatch(
-      /resp\.status === 400 \|\| resp\.status === 413\)\) \{\s*[\s\S]{0,400}this\._dropRejectedInput\(sessionId, rec\);/
-    );
+    expect(body.length).toBeGreaterThan(0);
+    expect(body).not.toMatch(/fetch\(/);
   });
 
   it('drops a frame the WebSocket refused with an error ACK', () => {

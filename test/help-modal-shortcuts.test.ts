@@ -15,10 +15,7 @@ function extractElementById(html: string, id: string): string {
   const start = html.lastIndexOf('<', idIndex);
   expect(start, `expected #${id} start tag`).toBeGreaterThanOrEqual(0);
 
-  // Bound at the next HTML comment (every following section is comment-labeled) so
-  // sections inserted between this element and any fixed marker don't leak into the
-  // slice — the cron modal's "Run At" text false-positived the stale-shortcut check.
-  const nextSection = html.indexOf('<!--', idIndex);
+  const nextSection = html.indexOf('\n    <!--', idIndex);
   expect(nextSection, `expected section marker after #${id}`).toBeGreaterThanOrEqual(0);
 
   const end = nextSection;
@@ -69,10 +66,9 @@ describe('help modal shortcuts', () => {
     expectShortcut(helpModal, ['Ctrl', '-'], 'Decrease Font');
     expectShortcut(helpModal, ['Shift', 'Enter'], 'Insert Newline');
     expectShortcut(helpModal, ['Ctrl', 'Enter'], 'Insert Newline');
-    // Ctrl+Shift+R (restore terminal size) is still dispatched — keep it documented.
-    expectShortcut(helpModal, ['Ctrl', 'Shift', 'R'], 'Restore Terminal Size');
 
     expect(helpModal).not.toMatch(/Ctrl<\/kbd>\s*\+\s*<kbd>K<\/kbd>/i);
+    expect(helpModal).not.toMatch(/Ctrl<\/kbd>\s*\+\s*<kbd>Shift<\/kbd>\s*\+\s*<kbd>R<\/kbd>/i);
     expect(helpModal).not.toMatch(/Ctrl<\/kbd>\s*\+\s*<kbd>Enter<\/kbd>.*?(Run|Start)/i);
   });
 

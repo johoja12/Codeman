@@ -102,6 +102,11 @@ function withWebviews<T>(fn: (list: Webview[]) => Promise<T> | T): Promise<T> {
   return next;
 }
 
+/** Tab-list/open ownership is exact; admin visibility must not become layout membership. */
+function belongsToLayoutOwner(resourceOwner: string | undefined, requestOwner: string | undefined): boolean {
+  return ownerLayoutKey(resourceOwner) === ownerLayoutKey(requestOwner);
+}
+
 export function registerWebviewRoutes(app: FastifyInstance, ctx: EventPort & TabLayoutPort, basePath = ''): void {
   registerCrudRoutes(app, ctx, basePath);
   registerProxyRoutes(app, basePath);
@@ -111,19 +116,18 @@ export function registerWebviewRoutes(app: FastifyInstance, ctx: EventPort & Tab
 
 function registerCrudRoutes(app: FastifyInstance, ctx: EventPort & TabLayoutPort, basePath: string): void {
   app.get('/api/webviews', async (req) => {
-    const user = getAuthUser(req);
+    const owner = ownerFor(req);
     const all = await readWebviews(configDir());
-    const webviews = all.filter((w) => canAccessOwned(user, w.owner));
+    const webviews = all.filter((webview) => belongsToLayoutOwner(webview.owner, owner));
     return { success: true, data: { webviews, maxLiveFrames: MAX_LIVE_WEBVIEW_FRAMES } };
   });
 
   app.post('/api/webviews', async (req, reply) => {
     const input = parseBody(WebviewCreateSchema, req.body);
     const owner = ownerFor(req);
-    const user = getAuthUser(req);
 
     const created = await withWebviews(async (list) => {
-      const mine = list.filter((w) => canAccessOwned(user, w.owner));
+      const mine = list.filter((webview) => belongsToLayoutOwner(webview.owner, owner));
       if (mine.length >= MAX_WEBVIEWS) return null;
 
       const webview: Webview = {
@@ -265,13 +269,13 @@ function registerCrudRoutes(app: FastifyInstance, ctx: EventPort & TabLayoutPort
    * starts on open rather than on page load.
    */
   app.post<{ Params: { id: string } }>('/api/webviews/:id/open', async (req, reply) => {
-    const user = getAuthUser(req);
+    const owner = ownerFor(req);
     const { id } = req.params;
 
     const webview = await withWebviews(async (list) => {
       const index = list.findIndex((w) => w.id === id);
       if (index === -1) return 'not-found' as const;
-      if (!canAccessOwned(user, list[index].owner)) return 'forbidden' as const;
+      if (!belongsToLayoutOwner(list[index].owner, owner)) return 'forbidden' as const;
       list[index] = { ...list[index], lastOpenedAt: Date.now() };
       await writeWebviews(configDir(), list);
       return list[index];

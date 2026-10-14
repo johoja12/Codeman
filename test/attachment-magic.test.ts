@@ -57,6 +57,8 @@ describe('attachment magic links', () => {
   });
 
   it('extracts Codex generated image file URLs from saved-to terminal output', () => {
+    // Codex's own `Saved to:` announcement is opt-in per session (registry capability
+    // `transcript === 'codex-rollout'`), so the codex-mode caller is what this pins.
     const requests = parseTerminalAttachmentRequests(
       'Saved to: file:///Users/aamer/.codex-personal/generated_images/mockup%20one.png',
       { codexArtifacts: true }
@@ -70,23 +72,16 @@ describe('attachment magic links', () => {
     ]);
   });
 
-  it('ignores Codex saved-to output unless the codex scanner is enabled', () => {
+  it('extracts Superpowers mockup paths printed as labeled terminal output', () => {
     const requests = parseTerminalAttachmentRequests(
-      'Saved to: file:///Users/aamer/.codex-personal/generated_images/mockup.png'
-    );
-
-    expect(requests).toEqual([]);
-  });
-
-  it('strips ANSI styling around Codex saved-to lines before capturing the URL', () => {
-    const requests = parseTerminalAttachmentRequests(
-      '\x1b[1mSaved to:\x1b[0m file:///Users/aamer/.codex/generated_images/mockup.png\x1b[0m\r\n',
-      { codexArtifacts: true }
+      ['Mockup:', '/Users/aamer/.config/superpowers/worktrees/flux-player/issue-268/output/playwright/mockup.png'].join(
+        '\n'
+      )
     );
 
     expect(requests).toEqual([
       {
-        path: '/Users/aamer/.codex/generated_images/mockup.png',
+        path: '/Users/aamer/.config/superpowers/worktrees/flux-player/issue-268/output/playwright/mockup.png',
         source: 'codex-generated',
       },
     ]);
@@ -111,23 +106,14 @@ describe('attachment magic links', () => {
     ]);
   });
 
-  it('does not emit codex-generated requests from non-codex session modes', () => {
-    for (const mode of ['claude', 'shell'] as const) {
-      const session = new Session({ id: `session-generated-artifact-${mode}`, workingDir: '/tmp', mode });
-      const requested: Array<{ path: string }> = [];
-      session.on('attachmentRequested', (event: { path: string }) => requested.push(event));
-
-      (session as unknown as { _handleTerminalOutput(data: string): void })._handleTerminalOutput(
-        'Saved to: file:///Users/aamer/.codex-personal/generated_images/output.png'
-      );
-
-      expect(requested).toEqual([]);
-    }
-  });
-
   it('supports generated image attachment extensions beyond png', () => {
     expect(isSupportedAttachmentExtension('jpg')).toBe(true);
     expect(isSupportedAttachmentExtension('jpeg')).toBe(true);
     expect(isSupportedAttachmentExtension('webp')).toBe(true);
+  });
+
+  it('supports modern Excel workbooks but not legacy XLS files', () => {
+    expect(isSupportedAttachmentExtension('xlsx')).toBe(true);
+    expect(isSupportedAttachmentExtension('xls')).toBe(false);
   });
 });

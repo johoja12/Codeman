@@ -340,12 +340,14 @@ const CodexConfigSchema = z
       .regex(/^[a-zA-Z0-9_-]+$/)
       .optional(),
     dangerouslyBypassApprovals: z.boolean().optional(),
+    dangerouslyBypassHookTrust: z.boolean().optional(),
     animations: z.boolean().optional(),
     renderMode: z
       .enum(['scrollback', 'hybrid'])
       .optional()
       .transform(() => 'hybrid' as const),
   })
+  .strict()
   .optional();
 
 /** Schema for Gemini CLI-specific configuration */
@@ -561,6 +563,10 @@ const parentSessionIdSchema = z.string().max(100).optional();
 const tabGroupIdSchema = z.string().min(1).max(100).optional();
 
 export const CreateSessionSchema = z.object({
+  caseName: z
+    .string()
+    .regex(/^[a-zA-Z0-9_-]+$/, 'Invalid case name format')
+    .optional(),
   workingDir: safePathSchema.optional(),
   mode: sessionModeSchema().optional(),
   name: z.string().max(100).optional(),
@@ -620,6 +626,14 @@ export const CreateSessionSchema = z.object({
         .regex(/^codeman-[a-zA-Z0-9._-]+$/, 'remoteSessionName must be a codeman-* tmux session name'),
     })
     .optional(),
+  /**
+   * COD-179 — the creating browser's terminal dims. New tmux windows spawn at
+   * this size instead of the 120x40 legacy default, avoiding the startup
+   * resize storm whose mismatched TUI repaints pollute the byte history.
+   * Bounds mirror ResizeSchema.
+   */
+  cols: z.number().int().min(1).max(500).optional(),
+  rows: z.number().int().min(1).max(200).optional(),
 });
 
 /**
@@ -638,6 +652,16 @@ export const ResizeSchema = z.object({
   cols: z.number().int().min(1).max(500),
   rows: z.number().int().min(1).max(200),
   viewportType: z.enum(['mobile', 'tablet', 'desktop']).optional(),
+  force: z.boolean().optional(),
+});
+
+/**
+ * Schema for POST /api/sessions/:id/park (COD-124)
+ * `force: true` acknowledges and disarms any live automation (respawn/
+ * auto-resume/ralph) armed against the session; without it, a park request
+ * against a session with obligations returns 409 CONFLICT instead.
+ */
+export const ParkSessionSchema = z.object({
   force: z.boolean().optional(),
 });
 
@@ -716,6 +740,14 @@ export const StatusTelemetrySchema = z.object({
 
 // ========== Case Routes ==========
 
+export const CodexCommandSelectionSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('default') }),
+  z.object({ kind: z.literal('profile'), profileId: z.string().min(1).max(100) }),
+  z.object({ kind: z.literal('custom'), command: z.string().trim().min(1).max(300) }),
+]);
+
+const LocalCaseCodexCommandSelectionSchema = CodexCommandSelectionSchema.optional();
+
 /**
  * Schema for POST /api/cases
  * Creates a new case folder.
@@ -725,6 +757,7 @@ export const CreateCaseSchema = z.object({
     .string()
     .regex(/^[a-zA-Z0-9_-]+$/, 'Invalid case name format. Use only letters, numbers, hyphens, underscores.'),
   description: z.string().max(1000).optional(),
+  codexCommandSelection: LocalCaseCodexCommandSelectionSchema,
   /**
    * Create the case in this folder instead of under the cases directory. Absolute, or starting with
    * `~`. Only length-bounded here: what makes it acceptable (shape, blocked trees, symlinks, an
@@ -752,6 +785,7 @@ export const CloneCaseSchema = z.object({
   /** `--depth 1`. */
   shallow: z.boolean().optional(),
   description: z.string().max(1000).optional(),
+  codexCommandSelection: LocalCaseCodexCommandSelectionSchema,
 });
 
 /** Schema for POST /api/cases/clone-preflight — ask the remote what it has, clone nothing. */
@@ -781,11 +815,10 @@ const RemoteCommandOverridesSchema = z
 const NO_SHELL_INJECTION = /^[^\n\r\0`]*$/;
 const noCommandSubstitution = (s: string) => !s.includes('$(');
 
-// `remotePath`/`identityFile` are shell-escaped, then the whole launch command is
-// embedded via `JSON.stringify(...)` inside `bash -c "..."` (tmux-manager). That
-// outer DOUBLE-quote layer re-exposes `$(...)`, backticks, and `$VAR` even though
-// the inner value is single-quoted — so a `$(cmd)` in the path would run LOCALLY at
-// launch. Reject `$` and backtick (and newline/CR/NUL) entirely at the boundary.
+// Docker fields are shell-escaped, then the whole launch command is embedded via
+// `JSON.stringify(...)` inside `bash -c "..."` (tmux-manager). That outer DOUBLE-quote
+// layer re-exposes `$(...)`, backticks, and `$VAR`, so they carry NO_SHELL_META
+// (rejects `$`/backtick that survive the outer quoting) as defense-in-depth.
 const NO_SHELL_META = /^[^\n\r\0`$]*$/;
 
 export const RemoteHostSchema = z.object({
@@ -802,9 +835,13 @@ export const RemoteHostSchema = z.object({
     .max(100)
     .regex(/^[a-zA-Z0-9._-]+$/, 'Invalid SSH username'),
   port: z.number().int().min(1).max(65535).optional(),
-  // Identity (private-key) file PATH only — never key bytes. Reject shell
-  // metacharacters ($, backtick) that survive into the `bash -c` launch layer.
-  identityFile: z.string().min(1).max(4096).regex(NO_SHELL_META, 'Invalid identity file path').optional(),
+  // Identity (private-key) file PATH only — never key bytes. No newline/NUL.
+  identityFile: z
+    .string()
+    .min(1)
+    .max(4096)
+    .regex(/^[^\n\r\0]*$/, 'Invalid identity file path')
+    .optional(),
   // SOCKS5 proxy as host:port (e.g. 127.0.0.1:1080).
   socksProxy: z
     .string()
@@ -870,15 +907,98 @@ export const RemoteHostSchema = z.object({
     .optional(),
 });
 
+const remoteWorkspacePathSchema = z
+  .string()
+  .min(1)
+  .max(2000)
+  .regex(/^\//, 'Remote path must be absolute')
+  .refine((path) => !/[\0\r\n]/.test(path), 'Remote path must not contain NUL, CR, or LF');
+
 export const RemoteCaseLinkSchema = z.object({
   name: z.string().regex(/^[a-zA-Z0-9_-]+$/, 'Invalid case name format'),
   hostId: z.string().regex(/^[a-zA-Z0-9_-]+$/, 'Invalid remote host id'),
-  remotePath: z
-    .string()
-    .min(1)
-    .max(2000)
-    .regex(/^\//, 'Remote path must be absolute')
-    .regex(NO_SHELL_META, 'Invalid characters in remote path'),
+  remotePath: remoteWorkspacePathSchema,
+  commands: RemoteCommandOverridesSchema.optional(),
+  codexCommandSelection: CodexCommandSelectionSchema.optional(),
+});
+
+// ========== Saved Codex Command Profiles ==========
+
+const codexCommandProfileNameSchema = z.string().trim().min(1).max(60);
+const codexCommandProfileCommandSchema = z.string().trim().min(1).max(300);
+const codexResumeCommandTemplateSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(300)
+  .refine((value) => (value.match(/\{\{resumeId\}\}/g) ?? []).length === 1, 'Use {{resumeId}} exactly once')
+  .refine((value) => !value.replace(/\{\{resumeId\}\}/g, '').includes('{{'), 'Unsupported template token');
+
+export const CodexCommandProfileCreateSchema = z
+  .object({
+    name: codexCommandProfileNameSchema,
+    command: codexCommandProfileCommandSchema,
+    resumeCommandTemplate: codexResumeCommandTemplateSchema.optional(),
+  })
+  .strict();
+
+export const CodexCommandProfileUpdateSchema = z
+  .object({
+    name: codexCommandProfileNameSchema.optional(),
+    command: codexCommandProfileCommandSchema.optional(),
+    resumeCommandTemplate: codexResumeCommandTemplateSchema.optional(),
+    confirmReferencedUpdate: z.boolean().optional(),
+  })
+  .strict()
+  .refine(
+    (value) => value.name !== undefined || value.command !== undefined || value.resumeCommandTemplate !== undefined,
+    {
+      message: 'At least one profile field must be provided',
+    }
+  );
+
+export const CodexCommandProfileParamsSchema = z
+  .object({
+    id: z.string().trim().min(1).max(100),
+  })
+  .strict();
+
+export const UpdateCaseSchema = z
+  .object({
+    name: z
+      .string()
+      .regex(/^[a-zA-Z0-9_-]+$/, 'Invalid case name format')
+      .optional(),
+    path: safePathSchema.optional(),
+    hostId: z
+      .string()
+      .regex(/^[a-zA-Z0-9_-]+$/, 'Invalid remote host id')
+      .optional(),
+    remotePath: remoteWorkspacePathSchema.optional(),
+    commands: RemoteCommandOverridesSchema.optional(),
+    codexCommandSelection: CodexCommandSelectionSchema.optional(),
+    defaultGroupId: z.string().min(1).max(100).nullable().optional(),
+  })
+  .refine(
+    (value) =>
+      value.name ||
+      value.path ||
+      value.hostId ||
+      value.remotePath ||
+      value.commands ||
+      value.codexCommandSelection ||
+      value.defaultGroupId !== undefined,
+    {
+      message: 'At least one case parameter must be provided',
+    }
+  );
+
+export const CaseDefaultGroupSchema = z.object({
+  groupId: z.string().min(1).max(100).nullable(),
+});
+
+export const BrowseDirectoryQuerySchema = z.object({
+  path: z.string().max(2000).optional(),
 });
 
 // ========== Docker cases ==========
@@ -1207,6 +1327,8 @@ export const HookEventSchema = z.object({
     'stop',
     'teammate_idle',
     'task_completed',
+    'session_start',
+    'checkpoint',
     // Claude Code's UserPromptSubmit: a first-hand report of the pane's live
     // conversation id. Keep in step with HookEventType in types/api.ts.
     'prompt_submitted',
@@ -1458,6 +1580,10 @@ export const SettingsUpdateSchema = z
     // CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK env var. Stripped before persisting.
     acknowledgeUnauthTunnel: z.boolean().optional(),
     tabTwoRows: z.boolean().optional(),
+    // COD-286: session tabs across the top vs a vertical rail beside the terminal.
+    // Declared here (like tabTwoRows) so it persists server-side and can seed a
+    // fresh device; it is still PER-DEVICE by client policy — settings-ui.js lists
+    // it in `displayKeys`, so a server value never overwrites a device's own choice.
     /**
      * CLI Logos on Tabs. Display key (per-device), default ON: only an explicit
      * false hides the agent logo on session tabs and the desktop home rail
@@ -1507,16 +1633,47 @@ export const SettingsUpdateSchema = z
      * on data-sidebar-detail. See applySessionListLayout() in app.js.
      */
     sessionListLayout: z.enum(['header', 'sidebar', 'sidebar-rich']).optional(),
-    /** Session-name text size in vertical navigation. Display key (per-device). */
+    /** Session-name text size in the vertical sidebar. Display key (per-device). */
     sessionSidebarFontSize: z.number().int().min(11).max(18).optional(),
+    // COD-242: custom keyboard shortcut overrides. Persisted server-side (settings.json)
+    // so they survive restarts, deploys, and upgrades. Keyed by shortcut id; each value
+    // carries an optional binding list (each binding an object: key/code/modifiers) and a
+    // disabled flag. The value object is permissive (.passthrough) so overrides round-trip
+    // without silently dropping fields; the client (getShortcutRegistry) tolerates missing
+    // or malformed entries by falling back to defaults.
+    shortcutOverrides: z
+      .record(
+        z.string().max(100),
+        z
+          .object({
+            bindings: z.array(z.record(z.string(), z.unknown())).max(16).optional(),
+            disabled: z.boolean().optional(),
+            paletteAgentModes: z
+              .array(z.enum(['claude', 'shell', 'opencode', 'codex', 'gemini', 'antigravity', 'pi']))
+              .min(1)
+              .max(7)
+              .optional(),
+          })
+          .passthrough()
+      )
+      .optional(),
     agentTeamsEnabled: z.boolean().optional(),
-    /** Model for new Claude sessions (e.g. "claude-fable-5[1m]", "opus[1m]"); takes precedence over opusContext1mEnabled */
-    claudeModel: z.string().max(50).optional(),
     opusContext1mEnabled: z.boolean().optional(),
+    // Opt Claude/non-codex sessions into COLORTERM=truecolor (COD-75); default off
+    truecolorEnabled: z.boolean().optional(),
+    // Enable Agent Checkpoint for newly created sessions (COD-257); default on when absent.
+    checkpointDefaultEnabled: z.boolean().optional(),
+    // Headroom proxy routing (COD-102). empty string for headroomProxyUrl = kill-switch (off).
+    headroomProxyUrl: z.string().max(300).optional(),
+    headroomRouteClaude: z.boolean().optional(),
+    headroomRouteCodex: z.boolean().optional(),
     // COD-108 remote-session auto-reconnect kill-switch (default ON). When false,
     // the TmuxManager watcher does nothing — dropped remote sessions are NOT
     // auto-reattached.
     remoteAutoReconnect: z.boolean().optional(),
+    // COD-438: opt-in automatic recovery of records created by this startup's
+    // dead-mux reconciliation. Unsafe/ambiguous records still remain queued.
+    autoRecoverSessionsAfterReboot: z.boolean().optional(),
     thinkingEffort: z.string().max(20).optional(),
     /** Advisor model for new Claude sessions ('' = leave it to the CLI's own /advisor choice). */
     claudeAdvisorModel: z
@@ -1539,7 +1696,6 @@ export const SettingsUpdateSchema = z
     showTokenCount: z.boolean().optional(),
     showCost: z.boolean().optional(),
     showLifecycleLog: z.boolean().optional(),
-    showResponseViewer: z.boolean().optional(),
     showMonitor: z.boolean().optional(),
     showProjectInsights: z.boolean().optional(),
     showFileBrowser: z.boolean().optional(),
@@ -1558,6 +1714,10 @@ export const SettingsUpdateSchema = z
     // Claude CLI settings
     claudeMode: z.string().max(50).optional(),
     allowedTools: z.string().max(2000).optional(),
+    /** Model for new Claude sessions (e.g. "claude-fable-5[1m]", "opus[1m]"); takes precedence over opusContext1mEnabled */
+    claudeModel: z.string().max(50).optional(),
+    /** Hide/show the response-viewer (eye) header button */
+    showResponseViewer: z.boolean().optional(),
     // Codex CLI settings
     codexModel: z
       .string()
@@ -1566,7 +1726,7 @@ export const SettingsUpdateSchema = z
       .optional(),
     codexReasoningEffort: z.enum(['', ...CODEX_REASONING_EFFORTS]).optional(),
     codexDangerouslyBypassApprovals: z.boolean().optional(),
-    codexAnimationsEnabled: z.boolean().optional(),
+    codexAnimationsEnabled: z.boolean().nullable().optional(),
     // Terminal history and retention
     terminalScrollbackLines: z
       .number()
@@ -1644,6 +1804,21 @@ export const SettingsUpdateSchema = z
           durationMinutes: z.number().optional(),
           builtIn: z.boolean().optional(),
           createdAt: z.number().optional(),
+        })
+      )
+      .max(20)
+      .optional(),
+    // COD-64: user-configured one-click "authoring actions" surfaced as a menu in
+    // the document preview. Each action sends a (templated) single-line instruction
+    // to the open document's agent session; `{path}` in the instruction is replaced
+    // with the document path. Ships EMPTY by default — no skill names baked in here
+    // (the user authors these, e.g. labels like "Tighten prose" / "Narrative review").
+    authoringActions: z
+      .array(
+        z.object({
+          id: z.string().max(100),
+          label: z.string().min(1).max(60),
+          instruction: z.string().min(1).max(2000),
         })
       )
       .max(20)
@@ -1800,6 +1975,15 @@ export const PinSessionSchema = z.object({
   pinned: z.boolean(),
 });
 
+/** POST /api/sessions/:id/checkpoint */
+export const CheckpointSchema = z.object({
+  enabled: z.boolean(),
+  /** Allowed modes the agent may invoke. Omit to leave unchanged. */
+  modes: z.array(z.enum(['compact', 'clear', 'new'])).optional(),
+  /** Deprecated single-mode form; treated as `modes: [mode]` when `modes` absent. */
+  mode: z.enum(['compact', 'clear', 'new']).optional(),
+});
+
 /** POST /api/sessions/:id/image-watcher */
 export const ImageWatcherSchema = z.object({
   enabled: z.boolean(),
@@ -1895,6 +2079,7 @@ export const CronJobEnabledSchema = z.object({ enabled: z.boolean() });
 export const LinkCaseSchema = z.object({
   name: z.string().regex(/^[a-zA-Z0-9_-]+$/, 'Invalid case name format'),
   path: safePathSchema,
+  codexCommandSelection: LocalCaseCodexCommandSelectionSchema,
 });
 
 /** PUT /api/cases/order */
@@ -2094,6 +2279,20 @@ export const SEARCH_SOURCE_TYPES = ['session', 'event', 'file'] as const;
  * integer clamped to 1..60. Validation is the first line of defense — a missing
  * or oversized `q`, an unknown type, or a non-numeric limit is rejected with 400.
  */
+export const LibraryQuerySchema = z.object({
+  q: z.string().trim().max(200).optional().default(''),
+  tag: z.string().trim().max(100).optional(),
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+});
+
+export const SessionSourceAddSchema = z.object({
+  type: z.enum(['file', 'url', 'highlight']),
+  title: z.string().trim().min(1, 'Title required').max(500, 'Title too long'),
+  url: z.string().trim().url('Invalid URL').optional(),
+  relativePath: z.string().trim().max(1000).optional(),
+  content: z.string().trim().max(10000).optional(),
+});
+
 export const SearchQuerySchema = z.object({
   q: z.string().trim().min(1, 'Query is required').max(200, 'Query too long (max 200 chars)'),
   types: z

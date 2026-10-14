@@ -75,8 +75,8 @@ describe('folder links (findFilePathLinks)', () => {
 describe('folder links are routed to the grid', () => {
   it('terminal provider opens folder links in the grid', () => {
     const src = read('terminal-ui.js');
-    expect(src).toMatch(/addLink\(found\.path, found\.index, !!found\.folder\)/);
-    expect(src).toMatch(/if \(folder\) \{\s*self\.openFolderGrid\(target, sessionId\);/);
+    expect(src).toContain('self.openFolderGrid(resolved, originatingSessionId)');
+    expect(src).toContain('findFilePathLinks(lineText)');
   });
 
   it('response viewer marks folder links and opens them in the grid', () => {

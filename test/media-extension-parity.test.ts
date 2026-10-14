@@ -12,12 +12,14 @@
  *    was missing `m4v ogv ogg oga m4a aac flac opus`, so an in-workspace
  *    `.m4a` routed to the log viewer and rendered as binary noise while the
  *    same file in /tmp played fine.
- *  - `VIDEO_EXTS`/`AUDIO_EXTS` (panels-ui.js) pick the <video>/<audio> markup
- *    for registered attachments; an entry missing there renders a text dump
- *    instead of a player.
+ * The <video>/<audio> markup choice is NOT a frontend copy here: the preview
+ * renders off `data.type` ('video'/'audio'), which `detectAttachmentType()`
+ * derives from those same registry sets, so that half cannot drift by
+ * construction. constants.js is the one hand-maintained copy left, and it is
+ * what this file pins.
  *
  * Same technique as test/sse-registry-parity.test.ts: the backend sets are
- * imported, the frontend copies are extracted from the shipped source as text
+ * imported, the frontend copy is extracted from the shipped source as text
  * (no build-time link exists), and the sets are compared. No port needed.
  */
 import { describe, expect, it } from 'vitest';
@@ -36,24 +38,11 @@ function filePreviewExtensions(): Set<string> {
   return new Set(m![1].split(' '));
 }
 
-/** `VIDEO_EXTS`/`AUDIO_EXTS` are quoted-string array Sets in panels-ui.js. */
-function panelsUiSet(name: string): Set<string> {
-  const src = publicFile('panels-ui.js');
-  const m = src.match(new RegExp(`const ${name} = new Set\\(\\[([^\\]]+)\\]\\)`));
-  expect(m, `${name} literal not found in panels-ui.js`).not.toBeNull();
-  const values = [...m![1].matchAll(/'([^']+)'/g)].map((q) => q[1]);
-  return new Set(values);
-}
-
-const sorted = (s: ReadonlySet<string>) => [...s].sort();
-
 describe('media extension parity (attachment registry ⇄ frontend)', () => {
   it('extracts non-trivial sets from every source (guards the parsers)', () => {
     expect(VIDEO_ATTACHMENT_EXTENSIONS.size).toBeGreaterThanOrEqual(5);
     expect(AUDIO_ATTACHMENT_EXTENSIONS.size).toBeGreaterThanOrEqual(8);
     expect(filePreviewExtensions().size).toBeGreaterThan(10);
-    expect(panelsUiSet('VIDEO_EXTS').size).toBeGreaterThanOrEqual(5);
-    expect(panelsUiSet('AUDIO_EXTS').size).toBeGreaterThanOrEqual(8);
   });
 
   it('every playable media extension routes to the preview overlay, not the log viewer', () => {
@@ -65,11 +54,21 @@ describe('media extension parity (attachment registry ⇄ frontend)', () => {
     ).toEqual([]);
   });
 
-  it("panels-ui.js VIDEO_EXTS exactly equals the registry's video set", () => {
-    expect(sorted(panelsUiSet('VIDEO_EXTS'))).toEqual(sorted(VIDEO_ATTACHMENT_EXTENSIONS));
-  });
-
-  it("panels-ui.js AUDIO_EXTS exactly equals the registry's audio set", () => {
-    expect(sorted(panelsUiSet('AUDIO_EXTS'))).toEqual(sorted(AUDIO_ATTACHMENT_EXTENSIONS));
+  it('renders registered media by type and keeps folder-grant media extensions in sync', () => {
+    // The upstream copies (VIDEO_EXTS/AUDIO_EXTS) were removed when the preview
+    // moved to server-supplied `data.type`. A reintroduced copy is a copy that
+    // can drift, which is the whole reason this file exists — so it fails here.
+    const src = publicFile('panels-ui.js');
+    for (const [name, canonical] of [
+      ['VIDEO', VIDEO_ATTACHMENT_EXTENSIONS],
+      ['AUDIO', AUDIO_ATTACHMENT_EXTENSIONS],
+    ] as const) {
+      const match = src.match(new RegExp(`const ${name}_EXTS = new Set\\(\\[([^\\]]+)\\]\\)`));
+      expect(match).not.toBeNull();
+      const extensions = [...match![1].matchAll(/'([^']+)'/g)].map((item) => item[1]).sort();
+      expect(extensions).toEqual([...canonical].sort());
+    }
+    expect(src).toContain("data.type === 'video'");
+    expect(src).toContain("data.type === 'audio'");
   });
 });

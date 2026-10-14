@@ -299,7 +299,9 @@ describe('openLinkThroughWebTabIfLoopback', () => {
 
 describe('callers consult the hook first', () => {
   it('terminal URL links try the web tab before window.open', () => {
-    const activate = TERMINAL_UI.indexOf('activate(_event, text) {');
+    // Downstream's activate() delegates to _openTerminalUrl(), so BOTH the desktop
+    // click and the mobile touch-tap path consult the hook. Read that function.
+    const activate = TERMINAL_UI.indexOf('_openTerminalUrl(text) {');
     expect(activate).toBeGreaterThan(-1);
     const body = TERMINAL_UI.slice(activate, TERMINAL_UI.indexOf('},', activate));
     expect(body.indexOf('openLinkThroughWebTabIfLoopback?.(text)')).toBeGreaterThan(-1);
@@ -307,8 +309,9 @@ describe('callers consult the hook first', () => {
   });
 
   it('response viewer links route through the hook and keep the file-path handler first', () => {
-    const bind = APP_JS.indexOf('_bindResponseViewerInteractions(body) {');
-    const section = APP_JS.slice(bind, bind + 3500);
+    // Downstream pins the viewer to a session id, so the signature has a 2nd param.
+    const bind = APP_JS.indexOf('_bindResponseViewerInteractions(body, responseSessionId = null) {');
+    const section = APP_JS.slice(bind, bind + 4000);
     const pathHandler = section.indexOf("closest('a.rv-path')");
     const urlHandler = section.indexOf("closest('a[href]')");
     expect(pathHandler).toBeGreaterThan(-1);

@@ -50,9 +50,11 @@ describe('create routes: tabGroupId', () => {
     ctx.addSession.mockImplementation(async (session: { id: string }, placement?: { tabGroupId?: string }) => {
       ctx.sessions.set(session.id, session as never);
       const refs = [{ kind: 'session' as const, id: session.id }];
-      return placement?.tabGroupId === 'g1'
-        ? { ...LAYOUT, version: 5, groups: [{ ...LAYOUT.groups[0], refs }] }
-        : { ...LAYOUT, version: 5, ungrouped: refs };
+      const layout =
+        placement?.tabGroupId === 'g1'
+          ? { ...LAYOUT, version: 5, groups: [{ ...LAYOUT.groups[0], refs }] }
+          : { ...LAYOUT, version: 5, ungrouped: refs };
+      return { layout, placements: [] };
     });
     registerSessionRoutes(app, ctx);
     installRouteErrorHandler(app);
@@ -104,7 +106,7 @@ describe('create routes: tabGroupId', () => {
     });
     expect(res.statusCode).toBe(200);
     const data = body(res.body);
-    expect(ctx.addSession.mock.calls[0][1]).toEqual({ tabGroupId: 'g1' });
+    expect(ctx.addSession.mock.calls[0][1]).toEqual({ caseName: 'tabgroupcase', tabGroupId: 'g1' });
     expect(data.tabLayout.groups[0].refs).toEqual([{ kind: 'session', id: data.sessionId }]);
 
     const plain = await app.inject({

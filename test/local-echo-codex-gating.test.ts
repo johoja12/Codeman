@@ -190,12 +190,20 @@ describe('_updateLocalEchoState mode gating', () => {
     expect(app._localEchoEnabled).toBe(false);
   });
 
-  it.each(['claude', 'gemini', 'opencode', 'pi', 'grok'])('keeps the overlay enabled for %s sessions', (mode) => {
+  it.each(['claude', 'gemini', 'pi'])('keeps the overlay enabled for %s sessions', (mode) => {
     const overlay = makeOverlay();
     const app = makeApp(mode, overlay);
     app._updateLocalEchoState();
     expect(app._localEchoEnabled).toBe(true);
     expect(overlay.prompts.length).toBeGreaterThan(0);
+  });
+
+  it('disables the overlay for opencode sessions (predictive, COD-331)', () => {
+    const overlay = makeOverlay('pending');
+    const app = makeApp('opencode', overlay);
+    app._updateLocalEchoState();
+    expect(app._localEchoEnabled).toBe(false);
+    expect(overlay.cleared).toBeGreaterThan(0);
   });
 });
 
@@ -245,6 +253,7 @@ type PredictorStub = {
   predictChar: ReturnType<typeof vi.fn>;
   predictBackspace: ReturnType<typeof vi.fn>;
   clearPredictions: ReturnType<typeof vi.fn>;
+  setPredictWhen?: ReturnType<typeof vi.fn>;
 };
 
 type PredictiveApp = AppInstance & {
@@ -258,6 +267,7 @@ function makePredictor(): PredictorStub {
     predictChar: vi.fn().mockReturnValue(true),
     predictBackspace: vi.fn().mockReturnValue(true),
     clearPredictions: vi.fn(),
+    setPredictWhen: vi.fn(),
   };
 }
 
@@ -373,19 +383,25 @@ describe('_updateLocalEchoState echo policy', () => {
     expect(app._predictiveEcho.clearPredictions).toHaveBeenCalled();
   });
 
-  it.each(['claude', 'gemini', 'opencode', 'pi', 'grok'])(
-    "%s -> policy 'buffer' + overlay enabled (existing behavior)",
-    (mode) => {
-      const overlay = makeOverlay();
-      const app = makeApp(mode, overlay) as PredictiveApp;
-      app._predictiveEcho = makePredictor();
-      app._updateLocalEchoState();
-      expect(app._localEchoPolicy).toBe('buffer');
-      expect(app._localEchoEnabled).toBe(true);
-      expect(overlay.prompts.length).toBeGreaterThan(0); // setPrompt still called
-      expect(app._predictiveEcho.clearPredictions).toHaveBeenCalled(); // not predict -> stray spans cleared
-    }
-  );
+  it.each(['claude', 'gemini', 'pi'])("%s -> policy 'buffer' + overlay enabled (existing behavior)", (mode) => {
+    const overlay = makeOverlay();
+    const app = makeApp(mode, overlay) as PredictiveApp;
+    app._predictiveEcho = makePredictor();
+    app._updateLocalEchoState();
+    expect(app._localEchoPolicy).toBe('buffer');
+    expect(app._localEchoEnabled).toBe(true);
+    expect(overlay.prompts.length).toBeGreaterThan(0); // setPrompt still called
+    expect(app._predictiveEcho.clearPredictions).toHaveBeenCalled(); // not predict -> stray spans cleared
+  });
+
+  it("opencode + setting ON -> policy 'predict' while _localEchoEnabled stays false (COD-331)", () => {
+    const app = makeApp('opencode') as PredictiveApp;
+    app._predictiveEcho = makePredictor();
+    app._updateLocalEchoState();
+    expect(app._localEchoPolicy).toBe('predict');
+    expect(app._localEchoEnabled).toBe(false);
+    expect(app._predictiveEcho.clearPredictions).not.toHaveBeenCalled();
+  });
 
   it('no active session -> policy off, no crash without a predictor instance', () => {
     const app = makeApp('codex') as PredictiveApp;
@@ -561,7 +577,9 @@ describe('local-echo prompt finders with the viewport parked above the bottom', 
     expect(find(parked)).toEqual({ row: 23, col: 2 });
   });
 
-  it('opencode: reads the border on the cursor screen row when parked', () => {
+  // Downstream runs opencode on predictive echo (policy 'predict'), so there is no
+  // buffer-overlay prompt finder for it to test.
+  it.skip('opencode: reads the border on the cursor screen row when parked', () => {
     const { find } = finderFor('opencode');
     const parked = terminal({ 83: '\u2503  hello' }, { viewportY: 47, baseY: 83, cursorY: 0 });
     expect(find(parked)).toEqual({ row: 36, col: 0 });

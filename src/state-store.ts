@@ -37,11 +37,15 @@ import {
   createInitialGlobalStats,
   TokenStats,
   TokenUsageEntry,
+  type CaseCodexCommandSelection,
+  type CodexCommandProfile,
 } from './types.js';
 import { Debouncer, MAX_SESSION_TOKENS } from './utils/index.js';
 import { dataPath, CODEMAN_INSTANCE } from './config/instance.js';
 import { normalizeSessionOrder } from './session-order.js';
 import { validateTabLayout, type TabLayout } from './tab-layout.js';
+import { sanitizeRecoveryLaunch } from './session-recovery.js';
+import type { SessionRecoveryRecord, SessionRecoveryStatus } from './types/session-recovery.js';
 
 /** Debounce delay for batching state writes (ms) */
 const SAVE_DEBOUNCE_MS = 500;
@@ -70,6 +74,23 @@ const SAVE_DEBOUNCE_MS = 500;
 /** Maximum consecutive save failures before circuit breaker opens */
 const MAX_CONSECUTIVE_FAILURES = 3;
 
+/** How long the circuit breaker stays open before allowing a HALF_OPEN trial write (ms) */
+const CIRCUIT_BREAKER_COOLDOWN_MS = 30_000;
+const MAX_TERMINAL_SESSION_RECOVERIES_PER_OWNER = 200;
+const TERMINAL_SESSION_RECOVERY_STATUSES: ReadonlySet<SessionRecoveryStatus> = new Set([
+  'manual_required',
+  'unavailable',
+  'recovered',
+]);
+
+function cloneSessionRecoveryRecord(recovery: SessionRecoveryRecord): SessionRecoveryRecord {
+  return {
+    ...recovery,
+    launch: sanitizeRecoveryLaunch(recovery.launch),
+    ...(recovery.providerSelection ? { providerSelection: { ...recovery.providerSelection } } : {}),
+  };
+}
+
 export class StateStore {
   private state: AppState;
   private filePath: string;
@@ -87,6 +108,7 @@ export class StateStore {
   // Circuit breaker for save failures (prevents hammering disk on persistent errors)
   private consecutiveSaveFailures: number = 0;
   private circuitBreakerOpen: boolean = false;
+  private circuitBreakerOpenedAt: number | null = null;
 
   // Guard against concurrent saveNowAsync() calls (debounce can race with in-flight write)
   private _saveInFlight: Promise<void> | null = null;
@@ -139,6 +161,22 @@ export class StateStore {
       console.log('[StateStore] Circuit breaker CLOSED - save succeeded');
       this.circuitBreakerOpen = false;
     }
+    this.circuitBreakerOpenedAt = null;
+  }
+
+  /**
+   * True if the breaker is open and still cooling down (skip the write).
+   * If the cooldown has elapsed, returns false to allow ONE trial write (HALF_OPEN).
+   */
+  private _circuitBreakerShouldSkipSave(): boolean {
+    if (!this.circuitBreakerOpen) return false;
+    const openedAt = this.circuitBreakerOpenedAt ?? 0;
+    if (Date.now() - openedAt < CIRCUIT_BREAKER_COOLDOWN_MS) {
+      console.warn('[StateStore] Circuit breaker open - cooling down, skipping save');
+      return true;
+    }
+    console.warn('[StateStore] Circuit breaker HALF_OPEN - attempting trial write');
+    return false;
   }
 
   private ensureDir(): void {
@@ -274,17 +312,30 @@ export class StateStore {
     if (this.state.tokenStats) {
       parts.push(`"tokenStats":${JSON.stringify(this.state.tokenStats)}`);
     }
-    if (this.state.cronJobs) {
-      parts.push(`"cronJobs":${JSON.stringify(this.state.cronJobs)}`);
-    }
-    if (this.state.cronJobRuns) {
-      parts.push(`"cronJobRuns":${JSON.stringify(this.state.cronJobRuns)}`);
-    }
     if (this.state.sessionOrder) {
       parts.push(`"sessionOrder":${JSON.stringify(this.state.sessionOrder)}`);
     }
     if (this.state.tabLayouts !== undefined) {
       parts.push(`"tabLayouts":${JSON.stringify(this.state.tabLayouts)}`);
+    }
+    if (this.state.caseDefaultGroups !== undefined) {
+      parts.push(`"caseDefaultGroups":${JSON.stringify(this.state.caseDefaultGroups)}`);
+    }
+    if (this.state.codexCommandProfiles !== undefined) {
+      parts.push(`"codexCommandProfiles":${JSON.stringify(this.state.codexCommandProfiles)}`);
+    }
+    if (this.state.sessionRecoveries !== undefined) {
+      parts.push(`"sessionRecoveries":${JSON.stringify(this.state.sessionRecoveries)}`);
+    }
+    if (this.state.caseCodexCommandSelections !== undefined) {
+      parts.push(`"caseCodexCommandSelections":${JSON.stringify(this.state.caseCodexCommandSelections)}`);
+    }
+    // ⚠️ This function is a hand-written ALLOWLIST, not a serializer over the
+    // whole state: a key absent here is silently dropped on every save, however
+    // correctly it was set in memory. `orchestrator` was missing, so orchestrator
+    // state never survived a restart (COD-265). Add new AppState keys here too.
+    if (this.state.orchestrator) {
+      parts.push(`"orchestrator":${JSON.stringify(this.state.orchestrator)}`);
     }
 
     return `{${parts.join(',')}}`;
@@ -306,6 +357,7 @@ export class StateStore {
         if (this.consecutiveSaveFailures >= MAX_CONSECUTIVE_FAILURES) {
           console.error('[StateStore] Circuit breaker OPEN - serialization failing repeatedly');
           this.circuitBreakerOpen = true;
+          this.circuitBreakerOpenedAt = Date.now();
         }
         return null;
       }
@@ -318,9 +370,9 @@ export class StateStore {
       return;
     }
 
-    // Circuit breaker: stop attempting writes after too many failures
-    if (this.circuitBreakerOpen) {
-      console.warn('[StateStore] Circuit breaker open - skipping save (too many consecutive failures)');
+    // Circuit breaker: stop attempting writes while cooling down. After the
+    // cooldown elapses, allow ONE trial write (HALF_OPEN) to test recovery.
+    if (this._circuitBreakerShouldSkipSave()) {
       return;
     }
 
@@ -364,10 +416,13 @@ export class StateStore {
         // Temp file may not exist
       }
 
-      // Check circuit breaker threshold
+      // Check circuit breaker threshold. Re-stamp openedAt on every failure
+      // (including a failed HALF_OPEN trial) so each failure restarts the
+      // cooldown window instead of retrying on every subsequent save.
       if (this.consecutiveSaveFailures >= MAX_CONSECUTIVE_FAILURES) {
         console.error('[StateStore] Circuit breaker OPEN - writes failing repeatedly');
         this.circuitBreakerOpen = true;
+        this.circuitBreakerOpenedAt = Date.now();
       }
     }
   }
@@ -383,8 +438,7 @@ export class StateStore {
       return;
     }
 
-    if (this.circuitBreakerOpen) {
-      console.warn('[StateStore] Circuit breaker open - skipping save (too many consecutive failures)');
+    if (this._circuitBreakerShouldSkipSave()) {
       return;
     }
 
@@ -422,6 +476,7 @@ export class StateStore {
       if (this.consecutiveSaveFailures >= MAX_CONSECUTIVE_FAILURES) {
         console.error('[StateStore] Circuit breaker OPEN - writes failing repeatedly');
         this.circuitBreakerOpen = true;
+        this.circuitBreakerOpenedAt = Date.now();
       }
     }
   }
@@ -440,6 +495,7 @@ export class StateStore {
         console.log('[StateStore] Successfully recovered state from backup');
         // Reset circuit breaker after successful recovery
         this.circuitBreakerOpen = false;
+        this.circuitBreakerOpenedAt = null;
         this.consecutiveSaveFailures = 0;
         return true;
       }
@@ -454,6 +510,7 @@ export class StateStore {
    */
   resetCircuitBreaker(): void {
     this.circuitBreakerOpen = false;
+    this.circuitBreakerOpenedAt = null;
     this.consecutiveSaveFailures = 0;
     console.log('[StateStore] Circuit breaker manually reset');
   }
@@ -491,6 +548,62 @@ export class StateStore {
     this.cachedSessionJsons.delete(id);
     this.dirtySessions.delete(id);
     this.save();
+  }
+
+  /** Returns defensive copies of durable recovery records. */
+  getSessionRecoveries(): SessionRecoveryRecord[] {
+    return (this.state.sessionRecoveries ?? []).map(cloneSessionRecoveryRecord);
+  }
+
+  /** Replaces durable recovery records with cloned, bounded records. */
+  setSessionRecoveries(recoveries: readonly SessionRecoveryRecord[]): void {
+    this.state.sessionRecoveries = this.pruneSessionRecoveries(recoveries);
+    this.save();
+  }
+
+  /** Inserts or replaces one recovery record by its durable record ID. */
+  upsertSessionRecovery(recovery: SessionRecoveryRecord): void {
+    const current = this.state.sessionRecoveries ?? [];
+    const index = current.findIndex((candidate) => candidate.id === recovery.id);
+    const next = [...current];
+    if (index === -1) {
+      next.push(recovery);
+    } else {
+      next[index] = recovery;
+    }
+    this.setSessionRecoveries(next);
+  }
+
+  /** Removes a durable recovery record without affecting any active session. */
+  removeSessionRecovery(id: string): void {
+    const current = this.state.sessionRecoveries ?? [];
+    const next = current.filter((recovery) => recovery.id !== id);
+    if (next.length === current.length) return;
+    this.state.sessionRecoveries = next;
+    this.save();
+  }
+
+  private pruneSessionRecoveries(recoveries: readonly SessionRecoveryRecord[]): SessionRecoveryRecord[] {
+    const cloned = recoveries.map(cloneSessionRecoveryRecord);
+    const terminalByOwner = new Map<string, Array<{ index: number; createdAt: number }>>();
+
+    cloned.forEach((recovery, index) => {
+      if (!TERMINAL_SESSION_RECOVERY_STATUSES.has(recovery.status)) return;
+      const owner = recovery.owner ?? '';
+      const terminal = terminalByOwner.get(owner) ?? [];
+      terminal.push({ index, createdAt: recovery.createdAt });
+      terminalByOwner.set(owner, terminal);
+    });
+
+    const discarded = new Set<number>();
+    for (const terminal of terminalByOwner.values()) {
+      terminal.sort((left, right) => left.createdAt - right.createdAt || left.index - right.index);
+      for (const record of terminal.slice(0, -MAX_TERMINAL_SESSION_RECOVERIES_PER_OWNER)) {
+        discarded.add(record.index);
+      }
+    }
+
+    return cloned.filter((_, index) => !discarded.has(index));
   }
 
   /**
@@ -708,6 +821,130 @@ export class StateStore {
     this.state.sessionOrder = sessionOrder;
     this.save();
     return { layouts: structuredClone(validated), sessionOrder: [...sessionOrder] };
+  }
+
+  /** Returns an owner's case default, distinguishing unset from intentional Ungrouped. */
+  getCaseDefaultGroup(owner: string, caseName: string): string | null | undefined {
+    const defaults = this.state.caseDefaultGroups;
+    if (!defaults || !Object.hasOwn(defaults, owner)) return undefined;
+
+    const ownerDefaults = defaults[owner];
+    return Object.hasOwn(ownerDefaults, caseName) ? ownerDefaults[caseName] : undefined;
+  }
+
+  /** Persists an owner-and-case scoped default session group. */
+  setCaseDefaultGroup(owner: string, caseName: string, groupId: string | null): void {
+    const defaults = this.state.caseDefaultGroups;
+    const existing = defaults && Object.hasOwn(defaults, owner) ? defaults[owner] : {};
+    const ownerDefaults = { ...existing, [caseName]: groupId };
+    this.state.caseDefaultGroups = { ...(defaults ?? {}), [owner]: ownerDefaults };
+    this.save();
+  }
+
+  /** Moves an owner's default when its case is renamed. */
+  renameCaseDefaultGroup(owner: string, fromCase: string, toCase: string): void {
+    const current = this.getCaseDefaultGroup(owner, fromCase);
+    if (current === undefined || fromCase === toCase) return;
+
+    const defaults = this.state.caseDefaultGroups;
+    const ownerDefaults = { ...(defaults && Object.hasOwn(defaults, owner) ? defaults[owner] : {}) };
+    delete ownerDefaults[fromCase];
+    const renamedDefaults = { ...ownerDefaults, [toCase]: current };
+    this.state.caseDefaultGroups = { ...(defaults ?? {}), [owner]: renamedDefaults };
+    this.save();
+  }
+
+  /** Removes an owner's default when its case is deleted. */
+  deleteCaseDefaultGroup(owner: string, caseName: string): void {
+    const defaults = this.state.caseDefaultGroups;
+    if (!defaults || !Object.hasOwn(defaults, owner)) return;
+
+    const existing = defaults[owner];
+    if (!Object.hasOwn(existing, caseName)) return;
+
+    const ownerDefaults = { ...existing };
+    delete ownerDefaults[caseName];
+    this.state.caseDefaultGroups = { ...defaults, [owner]: ownerDefaults };
+    this.save();
+  }
+
+  /** Returns cloned owner-private Codex command profiles. */
+  getCodexCommandProfiles(owner: string): CodexCommandProfile[] {
+    const profiles = this.state.codexCommandProfiles;
+    if (!profiles || !Object.hasOwn(profiles, owner)) return [];
+
+    return profiles[owner].map((profile) => ({ ...profile }));
+  }
+
+  /** Persists cloned owner-private Codex command profiles. */
+  setCodexCommandProfiles(owner: string, profiles: CodexCommandProfile[]): void {
+    const clonedProfiles = profiles.map((profile) => ({ ...profile }));
+    this.state.codexCommandProfiles = { ...(this.state.codexCommandProfiles ?? {}), [owner]: clonedProfiles };
+    this.save();
+  }
+
+  /** Returns a cloned owner-and-case scoped Codex command selection, or undefined for default. */
+  getCaseCodexCommandSelection(owner: string, caseName: string): CaseCodexCommandSelection | undefined {
+    const ownerSelections = this.getCaseCodexCommandSelections(owner);
+    return Object.hasOwn(ownerSelections, caseName) ? { ...ownerSelections[caseName] } : undefined;
+  }
+
+  /** Returns cloned local case Codex command selections for an owner. */
+  getCaseCodexCommandSelections(owner: string): Record<string, CaseCodexCommandSelection> {
+    const selections = this.state.caseCodexCommandSelections;
+    if (!selections || !Object.hasOwn(selections, owner)) return {};
+
+    return Object.fromEntries(
+      Object.entries(selections[owner]).map(([caseName, selection]) => [caseName, { ...selection }])
+    );
+  }
+
+  /**
+   * Persists a local case Codex command selection. A default selection is
+   * represented by absence: passing undefined removes the entry.
+   */
+  setCaseCodexCommandSelection(
+    owner: string,
+    caseName: string,
+    selection: CaseCodexCommandSelection | undefined
+  ): void {
+    const selections = this.state.caseCodexCommandSelections;
+    const ownerSelections = { ...(selections && Object.hasOwn(selections, owner) ? selections[owner] : {}) };
+    if (selection === undefined) delete ownerSelections[caseName];
+    else ownerSelections[caseName] = { ...selection };
+
+    this.state.caseCodexCommandSelections = {
+      ...(selections ?? {}),
+      [owner]: ownerSelections,
+    };
+    this.save();
+  }
+
+  /** Moves an owner's local Codex command selection when its case is renamed. */
+  renameCaseCodexCommandSelection(owner: string, fromCase: string, toCase: string): void {
+    const current = this.getCaseCodexCommandSelection(owner, fromCase);
+    if (current === undefined || fromCase === toCase) return;
+
+    const selections = this.state.caseCodexCommandSelections;
+    const ownerSelections = { ...(selections && Object.hasOwn(selections, owner) ? selections[owner] : {}) };
+    delete ownerSelections[fromCase];
+    ownerSelections[toCase] = current;
+    this.state.caseCodexCommandSelections = { ...(selections ?? {}), [owner]: ownerSelections };
+    this.save();
+  }
+
+  /** Removes an owner's local Codex command selection when its case is deleted. */
+  deleteCaseCodexCommandSelection(owner: string, caseName: string): void {
+    const selections = this.state.caseCodexCommandSelections;
+    if (!selections || !Object.hasOwn(selections, owner)) return;
+
+    const ownerSelections = selections[owner];
+    if (!Object.hasOwn(ownerSelections, caseName)) return;
+
+    const nextOwnerSelections = { ...ownerSelections };
+    delete nextOwnerSelections[caseName];
+    this.state.caseCodexCommandSelections = { ...selections, [owner]: nextOwnerSelections };
+    this.save();
   }
 
   /** Resets all state to initial values and saves immediately. */

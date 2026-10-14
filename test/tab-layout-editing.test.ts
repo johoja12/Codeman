@@ -292,7 +292,7 @@ describe('edit coordinator', () => {
     return { editor, applied };
   }
 
-  it('applies at once and PUTs exactly { baseVersion, layout } with the held version', async () => {
+  it('applies at once and supplies the layout and semantic intent with the held version', async () => {
     const { put, calls } = controlledPut();
     const { editor, applied } = makeEditor(put);
     editor.enqueue({ type: 'renameGroup', groupId: 'g1', name: 'Front' });
@@ -300,7 +300,8 @@ describe('edit coordinator', () => {
     expect(applied.at(-1).meta).toEqual({ optimistic: true });
     await settle();
     expect(calls).toHaveLength(1);
-    expect(Object.keys(calls[0].request).sort()).toEqual(['baseVersion', 'layout']);
+    expect(Object.keys(calls[0].request).sort()).toEqual(['baseVersion', 'layout', 'operations']);
+    expect(calls[0].request.operations).toEqual([{ type: 'renameGroup', groupId: 'g1', name: 'Front' }]);
     expect(calls[0].request.baseVersion).toBe(5);
     expect(calls[0].request.layout.groups[0].name).toBe('Front');
     calls[0].resolve({
@@ -790,8 +791,7 @@ describe('group cap', () => {
     app.closeTabRailActionMenu();
     header('g0').focus();
     key(header('g0'), 'F10', { shiftKey: true });
-    // "New session" adds a tab, not a group, so it stays offered at the cap.
-    expect(menuLabels()).toEqual(['New session', 'Rename group', 'Move group down', 'Delete group']);
+    expect(menuLabels()).toEqual(['Rename group', 'New session in group', 'Move group down', 'Delete group']);
     app.closeTabGroupMenu();
   });
 });
@@ -803,15 +803,27 @@ describe('group menu', () => {
     win.confirm = vi.fn(() => true);
     header('gx').focus();
     key(header('gx'), 'F10', { shiftKey: true });
-    expect(menuLabels()).toEqual(['New session', 'Rename group', 'New group', 'Move group down', 'Delete group']);
-    expect(document.activeElement?.textContent).toBe('New session');
+    expect(menuLabels()).toEqual([
+      'Rename group',
+      'New session in group',
+      'New group',
+      'Move group down',
+      'Delete group',
+    ]);
+    expect(document.activeElement?.textContent).toBe('Rename group');
     clickMenu('Move group down');
     await flush();
     expect(puts.at(-1).layout.groups.map((g: any) => g.id)).toEqual(['gy', 'gx']);
     expect(document.activeElement).toBe(header('gx'));
 
     key(header('gx'), 'ContextMenu');
-    expect(menuLabels()).toEqual(['New session', 'Rename group', 'New group', 'Move group up', 'Delete group']);
+    expect(menuLabels()).toEqual([
+      'Rename group',
+      'New session in group',
+      'New group',
+      'Move group up',
+      'Delete group',
+    ]);
     clickMenu('Delete group');
     expect(win.confirm).toHaveBeenCalledWith('Delete group "<Core & Ops>"? Its tabs move to Ungrouped.');
     await flush();
@@ -959,7 +971,7 @@ describe('new session in a group', () => {
     app.run = vi.fn(async () => {});
     header('gx').focus();
     key(header('gx'), 'F10', { shiftKey: true });
-    clickMenu('New session');
+    clickMenu('New session in group');
     await flush();
     expect(app.run).toHaveBeenCalledTimes(1);
     expect(app.run).toHaveBeenCalledWith({ count: 1, tabGroupId: 'gx' });

@@ -14,7 +14,7 @@
  * | Module       | Key exports                                                           | Persistence / API                              |
  * |--------------|-----------------------------------------------------------------------|-------------------------------------------------|
  * | common       | Disposable, BufferConfig, CleanupRegistration, NiceConfig, ProcessStats | In-memory only                                 |
- * | session      | SessionState, SessionConfig, SessionStatus, SessionMode, ClaudeMode, OpenCodeConfig | `~/.codeman/state.json` → `GET /api/sessions`  |
+ * | session      | SessionState, SessionConfig, SessionStatus, SessionMode, ClaudeMode, OpenCodeConfig, CodexConfig | `~/.codeman/state.json` → `GET /api/sessions`  |
  * | task         | TaskDefinition, TaskState, TaskStatus                                 | `~/.codeman/state.json` → `GET /api/tasks`     |
  * | app-state    | AppState, AppConfig, GlobalStats, TokenStats, DEFAULT_CONFIG          | `~/.codeman/state.json` → `GET /api/status`    |
  * | respawn      | RespawnConfig, RespawnPreset, RespawnCycleMetrics, RalphLoopHealthScore, TimingHistory | Per-session in state.json → `GET /api/sessions/:id/respawn` |
@@ -68,9 +68,13 @@ export * from './push.js';
 export * from './plan.js';
 export * from './orchestrator.js';
 export * from './update.js';
+export * from './search.js';
 export * from './workflow-run.js';
 export * from './search.js';
+export * from './library.js';
+export * from './sources.js';
 export * from './user.js';
 export * from './webview.js';
 export * from './intent.js';
+export * from './session-recovery.js';
 export * from './mcp-sync.js';

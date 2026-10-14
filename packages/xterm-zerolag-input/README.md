@@ -57,15 +57,15 @@ Since 0.2.0 the package ships **two addons for two kinds of TUIs**:
 
 ## Why this one
 
-| | |
-|---|---|
-| **Survives full-screen TUIs** | Ink, blessed, and friends repaint the whole screen constantly. The overlay is a separate DOM layer they cannot reach, so it does not get clobbered. |
-| **Pixel-matched to the canvas** | Each character is its own absolutely-positioned `<span>` at exact cell coordinates, so it does not drift out of the grid like normal DOM text flow. |
-| **Wide characters included** | CJK, fullwidth forms and emoji render double-width and position by visual column, using the terminal's Unicode addon when one is loaded. |
-| **Backspace that actually works** | A three-layer cascade (unsent, in-flight, already on screen) tells you exactly what to forward to the PTY, so editing works through any mix of typed, flushed and tab-completed text. |
-| **You keep control of input** | The addon never hooks `onData` for you. You decide what gets echoed and what gets forwarded, which is what makes char-at-a-time, buffered, and multi-session tab switching all possible. |
-| **Small and self-contained** | 6.1 kB gzipped, zero runtime dependencies, dual CJS/ESM with full type declarations. |
-| **Proven under load** | Extracted from [Codeman](https://getcodeman.com), hardened over thousands of hours of real remote and mobile usage, 175 tests over every state transition. |
+|                                   |                                                                                                                                                                                          |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Survives full-screen TUIs**     | Ink, blessed, and friends repaint the whole screen constantly. The overlay is a separate DOM layer they cannot reach, so it does not get clobbered.                                      |
+| **Pixel-matched to the canvas**   | Each character is its own absolutely-positioned `<span>` at exact cell coordinates, so it does not drift out of the grid like normal DOM text flow.                                      |
+| **Wide characters included**      | CJK, fullwidth forms and emoji render double-width and position by visual column, using the terminal's Unicode addon when one is loaded.                                                 |
+| **Backspace that actually works** | A three-layer cascade (unsent, in-flight, already on screen) tells you exactly what to forward to the PTY, so editing works through any mix of typed, flushed and tab-completed text.    |
+| **You keep control of input**     | The addon never hooks `onData` for you. You decide what gets echoed and what gets forwarded, which is what makes char-at-a-time, buffered, and multi-session tab switching all possible. |
+| **Small and self-contained**      | 6.1 kB gzipped, zero runtime dependencies, dual CJS/ESM with full type declarations.                                                                                                     |
+| **Proven under load**             | Extracted from [Codeman](https://getcodeman.com), hardened over thousands of hours of real remote and mobile usage, 175 tests over every state transition.                               |
 
 Built for anything that puts a terminal behind a network hop: SSH web clients, cloud IDEs, mobile terminals, Kubernetes and container consoles, remote agent dashboards, browser-based dev environments.
 
@@ -210,11 +210,11 @@ Implements the xterm.js `ITerminalAddon` interface. It deliberately does **not**
 
 `removeChar()` cascades through three layers and tells you what it removed:
 
-| Return | Source | Your action |
-|--------|--------|-------------|
-| `'pending'` | Unsent text (never transmitted to the PTY) | Do nothing |
-| `'flushed'` | Text already sent to the PTY | Send `\x7f` to the PTY |
-| `false` | Nothing to remove | Do nothing |
+| Return      | Source                                     | Your action            |
+| ----------- | ------------------------------------------ | ---------------------- |
+| `'pending'` | Unsent text (never transmitted to the PTY) | Do nothing             |
+| `'flushed'` | Text already sent to the PTY               | Send `\x7f` to the PTY |
+| `false`     | Nothing to remove                          | Do nothing             |
 
 The cascade order is pending text, then flushed text, then auto-detected buffer text (which is what makes backspace work after tab completion). Backspace "just works" across any combination of typed, in-flight and completed text.
 
@@ -235,22 +235,22 @@ The composition is visual only: it is never part of `pendingText`, `hasPending` 
 
 "Flushed" means sent to the PTY but the echo has not arrived yet. This happens during tab switches and tab completion.
 
-| Method | Description |
-|--------|-------------|
+| Method                             | Description                                                                                             |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------- |
 | `setFlushed(count, text, render?)` | Mark text as flushed. Pass `render=false` during tab-switch restore, when the buffer is not loaded yet. |
-| `getFlushed()` | Returns `{ count, text }`. |
-| `clearFlushed()` | Clear flushed state once the server echo arrives. |
+| `getFlushed()`                     | Returns `{ count, text }`.                                                                              |
+| `clearFlushed()`                   | Clear flushed state once the server echo arrives.                                                       |
 
 ### Buffer detection
 
 Finds text that exists after the prompt but was never typed through the overlay.
 
-| Method | Description |
-|--------|-------------|
-| `detectBufferText()` | Scan and return the detected text (or `null`), marking it flushed. Guarded: runs once per `clear()` cycle. |
-| `resetBufferDetection()` | Re-enable detection. |
+| Method                      | Description                                                                                                |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `detectBufferText()`        | Scan and return the detected text (or `null`), marking it flushed. Guarded: runs once per `clear()` cycle. |
+| `resetBufferDetection()`    | Re-enable detection.                                                                                       |
 | `suppressBufferDetection()` | Block detection until the next `clear()`. Use for sessions that render UI framework text after the prompt. |
-| `undoDetection()` | Undo the last detection: clears flushed state and re-enables detection. For tab-completion retries. |
+| `undoDetection()`           | Undo the last detection: clears flushed state and re-enables detection. For tab-completion retries.        |
 
 ### Rendering
 
@@ -261,11 +261,11 @@ Finds text that exists after the prompt but was never typed through the overlay.
 
 ### Prompt
 
-| Method | Description |
-|--------|-------------|
-| `setPrompt(finder)` | Replace the prompt detection strategy at runtime. |
-| `findPrompt()` | Find the prompt position. Returns `{ row, col }` or `null`. |
-| `readPromptText()` | Read the text after the prompt marker. Returns a string or `null`. |
+| Method              | Description                                                        |
+| ------------------- | ------------------------------------------------------------------ |
+| `setPrompt(finder)` | Replace the prompt detection strategy at runtime.                  |
+| `findPrompt()`      | Find the prompt position. Returns `{ row, col }` or `null`.        |
+| `readPromptText()`  | Read the text after the prompt marker. Returns a string or `null`. |
 
 ### State
 

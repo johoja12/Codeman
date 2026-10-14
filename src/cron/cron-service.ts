@@ -32,6 +32,7 @@ import type { SessionPort, EventPort, ConfigPort, InfraPort } from '../web/ports
 import type { CronJob, CronJobRun, CronJobRunStatus, TriggerType } from '../types/cron.js';
 import type { GeminiConfig, PiConfig, SessionMode } from '../types/session.js';
 import type { CronJobInput } from './cron-input.js';
+import { verifyClaudeSessionStartHookCapability } from '../hooks-config.js';
 
 /** The subset of the route context the cron depends on. */
 export type CronDeps = SessionPort & EventPort & ConfigPort & InfraPort;
@@ -467,6 +468,8 @@ export class CronService {
       const globalNice = await this.deps.getGlobalNiceConfig();
       const modelConfig = await this.deps.getModelConfig();
       const claudeModeConfig = await this.deps.getClaudeModeConfig();
+      const checkpointEnabled = await this.deps.getCheckpointDefaultEnabled();
+      const claudeSessionStartHookReady = await verifyClaudeSessionStartHookCapability(mode, job.workingDir, false);
       const effectiveClaudeMode = await resolveClaudeModeForUsername(claudeModeConfig.claudeMode, job.owner);
       // Cron carries no per-CLI config object, so the only model it can supply is the global
       // default — and only to a CLI that takes a model at all.
@@ -506,6 +509,8 @@ export class CronService {
         geminiConfig,
         piConfig,
         owner: job.owner,
+        checkpointEnabled,
+        claudeSessionStartHookReady,
       });
       await this.deps.addSession(session);
       this.store.incrementSessionsCreated();

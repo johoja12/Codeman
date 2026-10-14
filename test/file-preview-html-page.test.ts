@@ -80,6 +80,8 @@ function loadApp(mint: 'ok' | 'refuse', prefs: Record<string, string> = {}) {
     document,
     window: { addEventListener: vi.fn(), removeEventListener: vi.fn(), open: vi.fn() },
     MobileDetection: {},
+    setInterval: vi.fn(),
+    clearInterval: vi.fn(),
     setTimeout,
     clearTimeout,
     confirm: () => true,

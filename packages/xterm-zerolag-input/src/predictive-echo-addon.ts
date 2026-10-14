@@ -21,7 +21,7 @@
 import { getCellDimensions } from './cell-dimensions.js';
 import { charCellWidth } from './overlay-renderer.js';
 import { addPredictionSpan, clearAllSpans, removePredictionSpan } from './prediction-renderer.js';
-import type { FontStyle, XtermAddon, XtermTerminal } from './types.js';
+import type { CellDimensions, FontStyle, XtermAddon, XtermTerminal } from './types.js';
 
 export interface PredictiveEchoOptions {
   /** Z-index of the span container. @default 7 (same layer as the buffer overlay) */
@@ -51,6 +51,18 @@ export interface PredictionState {
   anchor: { row: number; col: number } | null;
 }
 
+export interface PredictiveEchoDebugState {
+  counts: Record<string, number>;
+  anchorHoldCount: number;
+  anchorHoldTotalMs: number;
+  anchorHoldMaxMs: number;
+  anchorHoldAvgMs: number;
+  lastAnchorHoldMs: number | null;
+  currentHoldMs: number | null;
+  totalPredictCalls: number;
+  totalSuppressed: number;
+}
+
 interface PredictionRecord {
   seq: number;
   char: string;
@@ -65,11 +77,19 @@ interface PredictionRecord {
   mismatches: number;
 }
 
+interface PredictionContext {
+  terminal: XtermTerminal;
+  container: HTMLDivElement;
+  dims: CellDimensions;
+  cursorX: number;
+  cursorY: number;
+}
+
 const DEFAULT_OPTIONS = {
   zIndex: 7,
   underlinePredictions: false,
   ttlMs: 1000,
-  maxPending: 32,
+  maxPending: 64,
   cursorGraceMs: 150,
   edgeMarginCells: 4,
 } as const;
@@ -88,6 +108,17 @@ export class PredictiveEchoAddon implements XtermAddon {
   private _confirmedTotal = 0;
   private _droppedTotal = 0;
   private _ttlTimer: ReturnType<typeof setTimeout> | null = null;
+  // ── Phase 1 instrumentation (COD-331): gate-miss counters + anchorHold timing ──
+  // Zero runtime cost when not inspected (counters are integers, no I/O). Exposed
+  // via get debugState for window.codemanEchoDebug when ?debugEcho is set.
+  private _debugCounts = new Map<string, number>();
+  private _debugAnchorHoldStart: number | null = null;
+  private _debugAnchorHoldCount = 0;
+  private _debugAnchorHoldTotalMs = 0;
+  private _debugAnchorHoldMaxMs = 0;
+  private _debugLastHoldMs: number | null = null;
+  private _debugTotalCalls = 0;
+  private _debugTotalSuppressed = 0;
   /** Anchor hold: set after an unpredicted wire edit (backspace into echoed
    *  text, any cleared input, an IME text commit). While held, new
    *  predictions are suppressed: the displayed cursor is stale until the
@@ -97,6 +128,22 @@ export class PredictiveEchoAddon implements XtermAddon {
    *  predictChar pass (which runs before the display could catch up). */
   private _anchorHold = false;
   private _reconcileScheduled = false;
+  private _armDebugAnchorHold(): void {
+    if (this._debugAnchorHoldStart !== null) return;
+    this._debugAnchorHoldStart = performance.now();
+    this._debugAnchorHoldCount++;
+  }
+  private _releaseDebugAnchorHold(): void {
+    if (this._debugAnchorHoldStart === null) return;
+    const ms = performance.now() - this._debugAnchorHoldStart;
+    this._debugLastHoldMs = ms;
+    this._debugAnchorHoldTotalMs += ms;
+    if (ms > this._debugAnchorHoldMaxMs) this._debugAnchorHoldMaxMs = ms;
+    this._debugAnchorHoldStart = null;
+  }
+  private _incDebug(reason: string): void {
+    this._debugCounts.set(reason, (this._debugCounts.get(reason) || 0) + 1);
+  }
   private _disposables: Array<{ dispose(): void }> = [];
   private _predictWhen: ((terminal: XtermTerminal) => boolean) | null;
   private _options: Required<Omit<PredictiveEchoOptions, 'foregroundColor' | 'backgroundColor' | 'predictWhen'>> &
@@ -149,6 +196,7 @@ export class PredictiveEchoAddon implements XtermAddon {
             this._reconcileScheduled = true;
             queueMicrotask(() => {
               this._reconcileScheduled = false;
+              if (this._anchorHold) this._releaseDebugAnchorHold();
               this._anchorHold = false; // a parse pass ran: the display caught up
               this._safeReconcile();
             });
@@ -191,36 +239,60 @@ export class PredictiveEchoAddon implements XtermAddon {
    */
   predictChar(ch: string): boolean {
     try {
+      this._debugTotalCalls++;
       this._reconcile();
-      if (this._anchorHold) return false; // display has not caught up with a wire edit
+      if (this._anchorHold) {
+        this._debugTotalSuppressed++;
+        this._incDebug('anchorHold');
+        return false;
+      }
 
-      const t = this._terminal;
-      if (!t || !this._container) return false;
-      const dims = getCellDimensions(t);
-      if (!dims) return false;
-      const buf = t.buffer.active;
-      if (typeof buf.cursorX !== 'number' || typeof buf.cursorY !== 'number') return false;
-      if (buf.viewportY !== buf.baseY) return false;
-      if (this._predictWhen && this._predictWhen(t) === false) return false;
+      const context = this._getPredictionContext();
+      if (!context) return false;
+      const { terminal: t, container, dims, cursorX, cursorY } = context;
 
       const cps = Array.from(ch);
-      if (cps.length !== 1) return false;
+      if (cps.length !== 1) {
+        this._debugTotalSuppressed++;
+        this._incDebug('multi-codepoint');
+        return false;
+      }
       const cp = cps[0].codePointAt(0)!;
-      if (cp < 0x20 || cp === 0x7f) return false;
+      if (cp < 0x20 || cp === 0x7f) {
+        this._debugTotalSuppressed++;
+        this._incDebug(cp === 0x7f ? 'is-del' : 'control');
+        return false;
+      }
       const w = charCellWidth(t, cps[0]);
-      if (w !== 1 && w !== 2) return false;
-      if (w === 2 && !this._hasGetCell()) return false; // ASCII fallback misaligns on wide cols
-      if (this._outstanding.length >= this._options.maxPending) return false;
+      if (w !== 1 && w !== 2) {
+        this._debugTotalSuppressed++;
+        this._incDebug('bad-width');
+        return false;
+      }
+      if (w === 2 && !this._hasGetCell()) {
+        this._debugTotalSuppressed++;
+        this._incDebug('wide-no-getCell');
+        return false;
+      }
+      if (this._outstanding.length >= this._options.maxPending) {
+        this._debugTotalSuppressed++;
+        this._incDebug('maxPending');
+        return false;
+      }
 
       if (this._outstanding.length === 0) {
-        this._anchor = { row: buf.cursorY, col: buf.cursorX };
+        this._anchor = { row: cursorY, col: cursorX };
         this._cursorOffRowSince = null;
       }
       const anchor = this._anchor!;
       const last = this._outstanding[this._outstanding.length - 1];
       const offset = last ? last.offsetCells + last.width : 0;
       const col = anchor.col + offset;
-      if (col + w > t.cols - this._options.edgeMarginCells) return false;
+      if (col + w > t.cols - this._options.edgeMarginCells) {
+        this._debugTotalSuppressed++;
+        this._incDebug('edgeMargin');
+        return false;
+      }
 
       const rec: PredictionRecord = {
         seq: this._seq++,
@@ -232,7 +304,7 @@ export class PredictiveEchoAddon implements XtermAddon {
         mismatches: 0,
       };
       this._outstanding.push(rec);
-      addPredictionSpan(this._container, this._spans, {
+      addPredictionSpan(container, this._spans, {
         seq: rec.seq,
         row: anchor.row,
         col,
@@ -250,6 +322,164 @@ export class PredictiveEchoAddon implements XtermAddon {
   }
 
   /**
+   * Predict an entire committed text run at the current insertion point.
+   * Validation, buffer snapshots, and span construction complete before any
+   * prediction is accepted, so a rejected or failed run never paints a prefix.
+   * The consumer sends the text to the PTY regardless of this visual result.
+   */
+  predictText(text: string): boolean {
+    let acceptedBefore = this._outstanding.length;
+    let seqBefore = this._seq;
+    let anchorBefore = this._anchor;
+    let cursorOffRowSinceBefore = this._cursorOffRowSince;
+    let timerBefore = this._ttlTimer;
+    let rollbackReady = false;
+    const appendedSpans: HTMLSpanElement[] = [];
+    const committedSeqs: number[] = [];
+
+    try {
+      this._debugTotalCalls++;
+      this._reconcile();
+      acceptedBefore = this._outstanding.length;
+      seqBefore = this._seq;
+      anchorBefore = this._anchor;
+      cursorOffRowSinceBefore = this._cursorOffRowSince;
+      timerBefore = this._ttlTimer;
+      rollbackReady = true;
+      if (this._anchorHold) {
+        this._debugTotalSuppressed++;
+        this._incDebug('anchorHold');
+        return false;
+      }
+
+      const context = this._getPredictionContext();
+      if (!context) return false;
+      const { terminal: t, container, dims, cursorX, cursorY } = context;
+
+      const chars = Array.from(text);
+      if (chars.length === 0) {
+        this._debugTotalSuppressed++;
+        this._incDebug('empty-text');
+        return false;
+      }
+      if (this._hasCompoundGrapheme(text, chars)) {
+        this._debugTotalSuppressed++;
+        this._incDebug('compound-grapheme');
+        return false;
+      }
+      if (this._outstanding.length + chars.length > this._options.maxPending) {
+        this._debugTotalSuppressed++;
+        this._incDebug('maxPending');
+        return false;
+      }
+
+      const widths: Array<1 | 2> = [];
+      let runWidth = 0;
+      let hasWide = false;
+      for (const char of chars) {
+        const cp = char.codePointAt(0)!;
+        if (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f) || cp === 0x2028 || cp === 0x2029) {
+          this._debugTotalSuppressed++;
+          this._incDebug(cp === 0x7f ? 'is-del' : 'control');
+          return false;
+        }
+        const width = charCellWidth(t, char);
+        if (width !== 1 && width !== 2) {
+          this._debugTotalSuppressed++;
+          this._incDebug('bad-width');
+          return false;
+        }
+        widths.push(width);
+        runWidth += width;
+        hasWide ||= width === 2;
+      }
+      if (hasWide && !this._hasGetCell()) {
+        this._debugTotalSuppressed++;
+        this._incDebug('wide-no-getCell');
+        return false;
+      }
+
+      const anchor = this._anchor ?? { row: cursorY, col: cursorX };
+      const last = this._outstanding[this._outstanding.length - 1];
+      const initialOffset = last ? last.offsetCells + last.width : 0;
+      if (anchor.col + initialOffset + runWidth > t.cols - this._options.edgeMarginCells) {
+        this._debugTotalSuppressed++;
+        this._incDebug('edgeMargin');
+        return false;
+      }
+
+      const sentAt = performance.now();
+      const candidates: PredictionRecord[] = [];
+      let offset = initialOffset;
+      for (let i = 0; i < chars.length; i++) {
+        candidates.push({
+          seq: seqBefore + i,
+          char: chars[i],
+          width: widths[i],
+          offsetCells: offset,
+          snapshot: this._readCell(anchor.row, anchor.col + offset),
+          sentAt,
+          mismatches: 0,
+        });
+        offset += widths[i];
+      }
+
+      // Construct the whole run off-DOM. Appending one fragment makes the
+      // visible paint atomic; records and the live span map are committed only
+      // after that append succeeds.
+      const staging = document.createElement('div');
+      const stagedSpans = new Map<number, HTMLSpanElement>();
+      for (const rec of candidates) {
+        addPredictionSpan(staging, stagedSpans, {
+          seq: rec.seq,
+          row: anchor.row,
+          col: anchor.col + rec.offsetCells,
+          char: rec.char,
+          width: rec.width,
+          dims,
+          font: this._font,
+          underline: this._options.underlinePredictions,
+        });
+      }
+      const fragment = document.createDocumentFragment();
+      for (const span of stagedSpans.values()) {
+        appendedSpans.push(span);
+        fragment.appendChild(span);
+      }
+      container.appendChild(fragment);
+
+      for (const rec of candidates) {
+        this._spans.set(rec.seq, stagedSpans.get(rec.seq)!);
+        committedSeqs.push(rec.seq);
+      }
+      this._outstanding.push(...candidates);
+      this._seq += candidates.length;
+      if (acceptedBefore === 0) {
+        this._anchor = anchor;
+        this._cursorOffRowSince = null;
+      }
+      this._armTtl();
+      return true;
+    } catch {
+      if (rollbackReady) {
+        for (const span of appendedSpans) span.remove();
+        for (const seq of committedSeqs) this._spans.delete(seq);
+        this._outstanding.splice(acceptedBefore);
+        this._seq = seqBefore;
+        this._anchor = anchorBefore;
+        this._cursorOffRowSince = cursorOffRowSinceBefore;
+        if (timerBefore === null && this._ttlTimer !== null) {
+          clearTimeout(this._ttlTimer);
+          this._ttlTimer = null;
+        }
+      }
+      this._debugTotalSuppressed++;
+      this._incDebug('exception');
+      return false;
+    }
+  }
+
+  /**
    * Pop the newest outstanding prediction (visual only). Returns false when
    * none are outstanding. The consumer forwards \x7f UNCONDITIONALLY either
    * way; deleting already-echoed text renders at RTT.
@@ -261,6 +491,8 @@ export class PredictiveEchoAddon implements XtermAddon {
         // \x7f goes to the wire and will delete ECHOED text: the cursor is
         // about to move in a way we cannot see yet
         this._anchorHold = true;
+        this._armDebugAnchorHold();
+        this._incDebug('backspace-into-echoed');
         return false;
       }
       removePredictionSpan(this._spans, rec.seq);
@@ -276,7 +508,10 @@ export class PredictiveEchoAddon implements XtermAddon {
    *  cursor effect is unknown until the next parsed write. */
   clearPredictions(): void {
     try {
+      if (!this._anchorHold) this._armDebugAnchorHold();
+      else if (this._debugAnchorHoldStart === null) this._armDebugAnchorHold();
       this._anchorHold = true;
+      if (this._outstanding.length > 0) this._incDebug('clearPredictions:' + this._outstanding.length);
       this._droppedTotal += this._outstanding.length;
       this._outstanding = [];
       clearAllSpans(this._spans);
@@ -289,6 +524,7 @@ export class PredictiveEchoAddon implements XtermAddon {
   /** Manual reconcile pass, for consumers without onWriteParsed. By contract
    *  it is called after writes parsed, so it also releases the anchor hold. */
   reconcile(): void {
+    if (this._anchorHold) this._releaseDebugAnchorHold();
     this._anchorHold = false;
     this._safeReconcile();
   }
@@ -316,6 +552,86 @@ export class PredictiveEchoAddon implements XtermAddon {
     };
   }
 
+  get debugState(): PredictiveEchoDebugState {
+    const counts: Record<string, number> = {};
+    for (const [k, v] of this._debugCounts) counts[k] = v;
+    const avg = this._debugAnchorHoldCount > 0 ? this._debugAnchorHoldTotalMs / this._debugAnchorHoldCount : 0;
+    const currentHoldMs = this._debugAnchorHoldStart !== null ? performance.now() - this._debugAnchorHoldStart : null;
+    return {
+      counts,
+      anchorHoldCount: this._debugAnchorHoldCount,
+      anchorHoldTotalMs: Math.round(this._debugAnchorHoldTotalMs),
+      anchorHoldMaxMs: Math.round(this._debugAnchorHoldMaxMs),
+      anchorHoldAvgMs: Math.round(avg),
+      lastAnchorHoldMs: this._debugLastHoldMs !== null ? Math.round(this._debugLastHoldMs) : null,
+      currentHoldMs: currentHoldMs !== null ? Math.round(currentHoldMs) : null,
+      totalPredictCalls: this._debugTotalCalls,
+      totalSuppressed: this._debugTotalSuppressed,
+    };
+  }
+
+  resetDebugState(): void {
+    this._debugCounts.clear();
+    this._debugAnchorHoldStart = null;
+    this._debugAnchorHoldCount = 0;
+    this._debugAnchorHoldTotalMs = 0;
+    this._debugAnchorHoldMaxMs = 0;
+    this._debugLastHoldMs = null;
+    this._debugTotalCalls = 0;
+    this._debugTotalSuppressed = 0;
+  }
+
+  private _getPredictionContext(): PredictionContext | null {
+    const terminal = this._terminal;
+    const container = this._container;
+    if (!terminal || !container) {
+      this._debugTotalSuppressed++;
+      this._incDebug(!terminal ? 'no-terminal' : 'no-container');
+      return null;
+    }
+    const dims = getCellDimensions(terminal);
+    if (!dims) {
+      this._debugTotalSuppressed++;
+      this._incDebug('no-dims');
+      return null;
+    }
+    const buf = terminal.buffer.active;
+    if (typeof buf.cursorX !== 'number' || typeof buf.cursorY !== 'number') {
+      this._debugTotalSuppressed++;
+      this._incDebug('no-cursor');
+      return null;
+    }
+    if (buf.viewportY !== buf.baseY) {
+      this._debugTotalSuppressed++;
+      this._incDebug('scrolled');
+      return null;
+    }
+    if (this._predictWhen && this._predictWhen(terminal) === false) {
+      this._debugTotalSuppressed++;
+      this._incDebug('predictWhen:false');
+      return null;
+    }
+    return { terminal, container, dims, cursorX: buf.cursorX, cursorY: buf.cursorY };
+  }
+
+  private _hasCompoundGrapheme(text: string, codePoints: string[]): boolean {
+    const Segmenter = Intl.Segmenter;
+    if (typeof Segmenter === 'function') {
+      const graphemes = Array.from(
+        new Segmenter(undefined, { granularity: 'grapheme' }).segment(text),
+        ({ segment }) => segment
+      );
+      return (
+        graphemes.length !== codePoints.length || graphemes.some((grapheme, index) => grapheme !== codePoints[index])
+      );
+    }
+    if (codePoints.length <= 1) return false;
+    return codePoints.some((codePoint) => {
+      const value = codePoint.codePointAt(0)!;
+      return value < 0x20 || value > 0x7e;
+    });
+  }
+
   // ─── Reconciliation ───────────────────────────────────────────────
 
   private _safeReconcile(): void {
@@ -332,6 +648,7 @@ export class PredictiveEchoAddon implements XtermAddon {
     if (this._outstanding.length === 0) return; // streaming cost: one boolean
     const buf = t.buffer.active;
     if (buf.viewportY !== buf.baseY) {
+      this._incDebug('reconcile:scrolled');
       this.clearPredictions(); // user scrolled up
       return;
     }
@@ -345,6 +662,7 @@ export class PredictiveEchoAddon implements XtermAddon {
     if (buf.cursorY !== anchor.row) {
       this._cursorOffRowSince ??= now;
       if (now - this._cursorOffRowSince > this._options.cursorGraceMs) {
+        this._incDebug('reconcile:offRow');
         this.clearPredictions();
         return;
       }
@@ -389,11 +707,15 @@ export class PredictiveEchoAddon implements XtermAddon {
         rec.mismatches = 0;
       }
     }
-    if (dropFrom !== -1) this._dropFrom(dropFrom);
+    if (dropFrom !== -1) {
+      this._incDebug('reconcile:mismatchDrop:' + dropFrom);
+      this._dropFrom(dropFrom);
+    }
 
     // TTL: the first stale record drops itself and everything after it.
     for (let i = 0; i < this._outstanding.length; i++) {
       if (now - this._outstanding[i].sentAt > this._options.ttlMs) {
+        this._incDebug('reconcile:ttlDrop');
         this._dropFrom(i);
         break;
       }

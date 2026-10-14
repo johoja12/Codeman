@@ -1,6 +1,12 @@
+# Opencode local config (machine-specific, not shared)
+opencode.json
+opencode.jsonc
+.opencode/
+
 # Claude Code local files
 .agents/
 skills-lock.json
+CLAUDE.local.md
 
 
 # In-session decision scratchpad (context-survival mechanism, not a deliverable)
@@ -118,6 +124,7 @@ packages/gesture-control/.vite/
 plan.json
 
 .claude/
+!.claude/commands/
 media-assets/
 commands
 todo.md
@@ -132,3 +139,7 @@ readme-preview.mjs
 # Local-LLM harness smoke-test config (real IPs/keys) — see the .example.json
 # alongside it in scripts/, which IS tracked as the template.
 scripts/local-llm-test.config.json
+
+# Local integration worktrees and browser inspection output.
+.worktrees/
+.playwright-mcp/

@@ -244,6 +244,7 @@ function loadApp() {
 function linksOn(lines: string[], row: number) {
   const app = loadApp();
   app.terminal = { cols: 80, registerLinkProvider: vi.fn(), buffer: { active: buffer(lines) } };
+  app.openExternalPathPreview = (path: string, id: string) => app.openFilePreview(path, id);
   const provider = app.registerFilePathLinkProvider() as Provider;
   let out: Link[] = [];
   provider.provideLinks(row, (links) => {
@@ -253,11 +254,12 @@ function linksOn(lines: string[], row: number) {
 }
 
 describe('terminal link provider', () => {
-  it('links a broken path once, across both rows, and opens the whole path', () => {
+  it('links each segment of a broken path to the whole file', () => {
     const { app, links } = linksOn(BROKEN, 2);
-    expect(links.map((l) => l.text)).toEqual([BROKEN_PATH]);
+    expect(links.map((l) => l.text)).toEqual([BROKEN_PATH, BROKEN_PATH]);
     expect(links[0].range.start).toEqual({ x: 11, y: 1 });
-    expect(links[0].range.end.y).toBe(2);
+    expect(links[0].range.end.y).toBe(1);
+    expect(links[1].range.start.y).toBe(2);
     links[0].activate({}, links[0].text);
     expect(app.openFilePreview).toHaveBeenCalledWith(BROKEN_PATH, 's1');
   });
@@ -265,10 +267,7 @@ describe('terminal link provider', () => {
   it('opens a relative path resolved against the working directory', () => {
     const { app, links } = linksOn(['  ⎿  wrote builds/captures/2026-10-10/a.png'], 1);
     links[0].activate({}, links[0].text);
-    expect(app.openFilePreview).toHaveBeenCalledWith(
-      '/mnt/build/neon_getaway-mgr-hebel/builds/captures/2026-10-10/a.png',
-      's1'
-    );
+    expect(app.openFilePreview).toHaveBeenCalledWith('builds/captures/2026-10-10/a.png', 's1');
   });
 
   it('opens a ~/ path as is, in the preview (the server expands it), even for text', () => {
@@ -294,7 +293,7 @@ describe('terminal link provider', () => {
       [['wrote docs/README.markdown'], 1, `${WS}/docs/README.markdown`, 'preview'],
       [['wrote report/index.htm'], 1, `${WS}/report/index.htm`, 'preview'],
       [['wrote ./notes/plan.md'], 1, `${WS}/notes/plan.md`, 'preview'],
-      [['wrote out/data.json'], 1, `${WS}/out/data.json`, 'log'],
+      [['wrote out/data.json'], 1, `${WS}/out/data.json`, 'preview'],
       [
         ['  ⎿  WROTE /mnt/build/neon_getaway-mgr-hebel/builds/reports/2', '     026-10-10/summary.md done', ''],
         2,
@@ -310,10 +309,17 @@ describe('terminal link provider', () => {
     ];
     for (const [lines, row, expected, where] of cases) {
       const { app, links } = linksOn(lines, row);
-      expect(links.length, expected).toBe(1);
+      expect(links.length, expected).toBe(row === 2 ? 2 : 1);
       links[0].activate({}, links[0].text);
       if (where === 'preview') {
-        expect(app.openFilePreview, expected).toHaveBeenCalledWith(expected, 's1');
+        expect(app.openFilePreview).toHaveBeenCalledTimes(1);
+        const [actualPath, actualSession] = app.openFilePreview.mock.calls[0];
+        const resolved =
+          actualPath.startsWith('/') || actualPath.startsWith('~/')
+            ? actualPath
+            : `/mnt/build/neon_getaway-mgr-hebel/${actualPath}`;
+        expect(resolved, expected).toBe(expected);
+        expect(actualSession).toBe('s1');
         expect(app.openLogViewerWindow, expected).not.toHaveBeenCalled();
       } else {
         expect(app.openLogViewerWindow, expected).toHaveBeenCalledWith(expected, 's1');

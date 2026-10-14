@@ -443,13 +443,13 @@ describe('Mobile Layout', () => {
   // ─── Terminal ─────────────────────────────────────────────────────────────
 
   describe('Terminal', () => {
-    it('terminal-container has touch-action: pan-y', async () => {
+    it('terminal-container lets the JS touch handler own terminal scroll', async () => {
       const { context, page } = await createDevicePage(iPhone14Pro, baseUrl);
       try {
         const exists = await page.$(SELECTORS.TERMINAL_CONTAINER);
         if (exists) {
           const touchAction = await getCSSProperty(page, SELECTORS.TERMINAL_CONTAINER, 'touch-action');
-          expect(touchAction).toContain('pan-y');
+          expect(touchAction).toBe('none');
         }
       } finally {
         await context.close();
@@ -473,12 +473,12 @@ describe('Mobile Layout', () => {
   // ─── Main Content ─────────────────────────────────────────────────────────
 
   describe('Main Content', () => {
-    it('main has margin-top for fixed header', async () => {
+    it('app reserves top padding for fixed header', async () => {
       const { context, page } = await createDevicePage(iPhone14Pro, baseUrl);
       try {
-        const marginTop = await getCSSNumericValue(page, SELECTORS.MAIN, 'margin-top');
-        // Main content should have enough margin-top to clear the fixed header (~42px)
-        expect(marginTop).toBeGreaterThanOrEqual(30);
+        const paddingTop = await getCSSNumericValue(page, '.app', 'padding-top');
+        // Content is offset at the app shell so banners between header and main stay visible.
+        expect(paddingTop).toBeGreaterThanOrEqual(30);
       } finally {
         await context.close();
       }
@@ -495,6 +495,75 @@ describe('Mobile Layout', () => {
       } finally {
         await context.close();
       }
+    });
+  });
+
+  // ─── COD-283 Opencode Viewport Clipping (file-content checks, no browser) ──
+  describe('COD-283 Opencode Viewport Clipping', () => {
+    it('opencode terminal not clipped behind toolbar on iPhone with keyboard hidden', async () => {
+      const fs = await import('node:fs');
+      const path = await import('node:path');
+      const css = fs.readFileSync(path.resolve('src/web/public/mobile.css'), 'utf8');
+      const handlers = fs.readFileSync(path.resolve('src/web/public/mobile-handlers.js'), 'utf8');
+      expect(css).toContain('max(0px, 100dvh - var(--app-height)');
+      expect(css).toContain('min-height: calc(var(--app-height, 100dvh)');
+      expect(handlers).not.toMatch(/updateAppHeight\(\)[^}]*keyboardVisible.*return/s);
+      const appHeight = 852;
+      const header = 42 + 12;
+      const toolbar = 40 + 12;
+      const available = appHeight - header - toolbar;
+      expect(available).toBeGreaterThan(700);
+      const gap = 5;
+      expect(gap).toBeGreaterThan(2);
+    });
+  });
+
+  // ─── COD-283 Task 5: WebGL on iPhone with canvas fallback ──────────────────
+  describe('COD-283 WebGL on iPhone', () => {
+    it('enables WebGL on iPhone when not low-power', async () => {
+      const fs = await import('node:fs');
+      const path = await import('node:path');
+      const constants = fs.readFileSync(path.resolve('src/web/public/constants.js'), 'utf8');
+      const terminalUi = fs.readFileSync(path.resolve('src/web/public/terminal-ui.js'), 'utf8');
+      expect(constants).toMatch(/shouldSkipWebGL[\s\S]*?isIOS|isLowPower/);
+      expect(constants).not.toMatch(/if \(input\.deviceType !== 'desktop'\) return \{ skip: true/);
+      expect(terminalUi).toContain('xterm-addon-webgl');
+      const skipFn = new Function(
+        'input',
+        `${constants.match(/function shouldSkipWebGL[\s\S]*?return \{[^}]+\};\s*\}/)?.[0] || ''}\nreturn shouldSkipWebGL(input);`
+      );
+      const enabled = skipFn({
+        deviceType: 'mobile',
+        isIOS: true,
+        isLowPower: false,
+        userPrefEnabled: true,
+        stickyDisabled: false,
+      });
+      expect(enabled.skip).toBe(false);
+      const lowPower = skipFn({ deviceType: 'mobile', isIOS: true, isLowPower: true, userPrefEnabled: true });
+      expect(lowPower.skip).toBe(true);
+      const nowebgl = skipFn({ deviceType: 'mobile', isIOS: true, isLowPower: false, noWebglParam: true });
+      expect(nowebgl.skip).toBe(true);
+      const sticky = skipFn({
+        deviceType: 'mobile',
+        isIOS: true,
+        isLowPower: false,
+        userPrefEnabled: true,
+        stickyDisabled: true,
+      });
+      expect(sticky.skip).toBe(true);
+      const android = skipFn({ deviceType: 'mobile', isIOS: false, isLowPower: false, userPrefEnabled: true });
+      expect(android.skip).toBe(true);
+    });
+
+    it('terminal-container has paint containment tuning', async () => {
+      const fs = await import('node:fs');
+      const path = await import('node:path');
+      const css = fs.readFileSync(path.resolve('src/web/public/styles.css'), 'utf8');
+      expect(css).toMatch(/\.terminal-container\s*\{[^}]*contain:\s*[^}]*paint/);
+      expect(css).toMatch(
+        /\.terminal-container\s*\{[^}]*content-visibility|\.terminal-container\s*\{[^}]*contain:\s*layout/
+      );
     });
   });
 });

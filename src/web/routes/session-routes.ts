@@ -1,14 +1,20 @@
+function captureHistoryLines(raw: string | undefined, historyLimit: number): number {
+  if (typeof raw !== 'string' || !/^\d{1,9}$/.test(raw)) return historyLimit;
+  const lines = Number(raw);
+  return lines >= 1 ? Math.min(lines, historyLimit) : historyLimit;
+}
+
 /**
  * @fileoverview Session management routes.
  * Covers session CRUD, input/output, terminal buffer, quick-start, quick-run,
  * auto-clear, auto-compact, image watcher, flicker filter, and logout.
  */
 
-import { FastifyInstance, type FastifyReply } from 'fastify';
+import { FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { join, dirname, extname, basename } from 'node:path';
+import { join, dirname, extname, basename, resolve, posix as pathPosix } from 'node:path';
 import { homedir } from 'node:os';
-import { existsSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, statSync, mkdirSync, writeFileSync, realpathSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import { finished } from 'node:stream/promises';
@@ -54,11 +60,13 @@ import {
   AutoCompactSchema,
   AutoResumeSchema,
   PinSessionSchema,
+  CheckpointSchema,
   ImageWatcherSchema,
   FlickerFilterSchema,
   QuickRunSchema,
   QuickStartSchema,
   InteractiveStartSchema,
+  ParkSessionSchema,
   SessionOrderUpdateSchema,
   SessionWaitQuerySchema,
   SessionWaitOutputQuerySchema,
@@ -92,6 +100,7 @@ import {
   type WakeableRemote,
 } from '../../remote-wake.js';
 import { clampWaitMs, MAX_BUFFER_SCAN_BYTES } from '../../config/agent-wait.js';
+import { isKeyboardTerminalInput } from '../../terminal-input-classifier.js';
 import {
   autoConfigureRalph,
   canAccessOwned,
@@ -105,6 +114,7 @@ import {
   ownerFor,
   parseBody,
   persistAndBroadcastSession,
+  readJsonConfig,
   resolveAgentCaseOrigin,
   resolveCasesDir,
   resolveParentSessionId,
@@ -133,6 +143,7 @@ import {
   seedAgentSessionPreamble,
   applyWorkspaceHooks,
   refreshStaleCodemanHooks,
+  verifyClaudeSessionStartHookCapability,
 } from '../../hooks-config.js';
 import { generateClaudeMd } from '../../templates/claude-md.js';
 import { imageWatcher } from '../../image-watcher.js';
@@ -153,13 +164,17 @@ import {
   setHistoryIndexRefresher,
   setHistorySessionIndex,
 } from '../session-history-index.js';
-import type { SessionPort, EventPort, ConfigPort, InfraPort, AuthPort, TabLayoutPort } from '../ports/index.js';
+import type {
+  SessionPort,
+  EventPort,
+  ConfigPort,
+  InfraPort,
+  AuthPort,
+  RespawnPort,
+  AgentActivityPort,
+  TabLayoutPort,
+} from '../ports/index.js';
 import { RunSummaryTracker } from '../../run-summary.js';
-
-import { MAX_INPUT_LENGTH, MAX_SESSION_NAME_LENGTH } from '../../config/terminal-limits.js';
-import { MAX_PASTE_IMAGE_BYTES, MAX_PASTE_VIDEO_BYTES } from '../../config/buffer-limits.js';
-import { VIDEO_ATTACHMENT_EXTENSIONS } from '../../attachment-registry.js';
-import { dataPath, getDataDir } from '../../config/instance.js';
 import {
   checkRemoteTmuxAvailable,
   readRemoteCases,
@@ -169,6 +184,24 @@ import {
   toSessionRemote,
 } from '../../remote-hosts.js';
 import { fetchRemoteScrollback } from '../../remote-pane-history.js';
+import { writeRemoteFileBytes } from '../../remote-file-transfer.js';
+import type { SessionRemote } from '../../types.js';
+import { resolveCodexCommandSelection, resolveLocalCaseCodexCommand } from '../../codex-command-profiles.js';
+
+import { MAX_INPUT_LENGTH, MAX_SESSION_NAME_LENGTH } from '../../config/terminal-limits.js';
+import { MAX_PASTE_IMAGE_BYTES, MAX_PASTE_VIDEO_BYTES } from '../../config/buffer-limits.js';
+import { dataPath, getDataDir } from '../../config/instance.js';
+import {
+  getLastTranscriptResponse,
+  isExternalCliTranscriptMode,
+  parseExternalCliTranscript,
+  selectLastAnsweredTurn,
+} from '../response-viewer-transcript.js';
+import { findActiveCodexConversation } from '../../checkpoint-conversation-identity.js';
+import { parseCodexRollout } from '../../codex-rollout-reader.js';
+// LRUMap is deliberately NOT in the utils barrel — import the module directly.
+import { LRUMap } from '../../utils/lru-map.js';
+import { VIDEO_ATTACHMENT_EXTENSIONS } from '../../attachment-registry.js';
 import {
   checkDockerAvailable,
   checkDockerConfigDrift,
@@ -181,17 +214,10 @@ import {
   readDockerHosts,
   toSessionDocker,
 } from '../../docker-hosts.js';
-import { LRUMap } from '../../utils/lru-map.js';
 import { describeUnknownPath, probePathKind } from '../../utils/index.js';
 import { findLatestOmpSessionId } from '../../utils/omp-session-resolver.js';
 import { scanOmpSessionsHistory } from '../../omp-transcript.js';
 import { scanCodexSessionsHistory, codexThreadBySessionId } from '../../codex-transcript.js';
-import {
-  getLastTranscriptResponse,
-  isExternalCliTranscriptMode,
-  parseExternalCliTranscript,
-  selectLastAnsweredTurn,
-} from '../response-viewer-transcript.js';
 import { readDeepSeekLastResponse } from '../../deepseek-transcript.js';
 import { appendClaudeCustomTitle } from '../../claude-session-title.js';
 import { UPLOADS_DIR } from '../paste-image-gc.js';
@@ -199,6 +225,96 @@ import { UPLOADS_DIR } from '../paste-image-gc.js';
 // Path to linked-cases registry (same file used by case-routes resolveCasePath)
 const LINKED_CASES_FILE = dataPath('linked-cases.json');
 const CODEMAN_CONFIG_DIR = getDataDir();
+const INFERABLE_LOCAL_CASE_NAME = /^[a-zA-Z0-9_-]+$/;
+const SINGLE_USER_OWNER = '@single';
+
+/**
+ * COD-463 — flag a /terminal response whose remote capture was skipped because
+ * the host is in ssh backoff: the body is the local wrapper's copy, which may
+ * not be live and holds about one screen of history. The client warns on it.
+ */
+function remoteCaptureDegradedFields(
+  ctx: { mux: { isRemoteCaptureDegraded?(remote: SessionRemote): boolean } },
+  session: { remote?: SessionRemote }
+): { remoteCaptureDegraded?: true } {
+  if (!session.remote || ctx.mux.isRemoteCaptureDegraded?.(session.remote) !== true) return {};
+  return { remoteCaptureDegraded: true };
+}
+
+function remoteProfileLibraryOwner(remoteCaseOwner: string | undefined, requestOwner: string | undefined): string {
+  return remoteCaseOwner ?? requestOwner ?? SINGLE_USER_OWNER;
+}
+
+function resolveRemoteCodexCommand(
+  remoteCase: Parameters<typeof toSessionRemote>[1],
+  host: Parameters<typeof toSessionRemote>[0],
+  profiles: ReturnType<ConfigPort['store']['getCodexCommandProfiles']>
+) {
+  const selection = resolveCodexCommandSelection(remoteCase, profiles, host.commands?.codex);
+  if (!selection.ok) return selection;
+  const commands = {
+    ...host.commands,
+    ...remoteCase.commands,
+    ...(selection.command !== undefined ? { codex: selection.command } : {}),
+  };
+  return {
+    ok: true as const,
+    remoteCase: {
+      ...remoteCase,
+      ...(Object.keys(commands).length > 0 ? { commands } : {}),
+      ...(selection.resumeCommandTemplate ? { codexResumeCommandTemplate: selection.resumeCommandTemplate } : {}),
+    },
+  };
+}
+
+/**
+ * Resolves an owner-scoped local/linked-local case Codex command before
+ * session construction. Returns the exact command to execute, or a failure
+ * that must abort creation before any Session/tmux construction.
+ */
+function resolveLocalCaseCodexLaunchCommand(
+  store: ConfigPort['store'],
+  owner: string | undefined,
+  caseName: string
+): { ok: true; command: string | undefined } | { ok: false; error: string } {
+  const profileOwner = owner ?? SINGLE_USER_OWNER;
+  const selection = store.getCaseCodexCommandSelection(profileOwner, caseName);
+  return resolveLocalCaseCodexCommand(selection, store.getCodexCommandProfiles(profileOwner));
+}
+
+const canonicalExistingPath = (value: string): string | undefined => {
+  try {
+    return realpathSync(resolve(value));
+  } catch {
+    return undefined;
+  }
+};
+
+/** Infer only exact local cases already visible through the authenticated case-list model. */
+const inferAccessibleLocalCaseName = async (req: FastifyRequest, workingDir: string): Promise<string | undefined> => {
+  const canonicalWorkingDir = canonicalExistingPath(workingDir);
+  if (!canonicalWorkingDir) return undefined;
+  const user = getAuthUser(req);
+
+  // A Docker workspace may be a real host directory, but it is not a local-case launch.
+  const dockerCases = await readDockerCases(CODEMAN_CONFIG_DIR);
+  if (dockerCases.some((item) => canonicalExistingPath(item.hostWorkspacePath) === canonicalWorkingDir)) {
+    return undefined;
+  }
+
+  const canonicalCasesDir = canonicalExistingPath(resolveCasesDir(user));
+  if (canonicalCasesDir && dirname(canonicalWorkingDir) === canonicalCasesDir) {
+    const name = basename(canonicalWorkingDir);
+    if (INFERABLE_LOCAL_CASE_NAME.test(name)) return name;
+  }
+
+  // The v1 linked-case registry is ownerless, matching case-routes: admin-only in multi-user mode.
+  if (!isAdmin(req)) return undefined;
+  const linkedCases = await readJsonConfig<Record<string, string>>(LINKED_CASES_FILE, 'linked cases', {});
+  return Object.entries(linkedCases).find(
+    ([name, path]) => INFERABLE_LOCAL_CASE_NAME.test(name) && canonicalExistingPath(path) === canonicalWorkingDir
+  )?.[0];
+};
 
 // Pre-compiled regex for terminal buffer cleaning (avoids per-request compilation)
 // eslint-disable-next-line no-control-regex
@@ -232,6 +348,26 @@ const ERASE_SCROLLBACK_PATTERN = /\x1b\[3J/g;
 // strip existed can still carry them; strip on replay for parity.
 // eslint-disable-next-line no-control-regex
 const MOUSE_TRACKING_PATTERN = /\x1b\[\?(?:1000|1001|1002|1003|1005|1006|1007)[hl]/g;
+
+const REMOTE_PASTE_IMAGE_SSH_TIMEOUT_MS = 15_000;
+
+// Native external-CLI resume-id capture (COD-124 unit 2 Gap B; widened to
+// opencode/gemini/agy by COD-251). Each pattern mirrors the validation the
+// matching CLI builder in tmux-manager.ts applies before putting the id on a
+// command line — captured ids are re-validated here as defense in depth.
+const OPENCODE_SESSION_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+const GEMINI_SESSION_ID_PATTERN = /^[a-zA-Z0-9._-]+$/;
+const AGY_CONVERSATION_ID_PATTERN = /^[a-zA-Z0-9._-]+$/;
+
+/** opencode's sqlite store root. Overridable via XDG_DATA_HOME for tests (mirrors codex's CODEX_HOME). */
+function opencodeDataHome(): string {
+  return process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share');
+}
+
+/** gemini/agy's config root. Overridable via GEMINI_HOME for tests (mirrors codex's CODEX_HOME). */
+function geminiHome(): string {
+  return process.env.GEMINI_HOME || join(homedir(), '.gemini');
+}
 
 /**
  * The replay half of the strip parity triangle: what `_handleTerminalOutput` (session.ts)
@@ -356,12 +492,10 @@ export function imageMagicMatchesExt(data: Buffer, ext: string): boolean {
       return data[0] === 0x42 && data[1] === 0x4d;
     case '.heic':
     case '.heif': {
-      // ISO Base Media File Format: size + "ftyp" + major brand. The brand
-      // list matches heic-decode's own isHeic() — accepting more brands here
-      // would only route bytes into a conversion that always throws.
+      // ISO Base Media File Format: size + "ftyp" + major brand.
       if (u32be(4) !== 0x66747970) return false;
       const brand = data.subarray(8, 12).toString('ascii');
-      return ['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand);
+      return ['heic', 'heix', 'hevc', 'hevx', 'heis', 'hevm', 'hevs', 'mif1', 'msf1'].includes(brand);
     }
     case '.mp4':
     case '.m4v':
@@ -379,6 +513,36 @@ export function imageMagicMatchesExt(data: Buffer, ext: string): boolean {
     default:
       return false;
   }
+}
+
+function getSessionRemote(session: { remote?: unknown }): SessionRemote | undefined {
+  const remote = session.remote;
+  if (!remote || typeof remote !== 'object') return undefined;
+  const candidate = remote as Partial<SessionRemote>;
+  if (
+    typeof candidate.hostId !== 'string' ||
+    typeof candidate.label !== 'string' ||
+    typeof candidate.host !== 'string' ||
+    typeof candidate.username !== 'string' ||
+    typeof candidate.remotePath !== 'string'
+  ) {
+    return undefined;
+  }
+  return candidate as SessionRemote;
+}
+
+async function writeRemotePasteImage(remote: SessionRemote, imageDir: string, filepath: string, imageBytes: Buffer) {
+  // Thin wrapper over the shared symlink-safe atomic remote-write (COD-241). The
+  // script, ssh argv, stdin streaming, timeout, and stderr handling all live in
+  // remote-file-transfer.ts so paste-image and document-upload cannot drift.
+  await writeRemoteFileBytes(remote, {
+    dir: imageDir,
+    filePath: filepath,
+    bytes: imageBytes,
+    timeoutMs: REMOTE_PASTE_IMAGE_SSH_TIMEOUT_MS,
+    transferLabel: 'remote image upload',
+    notADirectoryMessage: '.claude-images is not a regular directory',
+  });
 }
 
 /**
@@ -526,6 +690,58 @@ export function _resetPasteRateBuckets(): void {
  * `read-only`, because the clamp exists to remove PRIVILEGE, not to break a
  * session's ability to edit its own workspace.
  */
+/**
+ * COD-124 unit 2, Gap A — computes which live automations are armed against
+ * a session and would not survive parking:
+ *  - 'respawn': a respawn controller is registered for this session at the
+ *    WebServer level (Session.park() has no visibility into it).
+ *  - 'autoResume': an auto-resume usage-limit timer is armed (autoResumeAt
+ *    non-null) — distinct from the user's autoResumeEnabled *preference*,
+ *    which park() must NOT clear (Session.park()/_clearAllTimers() already
+ *    cancels only the armed timer and preserves the preference).
+ *  - 'ralph': the session's Ralph tracker is enabled (Session.park() already
+ *    tears it down via cleanupTrackerListeners(), same as stop()).
+ * Order is stable (respawn, autoResume, ralph) so callers/tests can assert
+ * on it directly.
+ */
+function computeParkObligations(ctx: RespawnPort, session: Session, id: string): string[] {
+  const obligations: string[] = [];
+  if (ctx.respawnControllers.has(id)) {
+    obligations.push('respawn');
+  }
+  if (session.autoResumeAt !== null) {
+    obligations.push('autoResume');
+  }
+  if (session.ralphTracker?.enabled) {
+    obligations.push('ralph');
+  }
+  return obligations;
+}
+
+/**
+ * COD-124 unit 2, Gap A — disarms the WebServer-held respawn controller for
+ * a session about to be parked. Mirrors POST /respawn/stop's exact sequence
+ * (controller.stop() → drop from the map → clear+drop any timed-respawn
+ * timer → clear the persisted respawn config) so a parked session can never
+ * have a respawn cycle fire into its now-detached pane. No-op when no
+ * controller is armed.
+ */
+function disarmRespawnForPark(ctx: RespawnPort & InfraPort, id: string): void {
+  const controller = ctx.respawnControllers.get(id);
+  if (!controller) return;
+
+  controller.stop();
+  ctx.respawnControllers.delete(id);
+
+  const timerInfo = ctx.respawnTimers.get(id);
+  if (timerInfo) {
+    clearTimeout(timerInfo.timer);
+    ctx.respawnTimers.delete(id);
+  }
+
+  ctx.mux.clearRespawnConfig(id);
+}
+
 async function clampExternalCliBypassForOwner(
   owner: string | undefined,
   configs: Record<string, unknown>
@@ -673,8 +889,12 @@ function waitCapacityResponse(err: WaitCapacityError): ApiResponse<never> {
  * Fixing it HERE rather than in `signalForStatus` is deliberate: liveness is not
  * derivable from `SessionStatus`, and the registry holds no `Session` reference.
  */
-function currentSignalFor(session: { pid: number | null; status: SessionStatus }, dead: boolean): WaitSignal | null {
+function currentSignalFor(
+  session: { pid: number | null; status: SessionStatus; isAutonomouslyIdle(): boolean },
+  dead: boolean
+): WaitSignal | null {
   if (dead || session.pid === null || session.pid === undefined) return 'exit';
+  if (session.status === 'idle' && !session.isAutonomouslyIdle()) return null;
   return signalForStatus(session.status);
 }
 
@@ -720,7 +940,14 @@ type LivenessSession = { usesMux?: boolean; muxName?: string | null };
  * False for anything not tmux-backed (nothing to ask), and false when the probe is
  * unavailable or throws — an unknown answer must never invent a death.
  */
-function workerIsDead(mux: InfraPort['mux'], session: LivenessSession, now: number = Date.now()): boolean {
+// async in this fork: TerminalMultiplexer.isPaneDead returns Promise<boolean>
+// here (upstream's is sync), so every caller awaits. The TTL cache keeps the
+// added await off the hot path.
+async function workerIsDead(
+  mux: InfraPort['mux'],
+  session: LivenessSession,
+  now: number = Date.now()
+): Promise<boolean> {
   const muxName = session.usesMux === false ? null : session.muxName;
   if (!muxName) return false;
   // Defensive: `TerminalMultiplexer` declares it, but route-test doubles may not.
@@ -731,7 +958,7 @@ function workerIsDead(mux: InfraPort['mux'], session: LivenessSession, now: numb
 
   let dead = false;
   try {
-    dead = mux.isPaneDead(muxName) === true;
+    dead = (await mux.isPaneDead(muxName)) === true;
   } catch {
     dead = false;
   }
@@ -770,8 +997,10 @@ function watchForDeadWorker(mux: InfraPort['mux'], session: LivenessSession, ses
     existing.refs++;
   } else {
     const timer = setInterval(() => {
-      if (!workerIsDead(mux, session)) return;
-      releaseWaitersForDeadWorker(sessionId);
+      void (async () => {
+        if (!(await workerIsDead(mux, session))) return;
+        releaseWaitersForDeadWorker(sessionId);
+      })();
     }, PANE_DEATH_POLL_MS);
     // Auxiliary to the waiter's own timer, which is deliberately NOT unref'd; this one
     // must never be the reason the process stays up.
@@ -909,20 +1138,6 @@ export function resolveOmpConfigForCreate(
 }
 
 /**
- * The tmux history lines a full capture may read (`capture-pane -S -<n>`): the
- * optional `lines` query parameter, an integer of at least 1, never more than
- * the configured history limit; absent or malformed, the limit itself, as
- * before. A grid tile sends its own scrollback size: its xterm keeps no more
- * than that, while a capture of the whole history (tens of thousands of lines,
- * cut to `tail` only afterwards) is synchronous work on this event loop.
- */
-function captureHistoryLines(raw: string | undefined, historyLimit: number): number {
-  if (typeof raw !== 'string' || !/^\d{1,9}$/.test(raw)) return historyLimit;
-  const lines = Number(raw);
-  return lines >= 1 ? Math.min(lines, historyLimit) : historyLimit;
-}
-
-/**
  * `RemoteHost` → the wake registry's host shape. They differ in one field name only
  * (`id` in host config vs `hostId` on a session's `remote`), but the rename is load-
  * bearing: the registry keys its per-host wake state on `hostId`. The proxy fields
@@ -944,7 +1159,7 @@ function wakeableHost(host: RemoteHost): WakeableRemote {
 
 export function registerSessionRoutes(
   app: FastifyInstance,
-  ctx: SessionPort & EventPort & ConfigPort & InfraPort & AuthPort & TabLayoutPort,
+  ctx: SessionPort & EventPort & ConfigPort & InfraPort & AuthPort & RespawnPort & AgentActivityPort & TabLayoutPort,
   /** Test seam: inject a registry with fake IO instead of the real TCP/WoL probes. */
   options: { remoteWake?: RemoteWakeRegistry } = {}
 ): RemoteWakeRegistry {
@@ -1065,12 +1280,11 @@ export function registerSessionRoutes(
     }
     let workingDir = body.workingDir || process.cwd();
     let remote = undefined;
+    const mode = body.mode || 'claude';
 
     // COD-105 — attach to a discovered (non-owned) remote tmux session. The
     // remote session is already running, so we skip the tmux-prereq probe and
-    // build a NON-owned SessionRemote (detach-not-kill on close). Remote CASE
-    // creation (owned durable sessions) is handled by the dedicated case-create
-    // endpoint below, which #145 consolidated remote-host resolution into.
+    // build a NON-owned SessionRemote (detach-not-kill on close).
     if (body.attachRemoteSession) {
       // Remote hosts are admin-only infrastructure everywhere else (the list answers
       // `[]` to a non-admin; write and discovery routes are `adminOnly`), and the wake
@@ -1101,6 +1315,35 @@ export function registerSessionRoutes(
       }
       workingDir = `${host.username}@${host.host}:${remoteSessionName}`;
       remote = toAttachedSessionRemote(host, remoteSessionName, workingDir);
+    } else if (body.caseName) {
+      const remoteCases = await readRemoteCases(CODEMAN_CONFIG_DIR);
+      const remoteCase = remoteCases.find(
+        (item) => item.name === body.caseName && canAccessOwned(getAuthUser(req), item.owner)
+      );
+      if (remoteCase) {
+        const host = (await readRemoteHosts(CODEMAN_CONFIG_DIR)).find((item) => item.id === remoteCase.hostId);
+        if (!host) return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Remote host not found');
+        const resolved = resolveRemoteCodexCommand(
+          remoteCase,
+          host,
+          ctx.store.getCodexCommandProfiles(remoteProfileLibraryOwner(remoteCase.owner, owner))
+        );
+        if (!resolved.ok) return createErrorResponse(ApiErrorCode.OPERATION_FAILED, resolved.error);
+        // COD-104: durable remote sessions run the agent inside a remote tmux,
+        // so the remote host must have tmux installed. Fail fast with a clear
+        // message rather than spawning a pane that silently can't start.
+        const tmuxCheck = await checkRemoteTmuxAvailable(host);
+        if (!tmuxCheck.ok) {
+          return createErrorResponse(ApiErrorCode.OPERATION_FAILED, tmuxCheck.error ?? 'remote tmux check failed');
+        }
+        workingDir = remoteCase.remotePath;
+        remote = toSessionRemote(host, resolved.remoteCase);
+      } else if (!body.workingDir) {
+        const linkedCases = await readJsonConfig<Record<string, string>>(LINKED_CASES_FILE, 'linked cases', {});
+        const linkedCase = isAdmin(req) ? linkedCases[body.caseName] : undefined;
+        const managedCasesDir = isAdmin(req) ? CASES_DIR : resolveCasesDir(getAuthUser(req));
+        workingDir = linkedCase || validatePathWithinBase(body.caseName, managedCasesDir) || workingDir;
+      }
     }
 
     // Multi-user: shell mode is arbitrary command execution as the host account,
@@ -1123,7 +1366,7 @@ export function registerSessionRoutes(
     // Validate workingDir exists and is a directory. Bounded: a workingDir on a
     // network mount that stopped answering must not freeze the event loop, and
     // "did not answer" is reported as such, never as "does not exist".
-    if (body.workingDir) {
+    if ((body.workingDir || body.caseName) && !remote) {
       const kind = await probePathKind(workingDir, { pastCap: true });
       if (kind === 'unknown') {
         return createErrorResponse(
@@ -1136,6 +1379,26 @@ export function registerSessionRoutes(
       }
       if (kind !== 'directory') {
         return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'workingDir is not a directory');
+      }
+    }
+
+    const placementCaseName =
+      body.caseName ?? (body.workingDir && !remote ? await inferAccessibleLocalCaseName(req, workingDir) : undefined);
+
+    // COD-392: resolve a local case Codex command before Session/tmux
+    // construction. Missing/foreign profiles and revoked grants fail closed.
+    let localCodexCommand: string | undefined;
+    if (mode === 'codex' && !remote && placementCaseName) {
+      const localResolved = resolveLocalCaseCodexLaunchCommand(ctx.store, owner, placementCaseName);
+      if (!localResolved.ok) return createErrorResponse(ApiErrorCode.OPERATION_FAILED, localResolved.error);
+      if (localResolved.command !== undefined) {
+        if (!(await canUsernameRunPrivilegedCommands(owner))) {
+          return createErrorResponse(
+            ApiErrorCode.FORBIDDEN,
+            'Custom Codex commands require the can-bypass-permissions grant'
+          );
+        }
+        localCodexCommand = localResolved.command;
       }
     }
 
@@ -1190,6 +1453,8 @@ export function registerSessionRoutes(
       await applyWorkspaceHooks(workingDir, await ctx.getWorkspaceHooksEnabled());
     }
 
+    const claudeSessionStartHookReady = await verifyClaudeSessionStartHookCapability(mode, workingDir, Boolean(remote));
+
     // Refuse up front if the requested CLI cannot start, rather than spawning a pane that
     // dies on `command not found`. The message comes from the resolver, so it names where
     // resolution actually looked (server PATH, login shell, the entry's search dirs); a
@@ -1201,7 +1466,13 @@ export function registerSessionRoutes(
     // shell deliberately fall through to tmux-manager's own not-found throw instead, and
     // pulling them forward here would change which error a missing claude produces.
     const requestedMode = body.mode ?? 'claude';
-    if (getCli(requestedMode)?.capabilities.external) {
+    // COD-392: a server-resolved local Codex command supplies its own binary, so the
+    // PATH pre-flight must not refuse it. Gated on the resolved command alone (never a
+    // mode id), which is both sufficient — it is only ever set for codex — and keeps
+    // this branch out of the no-id-branching guard.
+    // `!remote`: the remote host runs its own CLI, so probing THIS server's PATH would
+    // refuse a perfectly good remote session. Upstream's version is not remote-gated.
+    if (!remote && getCli(requestedMode)?.capabilities.external && localCodexCommand === undefined) {
       const cliLaunchError = await resolveCliLaunchError(
         requestedMode,
         legacyConfigForMode(requestedMode, body as unknown as Record<string, unknown>)
@@ -1255,7 +1526,6 @@ export function registerSessionRoutes(
 
     const globalNice = await ctx.getGlobalNiceConfig();
     const modelConfig = await ctx.getModelConfig();
-    const mode = body.mode || 'claude';
     // Synced App Settings launch defaults (capabilities.launchDefaults, codex's model and
     // effort today) fill the CLI's own config object where the caller left it unset.
     // Local launches only: a remote attach runs whatever the remote pane already runs.
@@ -1301,6 +1571,8 @@ export function registerSessionRoutes(
       launchBody.deepSeekConfig
     );
     const terminalHistoryConfig = await ctx.getTerminalHistoryConfig();
+    const truecolorEnabled = await ctx.getTruecolorEnabled();
+    const checkpointEnabled = await ctx.getCheckpointDefaultEnabled();
     const session = new Session({
       workingDir,
       mode,
@@ -1312,7 +1584,12 @@ export function registerSessionRoutes(
       claudeMode: effectiveClaudeMode,
       allowedTools: claudeModeConfig.allowedTools,
       openCodeConfig: mode === 'opencode' ? launchBody.openCodeConfig : undefined,
-      codexConfig: mode === 'codex' ? gatedCodexConfig : undefined,
+      codexConfig:
+        mode === 'codex'
+          ? localCodexCommand !== undefined
+            ? { ...gatedCodexConfig, baseCommand: localCodexCommand }
+            : gatedCodexConfig
+          : undefined,
       geminiConfig: mode === 'gemini' ? gatedGeminiConfig : undefined,
       antigravityConfig: mode === 'antigravity' ? gatedAntigravityConfig : undefined,
       piConfig: mode === 'pi' ? gatedPiConfig : undefined,
@@ -1322,16 +1599,29 @@ export function registerSessionRoutes(
       resumeSessionId: validatedResumeId,
       envOverrides: await clampEnvOverridesForOwner(owner, body.envOverrides),
       effort: body.effort,
+      truecolorEnabled,
+      checkpointEnabled,
+      claudeSessionStartHookReady,
       advisorModel: body.advisorModel,
-      tmuxHistoryLimit: terminalHistoryConfig.tmuxHistoryLimit,
       remote,
+      tmuxHistoryLimit: terminalHistoryConfig.tmuxHistoryLimit,
+      terminalBufferConfig: {
+        maxBytes: terminalHistoryConfig.terminalBufferMaxBytes,
+        trimBytes: terminalHistoryConfig.terminalBufferTrimBytes,
+      },
+      initialDims: body.cols && body.rows ? { cols: body.cols, rows: body.rows } : undefined,
       owner,
       parentSessionId: resolveParentSessionId(ctx, req, body.parentSessionId, owner),
     });
 
-    const tabLayout = body.tabGroupId
-      ? await ctx.addSession(session, { tabGroupId: body.tabGroupId })
-      : await ctx.addSession(session);
+    const creationOptions = {
+      ...(placementCaseName ? { caseName: placementCaseName } : {}),
+      ...(body.tabGroupId ? { tabGroupId: body.tabGroupId } : {}),
+    };
+    const tabLayoutSnapshot =
+      Object.keys(creationOptions).length > 0
+        ? await ctx.addSession(session, creationOptions)
+        : await ctx.addSession(session);
     ctx.store.incrementSessionsCreated();
     ctx.persistSessionState(session);
     await ctx.setupSessionListeners(session);
@@ -1349,9 +1639,12 @@ export function registerSessionRoutes(
     // Avoids serializing 2-3MB of terminal+text buffers per session creation.
     const lightState = ctx.getSessionStateWithRespawn(session);
     ctx.broadcast(SseEvent.SessionCreated, lightState);
-    // A grouped creation also returns the layout that placed it, so the browser
-    // draws the tab inside its group at once instead of after a re-read.
-    return { session: lightState, ...(body.tabGroupId ? { tabLayout } : {}) };
+    return {
+      session: lightState,
+      ...(body.tabGroupId || tabLayoutSnapshot.placementSource === 'case-default'
+        ? { tabLayout: tabLayoutSnapshot.layout, tabPlacements: tabLayoutSnapshot.placements }
+        : {}),
+    };
   });
 
   // ========== Rename Session ==========
@@ -1368,7 +1661,8 @@ export function registerSessionRoutes(
     session.name = name;
     // Also update the mux session name if applicable
     ctx.mux.updateSessionName(id, session.name);
-    persistAndBroadcastSession(ctx, session);
+    ctx.persistSessionStateNow(session);
+    ctx.broadcast(SseEvent.SessionUpdated, ctx.getSessionStateWithRespawn(session));
     await syncClaudeTitle(session);
     return { name: session.name };
   });
@@ -1766,19 +2060,9 @@ export function registerSessionRoutes(
         }
       }
 
-      // COD-118: ONLY an explicit user-initiated restart (body {clearBreaker:true})
-      // clears a tripped PTY-exit circuit breaker. This endpoint is ALSO the frontend's
-      // automatic re-attach path (selectSession auto-POSTs it for any pid===null
-      // session), so an unconditional reset here would re-arm the exact crash loop
-      // the breaker exists to stop — auto-reattach sends no body and must not clear.
-      if (clearBreaker) {
-        session.resetRespawnBreaker();
-      }
-      // Re-attach listener wiring if a prior PTY exit detached it: the wiring exit
-      // handler removes ALL session listeners (incl. respawnBreakerTripped), and only
-      // session-create/boot-recovery paths ran setupSessionListeners before this fix —
-      // without this, a re-attached session's SSE/terminal/trip events go unobserved.
-      // setupSessionListeners is idempotent (no-op while refs are still attached).
+      // This endpoint is also used by automatic re-attach. Only explicit user
+      // intent may clear a tripped PTY-exit breaker.
+      if (clearBreaker) session.resetRespawnBreaker();
       await ctx.setupSessionListeners(session);
       await session.startInteractive();
       getLifecycleLog().log({
@@ -1827,6 +2111,111 @@ export function registerSessionRoutes(
       ctx.persistSessionState(session);
       ctx.broadcast(SseEvent.SessionInteractive, { id, mode: 'shell' });
       ctx.broadcast(SseEvent.SessionUpdated, { session: ctx.getSessionStateWithRespawn(session) });
+      return {};
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Park / Resume (COD-124)
+  // ═══════════════════════════════════════════════════════════════
+
+  // ========== Park ==========
+  // Detaches the tmux session + stops the CLI gracefully (SIGTERM), preserving
+  // the session record (workingDir, resumeSessionId/transcript, mux metadata)
+  // for a later /resume. Remote-attached sessions (owned:false) are detached,
+  // never killed — enforced inside Session.park() (COD-105 invariant).
+  //
+  // Obligation interlock (COD-124 unit 2, Gap A): parking must neutralize any
+  // live automation armed against the session, or that automation will later
+  // fire into a dead/detached pane (respawn cycling a parked session, an
+  // auto-resume usage-limit timer sending Esc+continue nowhere, ...).
+  // auto-resume and Ralph teardown are already fully handled inside
+  // Session.park() (it calls the same _clearAllTimers()/
+  // cleanupTrackerListeners() that stop() does) — only the WebServer-held
+  // respawn controller map is outside Session's visibility, so this route
+  // disarms it explicitly, mirroring POST /respawn/stop's exact sequence.
+  //
+  // Callers that haven't acknowledged the obligations get a 409 CONFLICT
+  // listing them (`obligations`), so the UI can confirm before resending
+  // with `{force: true}`.
+
+  app.post('/api/sessions/:id/park', async (req) => {
+    const { id } = req.params as { id: string };
+    const session = findSessionOrFail(ctx, id, req);
+
+    // Idempotent: parking an already-parked session is a no-op success.
+    if (session.status === 'parked') {
+      return {};
+    }
+
+    const { force } = parseBody(ParkSessionSchema, req.body ?? {});
+    const obligations = computeParkObligations(ctx, session, id);
+    if (obligations.length > 0 && !force) {
+      const msg = `Session has active automation that will not survive parking: ${obligations.join(', ')}`;
+      // Structured throw (not a bare return) — installRouteErrorHandler renders
+      // {statusCode, body} at the right HTTP status in both the test harness
+      // and production (mirrors findSessionOrFail/parseBody in route-helpers.ts).
+      // A bare `return {success:false,...}` only gets its status code fixed up
+      // by the preSerialization hook, which is production-server-only.
+      throw Object.assign(new Error(msg), {
+        statusCode: 409,
+        body: { ...createErrorResponse(ApiErrorCode.CONFLICT, msg), obligations },
+      });
+    }
+
+    try {
+      disarmRespawnForPark(ctx, id);
+      // COD-124 unit 2, Gap B: best-effort capture — a failure here must not
+      // block parking, so it's isolated from session.park()'s own try/catch.
+      try {
+        session.setNativeResumeId(await captureNativeResumeId(session));
+      } catch (err) {
+        console.warn(`[Server] park: failed to capture native resume id for ${id}:`, getErrorMessage(err));
+      }
+      await session.park();
+      getLifecycleLog().log({
+        event: 'parked',
+        sessionId: id,
+        name: session.name,
+        mode: session.mode,
+      });
+      persistAndBroadcastSession(ctx, session);
+      ctx.broadcast(SseEvent.SessionParked, { id });
+      return {};
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
+    }
+  });
+
+  // ========== Resume ==========
+  // Claude-mode sessions resume the prior conversation via the preserved
+  // resumeSessionId (startInteractive() passes --resume). Non-Claude CLIs
+  // (codex/opencode/gemini/shell) are a best-effort relaunch in the same
+  // workingDir with NO conversation restore — those CLIs don't have an
+  // equivalent resume mechanism wired here.
+
+  app.post('/api/sessions/:id/resume', async (req) => {
+    const { id } = req.params as { id: string };
+    const session = findSessionOrFail(ctx, id, req);
+
+    if (session.status !== 'parked') {
+      return createErrorResponse(ApiErrorCode.CONFLICT, 'Session is not parked');
+    }
+
+    try {
+      // Re-attach listener wiring detached by park()'s PTY exit (see /interactive).
+      await ctx.setupSessionListeners(session);
+      await session.startInteractive();
+      getLifecycleLog().log({
+        event: 'resumed',
+        sessionId: id,
+        name: session.name,
+        mode: session.mode,
+      });
+      persistAndBroadcastSession(ctx, session);
+      ctx.broadcast(SseEvent.SessionResumed, { id });
       return {};
     } catch (err) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
@@ -1904,6 +2293,10 @@ export function registerSessionRoutes(
     const { id } = req.params as { id: string };
     const { input, useMux, seq, clientId, wait, waitTimeout } = parseBody(SessionInputWithLimitSchema, req.body);
     const session = findSessionOrFail(ctx, id, req);
+    if (session.assistantInputLocked)
+      return reply
+        .code(409)
+        .send(createErrorResponse(ApiErrorCode.CONFLICT, 'Assistant owns session input; take control in Assistants'));
 
     const inputStr = String(input);
     if (inputStr.length > MAX_INPUT_LENGTH) {
@@ -1937,6 +2330,16 @@ export function registerSessionRoutes(
     const duplicate = tagged && !session.shouldApplyInput(clientId as string, seq as number);
     if (duplicate && !wantsWait) {
       return {};
+    }
+    if (!duplicate && isKeyboardTerminalInput(inputStr)) {
+      if (session.isCheckpointActive) {
+        console.info('[Checkpoint] manual takeover', {
+          sessionId: id,
+          route: 'http',
+          inputClass: 'keyboard',
+        });
+      }
+      session.cancelCheckpoint('manual-takeover');
     }
 
     // Wake-on-LAN (remote-wake.ts): a wake-enabled remote host that suspended leaves
@@ -1977,7 +2380,7 @@ export function registerSessionRoutes(
 
     // Only a waiting request pays for the tmux probe: the browser's plain input path
     // (thousands of calls per session) must stay exec-free.
-    const workerDead = wantsWait && workerIsDead(ctx.mux, session);
+    const workerDead = wantsWait ? await workerIsDead(ctx.mux, session) : false;
 
     const timeoutMs = clampWaitMs(waitTimeout ?? undefined);
     // Same slot leak as the GET routes: a client that gives up mid-wait would
@@ -2182,7 +2585,7 @@ export function registerSessionRoutes(
         abortSignal: abort.signal,
         requireTransition: query.fresh === '1' || query.fresh === 'true',
         // Read BEFORE awaiting: this is the state the caller is asking about.
-        currentSignal: currentSignalFor(session, workerIsDead(ctx.mux, session)),
+        currentSignal: currentSignalFor(session, await workerIsDead(ctx.mux, session)),
       });
 
       return {
@@ -2304,6 +2707,9 @@ export function registerSessionRoutes(
     }
 
     const session = findSessionOrFail(ctx, id, req);
+    if (session.assistantInputLocked)
+      throw { statusCode: 409, body: createErrorResponse(ApiErrorCode.CONFLICT, 'Assistant owns session input') };
+    session.cancelCheckpoint('manual-takeover');
     const muxName = session.muxName;
     if (!muxName) {
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'No tmux session');
@@ -2324,17 +2730,20 @@ export function registerSessionRoutes(
     try {
       // Route through the dedicated Codeman socket — bare `tmux` would target the
       // user's default server and never find this session (same #80 regression class).
-      await new Promise<void>((resolve, reject) => {
-        execFile(
-          'tmux',
-          ['-L', ctx.mux.muxSocket, 'send-keys', '-H', '-t', muxName, ...hex],
-          { timeout: 5000 },
-          (err) => {
-            if (err) reject(err);
-            else resolve();
-          }
-        );
-      });
+      await session.performAuxiliaryInput(
+        () =>
+          new Promise<void>((resolve, reject) => {
+            execFile(
+              'tmux',
+              ['-L', ctx.mux.muxSocket, 'send-keys', '-H', '-t', muxName, ...hex],
+              { timeout: 5000 },
+              (err) => {
+                if (err) reject(err);
+                else resolve();
+              }
+            );
+          })
+      );
     } catch (err) {
       console.error('[Server] send-key failed:', err);
       return createErrorResponse(ApiErrorCode.INTERNAL_ERROR, 'tmux send-keys failed');
@@ -2349,16 +2758,17 @@ export function registerSessionRoutes(
 
   app.post('/api/sessions/:id/resize', async (req) => {
     const { id } = req.params as { id: string };
-    const { cols, rows, viewportType, force } = parseBody(ResizeSchema, req.body);
+    const { cols, rows } = parseBody(ResizeSchema, req.body);
     const session = findSessionOrFail(ctx, id, req);
 
-    session.resize(cols, rows, { viewportType, force });
-    // Answer with the geometry the PTY ACTUALLY holds, which is not always the
-    // one asked for: `Session.resize` declines small-viewport requests while a
-    // desktop connection holds an active sizing claim. A browser terminal left
-    // at a shape the PTY refused renders garbled output, not merely wrong-sized
-    // output, so the client adopts this (issue #464). A session with no pane
-    // reports nothing rather than the constructor defaults — see `ptyGeometry`.
+    if (!session.resizeIfNoActiveTerminalViewer(cols, rows)) {
+      return createErrorResponse(
+        ApiErrorCode.CONFLICT,
+        'Resize rejected because an active terminal viewer owns sizing; reconnect to use viewer-aware resizing'
+      );
+    }
+    // The HTTP fallback has no connection identity, so it can resize only when
+    // no viewer owns the pane. Return the resulting geometry for the caller.
     return session.ptyGeometry ?? {};
   });
 
@@ -2464,6 +2874,26 @@ export function registerSessionRoutes(
 
     claudeHistoryPinCache.set(session.id, { submitAt, claudeSessionId: best.sessionId });
     return best.sessionId;
+  }
+
+  async function getCanonicalTranscriptBuffer(session: Session): Promise<string> {
+    if (!isExternalCliTranscriptMode(session.mode)) return session.terminalBuffer;
+
+    const muxName = session.muxName;
+    let liveMuxBuffer: string | null = null;
+
+    if (muxName && session.remote && typeof ctx.mux.captureRemotePaneBuffer === 'function') {
+      liveMuxBuffer = await ctx.mux.captureRemotePaneBuffer(session.remote, session.id, muxName, { fullHistory: true });
+      if (liveMuxBuffer !== null && liveMuxBuffer.length === 0) {
+        liveMuxBuffer = null;
+      }
+    }
+
+    if (liveMuxBuffer === null && muxName && typeof ctx.mux.captureActivePaneBuffer === 'function') {
+      liveMuxBuffer = ctx.mux.captureActivePaneBuffer(muxName, { fullHistory: true });
+    }
+
+    return liveMuxBuffer && liveMuxBuffer.length > 0 ? liveMuxBuffer : session.terminalBuffer;
   }
 
   interface ClaudeResponseMessage {
@@ -2706,13 +3136,42 @@ export function registerSessionRoutes(
   app.get('/api/sessions/:id/last-response', async (req) => {
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id, req);
+    const query = req.query as { context?: string };
 
-    // Codex sessions don't write to ~/.claude/projects — their transcripts
-    // live in ~/.codex/sessions/**. Branch to a Codex-specific reader so the
-    // response-viewer works for Codex panes too.
+    // Codex has a structured rollout source. Prefer it when a rollout can be
+    // attributed to this pane; fall back to the rendered terminal transcript
+    // for live/legacy panes that do not yet have a matching rollout.
     if (getCli(session.mode)?.capabilities.transcript === 'codex-rollout') {
-      const codexQuery = req.query as { context?: string };
-      return await readCodexLastResponse(session, codexQuery.context === 'full');
+      const full = query.context === 'full';
+      const codexResponse = await readCodexLastResponse(session, full);
+      if (codexResponse.text || (full && codexResponse.messages && codexResponse.messages.length > 0)) {
+        return codexResponse;
+      }
+
+      const transcriptBuffer = await getCanonicalTranscriptBuffer(session);
+      const blocks = parseExternalCliTranscript(transcriptBuffer, session.mode);
+      const transcriptText = getLastTranscriptResponse(blocks);
+      if (transcriptText || blocks.length > 0) {
+        return {
+          text: transcriptText,
+          timestamp: '',
+          hasContext: blocks.length > 0,
+          messages: full ? blocks : undefined,
+        };
+      }
+      return codexResponse;
+    }
+
+    if (isExternalCliTranscriptMode(session.mode)) {
+      const transcriptBuffer = await getCanonicalTranscriptBuffer(session);
+      const blocks = parseExternalCliTranscript(transcriptBuffer, session.mode);
+      const transcriptText = getLastTranscriptResponse(blocks);
+      return {
+        text: transcriptText,
+        timestamp: '',
+        hasContext: blocks.length > 0,
+        messages: query.context === 'full' ? blocks : undefined,
+      };
     }
 
     // DeepSeek Harness writes a real structured transcript under
@@ -2769,6 +3228,7 @@ export function registerSessionRoutes(
     const activeId = await resolveActiveClaudeSessionIdFromHistory(session, projectsDir);
     if (activeId && activeId !== session.claudeSessionId) {
       session.adoptClaudeSessionId(activeId);
+      ctx.agentActivity.identityChanged(session);
       // Flush the Enter that vouched for this adoption to state.json. A `/clear`
       // emits no completion event, so without this the anchor could still be
       // unpersisted when the server restarts — and recovery would fall back to
@@ -2782,10 +3242,10 @@ export function registerSessionRoutes(
       }
     }
 
-    const query = req.query as { context?: string };
     // `turn` is the brief view's context: the last ANSWERED turn's assistant
     // messages, so a multi-row answer is not reduced to its final row. `text`
     // stays the last assistant row in every mode (agent pollers hash it).
+    // (`query` is already destructured at the top of this handler downstream.)
     const wantsMessages = query.context === 'full' || query.context === 'turn';
     const claudeSessionId = session.claudeSessionId || session.id;
     const transcript = await findClaudeTranscript(projectsDir, claudeSessionId, session.id);
@@ -2795,6 +3255,7 @@ export function registerSessionRoutes(
 
     if (transcript.sessionId !== session.claudeSessionId && transcript.sessionId !== session.id) {
       session.adoptClaudeSessionId(transcript.sessionId);
+      ctx.agentActivity.identityChanged(session);
       if (session.docker) {
         void persistDockerCaseClaudeSessionId(
           CODEMAN_CONFIG_DIR,
@@ -2820,112 +3281,9 @@ export function registerSessionRoutes(
     }
   });
 
-  function isCodexInjectedContext(text: string): boolean {
-    return (
-      /^# AGENTS\.md instructions\b/i.test(text) ||
-      /^<environment_context\b/i.test(text) ||
-      /^<turn_aborted\b/i.test(text) ||
-      /^<codex_internal_context\b/i.test(text) ||
-      /^<recommended_plugins\b/i.test(text) ||
-      /^<user_instructions\b/i.test(text) ||
-      /^# Options\b/i.test(text)
-    );
-  }
-
   // ── Codex response-viewer support ───────────────────────────────────────────────────────
-  // Read the rollout's session_meta identity fields (plus turn_context cwd as
-  // a fallback when the huge session_meta line got truncated by the head read).
-  function readCodexRolloutMeta(head: string): { cwd?: string; originator?: string } {
-    let cwd: string | undefined;
-    let originator: string | undefined;
-    for (const line of head.split('\n')) {
-      if (!line) continue;
-      try {
-        const entry = JSON.parse(line) as {
-          type?: string;
-          payload?: { cwd?: string; originator?: string };
-        };
-        if (entry.type === 'session_meta') {
-          cwd ??= entry.payload?.cwd;
-          originator ??= entry.payload?.originator;
-        } else if (entry.type === 'turn_context') {
-          cwd ??= entry.payload?.cwd;
-        }
-      } catch {
-        // Malformed or truncated head line — keep scanning.
-      }
-      if (cwd && originator) break;
-    }
-    return { cwd, originator };
-  }
-
-  // The pane's last Enter (Session.lastSubmitAt) correlated against
-  // ~/.codex/history.jsonl, which logs every submitted user message as
-  // {session_id, ts}. This identifies the thread the pane is ACTUALLY on and
-  // is the only signal that survives /resume, /new and /fork typed inside the
-  // codex TUI itself. An entry is credited to this pane only when its Enter is
-  // the closest among all codex panes, so a menu keystroke in another pane
-  // can't steal the attribution.
-  const codexHistoryPinCache = new LRUMap<string, { submitAt: number; threadId: string }>({ maxSize: 1024 });
-  async function resolveCodexThreadFromHistory(
-    session: { id: string; lastSubmitAt?: number },
-    codexHome: string
-  ): Promise<string | null> {
-    const submitAt = session.lastSubmitAt || 0;
-    if (!submitAt) return null;
-    const cached = codexHistoryPinCache.get(session.id);
-    if (cached && cached.submitAt === submitAt) return cached.threadId;
-
-    const histPath = join(codexHome, 'history.jsonl');
-    const st = await fs.stat(histPath).catch(() => null);
-    if (!st || st.size === 0) return null;
-    const tail = await readFileTail(histPath, Buffer.alloc(65536), st.size);
-    if (!tail) return null;
-
-    const WINDOW_MS = 15_000;
-    const otherSubmits: number[] = [];
-    for (const s of ctx.sessions.values()) {
-      if (s.id !== session.id && getCli(s.mode)?.capabilities.transcript === 'codex-rollout' && s.lastSubmitAt) {
-        otherSubmits.push(s.lastSubmitAt);
-      }
-    }
-
-    let best: { threadId: string; dist: number } | undefined;
-    for (const line of tail.split('\n')) {
-      if (!line) continue;
-      let e: { session_id?: string; ts?: number };
-      try {
-        e = JSON.parse(line);
-      } catch {
-        continue; // first tail line may be cut mid-JSON
-      }
-      if (!e.session_id || typeof e.ts !== 'number') continue;
-      const tsMs = e.ts * 1000; // history timestamps are unix seconds
-      const dist = Math.abs(tsMs - submitAt);
-      if (dist > WINDOW_MS) continue;
-      if (otherSubmits.some((o) => Math.abs(tsMs - o) < dist)) continue; // another pane is closer
-      if (!best || dist < best.dist) best = { threadId: e.session_id, dist };
-    }
-    if (!best) return null;
-    codexHistoryPinCache.set(session.id, { submitAt, threadId: best.threadId });
-    return best.threadId;
-  }
-
-  // Locate THIS pane's rollout, in order of confidence:
-  //   0. history match — the thread the pane last submitted a message to
-  //      (see resolveCodexThreadFromHistory); tracks the pane through
-  //      /resume //new //fork typed inside the TUI.
-  //   1. originator match — Codeman spawns codex panes with
-  //      CODEX_INTERNAL_ORIGINATOR_OVERRIDE=codeman_<sessionId>, which codex
-  //      writes into session_meta.originator of every rollout it creates
-  //      (including new files after /new in the same pane; newest match wins).
-  //   2. resume-id match — resumed rollouts keep their ORIGINAL session_meta
-  //      (codex appends without rewriting it), so originator matching can't
-  //      see them; but the rollout uuid is in the filename and we know the id.
-  //   3. legacy cwd+mtime heuristic — panes started before this feature, or
-  //      TUI-resumed threads before their first tracked submit. Case-blind
-  //      cwd compare (codex records the launch-time case, /mnt paths vary)
-  //      and rollouts claimed by OTHER codeman panes are excluded.
+  // The exact same full resolver backs checkpoint generation observation and
+  // response viewing: history pin, originator, configured resume, then legacy cwd.
   async function findActiveCodexFile(session: {
     id: string;
     workingDir: string;
@@ -2933,122 +3291,177 @@ export function registerSessionRoutes(
     codexConfig?: { resumeSessionId?: string };
   }): Promise<string | null> {
     const codexHome = process.env.CODEX_HOME || join(process.env.HOME || '/tmp', '.codex');
-    const sessionsDir = join(codexHome, 'sessions');
+    const conversation = await findActiveCodexConversation({
+      codexHome,
+      sessionId: session.id,
+      workingDir: session.workingDir,
+      resumeSessionId: session.codexConfig?.resumeSessionId,
+      lastSubmitAt: session.lastSubmitAt,
+      competingSubmitAts: [...ctx.sessions.values()]
+        .filter((other) => other.id !== session.id && other.mode === 'codex' && other.lastSubmitAt)
+        .map((other) => other.lastSubmitAt),
+    });
+    return conversation?.path ?? null;
+  }
 
-    const files: Array<{ path: string; mtimeMs: number }> = [];
-    const walk = async (dir: string): Promise<void> => {
-      let entries: import('node:fs').Dirent[];
+  // opencode stores sessions in a sqlite db keyed by absolute working
+  // directory. node:sqlite (DatabaseSync) is unflagged on Node 24+ but needs
+  // --experimental-sqlite on Node 22 (what CI runs), so the import is dynamic
+  // and wrapped so a missing/unflagged module degrades to null rather than
+  // throwing.
+  async function findOpencodeSessionId(workingDir: string): Promise<string | null> {
+    let sqliteModule: typeof import('node:sqlite');
+    try {
+      sqliteModule = await import('node:sqlite');
+    } catch {
+      return null;
+    }
+    const dbPath = join(opencodeDataHome(), 'opencode', 'opencode.db');
+    if (!existsSync(dbPath)) return null;
+    let db: InstanceType<typeof sqliteModule.DatabaseSync> | undefined;
+    try {
+      db = new sqliteModule.DatabaseSync(dbPath, { readOnly: true });
+      // OpenCode's database has no Codeman pane identity. Selecting its newest
+      // row by shared working directory can recover a different concurrent pane,
+      // so capture only the unambiguous single-row case.
+      const rows = db.prepare('SELECT id FROM session WHERE directory = ? LIMIT 2;').all(workingDir) as Array<{
+        id?: unknown;
+      }>;
+      if (rows.length !== 1) return null;
+      const id = typeof rows[0]?.id === 'string' ? rows[0].id : null;
+      return id && OPENCODE_SESSION_ID_PATTERN.test(id) ? id : null;
+    } catch {
+      return null;
+    } finally {
       try {
-        entries = await fs.readdir(dir, { withFileTypes: true });
+        db?.close();
       } catch {
-        return;
+        // ignore close errors — best-effort cleanup only
       }
+    }
+  }
+
+  // gemini maps an absolute working directory to a project "slug" via
+  // ~/.gemini/projects.json, then keeps that project's chat transcripts under
+  // ~/.gemini/tmp/<slug>/chats/session-*.jsonl. The newest transcript's first
+  // line is a JSON object carrying the session id.
+  async function findGeminiSessionId(workingDir: string): Promise<string | null> {
+    try {
+      const projectsRaw = await fs.readFile(join(geminiHome(), 'projects.json'), 'utf8');
+      const projects = JSON.parse(projectsRaw) as { projects?: Record<string, string> };
+      const slug = projects.projects?.[workingDir];
+      if (!slug) return null;
+
+      const chatsDir = join(geminiHome(), 'tmp', slug, 'chats');
+      const entries = await fs.readdir(chatsDir, { withFileTypes: true }).catch(() => []);
+      const files: Array<{ path: string; mtimeMs: number }> = [];
       for (const entry of entries) {
-        const fullPath = join(dir, entry.name);
-        if (entry.isDirectory()) {
-          await walk(fullPath);
-          continue;
-        }
-        if (!entry.isFile() || !entry.name.endsWith('.jsonl')) continue;
+        if (!entry.isFile() || !entry.name.startsWith('session-') || !entry.name.endsWith('.jsonl')) continue;
+        const fullPath = join(chatsDir, entry.name);
         const st = await fs.stat(fullPath).catch(() => null);
-        if (!st || st.size < 100) continue;
-        files.push({ path: fullPath, mtimeMs: st.mtimeMs });
+        if (st) files.push({ path: fullPath, mtimeMs: st.mtimeMs });
       }
-    };
-    await walk(sessionsDir);
-    files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      if (files.length === 0) return null;
+      files.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
-    const historyThreadId = await resolveCodexThreadFromHistory(session, codexHome);
-    if (historyThreadId) {
-      const hit = files.find((f) => basename(f.path).endsWith(`-${historyThreadId}.jsonl`));
-      if (hit) return hit.path;
+      const firstLine = (await fs.readFile(files[0].path, 'utf8')).split('\n')[0]?.trim();
+      if (!firstLine) return null;
+      const parsed = JSON.parse(firstLine) as { sessionId?: unknown };
+      const id = typeof parsed.sessionId === 'string' ? parsed.sessionId : null;
+      return id && GEMINI_SESSION_ID_PATTERN.test(id) ? id : null;
+    } catch {
+      return null;
     }
+  }
 
-    const rawResumeId = session.codexConfig?.resumeSessionId;
-    const resumeId =
-      rawResumeId && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(rawResumeId)
-        ? rawResumeId
-        : undefined;
-    const idMatch = resumeId ? files.find((f) => basename(f.path).endsWith(`-${resumeId}.jsonl`)) : undefined;
-
-    // Scan newest-first for our originator; anything strictly older than the
-    // id match can never beat it, so the head reads stop there (mtime ties are
-    // still scanned — a /new rollout may land in the same clock tick). The
-    // 128 KiB head budget covers the session_meta line, which embeds full
-    // base_instructions (observed max ~22 KiB on codex 0.144).
-    const originator = `codeman_${session.id}`;
-    const wantCwd = session.workingDir.toLowerCase();
-    const headBuf = Buffer.alloc(131072);
-    let cwdFallback: { path: string; mtimeMs: number } | undefined;
-    for (const f of files) {
-      if (idMatch && f.mtimeMs < idMatch.mtimeMs) break;
-      const meta = await readCodexRolloutMetaCached(f.path, headBuf);
-      if (!meta) continue;
-      if (meta.originator === originator) return f.path; // newest-first → first hit wins
-      if (
-        !cwdFallback &&
-        !idMatch &&
-        meta.cwd?.toLowerCase() === wantCwd &&
-        // A rollout stamped by another codeman pane belongs to that pane.
-        !(meta.originator?.startsWith('codeman_') && meta.originator !== originator)
-      ) {
-        cwdFallback = f;
+  // agy ("antigravity") keeps a separate tree from gemini proper — do not
+  // reuse gemini's projects/chats layout. history.jsonl is NDJSON; the last
+  // entry whose workspace matches ours and that carries a conversationId wins.
+  // A literal 'latest' means "resume the most recent conversation" (--continue
+  // in buildAntigravityCommand()), so it is never returned as a captured id.
+  async function findAgySessionId(workingDir: string): Promise<string | null> {
+    try {
+      const raw = await fs.readFile(join(geminiHome(), 'antigravity-cli', 'history.jsonl'), 'utf8');
+      let match: string | null = null;
+      for (const line of raw.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let entry: { workspace?: unknown; conversationId?: unknown };
+        try {
+          entry = JSON.parse(trimmed);
+        } catch {
+          continue; // skip malformed lines
+        }
+        if (entry.workspace === workingDir && typeof entry.conversationId === 'string' && entry.conversationId) {
+          match = entry.conversationId;
+        }
       }
+      return match && match !== 'latest' && AGY_CONVERSATION_ID_PATTERN.test(match) ? match : null;
+    } catch {
+      return null;
     }
-
-    return idMatch?.path ?? cwdFallback?.path ?? null;
   }
 
-  // session_meta is written once when codex creates the rollout and never
-  // rewritten (verified: resume appends without touching it), so the parsed
-  // identity of a given path can be cached forever. This turns the per-request
-  // scan into stat calls plus head reads for new files only.
-  const codexRolloutMetaCache = new LRUMap<string, { cwd?: string; originator?: string }>({ maxSize: 4096 });
-  async function readCodexRolloutMetaCached(
-    filePath: string,
-    headBuf: Buffer
-  ): Promise<{ cwd?: string; originator?: string } | null> {
-    const cached = codexRolloutMetaCache.get(filePath);
-    if (cached) return cached;
-    const head = await readFileHead(filePath, headBuf);
-    if (!head) return null;
-    const meta = readCodexRolloutMeta(head);
-    // Don't cache a still-incomplete head: a rollout being created may not
-    // have flushed session_meta/turn_context yet.
-    if (!meta.cwd && !meta.originator) return meta;
-    codexRolloutMetaCache.set(filePath, meta);
-    return meta;
+  // COD-124 unit 2, Gap B (widened to opencode/gemini/agy by COD-251): capture
+  // the native external-CLI session/conversation id at park time so a later
+  // /resume can thread it back into the relaunch command. codex reuses
+  // findActiveCodexFile() (the same rollout-discovery logic backing the
+  // eye-view codexLastResponse endpoint) and extracts the rollout UUID from
+  // the filename; opencode/gemini/agy each read that CLI's own on-disk store
+  // (see findOpencodeSessionId/findGeminiSessionId/findAgySessionId above).
+  // claude/shell have no analogous "resume this exact conversation by id"
+  // flow wired into their CLI builders — this intentionally returns null for
+  // them rather than inventing a resume flag that doesn't exist; those modes
+  // stay a best-effort relaunch in the same workingDir with no id to restore.
+  // Must never throw: capture is opportunistic and must never block park().
+  async function captureNativeResumeId(session: {
+    mode: string;
+    id: string;
+    workingDir: string;
+    lastSubmitAt?: number;
+    codexConfig?: { resumeSessionId?: string };
+    openCodeConfig?: { continueSession?: string };
+  }): Promise<string | null> {
+    try {
+      if (session.mode === 'codex') {
+        // An explicit caller target is already trustworthy and must out-rank
+        // opportunistic filesystem discovery.
+        if (session.codexConfig?.resumeSessionId) return session.codexConfig.resumeSessionId;
+        const rolloutPath = await findActiveCodexFile(session);
+        if (!rolloutPath) return null;
+        const match = basename(rolloutPath).match(
+          /-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i
+        );
+        return match ? match[1] : null;
+      }
+      if (session.mode === 'opencode') {
+        // Keep an explicitly selected OpenCode session rather than replacing it
+        // with a directory-only database lookup.
+        if (session.openCodeConfig?.continueSession) return session.openCodeConfig.continueSession;
+        return await findOpencodeSessionId(session.workingDir);
+      }
+      if (session.mode === 'gemini') return await findGeminiSessionId(session.workingDir);
+      if (session.mode === 'antigravity') return await findAgySessionId(session.workingDir);
+      return null;
+    } catch {
+      return null;
+    }
   }
 
-  function extractCodexBlockText(content: unknown, kinds: string[]): string {
-    if (typeof content === 'string') return content;
-    if (!Array.isArray(content)) return '';
-    return content
-      .filter(
-        (b): b is { type: string; text: string } =>
-          !!b &&
-          typeof b === 'object' &&
-          kinds.includes((b as { type?: string }).type || '') &&
-          typeof (b as { text?: string }).text === 'string'
-      )
-      .map((b) => b.text)
-      .join('\n\n');
-  }
-
-  // Single pass over a Codex rollout: track the last assistant message (for the
-  // default eye view) and, when `full`, the whole user/assistant thread.
-  //
-  // User turns come from event_msg/user_message when available: codex emits one
-  // per REAL user input, and injected context (AGENTS.md, environment_context,
-  // compaction summaries, …) never appears there — so no filtering heuristics.
-  // response_item user rows duplicate those inputs mixed with the injections;
-  // they are kept only as a fallback for old rollouts without event_msg rows.
+  // Rollout identity remains above in `findActiveCodexFile()`; parsing itself is
+  // shared with Read My Mind so viewer behavior cannot drift from its signals.
   async function readCodexLastResponse(
-    session: { id: string; workingDir: string; codexConfig?: { resumeSessionId?: string } },
+    session: {
+      id: string;
+      workingDir: string;
+      lastSubmitAt?: number;
+      codexConfig?: { resumeSessionId?: string };
+    },
     full: boolean
   ): Promise<{
     text: string;
     timestamp: string;
+    hasContext?: boolean;
     messages?: Array<{ role: string; text: string; timestamp?: string }>;
   }> {
     const empty = full ? { text: '', timestamp: '', messages: [] } : { text: '', timestamp: '' };
@@ -3062,113 +3475,139 @@ export function registerSessionRoutes(
       return empty;
     }
 
-    let lastText = '';
-    let lastTimestamp = '';
-    const messages: Array<{ role: string; text: string; timestamp?: string; legacyUser?: boolean }> = [];
-    // Multiset of event-sourced user texts: a real input appears BOTH as an
-    // event_msg and as a response_item row, so each event text cancels exactly
-    // one legacy twin. Legacy rows without an event twin (turns written by an
-    // older codex appending to the same rollout) survive — a file-wide boolean
-    // would wrongly drop them.
-    const eventUserTexts = new Map<string, number>();
+    const parsed = parseCodexRollout(content.split('\n'), {
+      includeMessages: full,
+      includeSignals: false,
+    });
 
-    for (const line of content.split('\n')) {
-      if (!line) continue;
-      let entry: {
-        timestamp?: string;
-        type?: string;
-        payload?: {
-          type?: string;
-          role?: string;
-          content?: unknown;
-          message?: unknown;
-          images?: unknown;
-          local_images?: unknown;
-        };
-      };
-      try {
-        entry = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (full && entry.type === 'event_msg' && entry.payload?.type === 'user_message') {
-        let text = typeof entry.payload.message === 'string' ? entry.payload.message.trim() : '';
-        if (text && isCodexInjectedContext(text)) continue;
-        if (text) eventUserTexts.set(text, (eventUserTexts.get(text) || 0) + 1);
-        // Image-only (or image+text) inputs: the text field alone would make
-        // the turn vanish, so surface a placeholder.
-        const imageCount =
-          (Array.isArray(entry.payload.images) ? entry.payload.images.length : 0) +
-          (Array.isArray(entry.payload.local_images) ? entry.payload.local_images.length : 0);
-        if (imageCount > 0) text = text ? `${text}\n\n*[image ×${imageCount}]*` : `*[image ×${imageCount}]*`;
-        if (text) messages.push({ role: 'user', text, timestamp: entry.timestamp });
-        continue;
-      }
-      if (entry.type !== 'response_item' || entry.payload?.type !== 'message') continue;
-      const role = entry.payload?.role;
-      if (role === 'assistant') {
-        const text = extractCodexBlockText(entry.payload?.content, ['output_text', 'text']);
-        if (text) {
-          lastText = text;
-          lastTimestamp = entry.timestamp || '';
-          if (full) messages.push({ role: 'assistant', text, timestamp: entry.timestamp });
-        }
-      } else if (role === 'user' && full) {
-        const text = extractCodexBlockText(entry.payload?.content, ['input_text', 'text']).trim();
-        // Drop Codex's injected context turns (AGENTS.md, environment_context, …)
-        // so the thread shows real user prompts only.
-        if (text && !isCodexInjectedContext(text)) {
-          messages.push({ role: 'user', text, timestamp: entry.timestamp, legacyUser: true });
-        }
-      }
+    // The response viewer has always exposed expandable context when a rollout
+    // has a non-empty assistant reply; retain that lightweight capability flag.
+    if (full) {
+      return { text: parsed.lastAssistantText, timestamp: parsed.lastAssistantTimestamp, messages: parsed.messages };
     }
-
-    const thread = messages
-      .filter((m) => {
-        if (!m.legacyUser) return true;
-        const n = eventUserTexts.get(m.text) || 0;
-        if (n > 0) {
-          eventUserTexts.set(m.text, n - 1);
-          return false; // duplicate of an event_msg row already in the thread
-        }
-        return true;
-      })
-      .map(({ role, text, timestamp }) => ({ role, text, timestamp }));
-
-    return full
-      ? { text: lastText, timestamp: lastTimestamp, messages: thread }
-      : { text: lastText, timestamp: lastTimestamp };
+    return parsed.lastAssistantText
+      ? { text: parsed.lastAssistantText, timestamp: parsed.lastAssistantTimestamp, hasContext: true }
+      : { text: parsed.lastAssistantText, timestamp: parsed.lastAssistantTimestamp };
   }
 
   // ========== Get Terminal Buffer ==========
 
   // Query params:
   //   tail=<bytes> - Only return last N bytes (faster initial load)
+  //   frame=1     - COD-187 live mirror: ONLY the current visible frame
   //   full=1       - Explicitly request the entire tmux scrollback (COD-47)
   //   alt=recording - With full=1: if the pane is in the alternate screen, load
   //                  the visible frame over the byte recording instead
   app.get('/api/sessions/:id/terminal', async (req, reply) => {
     const routeStartedAt = performance.now();
     const { id } = req.params as { id: string };
-    const query = req.query as { tail?: string; full?: string; lines?: string; alt?: string };
+    const query = req.query as {
+      tail?: string;
+      frame?: string;
+      mirror?: string;
+      alt?: string;
+      lines?: string;
+      capture?: string;
+      full?: string;
+    };
     const session = findSessionOrFail(ctx, id, req);
+
+    // COD-187 (live mirror): `frame=1` returns ONLY the current visible frame —
+    // a cursor-positioned snapshot of the pane's screen, no byte history, no
+    // scrollback, no strip/tail processing (captures contain none of that).
+    // Remote sessions capture the remote pane over ssh; the LOCAL nested-tmux
+    // wrapper displays the identical screen, so falling back to the local
+    // capture is correct (unlike history, which lives only remotely).
+    // `mux-frame` is a distinct source: frame consumers accept only it, and the
+    // full-history consumers ('mux-full-history' gate) never accept a frame.
+    if (query.frame === '1') {
+      const frameMuxName = session.muxName;
+      let frame: string | null = null;
+      // A live remote wrapper already receives the current visible screen over
+      // its persistent SSH attachment. Browser mirrors can capture that locally
+      // instead of opening an extra SSH channel on every selection/reconcile.
+      // Canonical history and default frame callers still capture remotely.
+      if (query.mirror === '1' && frameMuxName && session.remote) {
+        if (typeof ctx.mux.captureLivePaneFrame === 'function') {
+          frame = await ctx.mux.captureLivePaneFrame(frameMuxName);
+        } else if (typeof ctx.mux.captureActivePaneBuffer === 'function' && !(await ctx.mux.isPaneDead(frameMuxName))) {
+          frame = ctx.mux.captureActivePaneBuffer(frameMuxName);
+        }
+      }
+      if (
+        (frame === null || frame.length === 0) &&
+        frameMuxName &&
+        session.remote &&
+        typeof ctx.mux.captureRemotePaneBuffer === 'function'
+      ) {
+        frame = await ctx.mux.captureRemotePaneBuffer(session.remote, session.id, frameMuxName, {
+          visibleFrame: true,
+          owner: ownerFor(req),
+        });
+      }
+      if (
+        (frame === null || frame.length === 0) &&
+        frameMuxName &&
+        typeof ctx.mux.captureActivePaneBuffer === 'function'
+      ) {
+        frame = ctx.mux.captureActivePaneBuffer(frameMuxName);
+      }
+      const frameBuffer = frame !== null && frame.length > 0 ? frame : '';
+      return {
+        terminalBuffer: frameBuffer,
+        status: session.status,
+        fullSize: frameBuffer.length,
+        truncated: false,
+        source: frameBuffer.length > 0 ? ('mux-frame' as const) : ('history' as const),
+        ...remoteCaptureDegradedFields(ctx, session),
+      };
+    }
 
     // `full=1` is the EXPLICIT full-history signal (COD-47): capture the ENTIRE
     // tmux scrollback so history beyond the server byte buffer can be recovered.
     // Requests WITHOUT it — shell selection/tab switches (`tail=`) and legacy
     // no-param callers — keep the fast visible-frame capture.
     const tailBytes = query.tail ? parseInt(query.tail, 10) : 0;
-    let isFullReload = query.full === '1' || query.full === 'true';
-    const { tmuxHistoryLimit, terminalBufferMaxBytes } = await ctx.getTerminalHistoryConfig();
+    let isFullReload = query.full === '1' || query.full === 'true' || tailBytes <= 0;
+    // COD-187 (history view lazy load): `lines=N` bounds the full-history
+    // capture to the last N lines — the fast first page. The frontend expands
+    // to the unbounded capture only when the user scrolls to the partial top.
+    const rawLines = query.lines && /^\d+$/.test(query.lines) ? Number(query.lines) : 0;
+    const lastLines =
+      Number.isFinite(rawLines) && rawLines > 0 ? Math.min(100_000, Math.max(100, rawLines)) : undefined;
+    // COD-187 claude expansion: the history view's requests (`lines=N` first
+    // page, `capture=1` full expansion) are capture-only for EVERY mode.
+    const isCaptureRequest = lastLines !== undefined || query.capture === '1';
 
     // Prepend the live tmux pane buffer so tab-switch replay shows the current
     // on-screen frame, not just the accumulated byte history. This matters for
-    // TUI modes (codex/opencode) that repaint only their latest frame: the
+    // TUI modes (codex/opencode/gemini) that repaint only their latest frame: the
     // accumulated buffer alone replays as the idle banner. We clear the viewport
     // (`\x1b[H\x1b[2J`) between the history and the live pane so they don't
     // overlap. `captureActivePaneBuffer` is a no-op ('') under test mode and
     // returns null when unavailable, in which case we fall back to history.
+    //
+    // COD-178: for codex/gemini the byte history is NEVER replayed when a
+    // capture is available. These TUIs repaint the entire screen (`\x1b[H` +
+    // every row) on each geometry change, so the accumulated history is a
+    // stack of full-frame redraws painted at historical window sizes; replaying
+    // a frame taller than the browser's current viewport scrolls it, orphaning
+    // the previous frame's rows into scrollback (stacked stale banner boxes).
+    // The tmux capture is line-based with no cursor addressing — tmux already
+    // applied every redraw in place — so it replays cleanly at any size and is
+    // the canonical scrollback. We therefore request the FULL history capture
+    // even on tab switch for these modes (bounded by tmux history-limit).
+    const isCaptureOnlyTuiMode =
+      session.mode === 'codex' ||
+      session.mode === 'gemini' ||
+      session.mode === 'opencode' ||
+      session.mode === 'antigravity';
     const muxName = session.muxName;
+    // Resolved BEFORE the capture: the full-history capture is bounded by the
+    // configured tmux history limit and sizes its stdout buffer from the byte
+    // cap the consumer will keep, or a multi-MB scrollback dump dies on
+    // execSync's 1MB default (ENOBUFS).
+    const { tmuxHistoryLimit, terminalBufferMaxBytes } = await ctx.getTerminalHistoryConfig();
     const captureStartedAt = performance.now();
     // The visible path used to pass no options at all. It passes one now for a
     // single reason: `capturedGeometry` comes BACK on it, and the response has
@@ -3176,13 +3615,15 @@ export function registerSessionRoutes(
     // for. See PaneCaptureOptions.capturedGeometry.
     // `lines` bounds only the history a FULL capture reads; the visible-frame
     // path reads no history and is untouched by it.
-    let captureOpts: PaneCaptureOptions = isFullReload
-      ? {
-          fullHistory: true,
-          historyLimitLines: captureHistoryLines(query.lines, tmuxHistoryLimit),
-          maxCaptureBytes: terminalBufferMaxBytes,
-        }
-      : {};
+    let captureOpts: PaneCaptureOptions =
+      isFullReload || isCaptureOnlyTuiMode || isCaptureRequest
+        ? {
+            fullHistory: true,
+            historyLimitLines: lastLines ?? captureHistoryLines(query.lines, tmuxHistoryLimit),
+            maxCaptureBytes: terminalBufferMaxBytes,
+          }
+        : {};
+    let remoteCaptureFailed = false;
     // A remote session's local pane only sees the remote tmux client's repaints,
     // so its own scrollback is a fraction of the real one: read that from the
     // remote tmux and splice it above the local frame. Null (host unreachable,
@@ -3194,6 +3635,7 @@ export function registerSessionRoutes(
         captureOpts.historyLimitLines,
         terminalBufferMaxBytes
       );
+      if (remoteScrollback === null) remoteCaptureFailed = true;
       if (remoteScrollback !== null) {
         captureOpts.scrollbackOverride = remoteScrollback.scrollback;
         captureOpts.scrollbackOverrideScreen = remoteScrollback.screen;
@@ -3228,32 +3670,52 @@ export function registerSessionRoutes(
     }
     const captureFinishedAt = performance.now();
     const hasLiveMuxBuffer = liveMuxBuffer !== null && liveMuxBuffer.length > 0;
-    const source: 'history' | 'mux-visible' | 'mux-full-history' = hasLiveMuxBuffer
-      ? isFullReload
-        ? 'mux-full-history'
-        : 'mux-visible'
-      : 'history';
-    // What the three row-preserving skips below must key on. `isFullReload` is
+    // COD-189: shell FULL reloads are capture-canonical too. Fast bursts make
+    // the byte history sparse (tmux attach-client jump-scroll skips output),
+    // while the pane history is contiguous — with the history-limit fix the
+    // capture retains the whole burst. Byte history remains the fallback and
+    // the tail/tab-switch fast path is unchanged.
+    const isShellFullReload = session.mode === 'shell' && isFullReload;
+    // COD-187 claude expansion: the history view's requests (`lines=N` first
+    // page, `capture=1` full expansion) are capture-only for EVERY mode —
+    // tailing byte history by "lines" is meaningless.
+    // ⚠️ An EXPLICIT `?full=1` is capture-only too: that capture is the RENDERED
+    // form of everything already in the byte buffer, so prepending the byte
+    // history replays the whole conversation twice (`\x1b[2J` clears only the
+    // viewport, not xterm scrollback). Deliberately NOT `isFullReload`, which
+    // downstream also sets for a bare tail-less `/terminal` — claude's legacy
+    // no-param reload keeps its byte-history+capture concat untouched.
+    const isExplicitFullReload = isFullReload && (query.full === '1' || query.full === 'true');
+    const captureOnly =
+      (isExplicitFullReload ||
+        isCaptureOnlyTuiMode ||
+        isShellFullReload ||
+        (isCaptureRequest && captureOpts.fullHistory === true)) &&
+      !(session.remote && remoteCaptureFailed);
+    // `source` doubles as the frontend's reconcile safety gate: only a
+    // 'mux-full-history' response may REPLACE a terminal's contents
+    // (_reconcileForeignResize). A remote session degraded to the local wrapper
+    // capture reports 'mux-visible' — content-wise that capture IS one screen.
+    const source: 'history' | 'mux-visible' | 'mux-full-history' =
+      liveMuxBuffer !== null && liveMuxBuffer.length > 0
+        ? (isFullReload || isCaptureOnlyTuiMode) && !(session.remote && remoteCaptureFailed)
+          ? 'mux-full-history'
+          : 'mux-visible'
+        : 'history';
+    let rawBuffer =
+      liveMuxBuffer !== null && liveMuxBuffer.length > 0
+        ? captureOnly || session.terminalBufferLength === 0
+          ? liveMuxBuffer
+          : `${session.terminalBuffer}\x1b[H\x1b[2J${liveMuxBuffer}`
+        : session.terminalBuffer;
+    // What the row-preserving skips below key on. NOT `isFullReload`, which is
     // only what the CLIENT ASKED FOR: when the capture comes back null — ENOBUFS,
-    // a timeout, a vanished pane, or a session with no mux at all — rawBuffer
-    // falls back to the byte history, which is a stream of successive frames with
-    // no row alignment to protect and every reason to be stripped.
-    const isFullCapture = isFullReload && hasLiveMuxBuffer;
-    let rawBuffer: string;
-    if (liveMuxBuffer !== null && liveMuxBuffer.length > 0) {
-      // Full-history capture is the RENDERED form of everything already in the
-      // byte buffer (up to tmux eviction) — return it alone. Prepending the byte
-      // history would replay the whole conversation twice: `\x1b[2J` clears only
-      // the viewport, not xterm scrollback. The history+clear+frame concat stays
-      // for the visible-frame path, where the single pane frame lacks history.
-      rawBuffer = isFullReload
-        ? liveMuxBuffer
-        : session.terminalBufferLength > 0
-          ? `${session.terminalBuffer}\x1b[H\x1b[2J${liveMuxBuffer}`
-          : liveMuxBuffer;
-    } else {
-      rawBuffer = session.terminalBuffer;
-    }
+    // a timeout, a vanished pane, a session with no mux — rawBuffer falls back to
+    // the byte history, a stream of successive frames with no row alignment to
+    // protect. It is also false for the concat path (byte history + clear +
+    // capture), where the capture is not the whole buffer and its trailing
+    // relative cursor move is not what the rows are counted from.
+    const isFullCapture = source === 'mux-full-history' && (captureOnly || session.terminalBufferLength === 0);
     const fullSize = rawBuffer.length;
     let truncated = false;
     // WHY the reason and not just the boolean (#258): `truncated` is set at two
@@ -3365,6 +3827,15 @@ export function registerSessionRoutes(
     cleanBuffer = cleanBuffer.replace(CTRL_L_PATTERN, '');
     if (!isFullCapture) cleanBuffer = cleanBuffer.replace(LEADING_WHITESPACE_PATTERN, '');
 
+    // COD-187: a `lines=N` capture that came back with >= N lines almost
+    // certainly has older history above it — the frontend shows a
+    // "scroll to top for older" affordance and expands on demand.
+    const historyPartial =
+      lastLines !== undefined &&
+      source === 'mux-full-history' &&
+      cleanBuffer.length > 0 &&
+      cleanBuffer.split('\n').length >= lastLines;
+
     const finishedAt = performance.now();
     reply.header(
       'Server-Timing',
@@ -3386,6 +3857,7 @@ export function registerSessionRoutes(
       // what existed before the cut. The gap is what the indicator reports.
       retainedBytes: cleanBuffer.length,
       source,
+      historyPartial,
       // The pane geometry this frame was drawn for. A visible-frame capture
       // positions every row absolutely, so a client whose terminal has fewer
       // rows than this overwrites its last line with the overflow and loses
@@ -3414,6 +3886,7 @@ export function registerSessionRoutes(
       // the alternate screen, so it always reports 0, while a `full=1` load reads
       // the real scrollback from the remote tmux (`fetchRemoteScrollback`).
       paneHistoryLines: hasLiveMuxBuffer && !session.remote ? captureOpts.capturedHistoryLines : undefined,
+      ...remoteCaptureDegradedFields(ctx, session),
     };
   });
 
@@ -3529,6 +4002,30 @@ export function registerSessionRoutes(
     return { success: true, data: { pinned: body.pinned, pinnedAt } };
   });
 
+  // ========== Checkpoint (agent-initiated compact-or-clear) ==========
+
+  app.post('/api/sessions/:id/checkpoint', async (req) => {
+    const { id } = req.params as { id: string };
+    const body = parseBody(CheckpointSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id, req);
+
+    // Prefer the allowed-modes array; fall back to the deprecated single `mode`.
+    const modes = body.modes ?? (body.mode !== undefined ? [body.mode] : undefined);
+    session.setCheckpoint(body.enabled, modes);
+    persistAndBroadcastSession(ctx, session);
+
+    return {
+      success: true,
+      data: {
+        checkpoint: {
+          enabled: session.checkpointEnabled,
+          modes: session.checkpointModes,
+          mode: session.checkpointMode,
+        },
+      },
+    };
+  });
+
   // ========== Image Watcher ==========
 
   app.post('/api/sessions/:id/image-watcher', async (req) => {
@@ -3615,11 +4112,15 @@ export function registerSessionRoutes(
     // session's claudeMode, so resolve it for the owner (bypass -> auto for non-granted).
     const runClaudeModeConfig = await ctx.getClaudeModeConfig();
     const runClaudeMode = await resolveClaudeModeForUsername(runClaudeModeConfig.claudeMode, runOwner);
+    const runCheckpointEnabled = await ctx.getCheckpointDefaultEnabled();
+    const runClaudeSessionStartHookReady = await verifyClaudeSessionStartHookCapability('claude', dir, false);
     const session = new Session({
       workingDir: dir,
       envOverrides: runEnvOverrides,
       claudeMode: runClaudeMode,
       allowedTools: runClaudeModeConfig.allowedTools,
+      checkpointEnabled: runCheckpointEnabled,
+      claudeSessionStartHookReady: runClaudeSessionStartHookReady,
       owner: runOwner,
     });
     await ctx.addSession(session);
@@ -3672,9 +4173,9 @@ export function registerSessionRoutes(
       effort,
       advisorModel,
       parentSessionId,
+      tabGroupId,
       agentOrigin,
       customModel,
-      tabGroupId,
     } = parseBody(QuickStartSchema, req.body);
 
     // Resolved ONCE here: the same value labels a case directory this request creates
@@ -3694,6 +4195,9 @@ export function registerSessionRoutes(
     let docker = undefined;
     let dockerResumeId: string | undefined;
     let casePath: string | null = null;
+    // COD-392: declared before the availability gates so the local exact-command
+    // check can skip the stock codex binary probe. Scoped to quick-start only.
+    let qsLocalCodexCommand: string | undefined;
     // Security: fold ownership INTO the match (don't early-return) so a NON-OWNED
     // same-named remote/docker case is skipped and control falls through to the caller's
     // own LOCAL case — remote/docker names are globally unique but local names are
@@ -3711,17 +4215,22 @@ export function registerSessionRoutes(
     if (remoteCase) {
       const host = (await readRemoteHosts(CODEMAN_CONFIG_DIR)).find((item) => item.id === remoteCase.hostId);
       if (!host) return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Remote host not found');
+      const resolved = resolveRemoteCodexCommand(
+        remoteCase,
+        host,
+        ctx.store.getCodexCommandProfiles(remoteProfileLibraryOwner(remoteCase.owner, owner))
+      );
+      if (!resolved.ok) return createErrorResponse(ApiErrorCode.OPERATION_FAILED, resolved.error);
 
-      // Per-session config that is applied to the LOCAL tmux/CLI wrapper (env vars via
-      // tmux setenv, effort/model CLI args, codex/gemini/antigravity/opencode config) does NOT
-      // cross ssh, so it would silently no-op. Reject rather than pretend it worked —
-      // remote command/env customization goes through the per-host command override.
+      // Only Codex's matching per-session config crosses SSH in Quick Start.
+      // Its remote command builder embeds the launch flags; other per-CLI
+      // configs and generic environment overrides must still be rejected.
       if (
         (envOverrides && Object.keys(envOverrides).length > 0) ||
         effort ||
         advisorModel ||
         modelOverride !== undefined ||
-        codexConfig ||
+        (codexConfig && mode !== 'codex') ||
         geminiConfig ||
         antigravityConfig ||
         piConfig ||
@@ -3756,9 +4265,6 @@ export function registerSessionRoutes(
         );
       }
 
-      // tmux is a hard prerequisite on the remote host (the agent runs inside a remote
-      // tmux server so it survives ssh drops). Probe before spawning so a missing tmux
-      // surfaces a clear, structured error instead of a dead "tmux: command not found" pane.
       const tmuxCheck = await checkRemoteTmuxAvailable(host);
       if (!tmuxCheck.ok) {
         // An unreachable host and a host without tmux fail the same way over ssh, so the
@@ -3779,7 +4285,7 @@ export function registerSessionRoutes(
       }
 
       casePath = remoteCase.remotePath;
-      remote = toSessionRemote(host, remoteCase);
+      remote = toSessionRemote(host, resolved.remoteCase);
     } else if (dockerCase) {
       // Docker case: the CLI executes INSIDE a container via local tmux + `docker
       // exec`, so the LOCAL availability gates below don't apply. Mirror the remote
@@ -3881,12 +4387,29 @@ export function registerSessionRoutes(
         dockerResumeId = dockerCase.lastClaudeSessionId;
       }
     } else {
+      // Resolve the selected local command before the stock CLI availability check.
+      // Quick Start must apply the same owner and privilege gates as POST /api/sessions.
+      if (mode === 'codex') {
+        const localResolved = resolveLocalCaseCodexLaunchCommand(ctx.store, owner, caseName);
+        if (!localResolved.ok) return createErrorResponse(ApiErrorCode.OPERATION_FAILED, localResolved.error);
+        if (localResolved.command !== undefined) {
+          if (!(await canUsernameRunPrivilegedCommands(owner))) {
+            return createErrorResponse(
+              ApiErrorCode.FORBIDDEN,
+              'Custom Codex commands require the can-bypass-permissions grant'
+            );
+          }
+          qsLocalCodexCommand = localResolved.command;
+        }
+      }
+
       // Same pre-flight as POST /api/sessions: refuse before spawning a pane that would die
       // on `command not found`, with the resolver's own diagnostics, and a launcher CLI's
       // more specific reason (dsh: binary vs no pane-capable profile vs the profile the
       // caller named). External CLIs only — claude and shell fall through to tmux-manager's
-      // own not-found throw, exactly as before.
-      if (getCli(mode)?.capabilities.external) {
+      // own not-found throw, exactly as before. COD-392: a resolved local Codex command
+      // supplies its own binary, so it skips the PATH check.
+      if (getCli(mode)?.capabilities.external && qsLocalCodexCommand === undefined) {
         const qsLaunchError = await resolveCliLaunchError(
           mode,
           legacyConfigForMode(mode, {
@@ -3899,14 +4422,10 @@ export function registerSessionRoutes(
             deepSeekConfig,
           } as unknown as Record<string, unknown>)
         );
-        if (qsLaunchError) {
-          return createErrorResponse(ApiErrorCode.OPERATION_FAILED, qsLaunchError);
-        }
+        if (qsLaunchError) return createErrorResponse(ApiErrorCode.OPERATION_FAILED, qsLaunchError);
       }
 
       // Resolve case path: check linked-cases registry first, then fall back to CASES_DIR.
-      // This mirrors the behaviour of resolveCasePath() in case-routes so that linked
-      // external project directories are honoured by quick-start just like regular case routes.
       let linkedCases: Record<string, string> = {};
       try {
         const raw = await fs.readFile(LINKED_CASES_FILE, 'utf-8');
@@ -4115,7 +4634,7 @@ export function registerSessionRoutes(
       qsLaunchConfigs.grokConfig,
       qsLaunchConfigs.deepSeekConfig
     );
-    const qsTerminalHistoryConfig = await ctx.getTerminalHistoryConfig();
+    // Same owner clamp for env overrides as POST /api/sessions (upstream 74194e4f).
     const qsGatedEnvOverrides = await clampEnvOverridesForOwner(owner, envOverrides);
     const qsResolvedOmpConfig = resolveOmpConfigForCreate(mode, resolvedCasePath, qsLaunchOmpConfig);
 
@@ -4262,6 +4781,15 @@ export function registerSessionRoutes(
       }
     }
 
+    const qsTerminalHistoryConfig = await ctx.getTerminalHistoryConfig();
+    const qsTruecolorEnabled = await ctx.getTruecolorEnabled();
+    const qsCheckpointEnabled = await ctx.getCheckpointDefaultEnabled();
+    const qsClaudeSessionStartHookReady = await verifyClaudeSessionStartHookCapability(
+      mode,
+      resolvedCasePath,
+      Boolean(remote)
+    );
+
     const qsSessionOptions: ConstructorParameters<typeof Session>[0] = {
       id: qsCustomModelSessionId,
       workingDir: resolvedCasePath,
@@ -4275,7 +4803,12 @@ export function registerSessionRoutes(
       allowedTools: qsClaudeModeConfig.allowedTools,
       owner,
       openCodeConfig: mode === 'opencode' ? qsLaunchConfigs.openCodeConfig : undefined,
-      codexConfig: mode === 'codex' ? qsGatedCodexConfig : undefined,
+      codexConfig:
+        mode === 'codex'
+          ? qsLocalCodexCommand !== undefined
+            ? { ...qsGatedCodexConfig, baseCommand: qsLocalCodexCommand }
+            : qsGatedCodexConfig
+          : undefined,
       geminiConfig: mode === 'gemini' ? qsGatedGeminiConfig : undefined,
       antigravityConfig: mode === 'antigravity' ? qsGatedAntigravityConfig : undefined,
       piConfig: mode === 'pi' ? qsGatedPiConfig : undefined,
@@ -4284,11 +4817,18 @@ export function registerSessionRoutes(
       ompConfig: qsResolvedOmpConfig,
       envOverrides: qsCustomModelEnvOverrides,
       effort,
+      truecolorEnabled: qsTruecolorEnabled,
+      checkpointEnabled: qsCheckpointEnabled,
+      claudeSessionStartHookReady: qsClaudeSessionStartHookReady,
       advisorModel,
       remote,
       docker,
       resumeSessionId: dockerResumeId,
       tmuxHistoryLimit: qsTerminalHistoryConfig.tmuxHistoryLimit,
+      terminalBufferConfig: {
+        maxBytes: qsTerminalHistoryConfig.terminalBufferMaxBytes,
+        trimBytes: qsTerminalHistoryConfig.terminalBufferTrimBytes,
+      },
       parentSessionId: qsParentSessionId,
     };
     // Force the custom-model selection's launchModel (pi/omp `custom/<id>`, grok's
@@ -4329,7 +4869,10 @@ export function registerSessionRoutes(
       }
     }
 
-    const tabLayout = tabGroupId ? await ctx.addSession(session, { tabGroupId }) : await ctx.addSession(session);
+    const tabLayoutSnapshot = await ctx.addSession(session, {
+      caseName,
+      ...(tabGroupId ? { tabGroupId } : {}),
+    });
     ctx.store.incrementSessionsCreated();
     ctx.persistSessionState(session);
     await ctx.setupSessionListeners(session);
@@ -4414,8 +4957,11 @@ export function registerSessionRoutes(
         sessionId: session.id,
         casePath: resolvedCasePath,
         caseName,
+        ...(tabGroupId || tabLayoutSnapshot.placementSource === 'case-default'
+          ? { tabLayout: tabLayoutSnapshot.layout, tabPlacements: tabLayoutSnapshot.placements }
+          : {}),
         ...(customModel ? { modelSwapInProgress: qsCustomModelSwapInProgress } : {}),
-        ...(tabGroupId ? { tabLayout } : {}),
+        ...(tabGroupId ? { tabLayout: tabLayoutSnapshot.layout, tabPlacements: tabLayoutSnapshot.placements } : {}),
       };
     } catch (err) {
       // Clean up session on error to prevent orphaned resources
@@ -5017,6 +5563,10 @@ export function registerSessionRoutes(
 
   app.get('/api/history/sessions', async (req) => {
     const query = req.query as { projectKey?: string; offset?: string; limit?: string };
+
+    // No testMode short-circuit here (unlike /api/sessions/unified): test/setup.ts
+    // gives every test file a temp HOME, so the scan is confined and returns empty
+    // on its own — and upstream's history-quality tests (#215) need it to run.
     const projectsDir = join(process.env.HOME || '/tmp', '.claude', 'projects');
     // scanProjectDir tries smallHeadBuf (16KB, the original size) first for every
     // file and only escalates to headBuf (128KB) when that wasn't enough — see the
@@ -5085,12 +5635,15 @@ export function registerSessionRoutes(
     // Live (in-memory) sessions.
     const live: LiveSessionInput[] = [...ctx.sessions.values()].map((s) => {
       const st = s.toState();
+      const activity = ctx.agentActivity.project(s);
       return {
         id: st.id,
         name: st.name,
         mode: st.mode,
         status: st.status,
         isWorking: s.isWorking,
+        activityStatus: activity.activityStatus,
+        activityStatusSince: activity.activityStatusSince,
         workingDir: st.workingDir,
         createdAt: st.createdAt,
         lastActivityAt: st.lastActivityAt,
@@ -5413,18 +5966,12 @@ export function registerSessionRoutes(
 
     const session = findSessionOrFail(ctx, id, req);
 
-    // The file lands on THIS host under the session's working directory, which
-    // for a remote (SSH) session is the remote path: the agent there could never
-    // read it, and the write would land in a same-named local directory or fail.
-    // An owned Docker case is fine, its workspace is bind-mounted at the same
-    // absolute path; an adopted container (owned: false) mounts nothing, so its
-    // agent reads the file only if the container exposes that host path.
-    if (session.remote) {
+    // Resolve SSH metadata before any filesystem access. Remote workspaces are
+    // paths on another host; never fall back to writing them on this host.
+    const remote = getSessionRemote(session);
+    if (session.remote && !remote) {
       reply.code(400);
-      return createErrorResponse(
-        ApiErrorCode.INVALID_INPUT,
-        'Prompt uploads are not supported for remote (SSH) sessions'
-      );
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid remote session connection metadata');
     }
 
     // The upload is written under session.workingDir (ensureUploadDir below), and
@@ -5614,17 +6161,35 @@ export function registerSessionRoutes(
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Image bytes do not match declared type ${ext}`);
     }
 
+    // Date.now() collides on same-ms uploads from two tabs (last-write wins
+    // silently). Append 8 hex chars so concurrent pastes get distinct names.
+    const filename = `paste-${Date.now()}-${randomBytes(4).toString('hex')}${ext}`;
+    // Remote sessions keep `.claude-images` (written over ssh by the shared
+    // symlink-safe remote writer); local sessions use the self-ignoring
     // {workingDir}/.codeman-uploads/, see ensureUploadDir.
-    const imageDir = await ensureUploadDir(session.workingDir);
+    const imageDir = remote
+      ? pathPosix.join(session.workingDir, '.claude-images')
+      : await ensureUploadDir(session.workingDir);
     if (!imageDir) {
       reply.code(403);
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, `${UPLOADS_DIR} is not a regular directory`);
     }
-    const { filename, filepath, fh } = await openPasteFile(imageDir, ext);
-    try {
-      await fh.writeFile(imageBytes);
-    } finally {
-      await fh.close();
+    const filepath = remote ? pathPosix.join(imageDir, filename) : join(imageDir, filename);
+
+    if (remote) {
+      await writeRemotePasteImage(remote, imageDir, filepath, imageBytes);
+    } else {
+      // O_EXCL: refuse to overwrite (collision is impossible with random suffix,
+      // but defends against TOCTOU). O_NOFOLLOW: refuse if filepath is a symlink.
+      const fh = await fs.open(
+        filepath,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW
+      );
+      try {
+        await fh.writeFile(imageBytes);
+      } finally {
+        await fh.close();
+      }
     }
 
     return { path: filepath, filename };

@@ -5,7 +5,7 @@
  * Port: N/A (app.inject doesn't open ports)
  *
  * Mocks: fs (promises + sync), subagentWatcher, imageWatcher,
- * session-lifecycle-log, and opencode-cli-resolver singletons.
+ * session-lifecycle-log, and CLI resolver singletons.
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
@@ -36,7 +36,9 @@ vi.mock('../../src/subagent-watcher.js', () => ({
     getSubagents: vi.fn(() => []),
     getRecentSubagents: vi.fn(() => []),
     getSubagentsForSession: vi.fn(() => []),
+    getSubagentsForConversation: vi.fn(() => []),
     getSubagent: vi.fn(() => null),
+    resolveSubagentReference: vi.fn(() => ({ status: 'not_found' })),
     getTranscript: vi.fn(async () => []),
     formatTranscript: vi.fn(() => ''),
     killSubagent: vi.fn(async () => false),
@@ -71,42 +73,62 @@ vi.mock('../../src/session-lifecycle-log.js', () => ({
   })),
 }));
 
+vi.mock('../../src/web/repo-status.js', () => ({
+  getRepositoryStatus: vi.fn(async () => ({
+    installType: 'git',
+    branch: 'local',
+    upstream: { remote: 'upstream', ahead: 0, behind: 0, incoming: [] },
+    fork: { remote: 'origin', ahead: 0, behind: 0, incoming: [] },
+  })),
+}));
+
 vi.mock('../../src/utils/opencode-cli-resolver.js', () => ({
   isOpenCodeAvailable: vi.fn(() => false),
   resolveOpenCodeDir: vi.fn(() => null),
+  getOpenCodeNotFoundMessage: vi.fn(() => 'OpenCode resolver diagnostic'),
+}));
+
+vi.mock('../../src/utils/claude-cli-resolver.js', () => ({
+  isClaudeAvailable: vi.fn(() => false),
+  findClaudeDir: vi.fn(() => null),
+  getClaudeNotFoundMessage: vi.fn(() => 'Claude resolver diagnostic'),
+}));
+
+vi.mock('../../src/utils/codex-cli-resolver.js', () => ({
+  isCodexAvailable: vi.fn(() => false),
+  resolveCodexDir: vi.fn(() => null),
+  getCodexNotFoundMessage: vi.fn(() => 'Codex resolver diagnostic'),
 }));
 
 vi.mock('../../src/utils/gemini-cli-resolver.js', () => ({
   isGeminiAvailable: vi.fn(() => false),
   resolveGeminiDir: vi.fn(() => null),
+  getGeminiNotFoundMessage: vi.fn(() => 'Gemini resolver diagnostic'),
 }));
 
 vi.mock('../../src/utils/antigravity-cli-resolver.js', () => ({
   isAntigravityAvailable: vi.fn(() => false),
   resolveAntigravityDir: vi.fn(() => null),
+  getAntigravityNotFoundMessage: vi.fn(() => 'Antigravity resolver diagnostic'),
 }));
 
 vi.mock('../../src/utils/pi-cli-resolver.js', () => ({
   isPiAvailable: vi.fn(() => false),
   resolvePiDir: vi.fn(() => null),
   getPiCliVersion: vi.fn(() => null),
-}));
-
-vi.mock('../../src/utils/grok-cli-resolver.js', () => ({
-  isGrokAvailable: vi.fn(() => false),
-  resolveGrokDir: vi.fn(() => null),
-  getGrokCliVersion: vi.fn(() => null),
+  getPiNotFoundMessage: vi.fn(() => 'Pi resolver diagnostic'),
 }));
 
 import fs from 'node:fs/promises';
 import { existsSync, readdirSync } from 'node:fs';
 import { subagentWatcher } from '../../src/subagent-watcher.js';
 import { getLifecycleLog } from '../../src/session-lifecycle-log.js';
-import { isOpenCodeAvailable, resolveOpenCodeDir } from '../../src/utils/opencode-cli-resolver.js';
-import { isGeminiAvailable, resolveGeminiDir } from '../../src/utils/gemini-cli-resolver.js';
-import { isAntigravityAvailable, resolveAntigravityDir } from '../../src/utils/antigravity-cli-resolver.js';
-import { isPiAvailable, resolvePiDir, getPiCliVersion } from '../../src/utils/pi-cli-resolver.js';
-import { isGrokAvailable, resolveGrokDir, getGrokCliVersion } from '../../src/utils/grok-cli-resolver.js';
+import { findClaudeDir } from '../../src/utils/claude-cli-resolver.js';
+import { resolveOpenCodeDir } from '../../src/utils/opencode-cli-resolver.js';
+import { resolveCodexDir } from '../../src/utils/codex-cli-resolver.js';
+import { resolveGeminiDir } from '../../src/utils/gemini-cli-resolver.js';
+import { resolveAntigravityDir } from '../../src/utils/antigravity-cli-resolver.js';
+import { resolvePiDir, getPiCliVersion } from '../../src/utils/pi-cli-resolver.js';
 
 const mockedReadFile = vi.mocked(fs.readFile);
 const mockedWriteFile = vi.mocked(fs.writeFile);
@@ -114,18 +136,13 @@ const mockedExistsSync = vi.mocked(existsSync);
 const mockedReaddirSync = vi.mocked(readdirSync);
 const mockedSubagentWatcher = vi.mocked(subagentWatcher);
 const mockedGetLifecycleLog = vi.mocked(getLifecycleLog);
-const mockedIsOpenCodeAvailable = vi.mocked(isOpenCodeAvailable);
+const mockedFindClaudeDir = vi.mocked(findClaudeDir);
 const mockedResolveOpenCodeDir = vi.mocked(resolveOpenCodeDir);
-const mockedIsGeminiAvailable = vi.mocked(isGeminiAvailable);
+const mockedResolveCodexDir = vi.mocked(resolveCodexDir);
 const mockedResolveGeminiDir = vi.mocked(resolveGeminiDir);
-const mockedIsAntigravityAvailable = vi.mocked(isAntigravityAvailable);
 const mockedResolveAntigravityDir = vi.mocked(resolveAntigravityDir);
-const mockedIsPiAvailable = vi.mocked(isPiAvailable);
 const mockedResolvePiDir = vi.mocked(resolvePiDir);
 const mockedGetPiCliVersion = vi.mocked(getPiCliVersion);
-const mockedIsGrokAvailable = vi.mocked(isGrokAvailable);
-const mockedResolveGrokDir = vi.mocked(resolveGrokDir);
-const mockedGetGrokCliVersion = vi.mocked(getGrokCliVersion);
 
 describe('system-routes', () => {
   let harness: RouteTestHarness;
@@ -140,6 +157,7 @@ describe('system-routes', () => {
     mockedExistsSync.mockReturnValue(true);
     mockedReaddirSync.mockReturnValue([]);
     mockedSubagentWatcher.getSubagents.mockReturnValue([]);
+    mockedSubagentWatcher.resolveSubagentReference.mockReturnValue({ status: 'not_found' });
     mockedSubagentWatcher.getStats.mockReturnValue({
       totalAgents: 0,
       activeAgents: 0,
@@ -151,10 +169,13 @@ describe('system-routes', () => {
       log: vi.fn(),
       query: vi.fn(async () => []),
     } as never);
-    mockedIsOpenCodeAvailable.mockReturnValue(false);
+    mockedFindClaudeDir.mockReturnValue(null);
     mockedResolveOpenCodeDir.mockReturnValue(null);
-    mockedIsGeminiAvailable.mockReturnValue(false);
+    mockedResolveCodexDir.mockReturnValue(null);
     mockedResolveGeminiDir.mockReturnValue(null);
+    mockedResolveAntigravityDir.mockReturnValue(null);
+    mockedResolvePiDir.mockReturnValue(null);
+    mockedGetPiCliVersion.mockReturnValue(null);
   });
 
   afterEach(async () => {
@@ -168,6 +189,57 @@ describe('system-routes', () => {
       const res = await harness.app.inject({ method: 'GET', url: '/api/status' });
       expect(res.statusCode).toBe(200);
       expect(harness.ctx.getLightState).toHaveBeenCalled();
+    });
+  });
+
+  // ========== GET /api/headroom/status ==========
+
+  describe('GET /api/headroom/status', () => {
+    it('keeps proxy-wide Claude activity separate from a direct Codex launch snapshot', async () => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string) => {
+          if (url.endsWith('/readyz')) return { ok: true, json: async () => ({ version: '0.25.0' }) } as Response;
+          return {
+            ok: true,
+            json: async () => ({
+              summary: { api_requests: 8, compression: {}, cost: {} },
+              agent_usage: {
+                agents: [
+                  {
+                    agent: 'claude-code',
+                    label: 'Claude Code',
+                    source: 'client',
+                    requests: 8,
+                    tokens_saved: 99,
+                    savings_percent: 50,
+                    providers: { anthropic: 8 },
+                  },
+                ],
+              },
+              requests: { by_provider: { anthropic: 8 }, by_model: {}, by_stack: { proxy: 8 } },
+            }),
+          } as Response;
+        })
+      );
+      const session = harness.ctx._session as typeof harness.ctx._session & {
+        headroomRouted?: boolean;
+        headroomRoutedAt?: number;
+      };
+      session.mode = 'codex';
+      session.headroomRouted = false;
+      session.headroomRoutedAt = 1_722_470_400_000;
+
+      const res = await harness.app.inject({ method: 'GET', url: '/api/headroom/status' });
+      const body = JSON.parse(res.body);
+
+      expect(res.statusCode).toBe(200);
+      expect(body.stats.attribution.agents).toEqual([
+        expect.objectContaining({ agent: 'claude-code', label: 'Claude Code', requests: 8 }),
+      ]);
+      expect(body.routedSessions).toEqual([
+        expect.objectContaining({ mode: 'codex', routed: false, routedAt: 1_722_470_400_000 }),
+      ]);
     });
   });
 
@@ -205,7 +277,7 @@ describe('system-routes', () => {
       });
       expect(res.statusCode).toBe(400);
       const body = JSON.parse(res.body);
-      expect(body.success).toBe(false);
+      expect(body.message ?? body.error).toBeTruthy();
     });
   });
 
@@ -328,19 +400,35 @@ describe('system-routes', () => {
     });
   });
 
+  // ========== GET /api/system/repo-status ==========
+
+  describe('GET /api/system/repo-status', () => {
+    it('registers once and returns repository status', async () => {
+      const res = await harness.app.inject({ method: 'GET', url: '/api/system/repo-status' });
+
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body)).toMatchObject({
+        installType: 'git',
+        branch: 'local',
+      });
+    });
+  });
+
   // ========== POST /api/cleanup-state ==========
 
   describe('POST /api/cleanup-state', () => {
-    it('cleans up stale session state', async () => {
+    it('deletes only the session ids revalidated by the layout service', async () => {
+      const confirmedIds = new Set(['confirmed-stale']);
       const runStaleSessionCleanup = vi.fn(
-        async (_activeIds: Set<string>, action: (ids: ReadonlySet<string>) => unknown) => action(new Set())
+        async (_activeIds: Set<string>, action: (ids: ReadonlySet<string>) => unknown) => action(confirmedIds)
       );
       harness.ctx.tabLayouts.runStaleSessionCleanup = runStaleSessionCleanup;
       const res = await harness.app.inject({ method: 'POST', url: '/api/cleanup-state' });
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
       expect(body.cleanedSessions).toBe(0);
-      expect(harness.ctx.store.cleanupSessionsByIds).toHaveBeenCalledWith(new Set());
+      expect(harness.ctx.store.cleanupSessionsByIds).toHaveBeenCalledWith(confirmedIds);
+      expect(harness.ctx.store.cleanupStaleSessions).not.toHaveBeenCalled();
       expect(runStaleSessionCleanup).toHaveBeenCalledOnce();
     });
   });
@@ -453,6 +541,25 @@ describe('system-routes', () => {
   // ========== PUT /api/settings ==========
 
   describe('PUT /api/settings', () => {
+    it('persists and returns checkpointDefaultEnabled across a settings round-trip', async () => {
+      mockedReadFile.mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+
+      const put = await harness.app.inject({
+        method: 'PUT',
+        url: '/api/settings',
+        payload: { checkpointDefaultEnabled: false },
+      });
+
+      expect(put.statusCode).toBe(200);
+      const written = mockedWriteFile.mock.calls.at(-1)?.[1] as string;
+      expect(JSON.parse(written).checkpointDefaultEnabled).toBe(false);
+      mockedReadFile.mockResolvedValueOnce(written as never);
+
+      const get = await harness.app.inject({ method: 'GET', url: '/api/settings' });
+      expect(get.statusCode).toBe(200);
+      expect(JSON.parse(get.body).checkpointDefaultEnabled).toBe(false);
+    });
+
     it('saves valid settings', async () => {
       mockedReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
 
@@ -463,6 +570,80 @@ describe('system-routes', () => {
       });
       expect(res.statusCode).toBe(200);
       expect(mockedWriteFile).toHaveBeenCalled();
+    });
+
+    // COD-242: keyboard shortcut overrides must persist server-side so they survive
+    // restarts, deploys, and upgrades. Previously shortcutOverrides was absent from
+    // the strict SettingsUpdateSchema, so the PUT 400'd and overrides never persisted.
+    const SHORTCUT_OVERRIDES = {
+      'command-palette': { bindings: [{ key: 'p', code: 'KeyP', modifiers: ['ctrl', 'shift'] }] },
+      search: { disabled: true },
+    };
+
+    it('persists shortcutOverrides to settings.json (durable across restart/upgrade)', async () => {
+      mockedReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+
+      const res = await harness.app.inject({
+        method: 'PUT',
+        url: '/api/settings',
+        payload: { shortcutOverrides: SHORTCUT_OVERRIDES },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const written = JSON.parse(mockedWriteFile.mock.calls[0][1] as string);
+      expect(written.shortcutOverrides).toEqual(SHORTCUT_OVERRIDES);
+    });
+
+    it('accepts shortcutOverrides alongside other settings without 400', async () => {
+      mockedReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+
+      const res = await harness.app.inject({
+        method: 'PUT',
+        url: '/api/settings',
+        payload: { showSystemStats: true, shortcutOverrides: SHORTCUT_OVERRIDES },
+      });
+
+      expect(res.statusCode).toBe(200);
+    });
+
+    it('saves terminal history settings and applies tmux history immediately', async () => {
+      mockedReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+
+      const res = await harness.app.inject({
+        method: 'PUT',
+        url: '/api/settings',
+        payload: {
+          terminalScrollbackLines: 100000,
+          tmuxHistoryLimit: 100000,
+          terminalBufferMaxBytes: 32 * 1024 * 1024,
+          terminalBufferTrimBytes: 24 * 1024 * 1024,
+        },
+      });
+
+      expect(res.statusCode).toBe(200);
+      const writtenContent = JSON.parse(mockedWriteFile.mock.calls[0][1] as string);
+      expect(writtenContent).toMatchObject({
+        terminalScrollbackLines: 100000,
+        tmuxHistoryLimit: 100000,
+        terminalBufferMaxBytes: 32 * 1024 * 1024,
+        terminalBufferTrimBytes: 24 * 1024 * 1024,
+      });
+      expect(harness.ctx.mux.setHistoryLimit).toHaveBeenCalledWith(100000);
+    });
+
+    it('rejects invalid terminal history settings', async () => {
+      const res = await harness.app.inject({
+        method: 'PUT',
+        url: '/api/settings',
+        payload: {
+          terminalScrollbackLines: 0,
+          tmuxHistoryLimit: 100000,
+          terminalBufferMaxBytes: 1024,
+          terminalBufferTrimBytes: 2048,
+        },
+      });
+
+      expect(res.statusCode).toBe(400);
     });
 
     it('merges with existing settings', async () => {
@@ -482,6 +663,17 @@ describe('system-routes', () => {
       expect(writtenContent.showTokenCount).toBe(false);
     });
 
+    it('accepts the opt-in automatic reboot recovery setting', async () => {
+      const res = await harness.app.inject({
+        method: 'PUT',
+        url: '/api/settings',
+        payload: { autoRecoverSessionsAfterReboot: true },
+      });
+      expect(res.statusCode).toBe(200);
+      const writtenContent = JSON.parse(mockedWriteFile.mock.calls[0][1] as string);
+      expect(writtenContent.autoRecoverSessionsAfterReboot).toBe(true);
+    });
+
     it('rejects unknown settings fields (strict schema)', async () => {
       const res = await harness.app.inject({
         method: 'PUT',
@@ -490,7 +682,7 @@ describe('system-routes', () => {
       });
       expect(res.statusCode).toBe(400);
       const body = JSON.parse(res.body);
-      expect(body.success).toBe(false);
+      expect(body.message ?? body.error).toBeTruthy();
     });
 
     it('saves lastUsedCase as partial update without overwriting other settings', async () => {
@@ -559,6 +751,63 @@ describe('system-routes', () => {
   // ========== PUT /api/subagent-window-states ==========
 
   describe('PUT /api/subagent-window-states', () => {
+    it('isolates Alice and Bob while reserving legacy global state for an admin', async () => {
+      const priorMode = process.env.CODEMAN_MULTIUSER;
+      process.env.CODEMAN_MULTIUSER = '1';
+      let persisted = JSON.stringify({ minimized: { legacy: true }, open: [] });
+      mockedReadFile.mockImplementation(async () => persisted as never);
+      mockedWriteFile.mockImplementation(async (_path, value) => {
+        persisted = String(value);
+      });
+      const alice = await createRouteTestHarness(registerSystemRoutes, {
+        authUser: { username: 'alice', role: 'user' },
+      });
+      const bob = await createRouteTestHarness(registerSystemRoutes, {
+        authUser: { username: 'bob', role: 'user' },
+      });
+      const admin = await createRouteTestHarness(registerSystemRoutes, {
+        authUser: { username: 'root', role: 'admin' },
+      });
+      try {
+        expect(
+          JSON.parse((await alice.app.inject({ method: 'GET', url: '/api/subagent-window-states' })).body)
+        ).toEqual({
+          minimized: {},
+          open: [],
+        });
+        await alice.app.inject({
+          method: 'PUT',
+          url: '/api/subagent-window-states',
+          payload: { minimized: { alice: true }, open: [] },
+        });
+        expect(JSON.parse((await bob.app.inject({ method: 'GET', url: '/api/subagent-window-states' })).body)).toEqual({
+          minimized: {},
+          open: [],
+        });
+        await bob.app.inject({
+          method: 'PUT',
+          url: '/api/subagent-window-states',
+          payload: { minimized: { bob: true }, open: [] },
+        });
+        expect(
+          JSON.parse((await alice.app.inject({ method: 'GET', url: '/api/subagent-window-states' })).body)
+        ).toEqual({
+          minimized: { alice: true },
+          open: [],
+        });
+        expect(
+          JSON.parse((await admin.app.inject({ method: 'GET', url: '/api/subagent-window-states' })).body)
+        ).toEqual({
+          minimized: { legacy: true },
+          open: [],
+        });
+      } finally {
+        await Promise.all([alice.app.close(), bob.app.close(), admin.app.close()]);
+        if (priorMode === undefined) delete process.env.CODEMAN_MULTIUSER;
+        else process.env.CODEMAN_MULTIUSER = priorMode;
+      }
+    });
+
     it('saves valid window states', async () => {
       const res = await harness.app.inject({
         method: 'PUT',
@@ -588,7 +837,7 @@ describe('system-routes', () => {
       });
       expect(res.statusCode).toBe(400);
       const body = JSON.parse(res.body);
-      expect(body.success).toBe(false);
+      expect(body.message ?? body.error).toBeTruthy();
     });
   });
 
@@ -616,6 +865,43 @@ describe('system-routes', () => {
   // ========== PUT /api/subagent-parents ==========
 
   describe('PUT /api/subagent-parents', () => {
+    it('isolates parent associations by owner and exposes legacy associations only to admin', async () => {
+      const priorMode = process.env.CODEMAN_MULTIUSER;
+      process.env.CODEMAN_MULTIUSER = '1';
+      let persisted = JSON.stringify({ 'legacy-secret-key': 'legacy-tab' });
+      mockedReadFile.mockImplementation(async () => persisted as never);
+      mockedWriteFile.mockImplementation(async (_path, value) => {
+        persisted = String(value);
+      });
+      const alice = await createRouteTestHarness(registerSystemRoutes, {
+        authUser: { username: 'alice', role: 'user' },
+      });
+      const bob = await createRouteTestHarness(registerSystemRoutes, {
+        authUser: { username: 'bob', role: 'user' },
+      });
+      const admin = await createRouteTestHarness(registerSystemRoutes, {
+        authUser: { username: 'root', role: 'admin' },
+      });
+      try {
+        await alice.app.inject({
+          method: 'PUT',
+          url: '/api/subagent-parents',
+          payload: { 'alice-key': 'alice-tab' },
+        });
+        expect(JSON.parse((await bob.app.inject({ method: 'GET', url: '/api/subagent-parents' })).body)).toEqual({});
+        expect(JSON.parse((await alice.app.inject({ method: 'GET', url: '/api/subagent-parents' })).body)).toEqual({
+          'alice-key': 'alice-tab',
+        });
+        expect(JSON.parse((await admin.app.inject({ method: 'GET', url: '/api/subagent-parents' })).body)).toEqual({
+          'legacy-secret-key': 'legacy-tab',
+        });
+      } finally {
+        await Promise.all([alice.app.close(), bob.app.close(), admin.app.close()]);
+        if (priorMode === undefined) delete process.env.CODEMAN_MULTIUSER;
+        else process.env.CODEMAN_MULTIUSER = priorMode;
+      }
+    });
+
     it('saves valid parent map', async () => {
       const res = await harness.app.inject({
         method: 'PUT',
@@ -645,7 +931,7 @@ describe('system-routes', () => {
       });
       expect(res.statusCode).toBe(400);
       const body = JSON.parse(res.body);
-      expect(body.success).toBe(false);
+      expect(body.message ?? body.error).toBeTruthy();
     });
   });
 
@@ -850,145 +1136,71 @@ describe('system-routes', () => {
     });
   });
 
-  // ========== GET /api/opencode/status ==========
+  // ========== GET /api/:agent/status ==========
 
-  describe('GET /api/opencode/status', () => {
-    it('returns unavailable when opencode is not installed', async () => {
-      mockedIsOpenCodeAvailable.mockReturnValue(false);
-      mockedResolveOpenCodeDir.mockReturnValue(null);
+  describe('CLI status routes', () => {
+    const agents = [
+      ['claude', mockedFindClaudeDir, 'Claude resolver diagnostic'],
+      ['opencode', mockedResolveOpenCodeDir, 'OpenCode resolver diagnostic'],
+      ['codex', mockedResolveCodexDir, 'Codex resolver diagnostic'],
+      ['gemini', mockedResolveGeminiDir, 'Gemini resolver diagnostic'],
+      ['antigravity', mockedResolveAntigravityDir, 'Antigravity resolver diagnostic'],
+      ['pi', mockedResolvePiDir, 'Pi resolver diagnostic'],
+    ] as const;
 
-      const res = await harness.app.inject({ method: 'GET', url: '/api/opencode/status' });
+    it.each(agents)('returns the %s resolver diagnostic when unavailable', async (agent, resolveDir, diagnostic) => {
+      resolveDir.mockReturnValue(null);
+
+      const res = await harness.app.inject({ method: 'GET', url: `/api/${agent}/status` });
+
       expect(res.statusCode).toBe(200);
-      const body = JSON.parse(res.body);
-      expect(body.available).toBe(false);
-      expect(body.path).toBeNull();
+      expect(JSON.parse(res.body)).toEqual({
+        available: false,
+        path: null,
+        ...(agent === 'pi' ? { version: null } : {}),
+        error: diagnostic,
+      });
+      expect(resolveDir).toHaveBeenCalledTimes(1);
+      if (agent === 'pi') expect(mockedGetPiCliVersion).not.toHaveBeenCalled();
     });
 
-    it('returns available with path when opencode is installed', async () => {
-      mockedIsOpenCodeAvailable.mockReturnValue(true);
-      mockedResolveOpenCodeDir.mockReturnValue('/usr/local/bin');
+    it.each(agents)('omits error from the %s status when available', async (agent, resolveDir) => {
+      resolveDir.mockReturnValue('/usr/local/bin');
+      if (agent === 'pi') mockedGetPiCliVersion.mockReturnValue('0.84.1');
 
-      const res = await harness.app.inject({ method: 'GET', url: '/api/opencode/status' });
+      const res = await harness.app.inject({ method: 'GET', url: `/api/${agent}/status` });
+
       expect(res.statusCode).toBe(200);
-      const body = JSON.parse(res.body);
-      expect(body.available).toBe(true);
-      expect(body.path).toBe('/usr/local/bin');
-    });
-  });
-
-  // ========== GET /api/gemini/status ==========
-
-  describe('GET /api/gemini/status', () => {
-    it('returns unavailable when gemini is not installed', async () => {
-      mockedIsGeminiAvailable.mockReturnValue(false);
-      mockedResolveGeminiDir.mockReturnValue(null);
-
-      const res = await harness.app.inject({ method: 'GET', url: '/api/gemini/status' });
-      expect(res.statusCode).toBe(200);
-      const body = JSON.parse(res.body);
-      expect(body.available).toBe(false);
-      expect(body.path).toBeNull();
+      expect(JSON.parse(res.body)).toEqual({
+        available: true,
+        path: '/usr/local/bin',
+        ...(agent === 'pi' ? { version: '0.84.1' } : {}),
+      });
+      expect(resolveDir).toHaveBeenCalledTimes(1);
     });
 
-    it('returns available with path when gemini is installed', async () => {
-      mockedIsGeminiAvailable.mockReturnValue(true);
-      mockedResolveGeminiDir.mockReturnValue('/usr/local/bin');
-
-      const res = await harness.app.inject({ method: 'GET', url: '/api/gemini/status' });
-      expect(res.statusCode).toBe(200);
-      const body = JSON.parse(res.body);
-      expect(body.available).toBe(true);
-      expect(body.path).toBe('/usr/local/bin');
-    });
-  });
-
-  // ========== GET /api/antigravity/status ==========
-
-  describe('GET /api/antigravity/status', () => {
-    it('returns unavailable when agy is not installed', async () => {
-      mockedIsAntigravityAvailable.mockReturnValue(false);
+    it('keeps the legacy agy alias coherent when Antigravity is unavailable', async () => {
       mockedResolveAntigravityDir.mockReturnValue(null);
 
-      const res = await harness.app.inject({ method: 'GET', url: '/api/antigravity/status' });
+      const res = await harness.app.inject({ method: 'GET', url: '/api/agy/status' });
+
       expect(res.statusCode).toBe(200);
-      const body = JSON.parse(res.body);
-      expect(body.available).toBe(false);
-      expect(body.path).toBeNull();
+      expect(JSON.parse(res.body)).toEqual({
+        available: false,
+        path: null,
+        error: 'Antigravity resolver diagnostic',
+      });
+      expect(mockedResolveAntigravityDir).toHaveBeenCalledTimes(1);
     });
 
-    it('returns available with path when agy is installed', async () => {
-      mockedIsAntigravityAvailable.mockReturnValue(true);
-      mockedResolveAntigravityDir.mockReturnValue('/home/user/.local/bin');
+    it('keeps the legacy agy alias coherent when Antigravity is available', async () => {
+      mockedResolveAntigravityDir.mockReturnValue('/usr/local/bin');
 
-      const res = await harness.app.inject({ method: 'GET', url: '/api/antigravity/status' });
+      const res = await harness.app.inject({ method: 'GET', url: '/api/agy/status' });
+
       expect(res.statusCode).toBe(200);
-      const body = JSON.parse(res.body);
-      expect(body.available).toBe(true);
-      expect(body.path).toBe('/home/user/.local/bin');
-    });
-  });
-
-  // ========== GET /api/pi/status ==========
-
-  describe('GET /api/pi/status', () => {
-    it('returns unavailable when pi is not installed', async () => {
-      mockedIsPiAvailable.mockReturnValue(false);
-      mockedResolvePiDir.mockReturnValue(null);
-      mockedGetPiCliVersion.mockReturnValue(null);
-
-      const res = await harness.app.inject({ method: 'GET', url: '/api/pi/status' });
-      expect(res.statusCode).toBe(200);
-      const body = JSON.parse(res.body);
-      expect(body.available).toBe(false);
-      expect(body.path).toBeNull();
-      expect(body.version).toBeNull();
-    });
-
-    it('returns available with path AND version when pi is installed', async () => {
-      // `version` is pi-specific: `pi` is a generic binary name, so the resolver
-      // version-probes it and this endpoint is where a misresolution shows up.
-      mockedIsPiAvailable.mockReturnValue(true);
-      mockedResolvePiDir.mockReturnValue('/home/user/.local/bin');
-      mockedGetPiCliVersion.mockReturnValue('0.84.1');
-
-      const res = await harness.app.inject({ method: 'GET', url: '/api/pi/status' });
-      expect(res.statusCode).toBe(200);
-      const body = JSON.parse(res.body);
-      expect(body.available).toBe(true);
-      expect(body.path).toBe('/home/user/.local/bin');
-      expect(body.version).toBe('0.84.1');
-    });
-  });
-
-  // ========== GET /api/grok/status ==========
-
-  describe('GET /api/grok/status', () => {
-    it('returns unavailable when grok is not installed', async () => {
-      mockedIsGrokAvailable.mockReturnValue(false);
-      mockedResolveGrokDir.mockReturnValue(null);
-      mockedGetGrokCliVersion.mockReturnValue(null);
-
-      const res = await harness.app.inject({ method: 'GET', url: '/api/grok/status' });
-      expect(res.statusCode).toBe(200);
-      const body = JSON.parse(res.body);
-      expect(body.available).toBe(false);
-      expect(body.path).toBeNull();
-      expect(body.version).toBeNull();
-    });
-
-    it('returns available with path AND version when grok is installed', async () => {
-      // `version` matters for the same reason as pi: `grok` has known squatters,
-      // so this endpoint is where a misresolution shows up.
-      mockedIsGrokAvailable.mockReturnValue(true);
-      mockedResolveGrokDir.mockReturnValue('/home/user/.grok/bin');
-      mockedGetGrokCliVersion.mockReturnValue('1.0.5');
-
-      const res = await harness.app.inject({ method: 'GET', url: '/api/grok/status' });
-      expect(res.statusCode).toBe(200);
-      const body = JSON.parse(res.body);
-      expect(body.available).toBe(true);
-      expect(body.path).toBe('/home/user/.grok/bin');
-      expect(body.version).toBe('1.0.5');
+      expect(JSON.parse(res.body)).toEqual({ available: true, path: '/usr/local/bin' });
+      expect(mockedResolveAntigravityDir).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -1088,6 +1300,26 @@ describe('system-routes', () => {
       expect(body.success).toBe(true);
       expect(body.data).toEqual(agentInfo);
     });
+
+    it('uses an opaque composite key for metadata lookup', async () => {
+      mockedSubagentWatcher.resolveSubagentReference.mockReturnValue({
+        status: 'found',
+        info: { agentKey: 'v1.opaque', agentId: 'same', sessionId: 'conversation-a' },
+      } as never);
+
+      const res = await harness.app.inject({ method: 'GET', url: '/api/subagents/v1.opaque' });
+
+      expect(res.statusCode).toBe(200);
+      expect(mockedSubagentWatcher.resolveSubagentReference).toHaveBeenCalledWith('v1.opaque');
+    });
+
+    it('rejects an ambiguous legacy bare ID', async () => {
+      mockedSubagentWatcher.resolveSubagentReference.mockReturnValue({ status: 'ambiguous' } as never);
+
+      const res = await harness.app.inject({ method: 'GET', url: '/api/subagents/shared' });
+
+      expect(JSON.parse(res.body)).toMatchObject({ success: false, errorCode: 'CONFLICT' });
+    });
   });
 
   // ========== GET /api/subagents/:agentId/transcript ==========
@@ -1132,6 +1364,26 @@ describe('system-routes', () => {
       });
       expect(mockedSubagentWatcher.getTranscript).toHaveBeenCalledWith('agent-1', 10);
     });
+
+    it('resolves opaque and unambiguous legacy references before transcript reads', async () => {
+      mockedSubagentWatcher.resolveSubagentReference.mockReturnValue({
+        status: 'found',
+        info: { agentKey: 'v1.exact', agentId: 'same' },
+      } as never);
+
+      await harness.app.inject({ method: 'GET', url: '/api/subagents/v1.exact/transcript' });
+
+      expect(mockedSubagentWatcher.getTranscript).toHaveBeenCalledWith('v1.exact', undefined);
+    });
+
+    it('rejects an ambiguous legacy transcript reference', async () => {
+      mockedSubagentWatcher.resolveSubagentReference.mockReturnValue({ status: 'ambiguous' } as never);
+
+      const res = await harness.app.inject({ method: 'GET', url: '/api/subagents/shared/transcript' });
+
+      expect(JSON.parse(res.body)).toMatchObject({ success: false, errorCode: 'CONFLICT' });
+      expect(mockedSubagentWatcher.getTranscript).not.toHaveBeenCalled();
+    });
   });
 
   // ========== DELETE /api/subagents/:agentId ==========
@@ -1149,7 +1401,7 @@ describe('system-routes', () => {
 
     it('kills a known agent successfully', async () => {
       mockedSubagentWatcher.getSubagent.mockReturnValue({ agentId: 'agent-1' } as never);
-      mockedSubagentWatcher.killSubagent.mockResolvedValue(true);
+      mockedSubagentWatcher.killSubagent.mockResolvedValue({ status: 'killed', agentKey: 'agent-1' });
 
       const res = await harness.app.inject({ method: 'DELETE', url: '/api/subagents/agent-1' });
       expect(res.statusCode).toBe(200);
@@ -1158,15 +1410,66 @@ describe('system-routes', () => {
       expect(body.data.status).toBe('killed');
     });
 
+    it('kills only the opaque composite record selected by the route', async () => {
+      mockedSubagentWatcher.resolveSubagentReference.mockReturnValue({
+        status: 'found',
+        info: { agentKey: 'v1.exact', agentId: 'same', sessionId: 'conversation-a' },
+      } as never);
+      mockedSubagentWatcher.killSubagent.mockResolvedValue({ status: 'killed', agentKey: 'v1.exact' });
+
+      const res = await harness.app.inject({ method: 'DELETE', url: '/api/subagents/v1.exact' });
+
+      expect(mockedSubagentWatcher.killSubagent).toHaveBeenCalledWith('v1.exact');
+      expect(JSON.parse(res.body).data).toEqual({
+        agentKey: 'v1.exact',
+        agentId: 'same',
+        status: 'killed',
+      });
+    });
+
+    it('preserves an unambiguous legacy bare-ID kill fallback', async () => {
+      mockedSubagentWatcher.resolveSubagentReference.mockReturnValue({
+        status: 'found',
+        info: { agentKey: 'v1.only', agentId: 'legacy' },
+      } as never);
+      mockedSubagentWatcher.killSubagent.mockResolvedValue({ status: 'killed', agentKey: 'v1.only' });
+
+      await harness.app.inject({ method: 'DELETE', url: '/api/subagents/legacy' });
+
+      expect(mockedSubagentWatcher.killSubagent).toHaveBeenCalledWith('v1.only');
+    });
+
+    it('rejects an ambiguous legacy bare-ID kill', async () => {
+      mockedSubagentWatcher.resolveSubagentReference.mockReturnValue({ status: 'ambiguous' } as never);
+
+      const res = await harness.app.inject({ method: 'DELETE', url: '/api/subagents/shared' });
+
+      expect(JSON.parse(res.body)).toMatchObject({ success: false, errorCode: 'CONFLICT' });
+      expect(mockedSubagentWatcher.killSubagent).not.toHaveBeenCalled();
+    });
+
     it('returns error when kill fails', async () => {
       mockedSubagentWatcher.getSubagent.mockReturnValue({ agentId: 'agent-1' } as never);
-      mockedSubagentWatcher.killSubagent.mockResolvedValue(false);
+      mockedSubagentWatcher.killSubagent.mockResolvedValue({ status: 'already_completed' });
 
       const res = await harness.app.inject({ method: 'DELETE', url: '/api/subagents/agent-1' });
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
       expect(body.error).toContain('already completed');
+    });
+
+    it('returns a typed safe failure when exact termination is unsupported', async () => {
+      mockedSubagentWatcher.getSubagent.mockReturnValue({ agentKey: 'v1.agent', agentId: 'agent-1' } as never);
+      mockedSubagentWatcher.killSubagent.mockResolvedValue({ status: 'atomic_termination_unavailable' });
+
+      const res = await harness.app.inject({ method: 'DELETE', url: '/api/subagents/agent-1' });
+
+      expect(JSON.parse(res.body)).toMatchObject({
+        success: false,
+        reason: 'atomic_termination_unavailable',
+        error: expect.stringContaining('unavailable'),
+      });
     });
   });
 
@@ -1198,6 +1501,16 @@ describe('system-routes', () => {
       expect(body.success).toBe(true);
       expect(body.data.cleared).toBe(5);
     });
+
+    it('returns the canonical remaining live-agent snapshot after clearing history', async () => {
+      const live = [{ agentKey: 'v1.live', agentId: 'live', status: 'idle' }];
+      mockedSubagentWatcher.clearAll.mockReturnValue(2);
+      mockedSubagentWatcher.getSubagents.mockReturnValue(live as never);
+
+      const res = await harness.app.inject({ method: 'DELETE', url: '/api/subagents' });
+
+      expect(JSON.parse(res.body).data).toEqual({ cleared: 2, remaining: live });
+    });
   });
 
   // ========== GET /api/sessions/:id/subagents ==========
@@ -1212,7 +1525,10 @@ describe('system-routes', () => {
     });
 
     it('returns subagents for valid session', async () => {
-      mockedSubagentWatcher.getSubagentsForSession.mockReturnValue([{ agentId: 'sub-1', status: 'active' }] as never);
+      Object.defineProperty(harness.ctx._session, 'claudeSessionId', { value: 'conversation-a', configurable: true });
+      mockedSubagentWatcher.getSubagentsForConversation.mockReturnValue([
+        { agentKey: 'v1.exact', agentId: 'sub-1', sessionId: 'conversation-a', status: 'active' },
+      ] as never);
 
       const res = await harness.app.inject({
         method: 'GET',
@@ -1222,6 +1538,10 @@ describe('system-routes', () => {
       const body = JSON.parse(res.body);
       expect(body.success).toBe(true);
       expect(body.data).toHaveLength(1);
+      expect(mockedSubagentWatcher.getSubagentsForConversation).toHaveBeenCalledWith(
+        harness.ctx._session.workingDir,
+        'conversation-a'
+      );
     });
   });
 

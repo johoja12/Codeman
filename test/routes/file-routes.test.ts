@@ -788,7 +788,7 @@ describe('file-routes', () => {
       expect(body.data.url).toContain('file-raw');
     });
 
-    it('flags known-binary extensions (e.g. xls) instead of dumping mojibake', async () => {
+    it('flags legacy XLS files as binary instead of dumping mojibake', async () => {
       mockedStat.mockResolvedValue({ size: 4096 } as never);
 
       const res = await harness.app.inject({
@@ -976,9 +976,10 @@ describe('file-routes', () => {
       expect(res.statusCode).toBe(404);
     });
 
-    it('serves a file past the historical 50MB cap', async () => {
+    it('serves a file past the historical 50MB cap, streamed and seekable', async () => {
       // The body is streamed and Range-aware, so size costs a read stream, not
-      // RSS. The old 50MB refusal only blocked legitimate artifact downloads.
+      // RSS. The old 50MB refusal only blocked legitimate artifact downloads,
+      // and `Accept-Ranges` is what makes a large video seekable in the preview.
       mockedStat.mockResolvedValue({ size: 100 * 1024 * 1024, isFile: () => true } as never); // 100MB
 
       const res = await harness.app.inject({
@@ -986,6 +987,7 @@ describe('file-routes', () => {
         url: `/api/sessions/${harness.ctx._sessionId}/file-raw?path=huge.bin`,
       });
       expect(res.statusCode).toBe(200);
+      expect(res.headers['accept-ranges']).toBe('bytes');
     });
 
     it('still refuses a file past the configured download cap', async () => {
@@ -1005,7 +1007,7 @@ describe('file-routes', () => {
 
       const preview = await harness.app.inject({ method: 'GET', url: `${url}&preview=true` });
       expect(preview.statusCode).toBe(413);
-      expect(JSON.parse(preview.body).error).toMatch(/too large to preview/i);
+      expect(JSON.parse(preview.body).error).toMatch(/file too large/i);
 
       const download = await harness.app.inject({ method: 'GET', url: `${url}&preview=true&download=true` });
       expect(download.statusCode).toBe(200);
@@ -1066,9 +1068,13 @@ describe('file-routes', () => {
     });
 
     it('downloads files scoped to the session working directory', async () => {
-      // The body is streamed (shared sendFileBody path), so the bytes come from
-      // the createReadStream mock rather than from readFile.
+      // The body is STREAMED (shared range-aware `sendFileBody`), so the bytes
+      // come from the createReadStream mock; the download path never calls
+      // readFile. Set both mocks explicitly rather than leaning on the module
+      // default, since vi.clearAllMocks() keeps implementations between tests.
       const content = Buffer.from('fake file bytes');
+      mockedReadFile.mockResolvedValue(content as never);
+      mockedCreateReadStream.mockReturnValue(Readable.from([content]) as never);
       mockedStat.mockResolvedValue({ size: content.length, isFile: () => true } as never);
 
       const res = await harness.app.inject({
@@ -1080,6 +1086,10 @@ describe('file-routes', () => {
       expect(res.headers['content-disposition']).toContain('filename="report.txt"');
       expect(res.headers['accept-ranges']).toBe('bytes');
       expect(res.body).toBe('fake file bytes');
+      // Also pin that the route resolved the requested path inside the workspace
+      // and streamed THAT file rather than any other.
+      expect(mockedCreateReadStream).toHaveBeenCalled();
+      expect(String(mockedCreateReadStream.mock.calls.at(-1)?.[0])).toContain('report.txt');
     });
 
     it('refuses a download past the configured cap', async () => {

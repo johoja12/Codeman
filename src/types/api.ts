@@ -9,6 +9,7 @@
  * - ApiResponse<T> — discriminated union envelope (success with data or error with code)
  * - ApiErrorCode — enum of standard error codes with user-friendly messages
  * - HookEventType — union of Claude Code hook event names (idle_prompt, stop, etc.)
+ * - createSuccessResponse() — factory for consistent success responses
  * - createErrorResponse() — factory for consistent error responses
  * - getErrorMessage() — safe extraction from unknown catch values
  * - CaseInfo, QuickStartResponse — case folder metadata types
@@ -110,6 +111,8 @@ export type HookEventType =
   | 'stop'
   | 'teammate_idle'
   | 'task_completed'
+  | 'session_start'
+  | 'checkpoint'
   // Claude Code's UserPromptSubmit. The payload's `session_id` is the pane's
   // LIVE conversation id, reported by the CLI process itself, so it survives a
   // `/clear` without any cwd/timestamp correlation.
@@ -130,6 +133,15 @@ export type ApiResponse<T = unknown> =
   | { success: false; error: string; errorCode: ApiErrorCode };
 
 /**
+ * Creates a standardized success response
+ * @param data Optional success payload
+ * @returns Formatted success response
+ */
+export function createSuccessResponse<T>(data?: T): ApiResponse<T> {
+  return data === undefined ? { success: true } : { success: true, data };
+}
+
+/**
  * Creates a standardized error response
  * @param code Error code
  * @param details Optional detailed error message
@@ -146,6 +158,11 @@ export function createErrorResponse(code: ApiErrorCode, details?: string): ApiRe
 /**
  * Information about a case folder
  */
+export type CaseCodexCommandSelectionMetadata =
+  | { kind: 'default' }
+  | { kind: 'custom'; commandPreview: string }
+  | { kind: 'profile'; profileId: string; name?: string; commandPreview?: string };
+
 export interface CaseInfo {
   /** Case name */
   name: string;
@@ -157,6 +174,8 @@ export interface CaseInfo {
   location?: 'local' | 'linked-local' | 'remote' | 'docker';
   /** Whether this is a linked local folder */
   linked?: boolean;
+  /** Persisted/default/custom Codex command choice for local/linked-local/remote cases. */
+  codexCommandSelection?: CaseCodexCommandSelectionMetadata;
   /**
    * The case folder did not answer (an unreachable network mount, or an error other
    * than "no such file"), or its probe was refused because folders on other unreachable
@@ -184,6 +203,9 @@ export interface CaseInfo {
     host: string;
     username: string;
     path: string;
+    commands?: Record<string, string>;
+    /** The persisted/default/custom Codex command choice, safe for this viewer. */
+    codexCommandSelection?: CaseCodexCommandSelectionMetadata;
   };
   /** Docker case metadata for display and session creation */
   docker?: {
@@ -245,7 +267,7 @@ export interface AgentCaseSummary {
  * @param value The value to check
  * @returns True if the value is an Error instance
  */
-function isError(value: unknown): value is Error {
+export function isError(value: unknown): value is Error {
   return value instanceof Error;
 }
 

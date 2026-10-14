@@ -13,6 +13,16 @@
  * @loadorder 11 of 15 — loaded after settings-ui.js, before session-ui.js
  */
 
+// Reverse-proxy mount prefix for the root-absolute app routes this module puts in
+// href/src attributes, window.open() and EventSource (fetch is prefixed globally by
+// constants.js, these are not). Guarded rather than calling CodemanBase.url directly:
+// several unit harnesses eval this module WITHOUT constants.js, where no base exists
+// and the correct answer is the unprefixed path.
+const withBasePath = (path) =>
+  typeof window !== 'undefined' && window.CodemanBase && typeof window.CodemanBase.url === 'function'
+    ? window.CodemanBase.url(path)
+    : path;
+
 const AWAY_DIGEST_LAST_VIEWED_KEY = 'codeman-away-digest-last-viewed';
 const FILE_BROWSER_SHOW_HIDDEN_KEY = 'codeman:fileBrowserShowHidden';
 // Bounds for the by-id text preview, mirroring what the workspace text preview
@@ -44,11 +54,21 @@ const AWAY_DIGEST_SECTIONS = [
 ];
 
 Object.assign(CodemanApp.prototype, {
-  _addActivityEntry(agentId, entry, maxSize = 50) {
-    const activity = this.subagentActivity.get(agentId) || [];
+  _requireSubagentEventKey(data, eventKind) {
+    if (typeof data?.agentKey === 'string' && data.agentKey.length > 0) return data.agentKey;
+    if (!this._subagentIdentityDiagnostics) this._subagentIdentityDiagnostics = new Set();
+    if (this._subagentIdentityDiagnostics.size < 16 && !this._subagentIdentityDiagnostics.has(eventKind)) {
+      this._subagentIdentityDiagnostics.add(eventKind);
+      console.warn(`[subagents] ignored ${eventKind} event without a valid agentKey`);
+    }
+    return null;
+  },
+
+  _addActivityEntry(agentKey, entry, maxSize = 50) {
+    const activity = this.subagentActivity.get(agentKey) || [];
     activity.push(entry);
     if (activity.length > maxSize) activity.shift();
-    this.subagentActivity.set(agentId, activity);
+    this.subagentActivity.set(agentKey, activity);
   },
 
   // Tasks
@@ -159,19 +179,29 @@ Object.assign(CodemanApp.prototype, {
 
 
   // Subagents (Claude Code background agents)
+  _touchSubagentEvent(agentKey) {
+    this._subagentEventClock = (this._subagentEventClock || 0) + 1;
+    if (!this._subagentEventVersions) this._subagentEventVersions = new Map();
+    this._subagentEventVersions.set(agentKey, this._subagentEventClock);
+  },
+
   _onSubagentDiscovered(data) {
-    // Clear all old data for this agentId (in case of ID reuse)
-    this.subagents.set(data.agentId, data);
-    this.subagentActivity.set(data.agentId, []);
-    this.subagentToolResults.delete(data.agentId);
-    // Close any existing window for this agentId (will be reopened fresh)
-    if (this.subagentWindows.has(data.agentId)) {
-      this.forceCloseSubagentWindow(data.agentId);
+    const agentKey = this._requireSubagentEventKey(data, 'discovered');
+    if (!agentKey) return;
+    this._touchSubagentEvent(agentKey);
+    // Clear all old data for this exact identity (in case of replay/reuse).
+    this.subagents.set(agentKey, data);
+    this.subagentActivity.set(agentKey, []);
+    this.subagentToolResults.delete(agentKey);
+    for (const timer of this._subagentCompletionTimers?.get(agentKey) || []) clearTimeout(timer);
+    this._subagentCompletionTimers?.delete(agentKey);
+    if (this.subagentWindows.has(agentKey)) {
+      this.forceCloseSubagentWindow(agentKey);
     }
     this.renderSubagentPanel();
 
     // Find which Codeman session owns this subagent (direct claudeSessionId match only)
-    this.findParentSessionForSubagent(data.agentId);
+    this.findParentSessionForSubagent(agentKey);
 
     // Subagent windows are no longer auto-opened on discovery.
     // Users can open them manually from the monitor panel or via openAllActiveSubagentWindows().
@@ -182,67 +212,78 @@ Object.assign(CodemanApp.prototype, {
     });
 
     // Notify about new subagent discovery
-    const parentId = this.subagentParentMap.get(data.agentId);
+    const parentId = this.subagentParentMap.get(agentKey);
     this._notifySession(parentId || data.sessionId, 'info', 'subagent-spawn', 'Subagent Spawned', data.description || 'New background agent started');
   },
 
   _onSubagentUpdated(data) {
-    const existing = this.subagents.get(data.agentId);
+    const agentKey = this._requireSubagentEventKey(data, 'updated');
+    if (!agentKey) return;
+    this._touchSubagentEvent(agentKey);
+    const existing = this.subagents.get(agentKey);
     if (existing) {
       // Merge updated fields (especially description)
       Object.assign(existing, data);
-      this.subagents.set(data.agentId, existing);
+      this.subagents.set(agentKey, existing);
     } else {
-      this.subagents.set(data.agentId, data);
+      this.subagents.set(agentKey, data);
     }
     this.renderSubagentPanel();
     // Update floating window if open (content + header/title)
-    if (this.subagentWindows.has(data.agentId)) {
-      this.renderSubagentWindowContent(data.agentId);
-      this.updateSubagentWindowHeader(data.agentId);
+    if (this.subagentWindows.has(agentKey)) {
+      this.renderSubagentWindowContent(agentKey);
+      this.updateSubagentWindowHeader(agentKey);
     }
   },
 
   _onSubagentToolCall(data) {
-    this._addActivityEntry(data.agentId, { type: 'tool', ...data });
-    if (this.activeSubagentId === data.agentId) {
+    const agentKey = this._requireSubagentEventKey(data, 'tool_call');
+    if (!agentKey) return;
+    this._addActivityEntry(agentKey, { type: 'tool', ...data });
+    if (this.activeSubagentKey === agentKey) {
       this.renderSubagentDetail();
     }
     this.renderSubagentPanel();
     // Update floating window (debounced — tool_call events fire rapidly)
-    if (this.subagentWindows.has(data.agentId)) {
-      this.scheduleSubagentWindowRender(data.agentId);
+    if (this.subagentWindows.has(agentKey)) {
+      this.scheduleSubagentWindowRender(agentKey);
     }
   },
 
   _onSubagentProgress(data) {
-    this._addActivityEntry(data.agentId, { type: 'progress', ...data });
-    if (this.activeSubagentId === data.agentId) {
+    const agentKey = this._requireSubagentEventKey(data, 'progress');
+    if (!agentKey) return;
+    this._addActivityEntry(agentKey, { type: 'progress', ...data });
+    if (this.activeSubagentKey === agentKey) {
       this.renderSubagentDetail();
     }
     // Update floating window (debounced)
-    if (this.subagentWindows.has(data.agentId)) {
-      this.scheduleSubagentWindowRender(data.agentId);
+    if (this.subagentWindows.has(agentKey)) {
+      this.scheduleSubagentWindowRender(agentKey);
     }
   },
 
   _onSubagentMessage(data) {
-    this._addActivityEntry(data.agentId, { type: 'message', ...data });
-    if (this.activeSubagentId === data.agentId) {
+    const agentKey = this._requireSubagentEventKey(data, 'message');
+    if (!agentKey) return;
+    this._addActivityEntry(agentKey, { type: 'message', ...data });
+    if (this.activeSubagentKey === agentKey) {
       this.renderSubagentDetail();
     }
     // Update floating window (debounced)
-    if (this.subagentWindows.has(data.agentId)) {
-      this.scheduleSubagentWindowRender(data.agentId);
+    if (this.subagentWindows.has(agentKey)) {
+      this.scheduleSubagentWindowRender(agentKey);
     }
   },
 
   _onSubagentToolResult(data) {
+    const agentKey = this._requireSubagentEventKey(data, 'tool_result');
+    if (!agentKey) return;
     // Store tool result by toolUseId for later lookup (cap at 50 per agent)
-    if (!this.subagentToolResults.has(data.agentId)) {
-      this.subagentToolResults.set(data.agentId, new Map());
+    if (!this.subagentToolResults.has(agentKey)) {
+      this.subagentToolResults.set(agentKey, new Map());
     }
-    const resultsMap = this.subagentToolResults.get(data.agentId);
+    const resultsMap = this.subagentToolResults.get(agentKey);
     resultsMap.set(data.toolUseId, data);
     if (resultsMap.size > 50) {
       const oldest = resultsMap.keys().next().value;
@@ -250,65 +291,445 @@ Object.assign(CodemanApp.prototype, {
     }
 
     // Add to activity stream
-    this._addActivityEntry(data.agentId, { type: 'tool_result', ...data });
+    this._addActivityEntry(agentKey, { type: 'tool_result', ...data });
 
-    if (this.activeSubagentId === data.agentId) {
+    if (this.activeSubagentKey === agentKey) {
       this.renderSubagentDetail();
     }
     // Update floating window (debounced)
-    if (this.subagentWindows.has(data.agentId)) {
-      this.scheduleSubagentWindowRender(data.agentId);
+    if (this.subagentWindows.has(agentKey)) {
+      this.scheduleSubagentWindowRender(agentKey);
     }
   },
 
   async _onSubagentCompleted(data) {
-    const existing = this.subagents.get(data.agentId);
+    const agentKey = this._requireSubagentEventKey(data, 'completed');
+    if (!agentKey) return;
+    this._touchSubagentEvent(agentKey);
+    const existing = this.subagents.get(agentKey);
     if (existing) {
       existing.status = 'completed';
-      this.subagents.set(data.agentId, existing);
+      this.subagents.set(agentKey, existing);
     }
     this.renderSubagentPanel();
     this.updateSubagentWindows();
 
     // Auto-minimize completed subagent windows
-    if (this.subagentWindows.has(data.agentId)) {
-      const windowData = this.subagentWindows.get(data.agentId);
+    if (this.subagentWindows.has(agentKey)) {
+      const windowData = this.subagentWindows.get(agentKey);
       if (windowData && !windowData.minimized) {
-        await this.closeSubagentWindow(data.agentId); // This minimizes to tab
+        await this.closeSubagentWindow(agentKey); // This minimizes to tab
         this.saveSubagentWindowStates(); // Persist the minimized state
       }
     }
 
     // Notify about subagent completion
-    const parentId = this.subagentParentMap.get(data.agentId);
+    const parentId = this.subagentParentMap.get(agentKey);
     this._notifySession(parentId || existing?.sessionId || data.sessionId, 'info', 'subagent-complete', 'Subagent Completed', existing?.description || data.description || 'Background agent finished');
 
     // Clean up activity/tool data for completed agents after 5 minutes
     // This prevents memory leaks from long-running sessions with many subagents
-    setTimeout(() => {
-      const agent = this.subagents.get(data.agentId);
+    for (const timer of this._subagentCompletionTimers?.get(agentKey) || []) clearTimeout(timer);
+    const activityCleanupTimer = setTimeout(() => {
+      const agent = this.subagents.get(agentKey);
       // Only clean up if agent is still completed (not restarted)
       if (agent?.status === 'completed') {
-        this.subagentActivity.delete(data.agentId);
-        this.subagentToolResults.delete(data.agentId);
+        this.subagentActivity.delete(agentKey);
+        this.subagentToolResults.delete(agentKey);
       }
     }, 5 * 60 * 1000); // 5 minutes
 
     // Prune stale completed agents from main maps after 30 minutes
     // Keeps subagents/subagentParentMap from growing unbounded in 24h sessions
-    setTimeout(() => {
-      const agent = this.subagents.get(data.agentId);
-      if (agent?.status === 'completed' && !this.subagentWindows.has(data.agentId)) {
-        this.subagents.delete(data.agentId);
-        this.subagentParentMap.delete(data.agentId);
+    const historyCleanupTimer = setTimeout(() => {
+      const agent = this.subagents.get(agentKey);
+      if (agent?.status === 'completed' && !this.subagentWindows.has(agentKey)) {
+        this.subagents.delete(agentKey);
+        this.subagentParentMap.delete(agentKey);
       }
+      this._subagentCompletionTimers?.delete(agentKey);
     }, 30 * 60 * 1000); // 30 minutes
+    if (!this._subagentCompletionTimers) this._subagentCompletionTimers = new Map();
+    this._subagentCompletionTimers.set(agentKey, [activityCleanupTimer, historyCleanupTimer]);
   },
 
   // Images
   _onImageDetected(data) {
     console.log('[Image Detected]', data);
     this.openImagePopup(data);
+  },
+
+  _onAttachmentDetected(data) {
+    console.log('[Attachment Detected]', data);
+    this.addAttachmentCard(data);
+    if (data.sessionId) {
+      const current = this.attachmentHistoryCounts.get(data.sessionId)
+        ?? this.sessions.get(data.sessionId)?.attachmentHistory?.length
+        ?? 0;
+      this.attachmentHistoryCounts.set(data.sessionId, Math.min(current + 1, 100));
+      if (data.sessionId === this.activeSessionId) {
+        this.updateAttachmentHistoryBadge();
+        if (this.attachmentHistoryDrawerOpen) {
+          this._debouncedCall('attachmentHistoryRefresh', () => this.loadAttachmentHistory(data.sessionId), 250);
+        }
+      }
+    }
+  },
+
+  // ═══════════════════════════════════════════════════════════════
+  // Sources Modal (COD-65)
+  // ═══════════════════════════════════════════════════════════════
+
+  openSources() {
+    const modal = document.getElementById('sourcesModal');
+    if (modal) modal.classList.add('active');
+    this._wireSourcesFilePicker();
+    this.updateSourceFormFields();
+    this.loadSources();
+  },
+
+  closeSources() {
+    const modal = document.getElementById('sourcesModal');
+    if (modal) modal.classList.remove('active');
+  },
+
+  _wireSourcesFilePicker() {
+    if (this._sourcesPickerWired) return;
+    const picker = document.getElementById('sourcesFilePicker');
+    const titleEl = document.getElementById('sourcesTitle');
+    if (!picker) return;
+    this._sourcesPickerWired = true;
+    picker.addEventListener('change', () => {
+      this._onSourcesFilePicked();
+      this.updateSourceFormFields();
+    });
+    if (titleEl) {
+      if (!titleEl.dataset) titleEl.dataset = {};
+      titleEl.addEventListener('input', () => {
+        const ds = titleEl.dataset;
+        if (!ds) return;
+        if (ds.autoFilled === '1') {
+          const cur = titleEl.value;
+          const expected = ds.autoFilledValue || '';
+          if (cur !== expected) {
+            delete ds.autoFilled;
+            delete ds.autoFilledValue;
+          }
+          if (cur.trim() === '') {
+            delete ds.autoFilled;
+            delete ds.autoFilledValue;
+          }
+        }
+      });
+    }
+  },
+
+  _onSourcesFilePicked() {
+    const picker = document.getElementById('sourcesFilePicker');
+    const titleEl = document.getElementById('sourcesTitle');
+    if (!picker || !titleEl) return;
+    if (!titleEl.dataset) titleEl.dataset = {};
+    const file = picker.files && picker.files[0];
+    if (!file || !file.name) {
+      if (titleEl.dataset.autoFilled === '1') {
+        titleEl.value = '';
+        delete titleEl.dataset.autoFilled;
+        delete titleEl.dataset.autoFilledValue;
+      }
+      return;
+    }
+    const segments = file.name.split(/[/\\]/);
+    let base = '';
+    for (let i = segments.length - 1; i >= 0; i--) {
+      const seg = segments[i].trim();
+      if (seg && seg !== '.' && seg !== '..') {
+        base = seg;
+        break;
+      }
+    }
+    // Strip control chars and lingering separators, mirror sanitizeUploadFilename client-side
+    base = base.replace(/[\x00-\x1f\x7f/\\]/g, '').trim();
+    if (!base) base = 'file';
+    if (base.length > 500) base = base.slice(0, 500);
+    const cur = titleEl.value.trim();
+    const isAuto = titleEl.dataset.autoFilled === '1';
+    if (cur === '' || isAuto) {
+      titleEl.value = base;
+      titleEl.dataset.autoFilled = '1';
+      titleEl.dataset.autoFilledValue = base;
+    }
+  },
+
+  updateSourceFormFields() {
+    const type = document.getElementById('sourcesTypeSelect')?.value || 'url';
+    const urlRow = document.getElementById('sourcesUrlRow');
+    const uploadRow = document.getElementById('sourcesUploadRow');
+    const contentRow = document.getElementById('sourcesContentRow');
+    if (urlRow) urlRow.classList.toggle('sources-field-row--hidden', type !== 'url');
+    if (uploadRow) uploadRow.classList.toggle('sources-field-row--hidden', type !== 'file');
+    if (contentRow) contentRow.classList.toggle('sources-field-row--hidden', type !== 'highlight');
+    const titleEl = document.getElementById('sourcesTitle');
+    const picker = document.getElementById('sourcesFilePicker');
+    if (titleEl) {
+      const hasFile = type === 'file' && !!(picker && picker.files && picker.files.length > 0);
+      titleEl.required = !hasFile;
+    }
+  },
+
+  async loadSources() {
+    const container = document.getElementById('sourcesList');
+    if (!container) return;
+    const sessionId = this.activeSessionId;
+    if (!sessionId) {
+      container.innerHTML = '<p class="empty-message sources-empty">No active session.</p>';
+      return;
+    }
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/sources`);
+      const json = await res.json();
+      if (json.success) {
+        this.renderSources(json.data.sources);
+      } else {
+        container.innerHTML = '<p class="empty-message sources-empty">Failed to load sources.</p>';
+      }
+    } catch {
+      container.innerHTML = '<p class="empty-message sources-empty">Error loading sources.</p>';
+    }
+  },
+
+  renderSources(sources) {
+    const container = document.getElementById('sourcesList');
+    if (!container) return;
+    if (!sources.length) {
+      container.innerHTML =
+        '<p class="empty-message sources-empty">No sources yet. Add a URL, file path, or highlight above.</p>';
+      return;
+    }
+    container.innerHTML = sources.map((s) => this.renderSourceCard(s)).join('');
+  },
+
+  renderSourceCard(src) {
+    const icons = { url: '\u{1F517}', file: '\u{1F4C4}', highlight: '\u{1F4AC}' };
+    const icon = icons[src.type] || '\u{1F4CB}';
+    const title = escapeHtml(src.title);
+    let detail = '';
+    if (src.url) detail = escapeHtml(src.url);
+    else if (src.relativePath) detail = escapeHtml(src.relativePath);
+    else if (src.content) detail = escapeHtml(src.content.slice(0, 100));
+    return `<div class="sources-card" data-source-id="${escapeHtml(src.id)}">
+      <span class="sources-card-icon" aria-hidden="true">${icon}</span>
+      <div class="sources-card-body">
+        <span class="sources-card-title">${title}</span>
+        ${detail ? `<span class="sources-card-detail">${detail}</span>` : ''}
+      </div>
+      <button class="sources-card-delete" onclick="app.deleteSource('${escapeHtml(src.id)}')" aria-label="Remove source" title="Remove">&times;</button>
+    </div>`;
+  },
+
+  async handleSourceUpload() {
+    const sessionId = this.activeSessionId;
+    if (!sessionId) return;
+    const fileInput = document.getElementById('sourcesFilePicker');
+    const file = fileInput?.files?.[0];
+    if (!file) return;
+
+    const form = new FormData();
+    form.append('file', file);
+    const title = document.getElementById('sourcesTitle')?.value?.trim();
+    if (title) form.append('title', title);
+
+    const btn = document.getElementById('sourcesUploadBtn');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = 'Uploading...';
+    }
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/sources/upload`, {
+        method: 'POST',
+        body: form,
+      });
+      const json = await res.json();
+      if (json.success) {
+        if (fileInput) fileInput.value = '';
+        const tEl = document.getElementById('sourcesTitle');
+        if (tEl) {
+          tEl.value = '';
+          if (tEl.dataset) {
+            delete tEl.dataset.autoFilled;
+            delete tEl.dataset.autoFilledValue;
+          }
+        }
+        if (typeof this.updateSourceFormFields === 'function') this.updateSourceFormFields();
+        if (typeof this.loadSources === 'function') this.loadSources();
+      }
+    } catch {
+      // silent — network error
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = 'Upload';
+      }
+    }
+  },
+
+  async handleAddSource(event) {
+    event.preventDefault();
+    const sessionId = this.activeSessionId;
+    if (!sessionId) return;
+    const type = document.getElementById('sourcesTypeSelect')?.value || 'url';
+    if (type === 'file') return;
+    const title = document.getElementById('sourcesTitle')?.value?.trim() || '';
+    if (!title) return;
+    const body = { type, title };
+    if (type === 'url') body.url = document.getElementById('sourcesUrl')?.value?.trim() || undefined;
+    else if (type === 'highlight')
+      body.content = document.getElementById('sourcesContent')?.value?.trim() || undefined;
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/sources`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const json = await res.json();
+      if (json.success) {
+        const tEl2 = document.getElementById('sourcesTitle');
+        if (tEl2) {
+          tEl2.value = '';
+          if (tEl2.dataset) {
+            delete tEl2.dataset.autoFilled;
+            delete tEl2.dataset.autoFilledValue;
+          }
+        }
+        const urlEl = document.getElementById('sourcesUrl');
+        if (urlEl) urlEl.value = '';
+        const content = document.getElementById('sourcesContent');
+        if (content) content.value = '';
+        const picker2 = document.getElementById('sourcesFilePicker');
+        if (picker2) picker2.value = '';
+        if (typeof this.updateSourceFormFields === 'function') this.updateSourceFormFields();
+        if (typeof this.loadSources === 'function') this.loadSources();
+      }
+    } catch {
+      // silent — network error
+    }
+  },
+
+  async deleteSource(sourceId) {
+    const sessionId = this.activeSessionId;
+    if (!sessionId) return;
+    try {
+      await fetch(
+        `/api/sessions/${encodeURIComponent(sessionId)}/sources/${encodeURIComponent(sourceId)}`,
+        { method: 'DELETE' }
+      );
+      this.loadSources();
+    } catch {
+      // silent
+    }
+  },
+
+  // ═══════════════════════════════════════════════════════════════
+  // Library Modal (COD-63)
+  // ═══════════════════════════════════════════════════════════════
+
+  openLibrary() {
+    const modal = document.getElementById('libraryModal');
+    if (modal) modal.classList.add('active');
+    this._wireLibrarySearch();
+    this.loadLibrary();
+  },
+
+  closeLibrary() {
+    const modal = document.getElementById('libraryModal');
+    if (modal) modal.classList.remove('active');
+  },
+
+  _wireLibrarySearch() {
+    if (this._librarySearchWired) return;
+    this._librarySearchWired = true;
+    const input = document.getElementById('librarySearchInput');
+    if (!input) return;
+    input.addEventListener('input', (e) => {
+      const q = e.target.value;
+      this._debouncedCall('librarySearch', () => this.loadLibrary(q), 300);
+    });
+  },
+
+  async loadLibrary(query = '') {
+    const container = document.getElementById('libraryDocuments');
+    if (!container) return;
+    try {
+      const res = await fetch(`/api/library?q=${encodeURIComponent(query)}&limit=100`);
+      const json = await res.json();
+      if (json.success) {
+        this.renderLibrary(json.data.documents);
+      } else {
+        container.innerHTML = '<p class="empty-message">Failed to load library.</p>';
+      }
+    } catch {
+      container.innerHTML = '<p class="empty-message">Error loading library.</p>';
+    }
+  },
+
+  renderLibrary(docs) {
+    const container = document.getElementById('libraryDocuments');
+    if (!container) return;
+    if (!docs.length) {
+      container.innerHTML = '<p class="empty-message library-empty">No documents found.</p>';
+      return;
+    }
+    container.innerHTML = docs.map((doc) => this.renderLibraryCard(doc)).join('');
+  },
+
+  renderLibraryCard(doc) {
+    const icon = this.getFileIcon?.(doc.extension) || '\u{1F4C4}';
+    const name = escapeHtml(doc.fileName);
+    const session = escapeHtml(doc.sessionName);
+    const path = doc.relativePath
+      ? `<span class="library-card-path">${escapeHtml(doc.relativePath)}</span>`
+      : '';
+    const date = escapeHtml(new Date(doc.addedAt).toLocaleString());
+    return `<div class="library-document-card">
+      <span class="library-card-icon" aria-hidden="true">${icon}</span>
+      <div class="library-card-body">
+        <span class="library-card-name">${name}</span>
+        ${path}
+        <span class="library-card-meta">${session} &middot; ${date}</span>
+      </div>
+    </div>`;
+  },
+
+  // ═══════════════════════════════════════════════════════════════
+  // Away Digest Modal
+  // ═══════════════════════════════════════════════════════════════
+
+  async openAwayDigest(range = 'since-last-visit') {
+    const settings = this.loadAppSettingsFromStorage?.() || {};
+    const defaults = this.getDefaultSettings?.() || {};
+    if ((settings.showAwayDigest ?? defaults.showAwayDigest ?? false) !== true) {
+      this.showToast?.('Away Digest is disabled in App Settings', 'info');
+      return;
+    }
+    this.awayDigestRange = range;
+    this._awayDigestLoadedSuccessfully = false;
+    this._awayDigestSinceLastVisitGeneratedAt = undefined;
+    const modal = document.getElementById('awayDigestModal');
+    if (modal) modal.classList.add('active');
+    this.updateAwayDigestRangeControls();
+    await this.loadAwayDigest();
+  },
+
+  closeAwayDigest() {
+    const modal = document.getElementById('awayDigestModal');
+    const generatedAt = this._awayDigestSinceLastVisitGeneratedAt;
+    if (Number.isFinite(generatedAt)) {
+      try {
+        localStorage.setItem(AWAY_DIGEST_LAST_VIEWED_KEY, String(generatedAt));
+      } catch (err) {
+        console.warn('Failed to save away digest last-viewed marker:', err);
+      }
+    }
+    if (modal) modal.classList.remove('active');
   },
 
   // ═══════════════════════════════════════════════════════════════
@@ -329,15 +750,13 @@ Object.assign(CodemanApp.prototype, {
     const registryAvailable =
       typeof this.getShortcutRegistry === 'function' && typeof this.matchesShortcutEvent === 'function';
     const palette = registryAvailable
-      ? this.getShortcutRegistry().find((s) => s.id === 'command-palette')
+      ? this.getShortcutRegistry().find((shortcut) => shortcut.id === 'command-palette')
       : null;
     if (palette) {
       if (palette.disabled || !this.matchesShortcutEvent(e, palette)) return false;
     } else {
       const key = (e.key || '').toLowerCase();
       if (key !== 'k' && e.code !== 'KeyK') return false;
-      // Don't hijack chords with extra modifiers (Ctrl+Shift+K is the Firefox
-      // devtools console; matchesShortcutEvent applies the same rule above).
       if (e.shiftKey) return false;
     }
 
@@ -352,6 +771,35 @@ Object.assign(CodemanApp.prototype, {
     if (target.isContentEditable) return false;
     if (typeof target.closest === 'function' && target.closest('[contenteditable="true"]')) return false;
     return true;
+  },
+
+  _getFilteredPaletteModes() {
+    const raw = (typeof this.getPaletteAgentModes === 'function' ? this.getPaletteAgentModes() : null) || ['claude', 'codex', 'opencode'];
+    const isAvailable = typeof this.isCliAvailable === 'function' ? this.isCliAvailable.bind(this) : null;
+    const filtered = isAvailable ? raw.filter((m) => m === 'shell' || isAvailable(m)) : raw;
+    return filtered.length ? filtered : ['claude'];
+  },
+
+  _resetPaletteModeIndex() {
+    const modes = this._getFilteredPaletteModes();
+    const current = this.runMode || this._runMode || 'claude';
+    const idx = modes.indexOf(current);
+    this._commandPaletteModeIndex = idx >= 0 ? idx : 0;
+  },
+
+  _getPaletteMode() {
+    const modes = this._getFilteredPaletteModes();
+    const idx = Number.isFinite(this._commandPaletteModeIndex) ? this._commandPaletteModeIndex : 0;
+    return modes[Math.max(0, Math.min(idx, modes.length - 1))];
+  },
+
+  _cyclePaletteMode(delta) {
+    const modes = this._getFilteredPaletteModes();
+    if (!modes.length) return;
+    const len = modes.length;
+    this._commandPaletteModeIndex = (Number.isFinite(this._commandPaletteModeIndex) ? this._commandPaletteModeIndex : 0) + delta;
+    this._commandPaletteModeIndex = ((this._commandPaletteModeIndex % len) + len) % len;
+    this.renderCommandPalette();
   },
 
   /**
@@ -420,7 +868,9 @@ Object.assign(CodemanApp.prototype, {
     const search = document.getElementById('commandPaletteSearch');
     if (!modal || !search) return;
 
+    this.closeMobileHeaderUtilities?.();
     this.commandPaletteActiveIndex = 0;
+    this._resetPaletteModeIndex();
     search.value = '';
     modal.classList.add('active');
 
@@ -462,6 +912,18 @@ Object.assign(CodemanApp.prototype, {
     });
 
     search?.addEventListener('keydown', async (e) => {
+      const activeItem = (this.commandPaletteItems || [])[this.commandPaletteActiveIndex || 0];
+      const isNewSessionActive = activeItem?.type === 'new-session';
+      if (e.key === 'ArrowLeft' && isNewSessionActive) {
+        e.preventDefault();
+        this._cyclePaletteMode(-1);
+        return;
+      }
+      if (e.key === 'ArrowRight' && isNewSessionActive) {
+        e.preventDefault();
+        this._cyclePaletteMode(1);
+        return;
+      }
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         this.moveCommandPaletteSelection(1);
@@ -492,6 +954,15 @@ Object.assign(CodemanApp.prototype, {
     });
 
     list?.addEventListener?.('click', (e) => {
+      const pickerBtn = e.target?.closest?.('[data-palette-cycle]');
+      if (pickerBtn) {
+        e.preventDefault();
+        e.stopPropagation();
+        const delta = pickerBtn.dataset.paletteCycle === 'next' ? 1 : -1;
+        const activeItem = (this.commandPaletteItems || [])[this.commandPaletteActiveIndex || 0];
+        if (activeItem?.type === 'new-session') this._cyclePaletteMode(delta);
+        return;
+      }
       const row = e.target?.closest?.('[data-command-index]');
       if (!row) return;
       this.commandPaletteActiveIndex = Number(row.dataset.commandIndex) || 0;
@@ -514,8 +985,10 @@ Object.assign(CodemanApp.prototype, {
       const session = this.sessions?.get?.(sessionId);
       if (!session) continue;
       const title = this.getSessionName?.(session) || session.name || session.title || sessionId.slice(0, 8);
-      const subtitleParts = [session.workingDir, session.mode, session.status].filter(Boolean);
-      const haystack = [title, session.workingDir, session.mode, session.status, sessionId].filter(Boolean).join(' ').toLowerCase();
+      const activity = globalThis.CodemanSessionActivity?.resolve(session);
+      const activityLabel = activity?.expandedLabel || session.status;
+      const subtitleParts = [session.workingDir, session.mode, activityLabel].filter(Boolean);
+      const haystack = [title, session.workingDir, session.mode, activityLabel, sessionId].filter(Boolean).join(' ').toLowerCase();
       if (needle && !haystack.includes(needle)) continue;
       sessionItems.push({
         id: `session:${sessionId}`,
@@ -532,13 +1005,14 @@ Object.assign(CodemanApp.prototype, {
   },
 
   _buildCommandPaletteNewSessionItem(query = '') {
-    const mode = this.runMode || this._runMode || 'claude';
-    const labels = { claude: 'Claude', opencode: 'OpenCode', codex: 'Codex', gemini: 'Gemini', antigravity: 'Antigravity', pi: 'Pi', grok: 'Grok', deepseek: 'DeepSeek', omp: 'OMP' };
+    const mode = this._getPaletteMode?.() || this.runMode || this._runMode || 'claude';
+    const labels = { claude: 'Claude', opencode: 'OpenCode', codex: 'Codex', gemini: 'Gemini', antigravity: 'Antigravity', pi: 'Pi', grok: 'Grok', deepseek: 'DeepSeek', omp: 'OMP', shell: 'Shell' };
     const caseName = this._findCommandPaletteCaseMatch(query) || document.getElementById('quickStartCase')?.value || 'testcase';
     return {
       id: 'new-session',
       type: 'new-session',
       caseName,
+      mode,
       title: 'New session',
       subtitle: `Run ${labels[mode] || mode} in ${caseName}`,
     };
@@ -592,22 +1066,45 @@ Object.assign(CodemanApp.prototype, {
     this.commandPaletteItems = items;
     this.commandPaletteActiveIndex = Math.max(0, Math.min(this.commandPaletteActiveIndex || 0, items.length - 1));
 
+    const paletteModes = this._getFilteredPaletteModes();
     list.innerHTML = items
       .map((item, index) => {
         const active = index === this.commandPaletteActiveIndex ? ' active' : '';
         const icon = item.type === 'new-session' ? '+' : item.type === 'browse-sessions' ? '≡' : '›';
         const browse = item.type === 'browse-sessions' ? ' command-palette-item--browse' : '';
+        let extra = '';
+        if (item.type === 'new-session') {
+          const labels = { claude: 'Claude', opencode: 'OpenCode', codex: 'Codex', gemini: 'Gemini', antigravity: 'Antigravity', pi: 'Pi', shell: 'Shell' };
+          const currentMode = item.mode || this._getPaletteMode();
+          const label = labels[currentMode] || currentMode;
+          const showPicker = paletteModes.length > 1;
+          if (showPicker) {
+            extra = ` <span class="command-palette-agent-picker" aria-label="Agent: ${escapeHtml(label)} — use left/right to change">
+              <button type="button" class="command-palette-agent-arrow" data-palette-cycle="prev" aria-label="Previous agent">◀</button>
+              <span class="command-palette-agent-label">${escapeHtml(label)}</span>
+              <button type="button" class="command-palette-agent-arrow" data-palette-cycle="next" aria-label="Next agent">▶</button>
+            </span>`;
+          } else {
+            extra = ` <span class="command-palette-agent-pill">${escapeHtml(label)}</span>`;
+          }
+        }
         return `
           <button class="command-palette-item${active}${browse}" type="button" data-command-index="${index}">
             <span class="command-palette-icon" aria-hidden="true">${icon}</span>
             <span class="command-palette-text">
-              <span class="command-palette-title">${escapeHtml(item.title)}</span>
+              <span class="command-palette-title">${escapeHtml(item.title)}${extra}</span>
               <span class="command-palette-subtitle">${escapeHtml(item.subtitle || '')}</span>
             </span>
           </button>
         `;
       })
       .join('');
+  },
+
+  _refreshCommandPaletteIfOpen() {
+    const modal = document.getElementById('commandPaletteModal');
+    if (!modal?.classList.contains('active')) return;
+    this.renderCommandPalette();
   },
 
   moveCommandPaletteSelection(delta) {
@@ -643,24 +1140,24 @@ Object.assign(CodemanApp.prototype, {
           option.textContent = item.caseName;
           caseSelect.appendChild(option);
         }
-        // selectQuickStartCase keeps the searchable combobox, dir display, and
-        // persisted last-used case in sync with the palette's pick (COD-151);
-        // fall back to a bare value set when the picker mixin isn't loaded.
+        // Keep the searchable combobox, directory display, and persisted
+        // last-used case in sync when its mixin is loaded.
         if (typeof this.selectQuickStartCase === 'function') {
           this.selectQuickStartCase(item.caseName);
         } else {
           caseSelect.value = item.caseName;
         }
       }
-      await this.run();
+      const paletteMode = item.mode || this._getPaletteMode?.() || this.runMode || 'claude';
+      await this.run({ mode: paletteMode });
     }
   },
 
   // ═══════════════════════════════════════════════════════════════
   // Session Manager Modal (COD-121)
-  // Unified session list (GET /api/sessions/unified) reachable mid-session,
-  // with a server-side search box. Reuses the history item renderer; clicking
-  // a live row switches to it, a history row resumes the conversation.
+  // Persistent, header-reachable session list (GET /api/sessions/unified)
+  // reachable mid-session, with a server-side search box. Reuses the
+  // unit-2 history item renderer so clicking resumes/switches sessions.
   // ═══════════════════════════════════════════════════════════════
 
   async openSessionManager() {
@@ -720,7 +1217,6 @@ Object.assign(CodemanApp.prototype, {
     this._restoreOverlayFocus('_sessionManagerPrevFocus', modal);
   },
 
-  /** Replace the Session Manager list body with a single status line. */
   _setSessionManagerMessage(list, message) {
     list.replaceChildren();
     const line = document.createElement('p');
@@ -729,119 +1225,480 @@ Object.assign(CodemanApp.prototype, {
     list.appendChild(line);
   },
 
+  _setSessionRecoveryMessage(list, message) {
+    list.replaceChildren();
+    if (!message) return;
+    const line = document.createElement('p');
+    line.className = 'session-recovery-empty';
+    line.textContent = message;
+    list.appendChild(line);
+  },
+
+  _recoveryActionFor(record) {
+    switch (record.status) {
+      case 'reattachable':
+        return { label: 'Reconnect', action: 'reconnect' };
+      case 'resumable':
+        return { label: 'Resume', action: 'resume' };
+      case 'manual_required':
+        return { label: 'Copy hint', action: 'copy' };
+      case 'unavailable':
+        return { label: 'Start new', action: 'start' };
+      case 'pending':
+        return { label: 'Refresh', action: 'refresh' };
+      default:
+        return null;
+    }
+  },
+
+  _renderSessionRecoveryList(list, records) {
+    const signature = JSON.stringify(records);
+    if (signature === this._sessionManagerRecoverySignature) return;
+    this._sessionManagerRecoverySignature = signature;
+    const top = list.scrollTop || 0;
+    list.replaceChildren();
+    const heading = document.getElementById('sessionRecoveryTitle');
+    if (heading) heading.textContent = `Recovery Queue (${records.length})`;
+    if (!records.length) return;
+    const newestFirst = [...records].sort((a, b) =>
+      (b.lastActivityAt ?? b.createdAt ?? 0) - (a.lastActivityAt ?? a.createdAt ?? 0) ||
+      (b.createdAt ?? 0) - (a.createdAt ?? 0)
+    );
+    for (const record of newestFirst) {
+      const row = document.createElement('article');
+      row.className = 'session-recovery-row';
+      row.dataset.recoveryId = record.id;
+
+      const details = document.createElement('div');
+      details.className = 'session-recovery-details';
+      const title = document.createElement('strong');
+      title.textContent = `Session name: ${record.conversationName || 'Name not saved'}`;
+      title.title = record.conversationName || '';
+      const tabName = document.createElement('span');
+      tabName.className = 'session-recovery-tab-name';
+      tabName.textContent = `${record.nameFromLifecycle ? 'Codeman tab (last recorded)' : 'Codeman tab'}: ${record.name || 'Name not saved'}`;
+      tabName.title = record.name || '';
+      const identity = document.createElement('span');
+      identity.className = 'session-recovery-location';
+      identity.textContent = `Codeman ID: ${record.sourceSessionId || record.id}`;
+      const location = document.createElement('span');
+      location.className = 'session-recovery-location';
+      location.textContent = `${record.mode || 'unknown'} · ${record.transport || 'local'} · ${record.workingDir || 'Unknown location'}`;
+      const status = document.createElement('span');
+      status.className = 'session-recovery-status';
+      status.textContent = record.status === 'unavailable' ? (record.lastCheckedAt ? 'Saved conversation or workspace unavailable' : 'Needs recovery check') : String(record.status || 'pending').replace(/_/g, ' ');
+      status.title = record.status === 'unavailable' ? 'Conversation metadata or the original workspace could not be verified. Refresh checks again; Start new opens a new conversation.' : '';
+      if (record.status === 'resumable') status.textContent = record.lastCheckedAt
+        ? 'Conversation metadata found; resume not confirmed'
+        : 'Saved resume ID; availability not checked';
+      if (record.status === 'recovered') status.textContent = record.restoreEvidence === 'remote_live'
+        ? 'Reconnected to live remote session'
+        : record.restoreEvidence === 'launch_returned' ? 'Session launch returned; conversation restore not confirmed' : 'Replacement session created; conversation restore not confirmed';
+      const nativeIdentity = document.createElement('span');
+      nativeIdentity.className = 'session-recovery-location';
+      nativeIdentity.textContent = `Conversation ID: ${record.mode === 'claude' ? record.claudeResumeId || record.displayConversationId || 'Not saved' : record.nativeResumeId || record.displayConversationId || 'Not saved'}`;
+      const activity = document.createElement('span');
+      activity.className = 'session-recovery-location';
+      const dateText = (value) => Number.isFinite(value) ? `${new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'UTC' }).format(value)}, ${new Date(value).toISOString()}` : 'Not saved';
+      activity.textContent = `Created: ${dateText(record.createdAt)} · Last recorded activity: ${dateText(record.lastActivityAt)}`;
+      details.append(title, tabName, location, identity, nativeIdentity, activity, status);
+      if (record.providerSelection) {
+        const provider = document.createElement('span');
+        provider.className = 'session-recovery-location';
+        provider.textContent = `Provider: ${record.providerSelection.label || record.providerSelection.endpointId} · ${record.providerSelection.modelId}`;
+        details.appendChild(provider);
+      }
+      row.appendChild(details);
+
+      const actions = document.createElement('div');
+      actions.className = 'session-recovery-actions';
+      const primary = this._recoveryActionFor(record);
+      if (primary) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'btn-toolbar';
+        button.textContent = primary.label;
+        if (primary.action === 'start') button.title = 'Open a new conversation from this session’s original location.';
+        if (primary.action === 'refresh') button.title = 'Recheck recovery availability for this session. Does not start an agent.';
+        button.addEventListener('click', () => this._runSessionRecoveryAction(record, primary.action));
+        actions.appendChild(button);
+      }
+      if (['unavailable', 'resumable'].includes(record.status) && record.transport === 'local' && ['codex', 'claude'].includes(record.mode) && record.launch?.kind === 'built-in') {
+        const refresh = document.createElement('button');
+        refresh.type = 'button';
+        refresh.className = 'btn-toolbar';
+        refresh.textContent = 'Refresh';
+        refresh.title = 'Recheck saved conversation metadata for this session. Does not start an agent.';
+        refresh.addEventListener('click', () => this._runSessionRecoveryAction(record, 'refresh'));
+        actions.appendChild(refresh);
+      }
+      const previewPanel = document.createElement('div');
+      previewPanel.className = 'session-recovery-preview';
+      previewPanel.hidden = true;
+      previewPanel.id = `recovery-preview-${record.id}`;
+
+      const preview = document.createElement('button');
+      preview.type = 'button';
+      preview.className = 'btn-toolbar';
+      preview.textContent = 'Preview';
+      preview.title = 'Show first, middle, and last user prompts from this saved conversation. Does not start an agent.';
+      preview.setAttribute('aria-expanded', 'false');
+      preview.setAttribute('aria-controls', previewPanel.id);
+      preview.addEventListener('click', async () => {
+        const opening = previewPanel.hidden;
+        previewPanel.hidden = !opening;
+        preview.setAttribute('aria-expanded', String(opening));
+        if (!opening || previewPanel.dataset.loaded) return;
+        preview.disabled = true;
+        previewPanel.textContent = 'Loading prompt preview…';
+        try {
+          const res = await fetch(`/api/session-recoveries/${encodeURIComponent(record.id)}/preview`);
+          const body = await res.json();
+          const data = body.data || body;
+          if (!res.ok || body.success === false) throw new Error(body.error?.message || body.error || 'Could not load preview');
+          previewPanel.replaceChildren();
+          const summary = document.createElement('p');
+          summary.textContent = data.available ? `${data.promptCount} readable user prompts. Preview does not confirm resumability.` : data.message || 'Preview unavailable.';
+          previewPanel.appendChild(summary);
+          if (data.available && data.message) {
+            const note = document.createElement('p');
+            note.textContent = data.message;
+            previewPanel.appendChild(note);
+          }
+          for (const prompt of data.prompts || []) {
+            const heading = document.createElement('strong');
+            heading.textContent = `${prompt.position} (${prompt.ordinal} of ${data.promptCount})`;
+            const excerpt = document.createElement('p');
+            excerpt.textContent = prompt.text + (prompt.truncated ? '\n[Excerpt shortened]' : '');
+            previewPanel.append(heading, excerpt);
+          }
+          for (const candidate of data.candidates || []) {
+            const section = document.createElement('details');
+            const label = document.createElement('summary');
+            label.textContent = `Candidate conversation ${candidate.conversationId} · Transcript updated: ${new Intl.DateTimeFormat('en-US', { weekday: 'short', timeZone: 'UTC' }).format(candidate.lastModified)}, ${new Date(candidate.lastModified).toISOString()}`;
+            section.appendChild(label);
+            section.open = true;
+            for (const prompt of candidate.preview.prompts || []) {
+              const heading = document.createElement('strong');
+              heading.textContent = `${prompt.position} (${prompt.ordinal} of ${candidate.preview.promptCount})`;
+              const excerpt = document.createElement('p');
+              excerpt.textContent = prompt.text + (prompt.truncated ? '\n[Excerpt shortened]' : '');
+              section.append(heading, excerpt);
+            }
+            previewPanel.appendChild(section);
+          }
+          previewPanel.dataset.loaded = 'true';
+        } catch (err) {
+          previewPanel.textContent = err.message || 'Could not load preview';
+        } finally {
+          preview.disabled = false;
+        }
+      });
+      actions.appendChild(preview);
+      const dismiss = document.createElement('button');
+      dismiss.type = 'button';
+      dismiss.className = 'btn-toolbar session-recovery-dismiss';
+      dismiss.textContent = 'Dismiss';
+      dismiss.addEventListener('click', () => this._dismissSessionRecovery(record));
+      actions.appendChild(dismiss);
+      row.append(previewPanel, actions);
+      list.appendChild(row);
+    }
+    list.scrollTop = top;
+  },
+
+  _confirmSessionRecovery(record, verb) {
+    const transport = record.transport === 'remote' ? 'remote' : record.transport === 'docker' ? 'Docker' : 'local';
+    return confirm(`${verb} the original ${transport} session at:\n\n${record.workingDir || 'Unknown location'}\n\nContinue?`);
+  },
+
+  async _dismissSessionRecovery(record) {
+    if (!this._confirmSessionRecovery(record, 'Dismiss recovery for')) return;
+    try {
+      const res = await fetch(`/api/session-recoveries/${encodeURIComponent(record.id)}/dismiss`, { method: 'POST' });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || data?.success === false) throw new Error(data?.error || 'Could not dismiss recovery');
+      await this._loadSessionManagerList(this._sessionManagerQuery || '');
+    } catch (err) {
+      this.showToast?.(err.message || 'Could not dismiss recovery', 'error');
+    }
+  },
+
+  async _startNewSessionFromRecovery(record) {
+    if (!this._confirmSessionRecovery(record, 'Start a new session in')) return;
+    if (record.transport !== 'local') {
+      this.showToast?.('Choose the original configured remote or Docker case to start a new session safely.', 'info');
+      return;
+    }
+    try {
+      const created = await fetch('/api/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workingDir: record.workingDir, mode: record.mode }),
+      });
+      const data = await created.json().catch(() => null);
+      const session = data?.data?.session || data?.session;
+      if (!created.ok || data?.success === false || !session?.id) throw new Error(data?.error || 'Could not start a new session');
+      const started = await fetch(`/api/sessions/${encodeURIComponent(session.id)}/interactive`, { method: 'POST' });
+      if (!started.ok) throw new Error('Could not start the new session');
+      await this._loadSessionManagerList(this._sessionManagerQuery || '');
+      await this.selectSession(session.id);
+    } catch (err) {
+      this.showToast?.(err.message || 'Could not start a new session', 'error');
+    }
+  },
+
+  async _runSessionRecoveryAction(record, action) {
+    if (action === 'copy') {
+      const hint = record.launch?.hint || 'Manual recovery is required. Start a new session from the original working directory.';
+      try {
+        if (!navigator.clipboard?.writeText) throw new Error('Clipboard is unavailable');
+        await navigator.clipboard.writeText(hint);
+        this.showToast?.('Recovery hint copied', 'success');
+      } catch {
+        this.showToast?.(hint, 'info');
+      }
+      return;
+    }
+    if (action === 'start') return this._startNewSessionFromRecovery(record);
+    if (!this._confirmSessionRecovery(record, action === 'reconnect' ? 'Reconnect to' : action === 'refresh' ? 'Refresh' : 'Resume'))
+      return;
+    try {
+      const res = await fetch(`/api/session-recoveries/${encodeURIComponent(record.id)}/${action}`, { method: 'POST' });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || data?.success === false) throw new Error(data?.error || `Could not ${action} recovery`);
+      await this._loadSessionManagerList(this._sessionManagerQuery || '');
+      const sessionId = data?.data?.session?.id || data?.session?.id;
+      if (sessionId) await this.selectSession(sessionId);
+    } catch (err) {
+      this.showToast?.(err.message || `Could not ${action} recovery`, 'error');
+    }
+  },
+
+  _sessionManagerProject(record) {
+    const normalize = value => {
+      const path = String(value || '').split(String.fromCharCode(92)).join('/');
+      return path.length > 1 ? path.replace(/\/+$/, '') : path;
+    };
+    const path = normalize(record.workingDir);
+    const matches = (this.cases || []).filter(c => {
+      const root = normalize(c.path);
+      return root && (path === root || path.startsWith(root.endsWith('/') ? root : root + '/'));
+    });
+    matches.sort((a, b) => normalize(b.path).length - normalize(a.path).length);
+    return matches[0]?.name || 'Unassigned';
+  },
+
+  _sessionManagerTitleWords(record) {
+    const ignored = new Set('the and for with this that from into your have has was are not saved name session sessions claude codex'.split(' '));
+    const title = [record.name, record.conversationName].filter(Boolean).join(' ')
+      .replace(/\bw\d+-[^:\s]+:?\s*/gi, '')
+      .replace(/(?:https?:\/\/|\/|[A-Za-z]:\\)\S+/g, ' ');
+    return [...new Set((title.toLowerCase().match(/\b[a-z][a-z-]{2,23}\b/g) || [])
+      .filter(word => !ignored.has(word)))];
+  },
+
+  _sessionManagerMatchesFilters(record) {
+    const project = this._sessionManagerProjectFilter;
+    const word = this._sessionManagerWordFilter;
+    return (!project || this._sessionManagerProject(record) === project) &&
+      (!word || this._sessionManagerTitleWords(record).includes(word));
+  },
+
+  _renderSessionManagerFilters() {
+    const container = document.getElementById('sessionManagerFilters');
+    if (!container) return;
+    const records = [...(this._sessionManagerRecoveryRecords || []), ...(this._sessionManagerHistoryRecords || [])];
+    const projects = new Map();
+    const words = new Map();
+    for (const record of records) {
+      const project = this._sessionManagerProject(record);
+      projects.set(project, (projects.get(project) || 0) + 1);
+      for (const word of this._sessionManagerTitleWords(record)) words.set(word, (words.get(word) || 0) + 1);
+    }
+    const projectTags = [...projects].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+    const wordTags = [...words].filter(([, count]) => count >= 2)
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 8);
+    const signature = JSON.stringify([projectTags, wordTags, this._sessionManagerProjectFilter, this._sessionManagerWordFilter]);
+    if (signature === this._sessionManagerFacetSignature) return;
+    this._sessionManagerFacetSignature = signature;
+    container.replaceChildren();
+    const scope = document.createElement('span');
+    scope.className = 'session-manager-filter-label';
+    scope.textContent = 'Filter loaded recovery and saved sessions';
+    container.appendChild(scope);
+    const makeGroup = (label, tags, field) => {
+      const group = document.createElement('div');
+      group.className = 'session-manager-filter-group';
+      const caption = document.createElement('span');
+      caption.className = 'session-manager-filter-label';
+      caption.textContent = label;
+      group.appendChild(caption);
+      for (const [value, count] of [['', records.length], ...tags]) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'session-manager-filter-chip';
+        button.textContent = value ? `${value} (${count})` : 'All';
+        button.setAttribute('aria-pressed', String((this[field] || '') === value));
+        button.title = value ? `Filter loaded sessions by ${label.toLowerCase()}: ${value}` : `Show all ${label.toLowerCase()}`;
+        button.addEventListener('click', () => {
+          this[field] = this[field] === value ? '' : value;
+          this._renderSessionManagerFilteredLists();
+          this._renderSessionManagerFilters();
+          const body = document.querySelector('#sessionManagerModal .modal-body');
+          if (body) body.scrollTop = 0;
+        });
+        group.appendChild(button);
+      }
+      container.appendChild(group);
+    };
+    makeGroup('Projects', projectTags, '_sessionManagerProjectFilter');
+    if (wordTags.length || this._sessionManagerWordFilter) {
+      if (this._sessionManagerWordFilter && !wordTags.some(([word]) => word === this._sessionManagerWordFilter))
+        wordTags.push([this._sessionManagerWordFilter, words.get(this._sessionManagerWordFilter) || 0]);
+      makeGroup('Title keywords', wordTags, '_sessionManagerWordFilter');
+    }
+  },
+
+  _renderSessionManagerFilteredLists() {
+    const recoveryList = document.getElementById('sessionRecoveryList');
+    const historyList = document.getElementById('sessionManagerList');
+    const body = typeof document.querySelector === 'function' ? document.querySelector('#sessionManagerModal .modal-body') : null;
+    const top = body?.scrollTop || 0;
+    if (recoveryList && this._sessionManagerRecoveryRecords) {
+      const all = this._sessionManagerRecoveryRecords;
+      const filtered = all.filter(record => this._sessionManagerMatchesFilters(record));
+      this._renderSessionRecoveryList(recoveryList, filtered);
+      const heading = document.getElementById('sessionRecoveryTitle');
+      if (heading) heading.textContent = `Recovery Queue (${filtered.length}${filtered.length === all.length ? '' : ` of ${all.length}`})`;
+    }
+    if (historyList && this._sessionManagerHistoryRecords) {
+      this._renderSessionManagerHistory(historyList,
+        this._sessionManagerHistoryRecords.filter(record => this._sessionManagerMatchesFilters(record)),
+        this._sessionManagerHistoryTotal);
+    }
+    if (body) body.scrollTop = top;
+  },
+
+  _renderSessionManagerHistory(list, sessions, total) {
+    const signature = JSON.stringify([sessions, total, sessions.map(s => this.sessions?.has?.(s.sessionId))]);
+    if (signature === this._sessionManagerHistorySignature) return;
+    this._sessionManagerHistorySignature = signature;
+    const heading = document.getElementById('sessionHistoryTitle');
+    if (heading) heading.textContent = `Saved sessions (${sessions.length} of ${total})`;
+    list.replaceChildren();
+    if (!sessions.length) {
+      this._setSessionManagerMessage(list, 'No saved sessions match these filters');
+      return;
+    }
+    for (const s of sessions) {
+      const record = {
+        sessionId: s.sessionId,
+        workingDir: s.workingDir || '',
+        sizeBytes: s.sizeBytes ?? 0,
+        lastModified: new Date(s.lastActivityAt ?? s.createdAt ?? Date.now()).toISOString(),
+        firstPrompt: s.firstPrompt || s.name || '',
+        // COD-124: status/mode drive the Parked badge, idle-duration flag,
+        // and the Park/Resume menu items in _buildHistoryItem/_openSessionRowMenu.
+        status: s.status,
+        mode: s.mode,
+        name: s.name,
+        claudeSessionId: s.claudeSessionId,
+        pinned: s.pinned,
+        pinnedAt: s.pinnedAt,
+        // Must be carried explicitly: this record is a re-projection, so any
+        // field omitted here silently vanishes from the Cmd+K list (#266).
+        gitBranch: s.gitBranch,
+        worktreeName: s.worktreeName,
+        worktreeRepo: s.worktreeRepo,
+        resumeId: s.resumeId,
+      };
+      const isLive = !!this.sessions?.has?.(s.sessionId);
+      if (isLive) {
+        // Enrich from the richer live-session cache — these fields aren't
+        // part of UnifiedSessionItem (COD-124: resume-fidelity + obligation markers).
+        const live = this.sessions.get(s.sessionId);
+        record.nativeResumeId = live?.nativeResumeId;
+        record.autoResumeAt = live?.autoResumeAt;
+        record.autoResumeEnabled = live?.autoResumeEnabled;
+        record.ralphEnabled = live?.ralphEnabled;
+      }
+      const item = this._buildHistoryItem(record, this.cases, {
+        showViewAll: false,
+        onActivate: () => {
+          this.closeSessionManager();
+          if (isLive) {
+            void this.selectSession(s.sessionId);
+          } else if (record.workingDir) {
+            // History rows are keyed by the Claude conversation UUID; resumed
+            // sessions carry theirs separately as claudeSessionId.
+            void this.resumeHistorySession(
+              s.claudeSessionId || s.sessionId,
+              record.workingDir,
+              undefined,
+              s.mode,
+              s.resumeId
+            );
+          }
+        },
+      });
+      list.appendChild(item);
+    }
+  },
+
   async _loadSessionManagerList(q = '') {
     this._sessionManagerQuery = q;
+    if (this._sessionManagerLoadInFlight) {
+      this._sessionManagerReloadPending = true;
+      return;
+    }
     const list = document.getElementById('sessionManagerList');
+    const recoveryList = document.getElementById('sessionRecoveryList');
     if (!list) return;
+    this._sessionManagerLoadInFlight = true;
+    const current = () => this._sessionManagerQuery === q;
     try {
       const url = '/api/sessions/unified?limit=200' + (q ? '&q=' + encodeURIComponent(q) : '');
-      const res = await fetch(url);
+      if (!this._sessionManagerRecoveryRecords) this._setSessionRecoveryMessage(recoveryList, 'Loading recovery queue…');
+      const sessionRequest = fetch(url);
+      const recoveryRequest = fetch('/api/session-recoveries').then(async (recoveryRes) => {
+        const recoveryData = await recoveryRes.json().catch(() => null);
+        if (!current() || !recoveryList) return;
+        if (recoveryRes.ok && recoveryData?.success !== false) {
+          const recoveries = recoveryData?.data?.recoveries ?? recoveryData?.recoveries;
+          this._sessionManagerRecoveryRecords = Array.isArray(recoveries) ? recoveries : [];
+          this._renderSessionManagerFilteredLists();
+          this._renderSessionManagerFilters();
+        } else if (!this._sessionManagerRecoveryRecords) {
+          this._setSessionRecoveryMessage(recoveryList, recoveryData?.error || 'Recovery Queue is unavailable');
+        }
+      }).catch(() => {
+        if (current() && !this._sessionManagerRecoveryRecords) this._setSessionRecoveryMessage(recoveryList, 'Recovery Queue is unavailable');
+      });
+      const [sessionResult] = await Promise.allSettled([sessionRequest, recoveryRequest]);
+      if (!current()) return;
+      if (sessionResult.status === 'rejected') throw sessionResult.reason;
+      const res = sessionResult.value;
       const data = await res.json().catch(() => null);
-      // ApiResponse envelope: { success: true, data: { sessions, total } }.
-      // Surface failures instead of rendering them as an empty result set.
+      if (!current()) return;
       if (!res.ok || !data || data.success === false || !data.data) {
-        this._setSessionManagerMessage(list, data?.error || `Failed to load sessions (HTTP ${res.status})`);
+        if (!this._sessionManagerHistoryRecords) this._setSessionManagerMessage(list, data?.error || `Failed to load sessions (HTTP ${res.status})`);
         return;
       }
-      const sessions = data.data.sessions || [];
-      list.replaceChildren();
-      if (sessions.length === 0) {
-        this._setSessionManagerMessage(list, q ? 'No sessions match your search' : 'No sessions found');
-        return;
-      }
-      for (const s of sessions) {
-        // Adapt UnifiedSessionItem (lastActivityAt epoch-ms, optional fields) to
-        // the history-record shape _buildHistoryItem renders (lastModified date
-        // string, sizeBytes, firstPrompt).
-        const record = {
-          sessionId: s.sessionId,
-          workingDir: s.workingDir || '',
-          sizeBytes: s.sizeBytes ?? 0,
-          lastModified: new Date(s.lastActivityAt ?? s.createdAt ?? Date.now()).toISOString(),
-          firstPrompt: s.firstPrompt || s.name || '',
-          // Must be carried explicitly: this record is a re-projection, so any
-          // field omitted here silently vanishes from the Cmd+K list (#266).
-          gitBranch: s.gitBranch,
-          worktreeName: s.worktreeName,
-          worktreeRepo: s.worktreeRepo,
-          mode: s.mode,
-          claudeSessionId: s.claudeSessionId,
-          resumeId: s.resumeId,
-        };
-        const isLive = !!this.sessions?.has?.(s.sessionId);
-        const item = this._buildHistoryItem(record, this.cases, {
-          showViewAll: false,
-          onActivate: () => {
-            this.closeSessionManager();
-            if (isLive) {
-              void this.selectSession(s.sessionId);
-            } else if (record.workingDir) {
-              // History rows are keyed by the Claude conversation UUID; resumed
-              // sessions carry theirs separately as claudeSessionId.
-              void this.resumeHistorySession(
-                s.claudeSessionId || s.sessionId,
-                record.workingDir,
-                undefined,
-                s.mode,
-                s.resumeId
-              );
-            }
-          },
-        });
-        list.appendChild(item);
-      }
+      this._sessionManagerHistoryRecords = data.data.sessions || [];
+      this._sessionManagerHistoryTotal = data.data.total ?? this._sessionManagerHistoryRecords.length;
+      this._renderSessionManagerFilteredLists();
+      this._renderSessionManagerFilters();
     } catch (err) {
       console.error('[_loadSessionManagerList]', err);
-      this._setSessionManagerMessage(list, 'Failed to load sessions');
-    }
-  },
-
-  // ═══════════════════════════════════════════════════════════════
-  // Away Digest Modal
-  // ═══════════════════════════════════════════════════════════════
-
-  async openAwayDigest(range = 'since-last-visit') {
-    this.awayDigestRange = range;
-    this._awayDigestLoadedSuccessfully = false;
-    this._awayDigestSinceLastVisitGeneratedAt = undefined;
-    const modal = document.getElementById('awayDigestModal');
-    if (modal) modal.classList.add('active');
-    this.updateAwayDigestRangeControls();
-    await this.loadAwayDigest();
-  },
-
-  closeAwayDigest() {
-    const modal = document.getElementById('awayDigestModal');
-    const generatedAt = this._awayDigestSinceLastVisitGeneratedAt;
-    if (Number.isFinite(generatedAt)) {
-      try {
-        localStorage.setItem(AWAY_DIGEST_LAST_VIEWED_KEY, String(generatedAt));
-      } catch (err) {
-        console.warn('Failed to save away digest last-viewed marker:', err);
+      if (current() && !this._sessionManagerHistoryRecords) this._setSessionManagerMessage(list, 'Failed to load sessions');
+    } finally {
+      this._sessionManagerLoadInFlight = false;
+      this._sessionManagerLastLoadedAt = Date.now();
+      if (this._sessionManagerReloadPending) {
+        this._sessionManagerReloadPending = false;
+        void this._loadSessionManagerList(this._sessionManagerQuery || '');
       }
-    }
-    if (modal) modal.classList.remove('active');
-  },
-
-  /**
-   * COD-121: live-refresh the unified session list when sessions change
-   * (created/updated/deleted via SSE). Only touches surfaces that are currently
-   * showing — the open Session Manager modal and/or the visible welcome list —
-   * and is debounced so an event burst collapses into one re-fetch. The current
-   * search query is preserved.
-   */
-  _onSessionListMaybeChanged() {
-    const modal = document.getElementById('sessionManagerModal');
-    if (modal && modal.classList.contains('active')) {
-      this._debouncedCall(
-        'sessionManagerRefresh',
-        () => this._loadSessionManagerList(this._sessionManagerQuery || ''),
-        400
-      );
-    }
-    const welcome = document.getElementById('welcomeOverlay');
-    if (welcome && welcome.classList.contains('visible')) {
-      this._debouncedCall('welcomeHistoryRefresh', () => this.loadHistorySessions(), 600);
     }
   },
 
@@ -1082,6 +1939,32 @@ Object.assign(CodemanApp.prototype, {
     };
     return labels[source] || source;
   },
+
+  /**
+   * COD-121: live-refresh the unified session list when sessions change
+   * (created/updated/deleted via SSE). Only touches surfaces that are currently
+   * showing — the open Session Manager modal and/or the visible welcome list —
+   * and is debounced so an event burst collapses into one re-fetch. The current
+   * search query is preserved.
+   */
+  _onSessionListMaybeChanged() {
+    const modal = document.getElementById('sessionManagerModal');
+    if (modal && modal.classList.contains('active')) {
+      this._debouncedCall(
+        'sessionManagerRefresh',
+        () => {
+          if (!this._sessionManagerLoadInFlight && Date.now() - (this._sessionManagerLastLoadedAt || 0) >= 10000)
+            void this._loadSessionManagerList(this._sessionManagerQuery || '');
+        },
+        400
+      );
+    }
+    const welcome = document.getElementById('welcomeOverlay');
+    if (welcome && welcome.classList.contains('visible')) {
+      this._debouncedCall('welcomeHistoryRefresh', () => this.loadHistorySessions(), 600);
+    }
+  },
+
 
   // ═══════════════════════════════════════════════════════════════
   // Token Statistics Modal
@@ -1577,12 +2460,13 @@ Object.assign(CodemanApp.prototype, {
     });
 
     for (const agent of sorted) {
-      const isActive = this.activeSubagentId === agent.agentId;
+      const agentKey = agent.agentKey;
+      const isActive = this.activeSubagentKey === agentKey;
       const statusClass = agent.status === 'active' ? 'active' : agent.status === 'idle' ? 'idle' : 'completed';
-      const activity = this.subagentActivity.get(agent.agentId) || [];
+      const activity = this.subagentActivity.get(agentKey) || [];
       const lastActivity = activity[activity.length - 1];
       const lastTool = lastActivity?.type === 'tool' ? lastActivity.tool : null;
-      const hasWindow = this.subagentWindows.has(agent.agentId);
+      const hasWindow = this.subagentWindows.has(agentKey);
       const canKill = agent.status === 'active' || agent.status === 'idle';
       const modelBadge = agent.modelShort
         ? `<span class="subagent-model-badge ${escapeHtml(agent.modelShort)}">${escapeHtml(agent.modelShort)}</span>`
@@ -1594,8 +2478,9 @@ Object.assign(CodemanApp.prototype, {
       const agentIcon = teammateInfo ? `<span class="subagent-icon teammate-dot teammate-color-${teammateInfo.color}">●</span>` : '<span class="subagent-icon">🤖</span>';
       html.push(`
         <div class="subagent-item ${statusClass} ${isActive ? 'selected' : ''}${teammateInfo ? ' is-teammate' : ''}"
-             onclick="app.selectSubagent(${escapeHtml(JSON.stringify(agent.agentId))})"
-             ondblclick="app.openSubagentWindow(${escapeHtml(JSON.stringify(agent.agentId))})"
+             data-agent-key="${escapeHtml(agentKey)}"
+             onclick="app.selectSubagent(${escapeHtml(JSON.stringify(agentKey))})"
+             ondblclick="app.openSubagentWindow(${escapeHtml(JSON.stringify(agentKey))})"
              title="Double-click to open tracking window">
           <div class="subagent-header">
             ${agentIcon}
@@ -1603,8 +2488,8 @@ Object.assign(CodemanApp.prototype, {
             ${teammateBadge}
             ${modelBadge}
             <span class="subagent-status ${statusClass}">${agent.status}</span>
-            ${canKill ? `<button class="subagent-kill-btn" onclick="event.stopPropagation(); app.killSubagent(${escapeHtml(JSON.stringify(agent.agentId))})" title="Kill agent">&#x2715;</button>` : ''}
-            <button class="subagent-window-btn" onclick="event.stopPropagation(); app.${hasWindow ? 'closeSubagentWindow' : 'openSubagentWindow'}(${escapeHtml(JSON.stringify(agent.agentId))})" title="${hasWindow ? 'Close window' : 'Open in window'}">
+            ${canKill ? `<button class="subagent-kill-btn" onclick="event.stopPropagation(); app.killSubagent(${escapeHtml(JSON.stringify(agentKey))})" title="Kill agent">&#x2715;</button>` : ''}
+            <button class="subagent-window-btn" onclick="event.stopPropagation(); app.${hasWindow ? 'closeSubagentWindow' : 'openSubagentWindow'}(${escapeHtml(JSON.stringify(agentKey))})" title="${hasWindow ? 'Close window' : 'Open in window'}">
               ${hasWindow ? '✕' : '⧉'}
             </button>
           </div>
@@ -1619,8 +2504,8 @@ Object.assign(CodemanApp.prototype, {
     list.innerHTML = html.join('');
   },
 
-  selectSubagent(agentId) {
-    this.activeSubagentId = agentId;
+  selectSubagent(agentKey) {
+    this.activeSubagentKey = agentKey;
     this.renderSubagentPanel();
     this.renderSubagentDetail();
   },
@@ -1629,13 +2514,13 @@ Object.assign(CodemanApp.prototype, {
     const detail = this.$('subagentDetail');
     if (!detail) return;
 
-    if (!this.activeSubagentId) {
+    if (!this.activeSubagentKey) {
       detail.innerHTML = '<div class="subagent-empty">Select an agent to view details</div>';
       return;
     }
 
-    const agent = this.subagents.get(this.activeSubagentId);
-    const activity = this.subagentActivity.get(this.activeSubagentId) || [];
+    const agent = this.subagents.get(this.activeSubagentKey);
+    const activity = this.subagentActivity.get(this.activeSubagentKey) || [];
 
     if (!agent) {
       detail.innerHTML = '<div class="subagent-empty">Agent not found</div>';
@@ -1700,7 +2585,7 @@ Object.assign(CodemanApp.prototype, {
         <span class="subagent-id" title="${escapeHtml(agent.description || agent.agentId)}">${escapeHtml(detailTitle.length > 60 ? detailTitle.substring(0, 60) + '...' : detailTitle)}</span>
         ${modelBadge}
         <span class="subagent-status ${agent.status}">${agent.status}</span>
-        <button class="subagent-transcript-btn" onclick="app.viewSubagentTranscript(${escapeHtml(JSON.stringify(agent.agentId))})">
+        <button class="subagent-transcript-btn" onclick="app.viewSubagentTranscript(${escapeHtml(JSON.stringify(agent.agentKey))})">
           View Full Transcript
         </button>
       </div>
@@ -1781,21 +2666,22 @@ Object.assign(CodemanApp.prototype, {
     return { primary, hasMore, fullInput: fullInput || input };
   },
 
-  async killSubagent(agentId) {
+  async killSubagent(agentKey) {
     try {
-      const res = await this._apiDelete(`/api/subagents/${agentId}`);
+      const res = await this._apiDelete(`/api/subagents/${encodeURIComponent(agentKey)}`);
       const data = await res?.json();
       if (data?.success) {
         // Update local state
-        const agent = this.subagents.get(agentId);
+        const agent = this.subagents.get(agentKey);
         if (agent) {
+          this._touchSubagentEvent(agentKey);
           agent.status = 'completed';
-          this.subagents.set(agentId, agent);
+          this.subagents.set(agentKey, agent);
         }
         this.renderSubagentPanel();
         this.renderSubagentDetail();
         this.updateSubagentWindows();
-        this.showToast(`Subagent ${agentId.substring(0, 7)} killed`, 'success');
+        this.showToast(`Subagent ${agent?.agentId || 'agent'} killed`, 'success');
       } else {
         this.showToast(data.error || 'Failed to kill subagent', 'error');
       }
@@ -1805,9 +2691,9 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
-  async viewSubagentTranscript(agentId) {
+  async viewSubagentTranscript(agentKey) {
     try {
-      const res = await fetch(`/api/subagents/${agentId}/transcript?format=formatted`);
+      const res = await fetch(`/api/subagents/${encodeURIComponent(agentKey)}/transcript?format=formatted`);
       const data = await res.json();
 
       if (!data.success) {
@@ -1816,19 +2702,20 @@ Object.assign(CodemanApp.prototype, {
       }
 
       // Show in a modal or new window
+      const displayId = this.subagents.get(agentKey)?.agentId || 'agent';
       const content = data.data.formatted.join('\n');
       const win = window.open('', '_blank', 'width=800,height=600');
       win.document.write(`
         <html>
           <head>
-            <title>Subagent ${escapeHtml(agentId)} Transcript</title>
+            <title>Subagent ${escapeHtml(displayId)} Transcript</title>
             <style>
               body { background: #1a1a2e; color: #eee; font-family: monospace; padding: 20px; }
               pre { white-space: pre-wrap; word-wrap: break-word; }
             </style>
           </head>
           <body>
-            <h2>Subagent ${escapeHtml(agentId)} Transcript (${data.data.entryCount} entries)</h2>
+            <h2>Subagent ${escapeHtml(displayId)} Transcript (${data.data.entryCount} entries)</h2>
             <pre>${escapeHtml(content)}</pre>
           </body>
         </html>
@@ -1845,7 +2732,7 @@ Object.assign(CodemanApp.prototype, {
   // ═══════════════════════════════════════════════════════════════
   //
   // CRITICAL: This system tracks which TAB an agent window connects to.
-  // The association is stored in `subagentParentMap` (agentId -> sessionId).
+  // The association is stored in `subagentParentMap` (agentKey -> sessionId).
   // The sessionId IS the tab identifier (tabs have data-id="${sessionId}").
   // Once set, this association is PERMANENT and persisted across restarts.
 
@@ -2296,7 +3183,7 @@ Object.assign(CodemanApp.prototype, {
     const idEl = win.querySelector('.subagent-window-title .id');
     if (idEl) {
       const teammateInfo = this.getTeammateInfo(agent);
-      const windowTitle = teammateInfo ? teammateInfo.name : (agent.description || agentId.substring(0, 7));
+      const windowTitle = teammateInfo ? teammateInfo.name : (agent.description || agent.agentId || 'agent');
       const truncatedTitle = windowTitle.length > 50 ? windowTitle.substring(0, 50) + '...' : windowTitle;
       idEl.textContent = truncatedTitle;
     }
@@ -2319,7 +3206,7 @@ Object.assign(CodemanApp.prototype, {
     // Update full tooltip
     const titleContainer = win.querySelector('.subagent-window-title');
     if (titleContainer) {
-      titleContainer.title = agent.description || agentId;
+      titleContainer.title = agent.description || agent.agentId || 'agent';
     }
 
     // Update or add model badge
@@ -3094,6 +3981,71 @@ Object.assign(CodemanApp.prototype, {
   // File Browser Panel
   // ═══════════════════════════════════════════════════════════════
 
+  updateFileBrowserHeaderButton() {
+    const button = this.$('fileBrowserBtn');
+    if (!button) return;
+
+    const panel = this.$('fileBrowserPanel');
+    const hasActiveSession = Boolean(this.activeSessionId);
+    const isOpen = hasActiveSession && Boolean(panel?.classList.contains('visible'));
+    button.disabled = !hasActiveSession;
+    button.classList.toggle('active', isOpen);
+    button.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+  },
+
+  toggleFileBrowserPanel() {
+    if (!this.activeSessionId) return;
+    const panel = this.$('fileBrowserPanel');
+    if (!panel) return;
+
+    if (panel.classList.contains('visible')) {
+      this.closeFileBrowserPanel();
+    } else {
+      this.showFileBrowserPanel(this.activeSessionId);
+    }
+  },
+
+  showConfiguredFileBrowserPanel(sessionId) {
+    const settings = this.loadAppSettingsFromStorage();
+    const panel = this.$('fileBrowserPanel');
+    if (settings.showFileBrowser && !panel?.classList.contains('visible')) {
+      this.showFileBrowserPanel(sessionId);
+    }
+  },
+
+  // Reveal the file browser panel and load the given session's files. This is the
+  // ONE canonical reveal path — it does NOT consult the `showFileBrowser` App Setting
+  // (that setting only gates whether settings-ui.js calls this on settings apply).
+  // An explicit user action (Session Manager → ⋯ → Open folder) always reveals.
+  showFileBrowserPanel(sessionId) {
+    const panel = this.$('fileBrowserPanel');
+    if (!panel) return;
+    panel.classList.add('visible');
+    this.updateFileBrowserHeaderButton?.();
+    // Attach drag listeners if not already attached
+    if (!this.fileBrowserDragListeners) {
+      const header = panel.querySelector('.file-browser-header');
+      if (header) {
+        // Convert right-positioned to left/top before drag so makeWindowDraggable works
+        const onFirstDrag = () => {
+          if (!panel.style.left) {
+            const rect = panel.getBoundingClientRect();
+            panel.style.left = `${rect.left}px`;
+            panel.style.top = `${rect.top}px`;
+            panel.style.right = 'auto';
+          }
+        };
+        header.addEventListener('mousedown', onFirstDrag);
+        header.addEventListener('touchstart', onFirstDrag, { passive: true });
+        this.fileBrowserDragListeners = this.makeWindowDraggable(panel, header);
+        this.fileBrowserDragListeners._onFirstDrag = onFirstDrag;
+      }
+    }
+    this._wireFileBrowserDrop?.();
+    // Load LAST: panel + #fileBrowserTree now exist, so loadFileBrowser won't early-return.
+    this.loadFileBrowser(sessionId);
+  },
+
   // Hidden files/folders (dot-prefixed) are filtered SERVER-side by
   // GET /api/sessions/:id/files, so the toggle re-fetches rather than
   // re-rendering the cached tree (issue #221). The flag is per-device and lives
@@ -3119,434 +4071,95 @@ Object.assign(CodemanApp.prototype, {
     btn.setAttribute('aria-label', label);
   },
 
-  _ensureFileBrowserState() {
-    if (!this._fileBrowserState) {
-      const ownerSessionId = this.activeSessionId || null;
-      const showHidden = this.fileBrowserShowHidden === true;
-      this._fileBrowserState = {
-        treeEpoch: 0,
-        searchEpoch: 0,
-        ownerSessionId,
-        view: 'normal',
-        normalState: this.fileBrowserData
-          ? { sessionId: ownerSessionId, showHidden, treeEpoch: 0, phase: 'ready', data: this.fileBrowserData }
-          : null,
-        treeInFlight: null,
-        inFlight: null,
-        matches: [],
-        deferredDirectoryTarget: null,
-        filter: typeof this.fileBrowserFilter === 'string' ? this.fileBrowserFilter : '',
-      };
-    }
-    return this._fileBrowserState;
-  },
-
-  _activateFileBrowserSession(sessionId) {
-    if (!sessionId) return;
-
-    const state = this._ensureFileBrowserState();
-    if (state.inFlight?.timer !== undefined && state.inFlight?.timer !== null) {
-      clearTimeout(state.inFlight.timer);
-    }
-    state.searchEpoch++;
-    state.treeEpoch++;
-    state.ownerSessionId = sessionId;
-    state.treeInFlight = null;
-    state.inFlight = null;
-    state.normalState = null;
-    state.matches = [];
-    state.deferredDirectoryTarget = null;
-    state.filter = '';
-    state.view = 'normal';
-    this.fileBrowserData = null;
-    this.fileBrowserFilter = '';
-    this.fileBrowserExpandedDirs?.clear?.();
-    this.fileBrowserAllExpanded = false;
-
-    const searchInput = this.$?.('fileBrowserSearch');
-    if (searchInput) searchInput.value = '';
-    this._syncFileBrowserExpandBtn();
-    const expandBtn = this.$?.('fileBrowserExpandBtn');
-    if (expandBtn) expandBtn.innerHTML = '\u229E';
-
-    const panel = this.$?.('fileBrowserPanel');
-    const treeEl = this.$?.('fileBrowserTree');
-    const statusEl = this.$?.('fileBrowserStatus');
-    const visible = panel?.classList.contains('visible') === true;
-    if (treeEl) {
-      treeEl.innerHTML = visible
-        ? `<div class="file-browser-loading">${escapeHtml('Loading files...')}</div>`
-        : '';
-    }
-    if (statusEl) statusEl.textContent = visible ? 'Loading files...' : '';
-
-    if (visible) {
-      const load = this.loadFileBrowser?.(sessionId);
-      load?.catch?.(() => {});
-    }
-  },
-
-  _resetFileBrowserForHide() {
-    const state = this._ensureFileBrowserState();
-    if (state.inFlight?.timer !== undefined && state.inFlight?.timer !== null) {
-      clearTimeout(state.inFlight.timer);
-    }
-    state.searchEpoch++;
-    state.treeEpoch++;
-    state.treeInFlight = null;
-    state.inFlight = null;
-    state.normalState = null;
-    state.matches = [];
-    state.deferredDirectoryTarget = null;
-    state.filter = '';
-    state.view = 'normal';
-    this.fileBrowserData = null;
-    this.fileBrowserFilter = '';
-    this.fileBrowserExpandedDirs?.clear?.();
-    this.fileBrowserAllExpanded = false;
-
-    const searchInput = this.$?.('fileBrowserSearch');
-    if (searchInput) searchInput.value = '';
-    this._syncFileBrowserExpandBtn();
-    const expandBtn = this.$?.('fileBrowserExpandBtn');
-    if (expandBtn) expandBtn.innerHTML = '\u229E';
-    const treeEl = this.$?.('fileBrowserTree');
-    if (treeEl) treeEl.innerHTML = '';
-    const statusEl = this.$?.('fileBrowserStatus');
-    if (statusEl) statusEl.textContent = '';
-  },
-
-  _setFileBrowserExpandDisabled(disabled) {
-    const btn = this.$('fileBrowserExpandBtn');
-    if (btn) btn.disabled = disabled;
-  },
-
-  _hasFileBrowserQuery() {
-    const state = this._ensureFileBrowserState();
-    const input = this.$?.('fileBrowserSearch');
-    const inputValue = typeof input?.value === 'string' ? input.value : '';
-    const filterValue = typeof state.filter === 'string' ? state.filter : '';
-    return inputValue.trim() !== '' || filterValue.trim() !== '';
-  },
-
-  _syncFileBrowserExpandBtn() {
-    this._setFileBrowserExpandDisabled(this._hasFileBrowserQuery());
-  },
-
-  _renderFileBrowserNormalStatus(data, showHidden) {
-    const statusEl = this.$('fileBrowserStatus');
-    if (!statusEl || !data) return;
-    const { totalFiles, totalDirectories, truncated } = data;
-    statusEl.textContent = `${totalFiles} files, ${totalDirectories} dirs${truncated ? ' (truncated)' : ''}${showHidden ? ' · hidden shown' : ''}`;
-  },
-
-  _isFileBrowserNormalCompatible(candidate, sessionId, showHidden, treeEpoch) {
-    return (
-      candidate?.sessionId === sessionId &&
-      candidate.showHidden === showHidden &&
-      candidate.treeEpoch === treeEpoch
-    );
-  },
-
-  _isFileBrowserTreeContextCurrent(request, requireCurrentRecord = false) {
-    const state = this._ensureFileBrowserState();
-    return (
-      (!requireCurrentRecord || state.treeInFlight === request) &&
-      state.ownerSessionId === request.sessionId &&
-      state.treeEpoch === request.treeEpoch &&
-      (this.fileBrowserShowHidden === true) === request.showHidden
-    );
-  },
-
-  _canRenderFileBrowserNormal(normalState) {
-    const state = this._ensureFileBrowserState();
-    return (
-      state.view === 'normal' &&
-      this.activeSessionId === normalState?.sessionId &&
-      this._isFileBrowserNormalCompatible(
-        normalState,
-        state.ownerSessionId,
-        this.fileBrowserShowHidden === true,
-        state.treeEpoch,
-      ) &&
-      this.$('fileBrowserPanel')?.classList.contains('visible') === true
-    );
-  },
-
-  _renderFileBrowserNormalState(normalState) {
-    if (!normalState || !this._canRenderFileBrowserNormal(normalState)) return;
-    const treeEl = this.$('fileBrowserTree');
-    const statusEl = this.$('fileBrowserStatus');
-    if (!treeEl) return;
-
-    if (normalState.phase === 'loading') {
-      this.fileBrowserData = null;
-      treeEl.innerHTML = `<div class="file-browser-loading">${escapeHtml('Loading files...')}</div>`;
-      if (statusEl) statusEl.textContent = 'Loading files...';
-      return;
-    }
-
-    if (normalState.phase === 'error') {
-      this.fileBrowserData = null;
-      const detail = normalState.error && normalState.error !== 'Failed to load files'
-        ? `: ${normalState.error}`
-        : '';
-      const message = `Failed to load files${detail}`;
-      treeEl.innerHTML = `<div class="file-browser-empty">${escapeHtml(message)}</div>`;
-      if (statusEl) statusEl.textContent = message;
-      return;
-    }
-
-    if (normalState.phase !== 'ready') return;
-    this.fileBrowserData = normalState.data;
-    this._syncFileBrowserExpandBtn();
-    this.renderFileBrowserTree(normalState.sessionId);
-    this._renderFileBrowserNormalStatus(normalState.data, normalState.showHidden);
-  },
-
-  _validateFileBrowserTreeEnvelope(result) {
-    if (!result || typeof result !== 'object' || result.success !== true) return null;
-    const data = result.data;
-    if (!data || typeof data !== 'object' || !Array.isArray(data.tree)) return null;
-    if (data.mode === 'search') return null;
-    if (
-      typeof data.totalFiles !== 'number' ||
-      !Number.isFinite(data.totalFiles) ||
-      data.totalFiles < 0 ||
-      typeof data.totalDirectories !== 'number' ||
-      !Number.isFinite(data.totalDirectories) ||
-      data.totalDirectories < 0 ||
-      typeof data.truncated !== 'boolean'
-    ) {
-      return null;
-    }
-
-    const validNodes = nodes => nodes.every(node => {
-      if (!node || typeof node !== 'object') return false;
-      if (typeof node.name !== 'string' || typeof node.path !== 'string') return false;
-      if (node.type !== 'file' && node.type !== 'directory') return false;
-      if (node.size !== undefined && (typeof node.size !== 'number' || !Number.isFinite(node.size))) return false;
-      if (node.extension !== undefined && typeof node.extension !== 'string') return false;
-      if (node.children !== undefined && (!Array.isArray(node.children) || !validNodes(node.children))) return false;
-      return true;
-    });
-
-    return validNodes(data.tree) ? data : null;
-  },
-
-  _normalizeFileBrowserTreeError(error) {
-    return typeof error?.message === 'string' && error.message ? error.message : 'Failed to load files';
-  },
-
-  _validateFileBrowserSearchEnvelope(result) {
-    if (!result || typeof result !== 'object' || result.success !== true) return null;
-    const data = result.data;
-    if (!data || typeof data !== 'object' || data.mode !== 'search' || !Array.isArray(data.matches)) return null;
-    if (typeof data.truncated !== 'boolean') return null;
-    if (
-      data.matchCount !== undefined &&
-      (typeof data.matchCount !== 'number' || !Number.isFinite(data.matchCount) || data.matchCount < 0)
-    ) {
-      return null;
-    }
-    for (const match of data.matches) {
-      if (!match || typeof match !== 'object') return null;
-      if (typeof match.name !== 'string' || typeof match.path !== 'string') return null;
-      if (match.type !== 'file' && match.type !== 'directory') return null;
-      if (match.size !== undefined && (typeof match.size !== 'number' || !Number.isFinite(match.size))) return null;
-      if (match.extension !== undefined && typeof match.extension !== 'string') return null;
-    }
-    return data;
-  },
-
-  _canRenderFileBrowserSearch(request) {
-    const state = this._ensureFileBrowserState();
-    const panel = this.$('fileBrowserPanel');
-    return (
-      state.searchEpoch === request.epoch &&
-      state.ownerSessionId === request.ownerSessionId &&
-      this.activeSessionId === request.ownerSessionId &&
-      (this.fileBrowserShowHidden === true) === request.showHidden &&
-      state.filter === request.rawInput &&
-      panel?.classList.contains('visible') === true
-    );
-  },
-
-  _renderFileBrowserSearchError() {
-    const treeEl = this.$('fileBrowserTree');
-    const statusEl = this.$('fileBrowserStatus');
-    const message = 'Search failed';
-    if (treeEl) treeEl.innerHTML = `<div class="file-browser-empty">${escapeHtml(message)}</div>`;
-    if (statusEl) statusEl.textContent = message;
-  },
-
-  _canContinueFileBrowserHiddenReload(continuation, normalState) {
-    const state = this._ensureFileBrowserState();
-    const input = this.$?.('fileBrowserSearch');
-    const currentInput = typeof input?.value === 'string' ? input.value : state.filter;
-    return (
-      state.view === 'normal' &&
-      state.searchEpoch === continuation.searchEpoch &&
-      state.treeEpoch === continuation.treeEpoch &&
-      state.ownerSessionId === continuation.ownerSessionId &&
-      this.activeSessionId === continuation.ownerSessionId &&
-      (this.fileBrowserShowHidden === true) === continuation.showHidden &&
-      state.filter === continuation.rawInput &&
-      currentInput === continuation.rawInput &&
-      currentInput.trim() === continuation.query &&
-      this.$?.('fileBrowserPanel')?.classList.contains('visible') === true &&
-      normalState?.phase === 'ready' &&
-      this._isFileBrowserNormalCompatible(
-        normalState,
-        continuation.ownerSessionId,
-        continuation.showHidden,
-        continuation.treeEpoch,
-      )
-    );
-  },
-
   async toggleFileBrowserHidden() {
-    const state = this._ensureFileBrowserState();
-    const rawInput = typeof state.filter === 'string' ? state.filter : '';
-    const query = rawInput.trim();
     this.fileBrowserShowHidden = !this.fileBrowserShowHidden;
     try {
       localStorage.setItem(FILE_BROWSER_SHOW_HIDDEN_KEY, this.fileBrowserShowHidden ? '1' : '0');
     } catch {}
     this._syncFileBrowserHiddenBtn();
-
-    if (state.inFlight?.timer !== undefined && state.inFlight?.timer !== null) {
-      clearTimeout(state.inFlight.timer);
-    }
-    state.searchEpoch++;
-    state.inFlight = null;
-    state.matches = [];
-    state.deferredDirectoryTarget = null;
-    state.normalState = null;
-    this.fileBrowserData = null;
-    if (query.length <= 256) state.view = 'normal';
-    this._syncFileBrowserExpandBtn();
-
     // Expanded-directory state is deliberately preserved so toggling does not
     // collapse the tree the user just navigated.
-    const ownerSessionId = state.ownerSessionId || this.activeSessionId;
-    if (!ownerSessionId || this.activeSessionId !== ownerSessionId) return;
-
-    const searchEpoch = state.searchEpoch;
-    const showHidden = this.fileBrowserShowHidden === true;
-    const load = this.loadFileBrowser(ownerSessionId, { force: true });
-    const treeEpoch = state.treeEpoch;
-    if (!load?.then) return;
-    await load;
-
-    if (!query || query.length > 256) return;
-    const continuation = { ownerSessionId, showHidden, treeEpoch, searchEpoch, rawInput, query };
-    if (this._canContinueFileBrowserHiddenReload(continuation, state.normalState)) {
-      this.filterFileBrowser(rawInput);
-    }
+    if (this.activeSessionId) await this.loadFileBrowser(this.activeSessionId);
   },
 
-  loadFileBrowser(sessionId, { force = false } = {}) {
-    if (!sessionId) return undefined;
+  async loadFileBrowser(sessionId) {
+    if (!sessionId) return;
 
-    const state = this._ensureFileBrowserState();
     const treeEl = this.$('fileBrowserTree');
-    this._syncFileBrowserHiddenBtn();
-    if (!treeEl) return undefined;
-    if (!state.ownerSessionId) state.ownerSessionId = sessionId;
-    if (state.ownerSessionId !== sessionId) return undefined;
+    const statusEl = this.$('fileBrowserStatus');
+    // Optional-call for the same reason as updateFileBrowserHeaderButton?.() above:
+    // the COD-231 ownership tests drive this method on partial host objects.
+    this._syncFileBrowserHiddenBtn?.();
+    if (!treeEl) return;
 
-    if (force) state.treeEpoch++;
-    const showHidden = this.fileBrowserShowHidden === true;
-    const treeEpoch = state.treeEpoch;
-    const inFlight = state.treeInFlight;
-    if (
-      !force &&
-      this._isFileBrowserNormalCompatible(inFlight, sessionId, showHidden, treeEpoch)
-    ) {
-      return inFlight.promise;
-    }
+    const loadGeneration = ++this.fileBrowserLoadGeneration;
 
-    const settled = state.normalState;
-    if (
-      !force &&
-      this._isFileBrowserNormalCompatible(settled, sessionId, showHidden, treeEpoch) &&
-      (settled.phase === 'ready' || settled.phase === 'error')
-    ) {
-      if (settled.phase === 'ready') this.fileBrowserData = settled.data;
-      this._renderFileBrowserNormalState(settled);
-      return Promise.resolve(settled);
-    }
+    // A fresh tree load supersedes any in-flight search state (COD-236).
+    this.fileBrowserSearchMode = false;
+    this.fileBrowserMatches = null;
 
-    const loadingState = { sessionId, showHidden, treeEpoch, phase: 'loading' };
-    state.normalState = loadingState;
-    this.fileBrowserData = null;
-    this._renderFileBrowserNormalState(loadingState);
+    // Show loading state
+    treeEl.innerHTML = '<div class="file-browser-loading">Loading files...</div>';
 
-    const record = { sessionId, showHidden, treeEpoch, promise: null };
-    const request = (async () => {
-      try {
-        const res = await fetch(
-          `/api/sessions/${encodeURIComponent(sessionId)}/files?depth=5&showHidden=${showHidden}`,
-        );
-        if (!res.ok) throw new Error('Failed to load files');
-        const result = await res.json();
-        const data = this._validateFileBrowserTreeEnvelope(result);
-        if (!data) {
-          const detail = result && typeof result === 'object' && typeof result.error === 'string'
-            ? result.error
-            : 'Failed to load files';
-          throw new Error(detail);
-        }
-        if (!this._isFileBrowserTreeContextCurrent(record, true)) return;
+    try {
+      const showHidden = this.fileBrowserShowHidden === true;
+      const res = await fetch(`/api/sessions/${sessionId}/files?depth=5&showHidden=${showHidden}`);
+      if (!res.ok) throw new Error('Failed to load files');
 
-        const nextNormalState = { sessionId, showHidden, treeEpoch, phase: 'ready', data };
-        state.normalState = nextNormalState;
-        this.fileBrowserData = data;
-        const deferredRendered = this._completeDeferredFileBrowserDirectory?.(nextNormalState) === true;
-        if (!deferredRendered) this._renderFileBrowserNormalState(nextNormalState);
-      } catch (error) {
-        if (!this._isFileBrowserTreeContextCurrent(record, true)) return;
-        const nextNormalState = {
-          sessionId,
-          showHidden,
-          treeEpoch,
-          phase: 'error',
-          error: this._normalizeFileBrowserTreeError(error),
-        };
-        state.normalState = nextNormalState;
-        this.fileBrowserData = null;
-        this._completeDeferredFileBrowserDirectory?.(nextNormalState);
-        console.error('Failed to load file browser:', error);
-        this._renderFileBrowserNormalState(nextNormalState);
+      const result = await res.json();
+      if (!result.success) throw new Error(result.error || 'Failed to load files');
+      if (loadGeneration !== this.fileBrowserLoadGeneration) return;
+
+      // Keep the rendered tree bound to the session that produced it. The active
+      // terminal tab can change independently while this panel remains open.
+      const isNewSession = this.fileBrowserSessionId !== sessionId;
+      this.fileBrowserSessionId = sessionId;
+      this.fileBrowserData = result.data;
+      this.fileBrowserLoadedDirs = new Set();
+      if (isNewSession) this.fileBrowserCurrentDir = '';
+      this.renderFileBrowserTree();
+
+      // Update status — include current dir if set
+      if (statusEl) {
+        const { totalFiles, totalDirectories, truncated } = result.data;
+        const base = `${totalFiles} files, ${totalDirectories} dirs${truncated ? ' (truncated)' : ''}`;
+        const dir = this.fileBrowserCurrentDir || '';
+        statusEl.textContent = dir ? `${base} · in ${dir}${showHidden ? ' · hidden shown' : ''}` : `${base}${showHidden ? ' · hidden shown' : ''}`;
       }
-    })();
-    record.promise = request.finally(() => {
-      if (state.treeInFlight === record) state.treeInFlight = null;
-    });
-    state.treeInFlight = record;
-    return record.promise;
+    } catch (err) {
+      if (loadGeneration !== this.fileBrowserLoadGeneration) return;
+      console.error('Failed to load file browser:', err);
+      treeEl.innerHTML = `<div class="file-browser-empty">Failed to load files: ${escapeHtml(err.message)}</div>`;
+    }
   },
 
-  renderFileBrowserTree(ownerSessionId) {
+  renderFileBrowserTree() {
     const treeEl = this.$('fileBrowserTree');
-    if (!treeEl || !this.fileBrowserData) return;
-
-    const state = this._ensureFileBrowserState();
-    const owner = ownerSessionId || state.normalState?.sessionId || state.ownerSessionId || this.activeSessionId;
-    if (!owner) return;
+    if (!treeEl || !this.fileBrowserData || !this.fileBrowserSessionId) return;
 
     const { tree } = this.fileBrowserData;
+    const fileBrowserSessionId = this.fileBrowserSessionId;
     if (!tree || tree.length === 0) {
       treeEl.innerHTML = '<div class="file-browser-empty">No files found</div>';
       return;
     }
 
     const html = [];
+    const filter = this.fileBrowserFilter.toLowerCase();
 
     const renderNode = (node, depth) => {
       const isDir = node.type === 'directory';
       const isExpanded = this.fileBrowserExpandedDirs.has(node.path);
+      const matchesFilter = !filter || node.name.toLowerCase().includes(filter);
+
+      // For directories, check if any children match
+      let hasMatchingChildren = false;
+      if (isDir && filter && node.children) {
+        hasMatchingChildren = this.hasMatchingChild(node, filter);
+      }
+
+      const shouldShow = matchesFilter || hasMatchingChildren;
+      const hiddenClass = !shouldShow && filter ? ' hidden-by-filter' : '';
 
       const icon = isDir
         ? (isExpanded ? '\uD83D\uDCC2' : '\uD83D\uDCC1')
@@ -3562,17 +4175,23 @@ Object.assign(CodemanApp.prototype, {
 
       const nameClass = isDir ? 'file-tree-name directory' : 'file-tree-name';
 
+      // COD-233: keep a real href for graceful fallback (middle-click / new tab),
+      // but the click is intercepted below and routed through a guarded fetch so a
+      // server error surfaces as a toast instead of navigating the SPA to the raw
+      // JSON error body. data-path drives the interceptor.
       const downloadBtn = !isDir
-        ? `<a class="file-tree-download" href="${escapeHtml(CodemanBase.url(`/api/sessions/${encodeURIComponent(owner)}/file-raw?path=${encodeURIComponent(node.path)}&download=true`))}" title="Download" onclick="event.stopPropagation()">&#x2B07;</a>`
+        ? `<a class="file-tree-download" href="${escapeHtml(withBasePath(`/api/sessions/${encodeURIComponent(fileBrowserSessionId)}/file-raw?path=${encodeURIComponent(node.path)}&download=true`))}" data-path="${escapeHtml(node.path)}" title="Download" role="button">&#x2B07;</a>`
         : '';
+      const renameBtn = `<button class="file-tree-rename" data-path="${escapeHtml(node.path)}" title="Rename" aria-label="Rename">✎</button>`;
+      const deleteBtn = `<button class="file-tree-delete" data-path="${escapeHtml(node.path)}" title="Delete" aria-label="Delete">🗑</button>`;
 
       html.push(`
-        <div class="file-tree-item" data-path="${escapeHtml(node.path)}" data-type="${escapeHtml(node.type)}" data-depth="${depth}">
+        <div class="file-tree-item${hiddenClass}" data-path="${escapeHtml(node.path)}" data-type="${node.type}" data-depth="${depth}">
           ${expandIcon}
           <span class="file-tree-icon">${icon}</span>
           <span class="${nameClass}">${escapeHtml(node.name)}</span>
           ${sizeStr}
-          ${downloadBtn}
+          ${downloadBtn}${renameBtn}${deleteBtn}
         </div>
       `);
 
@@ -3592,314 +4211,623 @@ Object.assign(CodemanApp.prototype, {
 
     // Add click handlers
     treeEl.querySelectorAll('.file-tree-item').forEach(item => {
-      item.addEventListener('click', () => {
+      item.addEventListener('click', (e) => {
+        // Ignore clicks on action buttons
+        if (e.target && e.target.closest && e.target.closest('.file-tree-rename, .file-tree-delete, .file-tree-download')) return;
         const path = item.dataset.path;
         const type = item.dataset.type;
 
         if (type === 'directory') {
           this.toggleFileBrowserFolder(path);
         } else {
-          this.openFilePreview(path, owner);
+          this.openFilePreview(path, fileBrowserSessionId);
         }
+      });
+    });
+
+    // COD-233: intercept download clicks so a server error (a JSON ApiResponse
+    // envelope, not a file) surfaces as a toast instead of navigating the SPA to
+    // the raw endpoint and rendering JSON over the terminal.
+    treeEl.querySelectorAll('.file-tree-download').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.downloadWorkspaceFile(fileBrowserSessionId, btn.dataset.path);
+      });
+    });
+    treeEl.querySelectorAll('.file-tree-rename').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.renameFileBrowserEntry(btn.dataset.path);
+      });
+    });
+    treeEl.querySelectorAll('.file-tree-delete').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.deleteFileBrowserEntry(btn.dataset.path);
       });
     });
   },
 
-  toggleFileBrowserFolder(path) {
-    if (this.fileBrowserExpandedDirs.has(path)) {
-      this.fileBrowserExpandedDirs.delete(path);
-    } else {
-      this.fileBrowserExpandedDirs.add(path);
+  /**
+   * COD-233: download a workspace file via fetch so a non-2xx response (which
+   * file-raw returns as a JSON error envelope, not a file) surfaces as a toast
+   * instead of a top-level navigation that replaces the terminal with raw JSON.
+   * On success the blob is saved through a temporary download anchor.
+   */
+  async downloadWorkspaceFile(sessionId, path) {
+    if (!sessionId || !path) return;
+    const url = `/api/sessions/${encodeURIComponent(sessionId)}/file-raw?path=${encodeURIComponent(path)}&download=true`;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) {
+        let message = `Download failed (${res.status})`;
+        try {
+          const body = await res.json();
+          if (body && body.error) message = body.error;
+        } catch {
+          // Non-JSON error body; keep the status-based message.
+        }
+        this.showToast(message, 'error');
+        return;
+      }
+      const blob = await res.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = objectUrl;
+      a.download = path.split('/').pop() || 'download';
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(objectUrl);
+    } catch (err) {
+      this.showToast(`Download failed: ${err && err.message ? err.message : err}`, 'error');
     }
-    this.renderFileBrowserTree();
   },
 
-  filterFileBrowser(value) {
-    const state = this._ensureFileBrowserState();
-    const rawInput = String(value ?? '');
-    const query = rawInput.trim();
-    state.searchEpoch++;
-    state.filter = rawInput;
-    state.deferredDirectoryTarget = null;
-    this.fileBrowserFilter = rawInput;
-    this._syncFileBrowserExpandBtn();
+  // ──────────────────────────────────────────────────────────────────
+  // File Browser Upload (COD-317)
+  // ──────────────────────────────────────────────────────────────────
+  _maxBatchFileUploads: 10,
+  _fileBrowserUploadConcurrency: 3,
 
-    if (state.inFlight?.timer !== undefined && state.inFlight?.timer !== null) {
-      clearTimeout(state.inFlight.timer);
+  triggerFileBrowserUpload(targetDir = '') {
+    if (!this.activeSessionId && !this.fileBrowserSessionId) {
+      this.showToast('No active session', 'error');
+      return;
     }
-    state.inFlight = null;
+    // Default to current folder when no explicit target (e.g. header button)
+    const effectiveDir =
+      typeof targetDir === 'string' && targetDir !== '' ? targetDir : this.fileBrowserCurrentDir || '';
+    this._ensureFileBrowserUploadInput(effectiveDir);
+    if (this._fileBrowserUploadInput) {
+      this._fileBrowserUploadTargetDir = effectiveDir;
+      this._fileBrowserUploadInput.click();
+    }
+  },
 
-    if (!state.ownerSessionId && this.activeSessionId) state.ownerSessionId = this.activeSessionId;
-    const ownerSessionId = state.ownerSessionId || null;
-    if (!this.activeSessionId || !ownerSessionId || this.activeSessionId !== ownerSessionId) return;
-    if (!query) {
-      state.view = 'normal';
-      state.matches = [];
-      this._syncFileBrowserExpandBtn();
-      const normal = state.normalState;
-      if (
-        ownerSessionId &&
-        this._isFileBrowserNormalCompatible(
-          normal,
-          ownerSessionId,
-          this.fileBrowserShowHidden === true,
-          state.treeEpoch,
-        )
-      ) {
-        this._renderFileBrowserNormalState(normal);
+  _ensureFileBrowserUploadInput(initialDir = '') {
+    if (this._fileBrowserUploadInput) {
+      this._fileBrowserUploadTargetDir = initialDir;
+      return;
+    }
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.style.display = 'none';
+    // No accept filter — File Manager is open (any file except blocked/sensitive guard)
+    input.addEventListener('change', () => {
+      const files = Array.from(input.files || []);
+      const targetDir = this._fileBrowserUploadTargetDir || '';
+      input.value = '';
+      if (files.length) this._uploadFilesToFileBrowser(files, targetDir);
+    });
+    document.body.appendChild(input);
+    this._fileBrowserUploadInput = input;
+    this._fileBrowserUploadTargetDir = initialDir;
+  },
+
+  async _uploadFilesToFileBrowser(fileList, targetDir = '') {
+    const sessionId = this.fileBrowserSessionId || this.activeSessionId;
+    if (!sessionId) {
+      this.showToast('No active session', 'error');
+      return;
+    }
+    let files = Array.from(fileList || []);
+    if (files.length === 0) return;
+    let capped = false;
+    if (files.length > this._maxBatchFileUploads) {
+      files = files.slice(0, this._maxBatchFileUploads);
+      capped = true;
+    }
+    const total = files.length;
+    let done = 0;
+    let failed = 0;
+    const results = new Array(total);
+    const progress = () => this.showToast(`Uploading ${Math.min(done + 1, total)}/${total} file${total > 1 ? 's' : ''}…`, 'info');
+    progress();
+    let next = 0;
+    const worker = async () => {
+      for (;;) {
+        const i = next++;
+        if (i >= total) return;
+        try {
+          results[i] = await this._uploadFileToWorkspace(sessionId, files[i], targetDir);
+        } catch (err) {
+          failed++;
+          console.warn('File upload failed:', err);
+          results[i] = null;
+        } finally {
+          done++;
+          if (done < total) progress();
+        }
       }
-      return;
-    }
-
-    if (query.length > 256) {
-      const message = 'Search queries are limited to 256 characters';
-      state.view = 'query-error';
-      state.matches = [];
-      this._syncFileBrowserExpandBtn();
-      const treeEl = this.$('fileBrowserTree');
-      const statusEl = this.$('fileBrowserStatus');
-      if (treeEl) treeEl.innerHTML = `<div class="file-browser-empty">${escapeHtml(message)}</div>`;
-      if (statusEl) statusEl.textContent = message;
-      return;
-    }
-
-    const panel = this.$('fileBrowserPanel');
-    const treeEl = this.$('fileBrowserTree');
-    if (!ownerSessionId || !panel || !treeEl) return;
-
-    const request = {
-      epoch: state.searchEpoch,
-      treeEpoch: state.treeEpoch,
-      ownerSessionId,
-      showHidden: this.fileBrowserShowHidden === true,
-      rawInput,
-      query,
-      timer: null,
     };
-    state.view = 'search-pending';
-    state.matches = [];
-    state.inFlight = request;
-    this._syncFileBrowserExpandBtn();
-    treeEl.innerHTML = `<div class="file-browser-loading">${escapeHtml('Searching...')}</div>`;
-    const statusEl = this.$('fileBrowserStatus');
-    if (statusEl) statusEl.textContent = 'Searching...';
-
-    request.timer = setTimeout(async () => {
-      request.timer = null;
-      try {
-        const res = await fetch(
-          `/api/sessions/${encodeURIComponent(ownerSessionId)}/files?depth=5&showHidden=${request.showHidden}&q=${encodeURIComponent(query)}`,
-        );
-        if (!res.ok) throw new Error('Search failed');
-        const result = await res.json();
-        const data = this._validateFileBrowserSearchEnvelope(result);
-        if (!data) throw new Error('Search failed');
-        const canRender = this._canRenderFileBrowserSearch(request);
-        if (state.inFlight === request) state.inFlight = null;
-        if (!canRender) return;
-        state.view = 'search-results';
-        state.matches = data.matches;
-        this._renderFileBrowserSearchResults(data.matches, ownerSessionId, data);
-      } catch (err) {
-        const canRender = this._canRenderFileBrowserSearch(request);
-        if (state.inFlight === request) state.inFlight = null;
-        if (!canRender) return;
-        console.error('Failed to search file browser:', err);
-        state.view = 'search-error';
-        state.matches = [];
-        this._renderFileBrowserSearchError();
+    await Promise.all(
+      Array.from({ length: Math.min(this._fileBrowserUploadConcurrency, total) }, () => worker())
+    );
+    const succeeded = results.filter(Boolean).length;
+    // Refresh tree preserves expanded state; loadFileBrowser already does that
+    try {
+      await this.loadFileBrowser(sessionId);
+      if (succeeded > 0 && targetDir) {
+        // Ensure uploaded-to folder is visible after reload
+        this.fileBrowserExpandedDirs.add(targetDir);
+        // Walk up to ensure parents are expanded as well
+        let p = targetDir;
+        while (p.includes('/')) {
+          p = p.split('/').slice(0, -1).join('/');
+          if (p) this.fileBrowserExpandedDirs.add(p);
+        }
+        this.fileBrowserCurrentDir = targetDir;
+        this.renderFileBrowserTree();
+        this._updateFileBrowserStatus?.();
       }
+    } catch {}
+    const parts = [];
+    if (succeeded > 0) parts.push(`${succeeded} file${succeeded > 1 ? 's' : ''} uploaded`);
+    if (failed > 0) parts.push(`${failed} failed`);
+    if (capped) parts.push(`max ${this._maxBatchFileUploads} per batch`);
+    const tone = succeeded > 0 ? (failed > 0 || capped ? 'info' : 'success') : 'error';
+    this.showToast(parts.join(' · ') || 'No files uploaded', tone);
+  },
+
+  async _uploadFileToWorkspace(sessionId, file, targetDir = '') {
+    const form = new FormData();
+    form.append('file', file);
+    const query = targetDir ? `?path=${encodeURIComponent(targetDir)}` : '';
+    const url = `/api/sessions/${encodeURIComponent(sessionId)}/files/upload${query}`;
+    const resp = await fetch(url, { method: 'POST', body: form });
+    if (!resp.ok) {
+      let msg = `HTTP ${resp.status}`;
+      try {
+        const data = await resp.json();
+        if (data && data.error) msg = data.error;
+      } catch {}
+      throw new Error(msg);
+    }
+    const data = await resp.json();
+    if (!data.success) throw new Error(data.error || 'Upload failed');
+    return data.data && data.data.path;
+  },
+
+  _wireFileBrowserDrop() {
+    const treeEl = this.$('fileBrowserTree');
+    const panel = this.$('fileBrowserPanel');
+    if (!treeEl || !panel || this._fileBrowserDropWired) return;
+    this._fileBrowserDropWired = true;
+    let dragDepth = 0;
+    treeEl.addEventListener('dragover', (e) => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+      if (dragDepth === 0) treeEl.classList.add('file-browser-drag-active');
+    });
+    treeEl.addEventListener('dragenter', (e) => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+      dragDepth++;
+    });
+    treeEl.addEventListener('dragleave', (e) => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (dragDepth === 0) treeEl.classList.remove('file-browser-drag-active');
+      // Also handle leaving panel entirely
+      if (!panel.contains(e.relatedTarget)) {
+        dragDepth = 0;
+        treeEl.classList.remove('file-browser-drag-active');
+      }
+    });
+    treeEl.addEventListener('drop', (e) => {
+      dragDepth = 0;
+      treeEl.classList.remove('file-browser-drag-active');
+      if (!e.dataTransfer || !e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
+      const files = Array.from(e.dataTransfer.files);
+      if (files.length === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      let targetDir = '';
+      const folderEl = e.target && e.target.closest ? e.target.closest('.file-tree-item[data-type="directory"]') : null;
+      if (folderEl && folderEl.dataset && folderEl.dataset.path) targetDir = folderEl.dataset.path;
+      this._uploadFilesToFileBrowser(files, targetDir);
+    });
+  },
+
+  _updateFileBrowserStatus() {
+    const statusEl = this.$('fileBrowserStatus');
+    if (!statusEl || !this.fileBrowserData) return;
+    const { totalFiles, totalDirectories, truncated } = this.fileBrowserData;
+    const base = `${totalFiles} files, ${totalDirectories} dirs${truncated ? ' (truncated)' : ''}`;
+    const dir = this.fileBrowserCurrentDir || '';
+    const showHidden = this.fileBrowserShowHidden === true ? ' · hidden shown' : '';
+    statusEl.textContent = dir ? `${base} · in ${dir}${showHidden}` : `${base}${showHidden}`;
+  },
+
+  async createFileBrowserFolder() {
+    const sessionId = this.fileBrowserSessionId || this.activeSessionId;
+    if (!sessionId) {
+      this.showToast('No active session', 'error');
+      return;
+    }
+    const hint = this.fileBrowserCurrentDir ? ` (in ${this.fileBrowserCurrentDir}/)` : '';
+    const input = window.prompt(`New folder name${hint} (e.g. myFolder or a/b/c):`);
+    if (input == null) return;
+    const name = String(input).trim();
+    if (!name) return;
+    // Allow nested like a/b/c but strip leading/trailing slashes
+    const sanitized = name.replace(/^\/+/, '').replace(/\\/g, '/').trim();
+    if (!sanitized) {
+      this.showToast('Invalid folder name', 'error');
+      return;
+    }
+    const finalPath = this.fileBrowserCurrentDir ? `${this.fileBrowserCurrentDir}/${sanitized}` : sanitized;
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/files/mkdir`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: finalPath }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) throw new Error(data.error || `Failed (${res.status})`);
+      this.showToast(`Folder "${finalPath}" created`, 'success');
+      await this.loadFileBrowser(sessionId);
+      // Auto-expand current dir and parent so new folder is visible
+      if (this.fileBrowserCurrentDir) this.fileBrowserExpandedDirs.add(this.fileBrowserCurrentDir);
+      const parent = finalPath.includes('/') ? finalPath.split('/').slice(0, -1).join('/') : null;
+      if (parent) this.fileBrowserExpandedDirs.add(parent);
+      this.fileBrowserExpandedDirs.add(finalPath);
+      this.fileBrowserCurrentDir = finalPath;
+      this._updateFileBrowserStatus?.();
+      this.renderFileBrowserTree();
+    } catch (err) {
+      this.showToast(`Create folder failed: ${err && err.message ? err.message : err}`, 'error');
+    }
+  },
+
+  async renameFileBrowserEntry(oldPath) {
+    const sessionId = this.fileBrowserSessionId || this.activeSessionId;
+    if (!sessionId || !oldPath) return;
+    const base = oldPath.split('/').pop() || oldPath;
+    const next = window.prompt(`Rename "${oldPath}" to:`, base);
+    if (next == null) return;
+    const newBase = String(next).trim();
+    if (!newBase || newBase === base) return;
+    if (newBase.includes('/') || newBase.includes('\\')) {
+      this.showToast('Name must not contain path separators', 'error');
+      return;
+    }
+    const dir = oldPath.includes('/') ? oldPath.split('/').slice(0, -1).join('/') : '';
+    const newPath = dir ? `${dir}/${newBase}` : newBase;
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/files/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: oldPath, to: newPath }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) throw new Error(data.error || `Failed (${res.status})`);
+      this.showToast(`Renamed to "${newPath}"`, 'success');
+      // If renamed directory was expanded, move expanded state
+      if (this.fileBrowserExpandedDirs.has(oldPath)) {
+        this.fileBrowserExpandedDirs.delete(oldPath);
+        this.fileBrowserExpandedDirs.add(newPath);
+      }
+      // Move current dir if it was the renamed path or a child
+      if (this.fileBrowserCurrentDir === oldPath) this.fileBrowserCurrentDir = newPath;
+      else if ((this.fileBrowserCurrentDir || '').startsWith(oldPath + '/')) {
+        this.fileBrowserCurrentDir = newPath + this.fileBrowserCurrentDir.slice(oldPath.length);
+      }
+      // Also update loaded dirs
+      if (this.fileBrowserLoadedDirs && this.fileBrowserLoadedDirs.has(oldPath)) {
+        this.fileBrowserLoadedDirs.delete(oldPath);
+      }
+      await this.loadFileBrowser(sessionId);
+      // Preserve moved current dir across reload (load would otherwise keep old)
+      if (this.fileBrowserCurrentDir === newPath || (this.fileBrowserCurrentDir || '').startsWith(newPath + '/')) {
+        this._updateFileBrowserStatus?.();
+      }
+    } catch (err) {
+      this.showToast(`Rename failed: ${err && err.message ? err.message : err}`, 'error');
+    }
+  },
+
+  async deleteFileBrowserEntry(targetPath) {
+    const sessionId = this.fileBrowserSessionId || this.activeSessionId;
+    if (!sessionId || !targetPath) return;
+    const isDir = targetPath && this.fileBrowserData && (() => {
+      const find = (nodes) => {
+        for (const n of nodes || []) {
+          if (n.path === targetPath) return n;
+          const c = find(n.children);
+          if (c) return c;
+        }
+        return null;
+      };
+      const node = find(this.fileBrowserData.tree || []);
+      return node ? node.type === 'directory' : false;
+    })();
+    const label = isDir ? 'folder' : 'file';
+    if (!window.confirm(`Delete ${label} "${targetPath}"?${isDir ? ' This will delete its contents.' : ''}`)) return;
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/files?path=${encodeURIComponent(targetPath)}`, {
+        method: 'DELETE',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) throw new Error(data.error || `Failed (${res.status})`);
+      this.showToast(`Deleted "${targetPath}"`, 'success');
+      this.fileBrowserExpandedDirs.delete(targetPath);
+      // If deleted path was current dir or ancestor, move current up
+      if (this.fileBrowserCurrentDir === targetPath || (this.fileBrowserCurrentDir || '').startsWith(targetPath + '/')) {
+        const parent = targetPath.includes('/') ? targetPath.split('/').slice(0, -1).join('/') : '';
+        this.fileBrowserCurrentDir = parent;
+      }
+      if (this.fileBrowserLoadedDirs) this.fileBrowserLoadedDirs.delete(targetPath);
+      await this.loadFileBrowser(sessionId);
+    } catch (err) {
+      this.showToast(`Delete failed: ${err && err.message ? err.message : err}`, 'error');
+    }
+  },
+
+  hasMatchingChild(node, filter) {
+    if (!node.children) return false;
+    for (const child of node.children) {
+      if (child.name.toLowerCase().includes(filter)) return true;
+      if (child.type === 'directory' && this.hasMatchingChild(child, filter)) return true;
+    }
+    return false;
+  },
+
+  async toggleFileBrowserFolder(path) {
+    if (this.fileBrowserExpandedDirs.has(path)) {
+      this.fileBrowserExpandedDirs.delete(path);
+      if (this.fileBrowserCurrentDir === path || (this.fileBrowserCurrentDir || '').startsWith(path + '/')) {
+        const parent = path.includes('/') ? path.split('/').slice(0, -1).join('/') : '';
+        this.fileBrowserCurrentDir = parent;
+        this._updateFileBrowserStatus?.();
+      }
+      this.renderFileBrowserTree();
+      return;
+    }
+
+    this.fileBrowserExpandedDirs.add(path);
+    this.fileBrowserCurrentDir = path;
+    this._updateFileBrowserStatus?.();
+    const treeData = this.fileBrowserData;
+    if (!treeData?.lazy || this.fileBrowserLoadedDirs?.has(path)) {
+      this.renderFileBrowserTree();
+      return;
+    }
+
+    // Remote trees are intentionally one directory deep. Capture both ownership
+    // and generation before the request so an old expansion can never graft its
+    // children onto a newly selected session's tree.
+    const sessionId = this.fileBrowserSessionId;
+    const generation = this.fileBrowserLoadGeneration;
+    const includeHidden = this.fileBrowserShowHidden === true;
+    try {
+      const res = await fetch(
+        `/api/sessions/${encodeURIComponent(sessionId)}/files?path=${encodeURIComponent(path)}&showHidden=${includeHidden}`
+      );
+      if (!res.ok) throw new Error('Failed to load folder');
+      const result = await res.json();
+      if (!result.success) throw new Error(result.error || 'Failed to load folder');
+      if (
+        generation !== this.fileBrowserLoadGeneration ||
+        sessionId !== this.fileBrowserSessionId ||
+        treeData !== this.fileBrowserData
+      ) {
+        return;
+      }
+
+      const findDirectory = (nodes) => {
+        for (const node of nodes || []) {
+          if (node.path === path && node.type === 'directory') return node;
+          const match = findDirectory(node.children);
+          if (match) return match;
+        }
+        return null;
+      };
+      const directory = findDirectory(treeData.tree);
+      if (!directory) return;
+      directory.children = result.data.tree || [];
+      (this.fileBrowserLoadedDirs ||= new Set()).add(path);
+      this.renderFileBrowserTree();
+    } catch (err) {
+      if (generation !== this.fileBrowserLoadGeneration || sessionId !== this.fileBrowserSessionId) return;
+      this.fileBrowserExpandedDirs.delete(path);
+      this.renderFileBrowserTree();
+      this.showToast?.(`Failed to load folder: ${err && err.message ? err.message : err}`, 'error');
+    }
+  },
+
+  // COD-236: server-side search. The filter box now hits the files endpoint with
+  // a `q` param (debounced) so a large workspace prunes the walk to matches
+  // instead of shipping/rendering the whole tree. An empty query restores the
+  // cached tree. The old client-side tree filter (renderFileBrowserTree's
+  // filter branch) stays intact for the no-query case.
+  filterFileBrowser(value) {
+    this.fileBrowserFilter = value;
+    if (this._fileBrowserSearchTimer) {
+      clearTimeout(this._fileBrowserSearchTimer);
+      this._fileBrowserSearchTimer = null;
+    }
+    this._fileBrowserSearchTimer = setTimeout(() => {
+      this._fileBrowserSearchTimer = null;
+      const q = (value || '').trim();
+      if (!q) {
+        // Restore the cached tree.
+        this.fileBrowserSearchMode = false;
+        this.fileBrowserMatches = null;
+        this.renderFileBrowserTree();
+        const statusEl = this.$('fileBrowserStatus');
+        if (statusEl && this.fileBrowserData) {
+          const { totalFiles, totalDirectories, truncated } = this.fileBrowserData;
+          statusEl.textContent = `${totalFiles} files, ${totalDirectories} dirs${truncated ? ' (truncated)' : ''}`;
+        }
+        return;
+      }
+      this.searchFileBrowser(q);
     }, 250);
   },
 
-  _renderFileBrowserSearchResults(matches, ownerSessionId, data) {
+  async searchFileBrowser(q) {
+    const sid = this.fileBrowserSessionId;
+    if (!sid) return;
     const treeEl = this.$('fileBrowserTree');
-    if (!treeEl || !ownerSessionId) return;
-    const state = this._ensureFileBrowserState();
-    const searchContext = {
-      ownerSessionId,
-      showHidden: this.fileBrowserShowHidden === true,
-      treeEpoch: state.treeEpoch,
-      searchEpoch: state.searchEpoch,
-      rawInput: state.filter,
-      query: state.filter.trim(),
-      view: state.view,
-    };
-    if (matches.length === 0) {
-      treeEl.innerHTML = `<div class="file-browser-empty">${escapeHtml('No matches')}</div>`;
-    } else {
-      const ownerPath = encodeURIComponent(ownerSessionId);
-      treeEl.innerHTML = matches
-        .map(match => {
-          const isDir = match.type === 'directory';
-          const icon = isDir ? '📁' : this.getFileIcon(match.extension || '');
-          const sizeStr = !isDir && match.size !== undefined
-            ? `<span class="file-tree-size">${this.formatFileSize(match.size)}</span>`
-            : '';
-          const nameClass = isDir ? 'file-tree-name directory' : 'file-tree-name';
-          const downloadBtn = !isDir
-            ? `<a class="file-tree-download" href="${escapeHtml(CodemanBase.url(`/api/sessions/${ownerPath}/file-raw?path=${encodeURIComponent(match.path)}&download=true`))}" title="Download" onclick="event.stopPropagation()">&#x2B07;</a>`
-            : '';
-          return `
-            <div class="file-tree-item" data-path="${escapeHtml(match.path)}" data-type="${escapeHtml(match.type)}" data-owner="${escapeHtml(ownerSessionId)}">
-              <span class="file-tree-expand"></span>
-              <span class="file-tree-icon">${icon}</span>
-              <span class="${nameClass}">${escapeHtml(match.name)}</span>
-              ${sizeStr}
-              ${downloadBtn}
-            </div>
-          `;
-        })
-        .join('');
+    const statusEl = this.$('fileBrowserStatus');
+    if (!treeEl) return;
+
+    // Remote SFTP listings are lazy by design. Searching the current directory
+    // would look complete while silently omitting nested matches, so filtering is
+    // explicitly limited to the folders that have already been expanded.
+    if (this.fileBrowserData?.lazy) {
+      this.fileBrowserSearchMode = false;
+      this.fileBrowserMatches = null;
+      this.renderFileBrowserTree();
+      if (statusEl) statusEl.textContent = `Filtering loaded folders for '${q}'`;
+      return;
     }
 
+    // Generation guard: a slow response must not clobber a newer query.
+    const loadGeneration = ++this.fileBrowserLoadGeneration;
+    const includeHidden = this.fileBrowserShowHidden === true;
+
+    try {
+      const res = await fetch(
+        `/api/sessions/${encodeURIComponent(sid)}/files?depth=5&showHidden=${includeHidden}&q=${encodeURIComponent(q)}`
+      );
+      if (!res.ok) throw new Error('Search failed');
+      const result = await res.json();
+      if (!result.success) throw new Error(result.error || 'Search failed');
+      if (loadGeneration !== this.fileBrowserLoadGeneration) return;
+
+      this.fileBrowserSearchMode = true;
+      this.fileBrowserMatches = result.data.matches || [];
+      this.renderFileBrowserMatches();
+
+      if (statusEl) {
+        const truncated = result.data.truncated;
+        statusEl.textContent = `${this.fileBrowserMatches.length} matches for '${q}'${truncated ? ' (truncated)' : ''}`;
+      }
+    } catch (err) {
+      if (loadGeneration !== this.fileBrowserLoadGeneration) return;
+      console.error('Failed to search file browser:', err);
+      treeEl.innerHTML = `<div class="file-browser-empty">Search failed: ${escapeHtml(err.message)}</div>`;
+    }
+  },
+
+  renderFileBrowserMatches() {
+    const treeEl = this.$('fileBrowserTree');
+    if (!treeEl || !this.fileBrowserSessionId) return;
+    const fileBrowserSessionId = this.fileBrowserSessionId;
+    const matches = this.fileBrowserMatches || [];
+
+    if (matches.length === 0) {
+      treeEl.innerHTML = '<div class="file-browser-empty">No matches</div>';
+      return;
+    }
+
+    const html = [];
+    for (const node of matches) {
+      const isDir = node.type === 'directory';
+      const icon = isDir ? '📁' : this.getFileIcon(node.extension);
+      const sizeStr =
+        !isDir && node.size !== undefined
+          ? `<span class="file-tree-size">${this.formatFileSize(node.size)}</span>`
+          : '';
+      const nameClass = isDir ? 'file-tree-name directory' : 'file-tree-name';
+
+      // COD-233: keep a real href for graceful fallback, but the click is
+      // intercepted below and routed through a guarded fetch.
+      const downloadBtn = !isDir
+        ? `<a class="file-tree-download" href="${escapeHtml(withBasePath(`/api/sessions/${encodeURIComponent(fileBrowserSessionId)}/file-raw?path=${encodeURIComponent(node.path)}&download=true`))}" data-path="${escapeHtml(node.path)}" title="Download" role="button">&#x2B07;</a>`
+        : '';
+      const renameBtn = `<button class="file-tree-rename" data-path="${escapeHtml(node.path)}" title="Rename" aria-label="Rename">✎</button>`;
+      const deleteBtn = `<button class="file-tree-delete" data-path="${escapeHtml(node.path)}" title="Delete" aria-label="Delete">🗑</button>`;
+
+      html.push(`
+        <div class="file-tree-item" data-path="${escapeHtml(node.path)}" data-type="${node.type}" data-depth="0">
+          <span class="file-tree-expand"></span>
+          <span class="file-tree-icon">${icon}</span>
+          <span class="${nameClass}">${escapeHtml(node.name)}</span>
+          ${sizeStr}
+          ${downloadBtn}${renameBtn}${deleteBtn}
+        </div>
+      `);
+    }
+
+    treeEl.innerHTML = html.join('');
+
     treeEl.querySelectorAll('.file-tree-item').forEach(item => {
-      item.addEventListener('click', () => {
+      item.addEventListener('click', (e) => {
+        if (e.target && e.target.closest && e.target.closest('.file-tree-rename, .file-tree-delete, .file-tree-download')) return;
         const path = item.dataset.path;
-        if (item.dataset.type === 'directory') {
-          this._openFileBrowserSearchDirectory({ ...searchContext, path });
+        const type = item.dataset.type;
+        if (type === 'directory') {
+          // Open the directory in the tree: clear the search, add to the
+          // expanded set, and re-render the cached tree.
+          this.fileBrowserFilter = '';
+          this.fileBrowserSearchMode = false;
+          this.fileBrowserMatches = null;
+          const searchInput = this.$('fileBrowserSearch');
+          if (searchInput) searchInput.value = '';
+          this.fileBrowserExpandedDirs.add(path);
+          this.renderFileBrowserTree();
+          const statusEl = this.$('fileBrowserStatus');
+          if (statusEl && this.fileBrowserData) {
+            const { totalFiles, totalDirectories, truncated } = this.fileBrowserData;
+            statusEl.textContent = `${totalFiles} files, ${totalDirectories} dirs${truncated ? ' (truncated)' : ''}`;
+          }
         } else {
-          this.openFilePreview(path, ownerSessionId);
+          this.openFilePreview(path, fileBrowserSessionId);
         }
       });
     });
 
-    const statusEl = this.$('fileBrowserStatus');
-    if (statusEl) {
-      const count = data.matchCount === undefined ? matches.length : data.matchCount;
-      statusEl.textContent = `${count} ${count === 1 ? 'match' : 'matches'}${data.truncated ? ' (truncated)' : ''}`;
-    }
-  },
-
-  _findFileBrowserDirectory(nodes, targetPath, ancestors = []) {
-    if (!Array.isArray(nodes)) return null;
-    for (const node of nodes) {
-      if (!node || typeof node !== 'object') continue;
-      if (node.type === 'directory' && node.path === targetPath) {
-        return { target: node, ancestors: [...ancestors] };
-      }
-      if (node.type !== 'directory' || !Array.isArray(node.children)) continue;
-      const found = this._findFileBrowserDirectory(node.children, targetPath, [...ancestors, node.path]);
-      if (found) return found;
-    }
-    return null;
-  },
-
-  _isFileBrowserDirectoryContextCurrent(target) {
-    const state = this._ensureFileBrowserState();
-    const input = this.$?.('fileBrowserSearch');
-    const currentInput = typeof input?.value === 'string' ? input.value : state.filter;
-    return (
-      target &&
-      state.ownerSessionId === target.ownerSessionId &&
-      this.activeSessionId === target.ownerSessionId &&
-      state.treeEpoch === target.treeEpoch &&
-      state.searchEpoch === target.searchEpoch &&
-      (this.fileBrowserShowHidden === true) === target.showHidden &&
-      state.filter === target.rawInput &&
-      currentInput === target.rawInput &&
-      currentInput.trim() === target.query &&
-      state.view === target.view &&
-      this.$?.('fileBrowserPanel')?.classList.contains('visible') === true
-    );
-  },
-
-  _promptFileBrowserDirectoryReload() {
-    this.showToast?.('Reload files before opening this folder', 'info');
-  },
-
-  _openFileBrowserSearchDirectory(target) {
-    if (!this._isFileBrowserDirectoryContextCurrent(target)) return;
-    const state = this._ensureFileBrowserState();
-    const normalState = state.normalState;
-    if (
-      !this._isFileBrowserNormalCompatible(
-        normalState,
-        target.ownerSessionId,
-        target.showHidden,
-        target.treeEpoch,
-      )
-    ) {
-      state.deferredDirectoryTarget = null;
-      this._promptFileBrowserDirectoryReload();
-      return;
-    }
-
-    if (normalState.phase === 'loading') {
-      state.deferredDirectoryTarget = { ...target };
-      return;
-    }
-
-    state.deferredDirectoryTarget = null;
-    if (normalState.phase !== 'ready') {
-      this._promptFileBrowserDirectoryReload();
-      return;
-    }
-
-    const found = this._findFileBrowserDirectory(normalState.data?.tree, target.path);
-    if (!found) {
-      this._promptFileBrowserDirectoryReload();
-      return;
-    }
-    this._leaveFileBrowserSearchForDirectory([...found.ancestors, found.target.path], normalState);
-  },
-
-  _completeDeferredFileBrowserDirectory(normalState) {
-    const state = this._ensureFileBrowserState();
-    const target = state.deferredDirectoryTarget;
-    if (!target) return false;
-    if (!this._isFileBrowserDirectoryContextCurrent(target)) {
-      if (state.deferredDirectoryTarget === target) state.deferredDirectoryTarget = null;
-      return false;
-    }
-    if (
-      !this._isFileBrowserNormalCompatible(
-        normalState,
-        target.ownerSessionId,
-        target.showHidden,
-        target.treeEpoch,
-      ) ||
-      (normalState.phase !== 'ready' && normalState.phase !== 'error')
-    ) {
-      return false;
-    }
-
-    state.deferredDirectoryTarget = null;
-    if (normalState.phase === 'error') {
-      this._promptFileBrowserDirectoryReload();
-      return false;
-    }
-
-    const found = this._findFileBrowserDirectory(normalState.data?.tree, target.path);
-    if (!found) {
-      this._promptFileBrowserDirectoryReload();
-      return false;
-    }
-    this._leaveFileBrowserSearchForDirectory([...found.ancestors, found.target.path], normalState);
-    return true;
-  },
-
-  _leaveFileBrowserSearchForDirectory(paths, normalState) {
-    const state = this._ensureFileBrowserState();
-    if (state.inFlight?.timer !== undefined && state.inFlight?.timer !== null) {
-      clearTimeout(state.inFlight.timer);
-    }
-    state.searchEpoch++;
-    state.inFlight = null;
-    state.filter = '';
-    state.matches = [];
-    state.deferredDirectoryTarget = null;
-    state.view = 'normal';
-    this.fileBrowserFilter = '';
-
-    const input = this.$?.('fileBrowserSearch');
-    if (input) input.value = '';
-    this._syncFileBrowserExpandBtn();
-    for (const path of paths) {
-      if (typeof path === 'string') this.fileBrowserExpandedDirs?.add?.(path);
-    }
-    this.fileBrowserData = normalState.data;
-    this._renderFileBrowserNormalState(normalState);
+    // COD-233: intercept download clicks so a server error surfaces as a toast.
+    treeEl.querySelectorAll('.file-tree-download').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.downloadWorkspaceFile(fileBrowserSessionId, btn.dataset.path);
+      });
+    });
+    treeEl.querySelectorAll('.file-tree-rename').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.renameFileBrowserEntry(btn.dataset.path);
+      });
+    });
+    treeEl.querySelectorAll('.file-tree-delete').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.deleteFileBrowserEntry(btn.dataset.path);
+      });
+    });
   },
 
   expandAllDirectories(nodes) {
@@ -3918,10 +4846,6 @@ Object.assign(CodemanApp.prototype, {
   },
 
   toggleFileBrowserExpand() {
-    if (this._hasFileBrowserQuery()) {
-      this._syncFileBrowserExpandBtn();
-      return;
-    }
     this.fileBrowserAllExpanded = !this.fileBrowserAllExpanded;
     const btn = this.$('fileBrowserExpandBtn');
 
@@ -3936,28 +4860,21 @@ Object.assign(CodemanApp.prototype, {
   },
 
   refreshFileBrowser() {
-    const state = this._ensureFileBrowserState();
-    if (state.inFlight?.timer !== undefined && state.inFlight?.timer !== null) {
-      clearTimeout(state.inFlight.timer);
+    if (this.fileBrowserSessionId) {
+      if (this._fileBrowserSearchTimer) {
+        clearTimeout(this._fileBrowserSearchTimer);
+        this._fileBrowserSearchTimer = null;
+      }
+      this.fileBrowserExpandedDirs.clear();
+      this.fileBrowserLoadedDirs?.clear();
+      this.fileBrowserFilter = '';
+      this.fileBrowserSearchMode = false;
+      this.fileBrowserMatches = null;
+      this.fileBrowserAllExpanded = false;
+      const searchInput = this.$('fileBrowserSearch');
+      if (searchInput) searchInput.value = '';
+      this.loadFileBrowser(this.fileBrowserSessionId);
     }
-    state.inFlight = null;
-    state.searchEpoch++;
-    state.filter = '';
-    state.matches = [];
-    state.deferredDirectoryTarget = null;
-    state.view = 'normal';
-    this.fileBrowserFilter = '';
-    this.fileBrowserExpandedDirs.clear();
-    this.fileBrowserAllExpanded = false;
-    const expandBtn = this.$('fileBrowserExpandBtn');
-    if (expandBtn) expandBtn.innerHTML = '\u229E';
-    const searchInput = this.$('fileBrowserSearch');
-    if (searchInput) searchInput.value = '';
-    this._syncFileBrowserExpandBtn();
-
-    const ownerSessionId = state.ownerSessionId || this.activeSessionId;
-    if (!ownerSessionId || this.activeSessionId !== ownerSessionId) return undefined;
-    return this.loadFileBrowser(ownerSessionId, { force: true });
   },
 
   // Header "File Viewer" button (opt-in via App Settings → Header Displays →
@@ -3988,7 +4905,6 @@ Object.assign(CodemanApp.prototype, {
 
   closeFileBrowserPanel() {
     const panel = this.$('fileBrowserPanel');
-    this._resetFileBrowserForHide();
     if (panel) {
       panel.classList.remove('visible');
       // Reset position so it reopens at default location
@@ -4021,8 +4937,196 @@ Object.assign(CodemanApp.prototype, {
     this.saveAppSettingsToStorage(settings);
     const checkbox = document.getElementById('appSettingsShowFileBrowser');
     if (checkbox) checkbox.checked = false;
+    // COD-235: TWO header buttons drive this one panel — the session-gated Files
+    // button (#fileBrowserBtn) and the opt-in File Viewer button
+    // (.btn-file-viewer). Closing used to sync only the latter's aria-expanded,
+    // so every non-header close (the panel's X, App Settings) left the Files
+    // button stuck `.active` + aria-expanded="true". Derive it from the panel
+    // through the canonical updater instead of hand-rolling a partial sync.
+    this.updateFileBrowserHeaderButton?.();
     const headerBtn = document.querySelector('.btn-file-viewer');
     if (headerBtn) headerBtn.setAttribute('aria-expanded', 'false');
+  },
+
+  async openExternalPathPreview(absolutePath, sessionId) {
+    if (!sessionId || !absolutePath) return;
+
+    const session = this.sessions?.get(sessionId);
+    if (session?.mode === 'codex' && session.remote) {
+      const fileUri = `file://${absolutePath.split('/').map(encodeURIComponent).join('/')}`;
+      return this.openFileUriPreview(fileUri, sessionId);
+    }
+
+    if (!this._externalPathPreviewRequests) this._externalPathPreviewRequests = new Map();
+    const requestKey = `${sessionId}\0${absolutePath}`;
+    const existing = this._externalPathPreviewRequests.get(requestKey);
+    if (existing && this.filePreviewState === existing.resolverState) return existing.request;
+    if (existing) this._externalPathPreviewRequests.delete(requestKey);
+
+    let resolverState;
+    const request = (async () => {
+      const overlay = this.$('filePreviewOverlay');
+      const titleEl = this.$('filePreviewTitle');
+      const bodyEl = this.$('filePreviewBody');
+      const footerEl = this.$('filePreviewFooter');
+      if (!overlay || !bodyEl) return;
+
+      this._stopFilePreviewPolling();
+      this._resetFilePreviewExternalAction?.();
+      this._resetFilePreviewOriginalDownloadAction?.();
+
+      overlay.classList.add('visible');
+      this._restorePreviewSize();
+      if (titleEl) titleEl.textContent = absolutePath;
+      bodyEl.innerHTML = '<div class="binary-message">Loading...</div>';
+      if (footerEl) footerEl.textContent = '';
+      this._hideFilePreviewNavigation();
+
+      const requestToken = Symbol('external-path-preview');
+      resolverState = { sessionId, absolutePath, requestToken, mode: 'external-path-resolver' };
+      this.filePreviewState = resolverState;
+      const ownsPreview = () => this.filePreviewState === resolverState && resolverState.requestToken === requestToken;
+      const renderError = (message) => {
+        if (!ownsPreview()) return;
+        const safeMessage =
+          typeof message === 'string' && message.trim() ? message.trim().slice(0, 300) : 'Unable to preview file';
+        bodyEl.innerHTML = `<div class="binary-message">Error: ${escapeHtml(safeMessage)}</div>`;
+      };
+
+      let response;
+      try {
+        response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/attachments`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: absolutePath }),
+        });
+      } catch (err) {
+        if (!ownsPreview()) return;
+        console.error('Failed to register external path preview:', err);
+        renderError('Unable to preview file');
+        return;
+      }
+      if (!ownsPreview()) return;
+
+      let payload;
+      try {
+        payload = await response.json();
+      } catch (err) {
+        if (!ownsPreview()) return;
+        console.error('Failed to parse external path preview response:', err);
+        renderError('Unable to preview file');
+        return;
+      }
+      if (!ownsPreview()) return;
+
+      const fileName = payload?.data?.fileName;
+      const attachmentId = payload?.data?.attachmentId;
+      if (!response.ok || payload?.success !== true) {
+        renderError(payload?.error);
+        return;
+      }
+      if (typeof fileName !== 'string' || !fileName || typeof attachmentId !== 'string' || !attachmentId) {
+        renderError('Unable to preview file');
+        return;
+      }
+
+      return this.openFilePreview(fileName, sessionId, attachmentId, { displayPath: absolutePath });
+    })();
+
+    const requestEntry = { request, resolverState };
+    this._externalPathPreviewRequests.set(requestKey, requestEntry);
+    try {
+      return await request;
+    } finally {
+      if (this._externalPathPreviewRequests.get(requestKey) === requestEntry) {
+        this._externalPathPreviewRequests.delete(requestKey);
+      }
+    }
+  },
+
+  async openFileUriPreview(fileUri, sessionId, { allowUnlistedPath = false } = {}) {
+    if (!sessionId || !fileUri) return;
+
+    const overlay = this.$('filePreviewOverlay');
+    const titleEl = this.$('filePreviewTitle');
+    const bodyEl = this.$('filePreviewBody');
+    const footerEl = this.$('filePreviewFooter');
+    if (!overlay || !bodyEl) return;
+
+    this._stopFilePreviewPolling();
+    this._resetFilePreviewExternalAction?.();
+    this._resetFilePreviewOriginalDownloadAction?.();
+
+    overlay.classList.add('visible');
+    this._restorePreviewSize();
+    if (titleEl) titleEl.textContent = fileUri;
+    bodyEl.innerHTML = '<div class="binary-message">Loading...</div>';
+    if (footerEl) footerEl.textContent = '';
+    this._hideFilePreviewNavigation();
+
+    const requestToken = Symbol('file-uri-preview');
+    const resolverState = { sessionId, fileUri, requestToken, mode: 'file-uri-resolver' };
+    this.filePreviewState = resolverState;
+    const ownsPreview = () => this.filePreviewState === resolverState && resolverState.requestToken === requestToken;
+    const renderError = (message, offerAllowOnce = false) => {
+      if (!ownsPreview()) return;
+      const safeMessage = typeof message === 'string' && message.trim() ? message.trim().slice(0, 300) : 'Unable to preview file';
+      bodyEl.innerHTML = `<div class="binary-message">Error: ${escapeHtml(safeMessage)}${
+        offerAllowOnce
+          ? '<br><button type="button" class="btn-toolbar file-preview-allow-once">Allow this file once</button>'
+          : ''
+      }</div>`;
+      if (offerAllowOnce) {
+        bodyEl.querySelector('.file-preview-allow-once')?.addEventListener('click', async (event) => {
+          const button = event.currentTarget;
+          button.disabled = true;
+          button.textContent = 'Allowing…';
+          await this.openFileUriPreview(fileUri, sessionId, { allowUnlistedPath: true });
+        });
+      }
+    };
+
+    let response;
+    try {
+      response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/file-uri-preview`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ uri: fileUri, ...(allowUnlistedPath ? { allowUnlistedPath: true } : {}) }),
+      });
+    } catch (err) {
+      if (!ownsPreview()) return;
+      console.error('Failed to resolve file URI preview:', err);
+      renderError('Unable to preview file');
+      return;
+    }
+    if (!ownsPreview()) return;
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (err) {
+      if (!ownsPreview()) return;
+      console.error('Failed to parse file URI preview response:', err);
+      renderError('Unable to preview file');
+      return;
+    }
+    if (!ownsPreview()) return;
+
+    const fileName = payload?.data?.fileName;
+    const attachmentId = payload?.data?.attachmentId;
+    if (!response.ok || payload?.success !== true) {
+      renderError(
+        payload?.error,
+        !allowUnlistedPath && response.status === 403 && payload?.error === 'Access to this file is blocked'
+      );
+      return;
+    }
+    if (typeof fileName !== 'string' || !fileName || typeof attachmentId !== 'string' || !attachmentId) {
+      renderError('Unable to preview file');
+      return;
+    }
+
+    return this.openFilePreview(fileName, sessionId, attachmentId);
   },
 
   /**
@@ -4036,6 +5140,9 @@ Object.assign(CodemanApp.prototype, {
    * A string compare is enough for ROUTING; the real containment decision stays
    * server-side (realpath + guard) on whichever route the request lands on. An
    * unknown workingDir answers false, leaving the historical path untouched.
+   *
+   * Registration for those paths is openExternalPathPreview()'s job (above):
+   * it POSTs to /attachments, then previews the minted id.
    */
   _isExternalPreviewPath(filePath, sessionId) {
     // `~/…` (a terminal or response-viewer link): only the server knows the home
@@ -4099,7 +5206,7 @@ Object.assign(CodemanApp.prototype, {
     // Prev/next only while browsing a folder grid; a preview opened from anywhere
     // else ends that browsing.
     if (!folderFile && this.folderGrid) this.folderGrid.index = null;
-    this._updateFolderPreviewNav(folderFile ? null : this._previewFolderPath(filePath, sessionId, attachmentId));
+    this._updateFolderPreviewNav?.(folderFile ? null : (this._previewFolderPath?.(filePath, sessionId, attachmentId) ?? null));
 
     const overlay = this.$('filePreviewOverlay');
     const titleEl = this.$('filePreviewTitle');
@@ -4108,45 +5215,78 @@ Object.assign(CodemanApp.prototype, {
 
     if (!overlay || !bodyEl) return;
 
+    // Stop any previous live-refresh poller before switching documents.
+    this._stopFilePreviewPolling();
+    this._resetFilePreviewExternalAction?.();
+    this._resetFilePreviewOriginalDownloadAction?.();
+    // Edit mode is per-document: a (re)open always lands in read mode, and the
+    // Edit button stays hidden until the server says this file is editable.
+    // `?.` matches the sibling resets above (partial hosts in unit harnesses).
+    this._resetFilePreviewEdit?.();
     // Only the newest load may write: paging ←/→ through a folder starts the next
     // load while the previous one still awaits its fetch, and its late answer would
     // put the previous file's text under the next file's title.
     const load = (this._filePreviewLoad = (this._filePreviewLoad || 0) + 1);
     const stale = () => load !== this._filePreviewLoad;
 
-    // Edit mode: reset any prior editor state whenever a preview (re)loads.
-    this._resetFilePreviewEdit();
     // Stop whatever the previous preview was playing. Overwriting innerHTML
     // only DETACHES a <video>/<audio>; a detached media element keeps playing.
-    this._stopFilePreviewMedia();
-    // Disarm detach until this load has a URL of its own: an early error return
-    // must not leave the button opening the PREVIOUS file in a new tab.
-    this.filePreviewDetachUrl = '';
-    const detachBtn = this.$('filePreviewDetachBtn');
-    if (detachBtn) detachBtn.hidden = true;
-    // Same for the text-view toggles: they act on the text this load has not
-    // fetched yet, and an image or PDF has nothing for them to toggle.
+    this._stopFilePreviewMedia?.();
+    // The MD/Lines/Wrap toggles act on text this load has not fetched yet,
+    // and an image or PDF has nothing for them to toggle.
     this.filePreviewText = null;
     this.filePreviewPage = null;
     this.filePreviewPageRefused = false;
-    this._updateFilePreviewToolbar('none');
+    this._updateFilePreviewToolbar?.('none');
 
     // Show overlay with loading state
     overlay.classList.add('visible');
-    titleEl.textContent = filePath;
+    this._restorePreviewSize();
+    const displayPath = typeof options.displayPath === 'string' && options.displayPath ? options.displayPath : filePath;
+    titleEl.textContent = displayPath;
     bodyEl.innerHTML = '<div class="binary-message">Loading...</div>';
     footerEl.textContent = '';
 
-    const ext = (filePath.split('.').pop() || '').toLowerCase();
+    const metadataUrl = attachmentId
+      ? `/api/sessions/${sessionId}/attachments/${encodeURIComponent(attachmentId)}`
+      : `/api/sessions/${sessionId}/file-content?path=${encodeURIComponent(filePath)}&lines=500`;
+    const previewState = {
+      sessionId,
+      filePath,
+      attachmentId,
+      displayPath,
+      metadataUrl,
+      signature: null,
+      docxView: 'pdf',
+      mtimeMs: null,
+    };
+    this.filePreviewState = previewState;
+    this._setFilePreviewOriginalDownloadAction?.(previewState);
+    this._hideFilePreviewNavigation();
+    // Navigation is deliberately independent from the document metadata request:
+    // attachment history is the authoritative ordered list, and a slow document
+    // conversion must not delay it. The loader checks this exact state identity
+    // before it ever reveals controls.
+    void this._loadFilePreviewNavigation(previewState);
+    this._annotations = [];
+    this._closeAnnotationTray();
 
+    const ext = (filePath.split('.').pop() || '').toLowerCase();
+    const detachBtn = this.$('filePreviewDetachBtn');
+    const officePreview = ext === 'docx' || ext === 'pptx';
+    this.filePreviewDetachUrl = withBasePath(attachmentId
+      ? `/api/sessions/${sessionId}/attachments/${encodeURIComponent(attachmentId)}/${officePreview ? 'preview' : 'raw'}`
+      : `/api/sessions/${sessionId}/${officePreview ? 'file-preview' : 'file-raw'}?path=${encodeURIComponent(filePath)}`);
+    if (detachBtn) detachBtn.hidden = false;
     // HTML renders as a page: the server mints a sandboxed /html-view URL for the
     // file's directory (html-view-routes.ts), so relative CSS, scripts and images
     // resolve, and the page runs in an opaque origin that cannot reach Codeman.
     // The Page pill switches to the source view below (with its Edit button), and
     // a refused mint (remote case, broad folder, hidden directory) falls through
     // to that source view on its own.
-    if (!attachmentId && rendersAsPage(filePath) && this._filePreviewPref('htmlRendered')) {
+    if (!attachmentId && (ext === 'html' || ext === 'htm') && this._filePreviewPref('htmlRendered')) {
       const pageUrl = await this._mintHtmlViewUrl(filePath, sessionId);
+      if (stale()) return;
       if (pageUrl) {
         footerEl.textContent = 'HTML';
         this.filePreviewPage = { filePath, sessionId };
@@ -4160,30 +5300,8 @@ Object.assign(CodemanApp.prototype, {
       this.filePreviewPageRefused = true;
     }
 
-    // Out-of-workspace path: mint an attachment id up front. Every branch below
-    // talks to a workspace-confined route, so without this the image/PDF ones
-    // render a broken frame and the text one reports a bare "File not found"
-    // for a file that is sitting right there on disk.
-    let externalError = '';
-    let externalSize = 0;
-    if (!attachmentId && !folderFile && this._isExternalPreviewPath(filePath, sessionId)) {
-      const external = await this._registerExternalPreview(filePath, sessionId);
-      if (stale()) return;
-      attachmentId = external.attachmentId || null;
-      externalError = external.error || '';
-      externalSize = external.size || 0;
-    }
-    if (!attachmentId && externalError) {
-      footerEl.textContent = '';
-      bodyEl.innerHTML = `<div class="binary-message">${escapeHtml(externalError)}</div>`;
-      return;
-    }
-
-    // Every branch below renders from one of these routes, so the detach button
-    // can always offer the same bytes in a browser tab: docx/pptx through the
-    // server-converted PDF preview, everything else through the raw route.
-    // (html/htm arrive as a download there by design — file-raw serves them
-    // attachment-only so widening READ never widens RUN.)
+    if (folderFile) {
+    let externalSize = options.size || 0;
     const officeDoc = ext === 'docx' || ext === 'pptx';
     const byIdBase = attachmentId
       ? `/api/sessions/${sessionId}/attachments/${encodeURIComponent(attachmentId)}`
@@ -4268,98 +5386,1659 @@ Object.assign(CodemanApp.prototype, {
       return;
     }
 
-    // Workspace-path (auto-detected, unregistered) attachments: Office docs are
-    // converted to PDF server-side via the file-preview route; PDFs stream raw.
-    // Both render inline in an iframe. Without this, docx/pptx/pdf fall through
-    // to file-content below, which would dump the binary bytes as mojibake.
-    if (ext === 'docx' || ext === 'pptx') {
-      footerEl.textContent = ext.toUpperCase();
-      const previewSrc = CodemanBase.url(`/api/sessions/${sessionId}/file-preview?path=${encodeURIComponent(filePath)}`);
-      bodyEl.innerHTML = `<iframe src="${escapeHtml(previewSrc)}" title="${escapeHtml(filePath)}"></iframe>`;
-      return;
     }
-    if (ext === 'pdf') {
-      footerEl.textContent = 'PDF';
-      const rawSrc = CodemanBase.url(`/api/sessions/${sessionId}/file-raw?path=${encodeURIComponent(filePath)}`);
-      bodyEl.innerHTML = `<iframe src="${escapeHtml(rawSrc)}" title="${escapeHtml(filePath)}"></iframe>`;
-      return;
-    }
-    // SVG renders as an image, but file-raw deliberately serves SVG as an
-    // untrusted octet-stream attachment (XSS hardening), so a direct
-    // <img src=file-raw> would break. Fetch the bytes and render via a
-    // same-origin blob typed image/svg+xml — <img> never executes scripts in
-    // the referenced SVG, so this is safe while still rendering the graphic.
-    if (ext === 'svg') {
-      footerEl.textContent = 'SVG';
-      try {
-        const res = await fetch(`/api/sessions/${sessionId}/file-raw?path=${encodeURIComponent(filePath)}`);
-        if (!res.ok) throw new Error('Failed to load image');
-        const svgText = await res.text();
-        if (stale()) return;
-        const blobUrl = URL.createObjectURL(new Blob([svgText], { type: 'image/svg+xml' }));
-        bodyEl.innerHTML = `<img src="${blobUrl}" alt="${escapeHtml(filePath)}">`;
-        const img = bodyEl.querySelector('img');
-        if (img) img.onload = () => URL.revokeObjectURL(blobUrl);
-      } catch (err) {
-        if (stale()) return;
-        bodyEl.innerHTML = `<div class="binary-message">Error: ${escapeHtml(err.message)}</div>`;
-      }
-      return;
-    }
-
-    // 500 lines is what keeps a huge log from locking the tab in one <pre>;
-    // markdown is rendered as a document and takes the route's ceiling instead.
-    const lineCap = MARKDOWN_EXTS.has(ext) ? MARKDOWN_PREVIEW_MAX_LINES : TEXT_PREVIEW_MAX_LINES;
     try {
-      const res = await fetch(
-        `/api/sessions/${sessionId}/file-content?path=${encodeURIComponent(filePath)}&lines=${lineCap}`
+      const data = await this._fetchFilePreviewMetadata(metadataUrl);
+      // A newer open/close owns the overlay now. Never let this stale response
+      // overwrite its body or start a poller for the wrong document.
+      if (this.filePreviewState !== previewState) return;
+      this._setFilePreviewExternalUrl?.(previewState, data);
+      previewState.signature = this._filePreviewSignature(data);
+      previewState.mtimeMs = data.mtimeMs ?? null;
+      const rendered = await this._renderFilePreviewBody(data, { sessionId, filePath, attachmentId }, previewState);
+      if (!rendered || this.filePreviewState !== previewState) return;
+      // Auto-refresh the open preview as the agent rewrites the file (COD-58).
+      this._startFilePreviewPolling();
+    } catch (err) {
+      if (this.filePreviewState !== previewState) return;
+      console.error('Failed to preview file:', err);
+      const searchedIn = this._filePreviewSearchedInBase(filePath, sessionId, attachmentId);
+      // `.binary-message` has no `white-space: pre-wrap`, so a "\n" here would
+      // collapse into a run-on line. The base is escaped; only the markup is ours.
+      const detail = searchedIn
+        ? `<div class="binary-message-detail">Searched in: ${escapeHtml(searchedIn)}</div>`
+        : '';
+      bodyEl.innerHTML = `<div class="binary-message">Error: ${escapeHtml(err.message)}${detail}</div>`;
+    }
+  },
+
+  /**
+   * COD-387: name the directory a failed RELATIVE preview was resolved against.
+   *
+   * COD-386 removed the common cause of a wrong base but not the invisibility of a
+   * remaining one — remote/Docker panes deliberately refuse a pane cwd, a session's
+   * cwd may not be known yet, and a file can simply be missing. "File not found"
+   * with no directory is correct and useless at the same time, which is what made
+   * the original report hard to write.
+   *
+   * Returns '' unless naming a base is both possible and meaningful:
+   * - an ABSOLUTE path was not resolved against anything, so naming one would be
+   *   actively misleading;
+   * - an attachment is addressed by id, not by a path relative to a workspace;
+   * - an unknown session has no base to name.
+   *
+   * The base comes from the SAME helper the terminal link provider resolves with
+   * (`CodemanFilePaths.relativeResolutionBase`), so this message cannot drift into
+   * naming a directory the link never used.
+   */
+  _filePreviewSearchedInBase(filePath, sessionId, attachmentId) {
+    if (attachmentId || typeof filePath !== 'string' || filePath.startsWith('/')) return null;
+    const session = this.sessions?.get?.(sessionId);
+    if (!session) return null;
+    return window.CodemanFilePaths?.relativeResolutionBase?.(session.workingDir, session) || null;
+  },
+
+  /** Clear any approved external URL and keep the header action inert. */
+  _resetFilePreviewExternalAction() {
+    if (this.filePreviewState) delete this.filePreviewState.externalPreviewUrl;
+    const button = this.$('filePreviewOpenNewTab');
+    if (button) button.disabled = true;
+  },
+
+  /** Reset the identity-only original-source action before replacing or closing a preview. */
+  _resetFilePreviewOriginalDownloadAction() {
+    const button = this.$('filePreviewDownloadOriginal');
+    if (button) button.disabled = true;
+  },
+
+  /** Enable original-source download synchronously from the current preview identity. */
+  _setFilePreviewOriginalDownloadAction(previewState) {
+    const button = this.$('filePreviewDownloadOriginal');
+    if (!button) return;
+    button.disabled = !this._filePreviewOriginalDownloadUrl(previewState);
+  },
+
+  /** Build the raw original route solely from the preview identity, never render metadata. */
+  _filePreviewOriginalDownloadUrl(previewState) {
+    if (!previewState?.sessionId) return null;
+    let url;
+    if (previewState.attachmentId) {
+      url = `/api/sessions/${encodeURIComponent(previewState.sessionId)}/attachments/${encodeURIComponent(previewState.attachmentId)}/raw`;
+    } else if (previewState.filePath) {
+      url = `/api/sessions/${encodeURIComponent(previewState.sessionId)}/file-raw?path=${encodeURIComponent(previewState.filePath)}`;
+    } else {
+      return null;
+    }
+    const separator = url.includes('?') ? '&' : '?';
+    const cacheBust = previewState.mtimeMs != null ? `&_t=${encodeURIComponent(String(previewState.mtimeMs))}` : '';
+    return `${url}${separator}download=true${cacheBust}`;
+  },
+
+  /** Fetch and save the original file; successful browser downloads intentionally remain toast-free. */
+  async downloadFilePreviewOriginal(expectedState = null) {
+    const st = this.filePreviewState;
+    if (!st || (expectedState && expectedState !== st)) return;
+    const url = this._filePreviewOriginalDownloadUrl(st);
+    if (!url) return;
+    try {
+      const res = await fetch(url);
+      if (this.filePreviewState !== st) return;
+      if (!res.ok) {
+        let message = 'Failed to download original file';
+        try {
+          const body = await res.json();
+          if (typeof body?.error === 'string') message = body.error;
+        } catch {
+          // Use the generic error when the response does not contain an envelope.
+        }
+        this.showToast?.(message, 'error');
+        return;
+      }
+      const blob = await res.blob();
+      if (this.filePreviewState !== st) return;
+      const objectUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = objectUrl;
+      a.download = String(st.filePath || 'download').split('/').pop() || 'download';
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(objectUrl);
+    } catch (err) {
+      if (this.filePreviewState === st) {
+        console.error('Failed to download preview source:', err);
+        this.showToast?.('Failed to download original file', 'error');
+      }
+    }
+  },
+
+  /**
+   * Resolve metadata URLs or the identity-derived raw route into a safe,
+   * same-origin browser address. Unsafe candidates are skipped so the next
+   * lower-priority representation can still be used.
+   */
+  _resolveFilePreviewExternalUrl(data, previewState) {
+    if (!previewState) return null;
+
+    const candidates = [];
+    if (typeof data?.previewUrl === 'string' && data.previewUrl) candidates.push(data.previewUrl);
+    if (typeof data?.url === 'string' && data.url) candidates.push(data.url);
+    if (previewState.sessionId && previewState.attachmentId) {
+      candidates.push(
+        `/api/sessions/${encodeURIComponent(previewState.sessionId)}/attachments/${encodeURIComponent(previewState.attachmentId)}/raw`
       );
-      if (!res.ok) throw new Error('Failed to load file');
+    } else if (previewState.sessionId && previewState.filePath) {
+      candidates.push(
+        `/api/sessions/${encodeURIComponent(previewState.sessionId)}/file-raw?path=${encodeURIComponent(previewState.filePath)}`
+      );
+    }
 
+    for (const candidate of candidates) {
+      try {
+        const resolved = new URL(candidate, window.location.href);
+        if (
+          (resolved.protocol === 'http:' || resolved.protocol === 'https:') &&
+          resolved.origin === window.location.origin
+        ) {
+          return `${resolved.pathname}${resolved.search}${resolved.hash}`;
+        }
+      } catch {
+        // Try the next lower-priority candidate.
+      }
+    }
+    return null;
+  },
+
+  /** Publish an external URL only while this exact preview still owns the overlay. */
+  _setFilePreviewExternalUrl(previewState, data) {
+    if (this.filePreviewState !== previewState) return;
+    const url = this._resolveFilePreviewExternalUrl(data, previewState);
+    if (this.filePreviewState !== previewState) return;
+    if (url) previewState.externalPreviewUrl = url;
+    else delete previewState.externalPreviewUrl;
+    const button = this.$('filePreviewOpenNewTab');
+    if (button) button.disabled = !url;
+  },
+
+  /** Open only the URL approved for the current preview state. */
+  openFilePreviewInNewTab() {
+    const url = this.filePreviewState?.externalPreviewUrl;
+    if (!url) return;
+    // A native wrapper (window.CodemanHost) opens it in a window of its own; a host
+    // that refuses must not fall through to window.open.
+    const hosted = this.openInHostWindow?.(url) ?? null;
+    if (hosted !== null) {
+      if (hosted) this.closeFilePreview();
+      else this.showToast('Could not open a new window for this preview', 'error');
+      return;
+    }
+    const opened = window.open(url, '_blank', 'noopener');
+    if (opened) {
+      try {
+        opened.opener = null;
+      } catch {
+        // Cross-window hardening is best-effort; noopener remains authoritative.
+      }
+    }
+  },
+
+  _hideFilePreviewNavigation() {
+    const navigation = this.$('filePreviewNavigation');
+    const previous = this.$('filePreviewPrevious');
+    const next = this.$('filePreviewNext');
+    const position = this.$('filePreviewPosition');
+    if (navigation) navigation.hidden = true;
+    if (previous) previous.disabled = true;
+    if (next) next.disabled = true;
+    if (position) position.textContent = '';
+  },
+
+  async _loadFilePreviewNavigation(previewState) {
+    this._hideFilePreviewNavigation();
+    try {
+      const res = await fetch(`/api/sessions/${previewState.sessionId}/attachments`);
+      if (!res.ok) throw new Error('Failed to load attachments');
       const result = await res.json();
-      if (stale()) return;
-      if (!result.success) throw new Error(result.error || 'Failed to load file');
+      if (this.filePreviewState !== previewState) return;
+      if (!result?.success || !Array.isArray(result.data?.items)) {
+        this._hideFilePreviewNavigation();
+        return;
+      }
 
-      const data = result.data;
+      // Keep the server's endpoint order; it is the attachment-history order.
+      // External attachments do not have a workspace-relative path, but their
+      // filename remains a valid title when reopening through their attachment ID.
+      const items = result.data.items.filter(
+        (item) =>
+          item &&
+          !item.missing &&
+          (typeof item.relativePath === 'string' || (typeof item.fileName === 'string' && item.fileName))
+      );
+      if (items.length < 2) {
+        this._hideFilePreviewNavigation();
+        return;
+      }
 
-      if (data.type === 'image') {
-        bodyEl.innerHTML = `<img src="${escapeHtml(CodemanBase.url(data.url))}" alt="${escapeHtml(filePath)}">`;
-        footerEl.textContent = `${this.formatFileSize(data.size)} \u2022 ${data.extension}`;
-      } else if (data.type === 'video') {
-        // playsinline: iOS otherwise hijacks playback into its fullscreen
-        // player, which leaves the overlay behind it and its own close button
-        // as the only way back.
-        bodyEl.innerHTML = `<video src="${escapeHtml(CodemanBase.url(data.url))}" controls autoplay playsinline preload="metadata"></video>`;
-        footerEl.textContent = `${this.formatFileSize(data.size)} \u2022 ${data.extension}`;
-      } else if (data.type === 'audio') {
-        bodyEl.innerHTML = `<audio src="${escapeHtml(CodemanBase.url(data.url))}" controls autoplay preload="metadata"></audio>`;
-        footerEl.textContent = `${this.formatFileSize(data.size)} \u2022 ${data.extension}`;
-      } else if (data.type === 'spreadsheet') {
-        this._openSpreadsheetPreview(bodyEl, CodemanBase.url(data.url), data.size);
-        footerEl.textContent = `${this.formatFileSize(data.size)} \u2022 ${data.extension}`;
-      } else if (data.type === 'binary') {
-        const downloadHref = CodemanBase.url(`/api/sessions/${sessionId}/file-raw?path=${encodeURIComponent(filePath)}&download=true`);
-        bodyEl.innerHTML = `<div class="binary-message">Binary file (${this.formatFileSize(data.size)})<br>Cannot preview<br><a href="${escapeHtml(downloadHref)}" download>Download</a></div>`;
-        footerEl.textContent = data.extension || 'binary';
+      let index = -1;
+      if (previewState.attachmentId) {
+        index = items.findIndex((item) => item.attachmentId === previewState.attachmentId);
       } else {
-        // Text content: rendered markdown or plain text, per the viewer's toggles.
-        this.filePreviewContent = data.content;
-        this.filePreviewText = { ext, sessionId, filePath };
-        this._renderFilePreviewText();
-        const truncNote = data.truncated ? ` (showing ${lineCap}/${data.totalLines} lines)` : '';
-        footerEl.textContent = `${data.totalLines} lines \u2022 ${this.formatFileSize(data.size)}${truncNote}`;
-        // Edit affordance only when the server says an edit=1 re-fetch would
-        // succeed (workspace text file inside the allowlist and size cap).
-        if (data.editable) {
-          this.filePreviewEditTarget = { sessionId, filePath };
-          const editBtn = this.$('filePreviewEditBtn');
-          if (editBtn) editBtn.hidden = false;
+        index = items.findIndex((item) => item.relativePath === previewState.filePath);
+      }
+      if (this.filePreviewState !== previewState) return;
+      if (index === -1) {
+        this._hideFilePreviewNavigation();
+        return;
+      }
+
+      previewState.navigationItems = items;
+      previewState.navigationIndex = index;
+      const navigation = this.$('filePreviewNavigation');
+      const previous = this.$('filePreviewPrevious');
+      const next = this.$('filePreviewNext');
+      const position = this.$('filePreviewPosition');
+      if (this.filePreviewState !== previewState) return;
+      if (position) position.textContent = `${index + 1} of ${items.length}`;
+      if (previous) previous.disabled = index === 0;
+      if (next) next.disabled = index === items.length - 1;
+      if (navigation) navigation.hidden = false;
+    } catch {
+      if (this.filePreviewState === previewState) this._hideFilePreviewNavigation();
+    }
+  },
+
+  navigateFilePreviewAttachment(direction) {
+    const state = this.filePreviewState;
+    if (!state || (direction !== -1 && direction !== 1) || !state.navigationItems) return;
+    const item = state.navigationItems[state.navigationIndex + direction];
+    if (!item) return;
+    this.openFilePreview(item.relativePath || item.fileName, state.sessionId, item.attachmentId || null);
+  },
+
+  async _fetchFilePreviewMetadata(metadataUrl) {
+    const res = await fetch(metadataUrl);
+    let result;
+    try {
+      result = await res.json();
+    } catch {
+      throw new Error('Failed to load file');
+    }
+    if (!res.ok) {
+      throw new Error(typeof result?.error === 'string' && result.error ? result.error : 'Failed to load file');
+    }
+    if (!result.success) throw new Error(result.error || 'Failed to load file');
+    return result.data;
+  },
+
+  /** Cheap change signal: file mtime + size. Re-render only when it changes. */
+  _filePreviewSignature(data) {
+    return `${data?.mtimeMs ?? ''}:${data?.size ?? ''}`;
+  },
+
+  /**
+   * Keep imported Word comments local to their annotated passage. The generated
+   * buttons only carry sanitized IDs; this delegated handler owns all state and
+   * deliberately never changes the preview's scroll position.
+   */
+  _bindDocxCommentInspector(bodyEl) {
+    const preview = bodyEl?.querySelector('.document-preview-html');
+    if (!preview || preview.dataset.docxCommentInspectorBound) return;
+    preview.dataset.docxCommentInspectorBound = '1';
+
+    const buttonForCard = (card) =>
+      [...preview.querySelectorAll('.docx-comment-button')].find(
+        (button) => button.getAttribute('aria-controls') === card.id
+      );
+    const setOpen = (card, open, restoreFocus = false) => {
+      preview.querySelectorAll('.docx-comment-card').forEach((otherCard) => {
+        const otherButton = buttonForCard(otherCard);
+        otherCard.hidden = otherCard !== card || !open;
+        otherButton?.setAttribute('aria-expanded', otherCard === card && open ? 'true' : 'false');
+      });
+      if (restoreFocus) buttonForCard(card)?.focus();
+    };
+
+    preview.addEventListener('click', (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const closeButton = target?.closest('.docx-comment-close');
+      if (closeButton) {
+        event.preventDefault();
+        const card = closeButton.closest('.docx-comment-card');
+        if (card) setOpen(card, false, true);
+        return;
+      }
+      const button = target?.closest('.docx-comment-button');
+      if (!button) return;
+      event.preventDefault();
+      const cardId = button.getAttribute('aria-controls');
+      const card = [...preview.querySelectorAll('.docx-comment-card')].find((item) => item.id === cardId);
+      if (!card) return;
+      setOpen(card, card.hidden);
+    });
+
+    preview.addEventListener('keydown', (event) => {
+      if (event.key !== 'Escape') return;
+      const card = [...preview.querySelectorAll('.docx-comment-card')].find((item) => !item.hidden);
+      if (!card) return;
+      event.preventDefault();
+      setOpen(card, false, true);
+    });
+  },
+
+  /**
+   * Render the preview body for the given metadata. Used both for the initial
+   * open and for live-refresh, so it must be idempotent and not assume a loading
+   * state. Markdown/plain-text re-fetch raw content; image/pdf get an mtime
+   * cache-bust so a rewritten file actually reloads.
+   */
+  async _renderFilePreviewBody(data, { sessionId, filePath, attachmentId, cachedText }, expectedState = null) {
+    const isCurrentPreview = () => !expectedState || this.filePreviewState === expectedState;
+    if (!isCurrentPreview()) return false;
+    const bodyEl = this.$('filePreviewBody');
+    const footerEl = this.$('filePreviewFooter');
+    if (!bodyEl) return false;
+    // withBasePath: every URL here is a root-absolute app route, which ignores
+    // <base href> — it must carry the reverse-proxy mount prefix (idempotent, no-op at root).
+    const bust = (rawUrl) => {
+      const url = withBasePath(rawUrl);
+      return data.mtimeMs ? `${url}${url.includes('?') ? '&' : '?'}_t=${data.mtimeMs}` : url;
+    };
+    const st = this.filePreviewState;
+    this._disposeSpreadsheetPreview?.(expectedState || st);
+    if (st) {
+      st.previewKind = null;
+      st.previewCopyUrl = null;
+    }
+    this.filePreviewContent = '';
+    // Re-decided per render: only the text branch below re-offers Edit, so any
+    // other type (image/video/binary/diff) leaves the button hidden.
+    this.filePreviewEditTarget = null;
+    const editBtnEl = this.$('filePreviewEditBtn');
+    if (editBtnEl) editBtnEl.hidden = true;
+    // Likewise the MD/Lines/Wrap toggles: only the text branch re-offers them.
+    this.filePreviewText = null;
+    this._updateFilePreviewToolbar?.('none');
+
+    if (data.type === 'spreadsheet') {
+      const renderer = window.CodemanSpreadsheetPreview;
+      if (!renderer?.open) {
+        bodyEl.innerHTML = '<div class="binary-message">Spreadsheet preview is unavailable.</div>';
+      } else {
+        bodyEl.textContent = '';
+        const previewState = expectedState || st;
+        const previewUrl = data.previewUrl || data.url;
+        if (!previewState || !previewUrl) {
+          bodyEl.innerHTML = '<div class="binary-message">Spreadsheet preview is unavailable.</div>';
+        } else {
+          previewState.spreadsheetPreview = renderer.open({
+            container: bodyEl,
+            url: bust(previewUrl),
+            size: data.size,
+            isCurrent: () => this.filePreviewState === previewState,
+          });
         }
       }
+      footerEl.textContent = `${this.formatFileSize(data.size)} • ${window.codemanT?.('Spreadsheet') || 'Spreadsheet'}`;
+    } else if (data.type === 'image') {
+      this.filePreviewZoom = 1;
+      this.filePreviewZoomMode = 'fit';
+      const imageUrl = bust(data.previewUrl || data.url);
+      if (st) {
+        st.previewKind = 'image';
+        st.previewCopyUrl = imageUrl;
+      }
+      bodyEl.innerHTML = `
+        <div class="document-preview-toolbar">
+          <button class="btn-icon-sm" onclick="app.setFilePreviewZoom('out')" title="Zoom out">-</button>
+          <button class="btn-icon-sm" onclick="app.setFilePreviewZoom('fit')" title="Fit">Fit</button>
+          <button class="btn-icon-sm" onclick="app.setFilePreviewZoom('in')" title="Zoom in">+</button>
+        </div>
+        <div class="document-preview-stage">
+          <img class="document-preview-image" src="${imageUrl}" alt="${escapeHtml(filePath)}">
+        </div>
+      `;
+      const image = bodyEl.querySelector('.document-preview-image');
+      const fitWhenReady = () => {
+        if (this.filePreviewZoomMode === 'fit') this._fitFilePreviewImage();
+      };
+      image?.addEventListener('load', fitWhenReady, { once: true });
+      // Cached images may already be complete before the load listener is bound.
+      if (image?.complete) requestAnimationFrame(fitWhenReady);
+      footerEl.textContent = `${this.formatFileSize(data.size)} \u2022 ${data.extension}`;
+    } else if (data.type === 'video') {
+      // playsinline: iOS otherwise hijacks playback into its fullscreen
+      // player, which leaves the overlay behind it and its own close button
+      // as the only way back.
+      bodyEl.innerHTML = `<video src="${escapeHtml(withBasePath(data.url))}" controls autoplay playsinline preload="metadata"></video>`;
+      footerEl.textContent = `${this.formatFileSize(data.size)} \u2022 ${data.extension}`;
+    } else if (data.type === 'audio') {
+      bodyEl.innerHTML = `<audio src="${escapeHtml(withBasePath(data.url))}" controls autoplay preload="metadata"></audio>`;
+      footerEl.textContent = `${this.formatFileSize(data.size)} \u2022 ${data.extension}`;
+    } else if (data.type === 'pdf' || data.type === 'document' || data.type === 'presentation') {
+      const st = this.filePreviewState;
+      const sourceExtension = String(data.extension || '')
+        .toLowerCase();
+      const isOfficePreview =
+        (data.type === 'document' && sourceExtension === 'docx') ||
+        (data.type === 'presentation' && sourceExtension === 'pptx');
+      // .docx supports a view switcher: rendered PDF (default), selectable HTML, and Changes (COD-68).
+      // COD-418: PDF/HTML are a property of the FILE — a docx renders to both — not of how it was
+      // opened, so they are gated on docx-ness. Gating them on `attachmentId` meant a docx opened by
+      // WORKSPACE PATH (the Files panel and terminal file-path links make the identical
+      // openFilePreview(path, sessionId) call) had no selectable HTML view and therefore no Comment,
+      // while the SAME file outside the workspace — registered as an attachment by
+      // openExternalPathPreview — did. The affordance depended on where the file happened to live.
+      // The server was already path-capable: /documents/html resolves attachmentId OR path.
+      // `Changes` stays attachment-only, and stays keyed on the attachment rather than on docx-ness,
+      // because it needs stored versions and a non-docx attachment still has a revision history.
+      const isDocx = data.type === 'document' && sourceExtension === 'docx';
+      const hasRevisions = !!attachmentId;
+      const view = isDocx ? st?.docxView || 'pdf' : 'pdf';
+      if (isDocx && view === 'html') {
+        let html = '';
+        try {
+          const r = await fetch(`/api/sessions/${sessionId}/documents/html?${this._documentParams()}`);
+          if (r.ok) html = (await r.json()).data?.html || '';
+        } catch {
+          /* fall through to empty */
+        }
+        if (!isCurrentPreview()) return false;
+        const safe = typeof this._sanitizeHtml === 'function' ? this._sanitizeHtml(html) : escapeHtml(html);
+        bodyEl.innerHTML = `<div class="document-preview-html rv-text">${safe}</div>`;
+        this._bindDocxCommentInspector(bodyEl);
+        // COD-418: re-apply comment highlights onto the freshly-rendered HTML, exactly as the
+        // markdown/text branch does. Without this a comment could be added on this view but its
+        // highlight vanished on the next poll re-render, and the COD-95 occurrence anchor was
+        // resolved against a null root (see _previewProseEl).
+        this._applyCommentHighlights(bodyEl.querySelector('.document-preview-html'));
+      } else {
+        const previewUrl =
+          data.previewUrl || data.url || `/api/sessions/${sessionId}/file-preview?path=${encodeURIComponent(filePath)}`;
+        const bustedPreviewUrl = bust(previewUrl);
+        // A Files-panel Office preview is a converted PDF, not the source file.
+        // Suppress the embedded PDF toolbar so its download icon cannot present
+        // that conversion as the primary download; the footer below provides an
+        // explicit guarded source download and a separately-labelled PDF export.
+        const iframeFragment = isOfficePreview ? '#toolbar=0' : '';
+        if (data.type === 'pdf') {
+          // Raw PDF: no server-side conversion, so embed it directly.
+          bodyEl.innerHTML = `<iframe class="document-preview-frame" src="${bustedPreviewUrl}${iframeFragment}" title="${escapeHtml(filePath)}"></iframe>`;
+        } else {
+          // docx/pptx (COD-239): the preview endpoint BLOCKS on a soffice→PDF
+          // conversion and only returns 200+PDF once it's ready (500 on failure).
+          // A bare iframe would sit blank for the whole conversion, so fetch the
+          // converted PDF to a blob behind a visible "Rendering…" state and swap
+          // in a blob-URL iframe when it lands. Fire-and-forget so the footer and
+          // loading state paint immediately; the helper re-checks staleness after
+          // every await and stores its promise for polling/tests.
+          const renderState = expectedState || this.filePreviewState;
+          const renderPromise = this._renderOfficeConversionPreview(
+            bodyEl,
+            bustedPreviewUrl,
+            iframeFragment,
+            filePath,
+            renderState
+          );
+          if (renderState) renderState.previewRenderPromise = renderPromise;
+        }
+      }
+      const label = data.type === 'presentation' ? 'slides' : data.type === 'document' ? 'document' : 'pdf';
+      const viewButtons = isDocx
+        ? `<button class="btn-icon-sm ${view === 'pdf' ? 'active' : ''}" onclick="app.switchDocxView('pdf')">PDF</button>` +
+          `<button class="btn-icon-sm ${view === 'html' ? 'active' : ''}" onclick="app.switchDocxView('html')">HTML</button>`
+        : '';
+      const changesButton = hasRevisions
+        ? `<button class="btn-icon-sm" onclick="app.switchDocxView('changes')">Changes</button>`
+        : '';
+      const switcher =
+        viewButtons || changesButton
+          ? ` <span class="document-view-switch">${viewButtons}${changesButton}</span>`
+          : '';
+      // Comment is available on the selectable HTML view (COD-68/69).
+      const comment =
+        isDocx && view === 'html'
+          ? ` <button class="btn-icon-sm document-comment-btn" onclick="app.commentOnSelection()">Comment</button>`
+          : '';
+      // One-click PDF export of the open document (COD-61). docx/pptx reuse the
+      // LibreOffice preview-PDF cache server-side; raw PDFs are already PDFs but
+      // the control downloads them consistently via the export endpoint.
+      const exportPdf = this._renderExportPdfControl();
+      footerEl.innerHTML = `${escapeHtml(
+        `${this.formatFileSize(data.size)} \u2022 ${label}`
+      )}${switcher}${comment}${exportPdf}`;
+    } else if (data.type === 'markdown' || data.type === 'text') {
+      // Fetch the raw text and render it client-side. Markdown goes through the
+      // shared sanitized renderer (_renderMarkdown -> _sanitizeHtml); plain text
+      // is HTML-escaped into a <pre> so whitespace is preserved without inline HTML.
+      // A view toggle (MD pill) re-renders from the text already fetched for
+      // this exact data (`cachedText`), so flipping views costs no request.
+      let text;
+      if (typeof cachedText === 'string') {
+        text = cachedText;
+      } else {
+        const rawUrl =
+          data.url || data.previewUrl || `/api/sessions/${sessionId}/file-raw?path=${encodeURIComponent(filePath)}`;
+        const textRes = await fetch(bust(rawUrl));
+        if (!isCurrentPreview()) return false;
+        if (!textRes.ok) throw new Error('Failed to load file');
+        text = await textRes.text();
+        if (!isCurrentPreview()) return false;
+      }
+      this.filePreviewContent = text;
+      // Edit affordance (issue #212): the server decides — `editable` is its own
+      // dry-run of the edit=1 gate (allowlist + sensitive/blocked + .git + size +
+      // UTF-8). Attachment previews come from a different endpoint that never sets
+      // it, so external documents stay read-only without a special case here.
+      if (data.editable === true && !attachmentId) {
+        this.filePreviewEditTarget = { sessionId, filePath };
+        const editBtn = this.$('filePreviewEditBtn');
+        if (editBtn) editBtn.hidden = false;
+      }
+      // Reset any prior outline scroll-spy before re-rendering (no observer leaks).
+      this._teardownOutlineScrollSpy();
+      // Restore persisted client-only view prefs (COD-62).
+      this.readingViewActive = this._readPreviewPref('codeman.preview.readingView');
+      const outlineOpenPref = this._readPreviewPref('codeman.preview.outlineOpen');
+      // Upstream #503 text view (MD / Lines / Wrap toggles), folded into the
+      // downstream document viewer: the MD pill flips a markdown file between
+      // the rendered document and its source, and the source / plain-text view
+      // takes the Lines and Wrap toggles. toggleFilePreviewMd re-renders through
+      // this branch (see _rerenderFilePreviewText) so outline, reading view,
+      // comments and Changes survive the flip.
+      const textExt = String(data.extension || filePath.split('.').pop() || '').toLowerCase();
+      this.filePreviewText = { ext: textExt, sessionId, filePath, attachmentId, data, text, state: expectedState || st };
+      const renderMarkdown = data.type === 'markdown' && this._filePreviewPref?.('mdRendered') !== false;
+      let outlineBtn = '';
+      let prose;
+      if (renderMarkdown) {
+        // Render prose first, then build the outline from the SANITIZED DOM and
+        // wrap both in a flex layout so the outline sidebar sits beside the prose.
+        // Built inside a <template> (upstream #503): a detached div with
+        // innerHTML set starts fetching every <img src> before the rebase pass
+        // rewrites the relative ones. `breaks: false`: a file is not a chat
+        // message, a hard-wrapped paragraph is one paragraph. data-i18n-skip
+        // keeps the translator off the document's own prose.
+        const tmpl = document.createElement('template');
+        tmpl.innerHTML = `<div class="document-preview-markdown rv-text file-preview-md${
+          this.readingViewActive ? ' reading-view' : ''
+        }" data-i18n-skip>${this._renderMarkdown(text, { breaks: false })}</div>`;
+        prose = tmpl.content.firstElementChild;
+        this._rebaseFilePreviewMarkdownRefs?.(prose, this.filePreviewText);
+        this._linkifyFilePaths?.(prose);
+        for (const a of prose.querySelectorAll('a.rv-path:not([data-session-id])')) a.dataset.sessionId = sessionId;
+        bodyEl.replaceChildren(prose);
+        const nav = this._buildDocumentOutline(prose);
+        const layout = document.createElement('div');
+        layout.className = 'document-preview-layout';
+        if (nav && outlineOpenPref) layout.classList.add('outline-open');
+        if (nav) layout.appendChild(nav);
+        layout.appendChild(prose);
+        bodyEl.innerHTML = '';
+        bodyEl.appendChild(layout);
+        this._bindResponseViewerInteractions?.(prose);
+        if (nav) {
+          this._setupOutlineScrollSpy(nav, prose);
+          outlineBtn = ` <button class="btn-icon-sm document-outline-btn${
+            outlineOpenPref ? ' active' : ''
+          }" onclick="app.toggleDocumentOutline()">Outline</button>`;
+        }
+      } else {
+        // Plain text, or a markdown file in source view: one span per line so
+        // the Lines gutter can number them without the numbers being part of the
+        // text (select/copy and the comment anchors see the exact file text).
+        const pre = document.createElement('pre');
+        pre.className = `document-preview-text file-preview-text${this.readingViewActive ? ' reading-view' : ''}`;
+        pre.classList.toggle('wrap', this._filePreviewPref?.('wrap') !== false);
+        pre.classList.toggle('show-lines', this._filePreviewPref?.('lineNumbers') === true);
+        const code = document.createElement('code');
+        code.innerHTML = text
+          .split('\n')
+          .map((line) => `<span class="fp-line">${escapeHtml(line)}</span>`)
+          .join('\n');
+        pre.appendChild(code);
+        bodyEl.replaceChildren(pre);
+        prose = pre;
+      }
+      this._updateFilePreviewToolbar?.(renderMarkdown ? 'markdown' : 'text');
+      // COD-95: re-apply comment highlights onto the freshly-rendered prose. The
+      // preview re-renders on poll, destroying any prior spans, so we rebuild them
+      // from the persisted per-comment anchors (quote + occurrence).
+      this._applyCommentHighlights(prose);
+      // Reading-view toggle (constrained measure) for both markdown and text.
+      const readingBtn = ` <button class="btn-icon-sm document-reading-btn${
+        this.readingViewActive ? ' active' : ''
+      }" onclick="app.toggleReadingView()">Reading view</button>`;
+      // Word count + reading time from the rendered prose textContent (COD-62).
+      const meta = this._formatReadingMeta(this._countWords(prose?.textContent || ''));
+      // Revision-history affordance for versioned (attached) documents (COD-59).
+      const changes = attachmentId
+        ? ` <button class="btn-icon-sm document-changes-btn" onclick="app.showDocumentDiff()">Changes</button>`
+        : '';
+      // Annotate a selected passage and send it back to the session (COD-60).
+      const comment = ` <button class="btn-icon-sm document-comment-btn" onclick="app.commentOnSelection()">Comment</button>`;
+      // User-configured one-click authoring actions (COD-64). Only shown when the
+      // user has configured at least one action AND there's a session to send to.
+      const authoring = this._renderAuthoringControl();
+      // One-click PDF export of the open document (COD-61).
+      const exportPdf = this._renderExportPdfControl();
+      footerEl.innerHTML = `${escapeHtml(
+        `${this.formatFileSize(data.size)} \u2022 ${data.extension || data.type} \u2022 ${meta}`
+      )}${outlineBtn}${readingBtn}${changes}${comment}${authoring}${exportPdf}`;
+    } else if (data.type === 'binary') {
+      bodyEl.innerHTML = `
+        <div class="binary-message">
+          Binary file (${this.formatFileSize(data.size)})<br>
+          Cannot preview<br><br>
+          <button class="btn-icon-sm" onclick="app.openAttachmentInNewTab(${escapeHtml(JSON.stringify(sessionId))}, ${escapeHtml(JSON.stringify(filePath))}, ${attachmentId ? escapeHtml(JSON.stringify(attachmentId)) : 'null'})">Open</button>
+        </div>
+      `;
+      footerEl.textContent = data.extension || 'binary';
+    } else {
+      // Text content (workspace file-content path)
+      this.filePreviewContent = data.content;
+      this.filePreviewText = { ext: String(data.extension || filePath.split('.').pop() || '').toLowerCase(), sessionId, filePath };
+      this._renderFilePreviewText();
+      if (data.editable && !attachmentId) {
+        this.filePreviewEditTarget = { sessionId, filePath };
+        const editBtn = this.$('filePreviewEditBtn');
+        if (editBtn) editBtn.hidden = false;
+      }
+      const truncNote = data.truncated ? ` (showing 500/${data.totalLines} lines)` : '';
+      footerEl.textContent = `${data.totalLines} lines \u2022 ${this.formatFileSize(data.size)}${truncNote}`;
+    }
+    return true;
+  },
+
+  /**
+   * Render a converted Office (docx/pptx) preview into the body (COD-239). The
+   * server's preview endpoint blocks on a soffice→PDF conversion, so a bare
+   * iframe pointed straight at it would sit blank for the whole conversion (the
+   * reported bug). Instead we paint a visible "Rendering document…" state and
+   * fetch the SAME-ORIGIN preview URL purely as a readiness probe (abortable,
+   * failure-detecting). On success we render the iframe against that same
+   * same-origin URL — it's a warm disk-cache hit (fast) AND allowed by the app's
+   * `default-src 'self'` CSP. We deliberately do NOT render a `blob:` URL: the
+   * CSP has no `frame-src`, so framing a blob: violates `default-src 'self'` and
+   * the browser blocks it (the preview would stay blank). An AbortController on
+   * the preview state lets a close/switch cancel the in-flight probe; staleness
+   * is re-checked after the await so a late response can't overwrite a newer
+   * preview. A failed conversion renders a Retry affordance.
+   */
+  async _renderOfficeConversionPreview(bodyEl, fetchUrl, iframeFragment, filePath, expectedState) {
+    if (!bodyEl) return;
+    const isCurrentPreview = () => !expectedState || this.filePreviewState === expectedState;
+    // Abort any prior in-flight readiness probe for this state before re-probing
+    // (e.g. a poll re-render after the document was rewritten).
+    this._teardownOfficePreviewResources(expectedState);
+    bodyEl.innerHTML = '<div class="binary-message">Rendering document…</div>';
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    if (expectedState) expectedState.previewFetchAbort = controller;
+    let res;
+    try {
+      res = await fetch(fetchUrl, controller ? { signal: controller.signal } : undefined);
     } catch (err) {
-      if (stale()) return;
-      console.error('Failed to preview file:', err);
-      bodyEl.innerHTML = `<div class="binary-message">Error: ${escapeHtml(err.message)}</div>`;
+      if ((err && err.name === 'AbortError') || !isCurrentPreview()) return;
+      this._renderOfficePreviewError(bodyEl, null);
+      return;
+    }
+    if (!isCurrentPreview()) return;
+    if (!res || !res.ok) {
+      let message = null;
+      try {
+        const errBody = await res.json();
+        if (errBody && typeof errBody.error === 'string') message = errBody.error;
+      } catch {
+        // Non-JSON error body — fall back to a generic message.
+      }
+      if (!isCurrentPreview()) return;
+      this._renderOfficePreviewError(bodyEl, message);
+      return;
+    }
+    // Conversion succeeded and is now warm in the server/disk cache. Free the
+    // probe's response body (we never read it) and render the iframe against the
+    // same-origin URL — CSP-allowed and a fast cache hit.
+    try {
+      res.body?.cancel();
+    } catch {
+      // Body already consumed/unsupported — nothing to release.
+    }
+    if (!isCurrentPreview()) return;
+    bodyEl.innerHTML = `<iframe class="document-preview-frame" src="${fetchUrl}${iframeFragment}" title="${escapeHtml(
+      filePath
+    )}"></iframe>`;
+  },
+
+  /** Render an Office-conversion failure state with a Retry control (COD-239). */
+  _renderOfficePreviewError(bodyEl, message) {
+    if (!bodyEl) return;
+    const text = message || 'Document preview conversion failed';
+    bodyEl.innerHTML =
+      `<div class="binary-message">${escapeHtml(text)}<br><br>` +
+      `<button class="btn-icon-sm" onclick="app.retryFilePreview()">Retry</button></div>`;
+  },
+
+  /**
+   * Cancel any in-flight Office conversion readiness probe so a close/switch
+   * can't let a late response overwrite a newer preview (COD-239). Safe to call
+   * repeatedly and on states with nothing set.
+   */
+  _teardownOfficePreviewResources(state) {
+    if (!state) return;
+    try {
+      state.previewFetchAbort?.abort();
+    } catch {
+      // Aborting an already-settled controller is a no-op.
+    }
+    state.previewFetchAbort = null;
+  },
+
+  /** Dispose the worker/fetch lifecycle owned by a spreadsheet preview state. */
+  _disposeSpreadsheetPreview(state) {
+    if (!state?.spreadsheetPreview) return;
+    try {
+      state.spreadsheetPreview.dispose();
+    } catch {
+      // Disposal is best-effort; the state identity still prevents stale renders.
+    }
+    state.spreadsheetPreview = null;
+  },
+
+  /** Re-open the current preview from scratch (COD-239 conversion Retry). */
+  retryFilePreview() {
+    const st = this.filePreviewState;
+    if (!st) return;
+    if (st.displayPath && st.displayPath !== st.filePath) {
+      this.openFilePreview(st.filePath, st.sessionId, st.attachmentId, { displayPath: st.displayPath });
+      return;
+    }
+    this.openFilePreview(st.filePath, st.sessionId, st.attachmentId);
+  },
+
+  _startFilePreviewPolling() {
+    this._stopFilePreviewPolling(true);
+    // Light cadence: a metadata stat every 1.5s while the preview is open and visible.
+    this._filePreviewPollTimer = setInterval(() => this._pollFilePreview(), 1500);
+  },
+
+  _stopFilePreviewPolling(keepState = false) {
+    if (this._filePreviewPollTimer) {
+      clearInterval(this._filePreviewPollTimer);
+      this._filePreviewPollTimer = null;
+    }
+    // On close/switch (not a poll-cycle restart) cancel the outgoing preview's
+    // in-flight Office conversion readiness probe before dropping its state.
+    if (!keepState) {
+      this._teardownOfficePreviewResources(this.filePreviewState);
+      this._disposeSpreadsheetPreview?.(this.filePreviewState);
+      this.filePreviewState = null;
+      this._resetFilePreviewOriginalDownloadAction?.();
+    }
+  },
+
+  async _pollFilePreview() {
+    const st = this.filePreviewState;
+    const overlay = this.$('filePreviewOverlay');
+    if (!st || !overlay || !overlay.classList.contains('visible') || document.hidden) return;
+    // Never poll while the editor is open: a change on disk re-renders the body
+    // wholesale (_renderFilePreviewBody replaces innerHTML), which would destroy
+    // the textarea and every unsaved keystroke in it. The agent writing the file
+    // underneath the editor is exactly when this fires, and it is also exactly
+    // what the save path's baseHash 409 is there to catch — so the right answer
+    // is to stop refreshing, not to merge.
+    if (this.filePreviewEdit) return;
+    if (this._filePreviewPolling) return; // don't overlap slow fetches
+    this._filePreviewPolling = true;
+    try {
+      const data = await this._fetchFilePreviewMetadata(st.metadataUrl);
+      if (this.filePreviewState !== st) return;
+      this._setFilePreviewExternalUrl?.(st, data);
+      st.mtimeMs = data.mtimeMs ?? null;
+      const sig = this._filePreviewSignature(data);
+      if (sig === st.signature) return; // unchanged
+      st.signature = sig;
+      // In revision-review mode, keep the diff live as the agent keeps editing.
+      if (st.mode === 'diff') {
+        await this.showDocumentDiff(st.diffFrom);
+        return;
+      }
+      const SCROLLERS = '.document-preview-markdown, .document-preview-text, .document-preview-stage, .document-preview-diff';
+      const bodyEl = this.$('filePreviewBody');
+      const prevTop = bodyEl?.querySelector(SCROLLERS)?.scrollTop || 0;
+      const rendered = await this._renderFilePreviewBody(
+        data,
+        {
+          sessionId: st.sessionId,
+          filePath: st.filePath,
+          attachmentId: st.attachmentId,
+        },
+        st
+      );
+      if (!rendered || this.filePreviewState !== st) return;
+      const newScroller = this.$('filePreviewBody')?.querySelector(SCROLLERS);
+      if (newScroller) newScroller.scrollTop = prevTop;
+    } catch {
+      // File may be momentarily unavailable mid-write \u2014 keep the last good render.
+    } finally {
+      this._filePreviewPolling = false;
+    }
+  },
+
+  /** Query string identifying the previewed document for the /documents endpoints. */
+  _documentParams() {
+    const st = this.filePreviewState;
+    if (!st) return '';
+    return st.attachmentId
+      ? `attachmentId=${encodeURIComponent(st.attachmentId)}`
+      : `path=${encodeURIComponent(st.filePath)}`;
+  },
+
+  /**
+   * Render the "Export PDF" footer control (COD-61), or '' when the document
+   * isn't exportable. Server supports docx/pptx (cached LibreOffice PDF) and
+   * md/markdown/txt (HTML→PDF); other types (incl. already-PDF) are skipped.
+   */
+  _renderExportPdfControl() {
+    const st = this.filePreviewState;
+    if (!st || (!st.filePath && !st.attachmentId)) return '';
+    const ext = (st.filePath || '').split('.').pop()?.toLowerCase() || '';
+    const exportable = ['docx', 'pptx', 'md', 'markdown', 'mdown', 'txt', 'text'];
+    // attachmentId-only previews (no path) still expose the control; the server
+    // resolves the extension from the attachment record and 400s if unsupported.
+    if (st.filePath && !exportable.includes(ext)) return '';
+    return ` <button class="btn-icon-sm document-export-btn" onclick="app.exportDocumentPdf()" title="Download a PDF of this document">Export PDF</button>`;
+  },
+
+  /** Download a PDF of the open document via the export endpoint (COD-61). */
+  exportDocumentPdf() {
+    const st = this.filePreviewState;
+    if (!st || !st.sessionId) {
+      this.showToast?.('No document to export', 'error');
+      return;
+    }
+    const params = this._documentParams();
+    if (!params) {
+      this.showToast?.('No document to export', 'error');
+      return;
+    }
+    const url = `/api/sessions/${st.sessionId}/documents/export?${params}&format=pdf`;
+    // Trigger a download via a temporary anchor so a server error (which returns
+    // a JSON envelope, not a PDF) doesn't navigate the SPA away.
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '';
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  },
+
+  /** Switch the preview into revision-review mode and render the diff (COD-59). */
+  async showDocumentDiff(fromId = null) {
+    const st = this.filePreviewState;
+    if (!st) return;
+    st.mode = 'diff';
+    st.diffFrom = fromId;
+    const sid = st.sessionId;
+    const params = this._documentParams();
+    const isCurrentDiff = () => this.filePreviewState === st && st.mode === 'diff';
+    try {
+      const vres = await fetch(`/api/sessions/${sid}/documents/versions?${params}`);
+      if (!isCurrentDiff()) return;
+      let versions = [];
+      if (vres.ok) {
+        const versionBody = await vres.json();
+        if (!isCurrentDiff()) return;
+        versions = versionBody.data?.versions || [];
+      }
+      let diff = { ops: [], from: null, to: null };
+      if (versions.length >= 2) {
+        const to = versions[versions.length - 1].id;
+        const from = fromId || versions[versions.length - 2].id;
+        const dres = await fetch(
+          `/api/sessions/${sid}/documents/diff?${params}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`
+        );
+        if (!isCurrentDiff()) return;
+        if (dres.ok) {
+          const diffBody = await dres.json();
+          if (!isCurrentDiff()) return;
+          diff = diffBody.data;
+        }
+      }
+      if (!isCurrentDiff()) return;
+      this._renderDocumentDiff(versions, diff);
+    } catch (err) {
+      if (!isCurrentDiff()) return;
+      const bodyEl = this.$('filePreviewBody');
+      if (bodyEl) bodyEl.innerHTML = `<div class="binary-message">Error: ${escapeHtml(err.message)}</div>`;
+    }
+  },
+
+  _renderDocumentDiff(versions, diff) {
+    const bodyEl = this.$('filePreviewBody');
+    const footerEl = this.$('filePreviewFooter');
+    if (!bodyEl) return;
+    const latest = versions[versions.length - 1];
+    const seqOf = (id) => (versions.find((vv) => vv.id === id) || {}).seq || '';
+    const diffHtml = (diff.ops || [])
+      .map((op) => {
+        const v = escapeHtml(op.value);
+        if (op.type === 'insert') return `<ins>${v}</ins>`;
+        if (op.type === 'delete') return `<del>${v}</del>`;
+        return `<span>${v}</span>`;
+      })
+      .join('');
+    const fromSelect =
+      versions.length >= 2
+        ? `<label class="document-diff-from">Compare from
+            <select onchange="app.showDocumentDiff(this.value)">
+              ${versions
+                .slice(0, -1)
+                .map((vv) => `<option value="${escapeHtml(vv.id)}" ${vv.id === diff.from ? 'selected' : ''}>v${vv.seq}</option>`)
+                .join('')}
+            </select> \u2192 v${latest ? latest.seq : ''}</label>`
+        : '';
+    const restoreBtn =
+      diff.from && diff.from !== diff.to
+        ? `<button class="btn-icon-sm" onclick="app.rollbackDocument(${escapeHtml(JSON.stringify(diff.from))})">Restore v${seqOf(diff.from)}</button>`
+        : '';
+    const content =
+      versions.length < 2
+        ? `<div class="binary-message">Only one version captured so far \u2014 keep this preview open while the agent edits to build up revision history.</div>`
+        : `<pre class="document-preview-diff">${diffHtml}</pre>`;
+    bodyEl.innerHTML = `
+      <div class="document-preview-actions">
+        <button class="btn-icon-sm" onclick="app.exitDocumentDiff()">\u2190 Back to preview</button>
+        ${fromSelect}
+        ${restoreBtn}
+        <button class="btn-icon-sm document-comment-btn" onclick="app.commentOnSelection()">Comment</button>
+      </div>
+      ${content}`;
+    // COD-100: re-apply comment highlights onto the freshly-rendered diff body, the
+    // same way the normal preview does (COD-95). The diff render replaces the
+    // annotated DOM, so commented passages would otherwise lose their highlight in
+    // the Changes view; COD-68 intended highlight/annotation to work on BOTH views.
+    // Anchors that no longer match the diffed text are skipped gracefully.
+    this._applyCommentHighlights(bodyEl.querySelector('.document-preview-diff'));
+    if (footerEl) {
+      footerEl.textContent = `${versions.length} version${versions.length === 1 ? '' : 's'} \u2022 additions and deletions vs the selected version`;
+    }
+  },
+
+  /** Leave revision-review mode and re-render the live document. */
+  async exitDocumentDiff() {
+    const st = this.filePreviewState;
+    if (!st) return;
+    st.mode = 'preview';
+    st.diffFrom = null;
+    try {
+      const data = await this._fetchFilePreviewMetadata(st.metadataUrl);
+      if (this.filePreviewState !== st) return;
+      st.signature = this._filePreviewSignature(data);
+      st.mtimeMs = data.mtimeMs ?? null;
+      await this._renderFilePreviewBody(
+        data,
+        {
+          sessionId: st.sessionId,
+          filePath: st.filePath,
+          attachmentId: st.attachmentId,
+        },
+        st
+      );
+    } catch {
+      // Leave the diff in place if the document can't be re-read right now.
+    }
+  },
+
+  /** Restore the document to a prior version, then return to the live preview. */
+  async rollbackDocument(versionId) {
+    const st = this.filePreviewState;
+    if (!st || !versionId) return;
+    const body = st.attachmentId ? { attachmentId: st.attachmentId, versionId } : { path: st.filePath, versionId };
+    try {
+      const res = await fetch(`/api/sessions/${st.sessionId}/documents/rollback`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        this.showToast?.('Document rolled back', 'success');
+        await this.exitDocumentDiff();
+      } else {
+        this.showToast?.('Rollback failed', 'error');
+      }
+    } catch {
+      this.showToast?.('Rollback failed', 'error');
+    }
+  },
+
+  /** Switch the .docx preview between PDF, selectable HTML, and Changes views (COD-68). */
+  async switchDocxView(view) {
+    const st = this.filePreviewState;
+    if (!st) return;
+    if (view === 'changes') {
+      await this.showDocumentDiff();
+      return;
+    }
+    st.mode = 'preview';
+    st.docxView = view;
+    try {
+      const data = await this._fetchFilePreviewMetadata(st.metadataUrl);
+      if (this.filePreviewState !== st) return;
+      st.signature = this._filePreviewSignature(data);
+      st.mtimeMs = data.mtimeMs ?? null;
+      await this._renderFilePreviewBody(
+        data,
+        {
+          sessionId: st.sessionId,
+          filePath: st.filePath,
+          attachmentId: st.attachmentId,
+        },
+        st
+      );
+    } catch {
+      /* keep current view on error */
+    }
+  },
+
+  /** Capture the selected passage in the preview and open the annotation composer (COD-60/69). */
+  commentOnSelection() {
+    const bodyEl = this.$('filePreviewBody');
+    const sel = typeof window !== 'undefined' && window.getSelection ? window.getSelection() : null;
+    const text = sel ? String(sel).trim() : '';
+    let withinPreview = false;
+    if (sel && sel.rangeCount && bodyEl) {
+      const node = sel.getRangeAt(0).commonAncestorContainer;
+      withinPreview = bodyEl.contains(node.nodeType === 1 ? node : node.parentNode);
+    }
+    if (!text || !withinPreview) {
+      this.showToast?.('Select some text in the document first', 'info');
+      return;
+    }
+    // COD-95: resolve which occurrence of the selected quote this is, so the
+    // highlight can be re-applied after the preview re-renders. We anchor on the
+    // whitespace-collapsed quote + its 0-based occurrence index within the prose.
+    // Compute it BEFORE opening the popover (opening clears any prior pending value),
+    // then assign so addAnnotation can read it.
+    const occurrence = this._selectionOccurrence(sel, this._previewProseEl());
+    this._openAnnotationPopover(text);
+    this._annotationPendingOccurrence = occurrence;
+  },
+
+  /**
+   * The rendered prose container the highlights live in: markdown, plain text, or
+   * the diff/Changes body (COD-68). COD-100 adds `.document-preview-diff` so the
+   * comment highlight + click-to-edit work while comparing versions, not just in
+   * the normal preview. COD-418 adds `.document-preview-html` — the docx HTML view, which is
+   * where a docx is commented — so its anchors resolve against real prose instead of null.
+   */
+  _previewProseEl() {
+    const bodyEl = this.$('filePreviewBody');
+    return (
+      bodyEl?.querySelector(
+        '.document-preview-markdown, .document-preview-text, .document-preview-diff, .document-preview-html'
+      ) || null
+    );
+  },
+
+  /** Collapse runs of whitespace to single spaces (matches stored anchor quotes). */
+  _normalizeQuote(s) {
+    return String(s ?? '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  },
+
+  /**
+   * COD-95: which 0-based occurrence of the selected quote (within `prose`) the
+   * current selection represents. Counts collapsed-text matches that start at or
+   * before the selection's start offset. Returns 0 when it can't be determined.
+   */
+  _selectionOccurrence(sel, prose) {
+    try {
+      if (!sel || !sel.rangeCount || !prose) return 0;
+      const quote = this._normalizeQuote(String(sel));
+      if (!quote) return 0;
+      const range = sel.getRangeAt(0);
+      // Text from the prose start up to the selection start, collapsed the same way.
+      const pre = range.cloneRange();
+      pre.selectNodeContents(prose);
+      pre.setEnd(range.startContainer, range.startOffset);
+      const before = this._normalizeQuote(pre.toString());
+      // Count non-overlapping matches of the quote that fully precede the selection.
+      let count = 0;
+      let idx = before.indexOf(quote);
+      while (idx !== -1) {
+        count++;
+        idx = before.indexOf(quote, idx + quote.length);
+      }
+      return count;
+    } catch {
+      return 0;
+    }
+  },
+
+  /**
+   * COD-95: build a stable anchor for a comment — the normalized quote plus the
+   * 0-based occurrence index within `prose`. Returns null when the quote isn't
+   * present (so we never persist an un-findable anchor).
+   */
+  _buildCommentAnchor(quote, prose, occurrence = 0) {
+    const q = this._normalizeQuote(quote);
+    if (!q) return null;
+    const haystack = this._normalizeQuote(prose?.textContent || '');
+    if (haystack.indexOf(q) === -1) return null;
+    return { quote: q, occurrence: Math.max(0, occurrence | 0) };
+  },
+
+  /**
+   * COD-95: re-apply every comment highlight onto the freshly-rendered prose. The
+   * preview re-renders on poll, so DOM spans are destroyed and must be rebuilt from
+   * the persisted anchors. For each anchor we walk the prose text nodes, locate the
+   * Nth occurrence of the (whitespace-collapsed) quote across the concatenated text,
+   * and wrap exactly that run — splitting text nodes as needed — in a
+   * `<span class="comment-highlight" data-comment-id>`. Quotes that can't be re-found
+   * (text changed) are skipped silently; nothing throws.
+   */
+  _applyCommentHighlights(prose) {
+    if (!prose) return;
+    const anns = (this._annotations || []).filter((a) => a && a.anchor && a.anchor.quote);
+    // Bind the delegated click-to-edit handler once per prose container.
+    if (!prose.dataset.commentHighlightBound) {
+      prose.dataset.commentHighlightBound = '1';
+      prose.addEventListener('click', (ev) => {
+        const span = ev.target?.closest?.('.comment-highlight');
+        if (span) this.editCommentFromHighlight(span.getAttribute('data-comment-id'));
+      });
+    }
+    for (const ann of anns) {
+      try {
+        this._wrapNthOccurrence(prose, ann.anchor.quote, ann.anchor.occurrence | 0, ann.id);
+      } catch {
+        /* anchor not re-findable after a content change — skip it gracefully */
+      }
+    }
+  },
+
+  /**
+   * Wrap the `occurrence`-th (0-based) match of the whitespace-collapsed `quote`
+   * within `root`'s text in highlight spans. Matching is done over the visible text
+   * with whitespace collapsed, mapping match positions back to (textNode, offset)
+   * pairs so a quote spanning multiple text nodes is wrapped piece by piece. No-op
+   * when the occurrence isn't found.
+   */
+  _wrapNthOccurrence(root, quote, occurrence, commentId) {
+    const q = this._normalizeQuote(quote);
+    if (!q) return;
+    // Collect text nodes (skip ones already inside a highlight to avoid re-wrapping).
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: (n) =>
+        n.parentElement && n.parentElement.closest('.comment-highlight')
+          ? NodeFilter.FILTER_REJECT
+          : NodeFilter.FILTER_ACCEPT,
+    });
+    const segments = []; // { node, start, end } over the COLLAPSED concatenation
+    let collapsed = '';
+    let prevWasSpace = true; // leading whitespace is trimmed in the collapsed form
+    let node;
+    while ((node = walker.nextNode())) {
+      const raw = node.nodeValue || '';
+      const segStart = collapsed.length;
+      // Map each raw char position to its position in the collapsed string.
+      const map = []; // map[i] = collapsed index for raw char i (or -1 if dropped)
+      for (let i = 0; i < raw.length; i++) {
+        const ch = raw[i];
+        if (/\s/.test(ch)) {
+          if (prevWasSpace) {
+            map.push(-1);
+          } else {
+            map.push(collapsed.length);
+            collapsed += ' ';
+            prevWasSpace = true;
+          }
+        } else {
+          map.push(collapsed.length);
+          collapsed += ch;
+          prevWasSpace = false;
+        }
+      }
+      segments.push({ node, raw, map, segStart });
+    }
+    const collapsedTrimmed = collapsed; // already collapsed; may have a trailing space
+    // Find the Nth occurrence start index in the collapsed text.
+    let from = 0;
+    let foundAt = -1;
+    for (let k = 0; k <= occurrence; k++) {
+      const at = collapsedTrimmed.indexOf(q, from);
+      if (at === -1) return; // not enough occurrences
+      foundAt = at;
+      from = at + q.length;
+    }
+    const matchStart = foundAt;
+    const matchEnd = foundAt + q.length; // exclusive, in collapsed coords
+
+    // For each text node, wrap the sub-range that falls inside [matchStart, matchEnd).
+    for (const seg of segments) {
+      // Determine which raw-char offsets in this node map into the match window.
+      let rawStart = -1;
+      let rawEnd = -1;
+      for (let i = 0; i < seg.raw.length; i++) {
+        const c = seg.map[i];
+        if (c === -1) continue;
+        if (c >= matchStart && c < matchEnd) {
+          if (rawStart === -1) rawStart = i;
+          rawEnd = i + 1;
+        }
+      }
+      if (rawStart === -1) continue; // this node contributes nothing to the match
+      this._wrapTextNodeRange(seg.node, rawStart, rawEnd, commentId);
+    }
+  },
+
+  /** Wrap [start, end) of a single text node in a comment-highlight span. */
+  _wrapTextNodeRange(textNode, start, end, commentId) {
+    const raw = textNode.nodeValue || '';
+    const mid = raw.slice(start, end);
+    const after = raw.slice(end);
+    const before = raw.slice(0, start);
+    const span = document.createElement('span');
+    span.className = 'comment-highlight';
+    span.setAttribute('data-comment-id', commentId);
+    span.setAttribute('title', 'Click to edit this comment');
+    span.textContent = mid;
+    const parent = textNode.parentNode;
+    if (!parent) return;
+    if (after) parent.insertBefore(document.createTextNode(after), textNode.nextSibling);
+    parent.insertBefore(span, textNode.nextSibling);
+    textNode.nodeValue = before;
+    if (!before) parent.removeChild(textNode);
+  },
+
+  /** COD-95: open the existing comment for the clicked highlight, ready to edit. */
+  editCommentFromHighlight(commentId) {
+    const ann = (this._annotations || []).find((a) => a.id === commentId);
+    if (!ann) return;
+    this._annotationPassage = ann.passage || ann.anchor?.quote || '';
+    this._openAnnotationPopover(this._annotationPassage, { note: ann.note || '', editingId: commentId });
+  },
+
+  _openAnnotationPopover(passage, { note = '', editingId = null } = {}) {
+    this._closeAnnotationPopover();
+    const shortPassage = passage.length > 240 ? `${passage.slice(0, 240)}…` : passage;
+    const editing = !!editingId;
+    const pop = document.createElement('div');
+    pop.className = 'annotation-popover';
+    pop.id = 'annotationPopover';
+    pop.innerHTML = `
+      <div class="annotation-popover-title">${editing ? 'Edit comment' : 'Add comment on selection'}</div>
+      <blockquote class="annotation-quote">${escapeHtml(shortPassage)}</blockquote>
+      <textarea class="annotation-note" rows="3" placeholder="e.g. tighten this; make it less formal; add a citation"></textarea>
+      <div class="annotation-popover-actions">
+        <button type="button" class="btn-icon-sm" onclick="app._closeAnnotationPopover()">Cancel</button>
+        <button type="button" class="btn-icon-sm annotation-send" onclick="app.addAnnotation()">${
+          editing ? 'Save comment' : 'Add to review'
+        }</button>
+      </div>`;
+    document.body.appendChild(pop);
+    this._annotationPassage = passage;
+    this._editingCommentId = editingId;
+    const ta = pop.querySelector('.annotation-note');
+    if (ta) ta.value = note;
+    setTimeout(() => ta?.focus(), 0);
+  },
+
+  _closeAnnotationPopover() {
+    document.getElementById('annotationPopover')?.remove();
+    this._annotationPassage = null;
+    this._annotationPendingOccurrence = 0;
+    this._editingCommentId = null;
+  },
+
+  /** Add the composed {passage, note} to the review tray (COD-69), or update an
+   * existing comment when editing from a highlight (COD-95). */
+  addAnnotation() {
+    const pop = document.getElementById('annotationPopover');
+    if (!pop) return;
+    const note = (pop.querySelector('.annotation-note')?.value || '').trim();
+    if (!note) {
+      this.showToast?.('Add a note first', 'info');
+      return;
+    }
+    this._annotations = this._annotations || [];
+    const editingId = this._editingCommentId;
+    if (editingId) {
+      // COD-95: edit-in-place from a highlight — keep id + anchor, swap the note.
+      const existing = this._annotations.find((a) => a.id === editingId);
+      if (existing) existing.note = note;
+      this._closeAnnotationPopover();
+    } else {
+      const passage = this._normalizeQuote(this._annotationPassage || '');
+      // COD-95: persist a stable anchor (quote + occurrence) so the selection can
+      // be re-highlighted after the preview re-renders.
+      const anchor = this._buildCommentAnchor(passage, this._previewProseEl(), this._annotationPendingOccurrence || 0);
+      this._annotations.push({ id: this._newCommentId(), passage, note, anchor });
+      this._closeAnnotationPopover();
+    }
+    this._renderAnnotationTray();
+    // Re-apply highlights immediately so the new/edited comment is visible.
+    this._applyCommentHighlights(this._previewProseEl());
+  },
+
+  /** Short, stable id for a comment (crypto.randomUUID with fallback). */
+  _newCommentId() {
+    try {
+      const uuid = globalThis.crypto?.randomUUID?.();
+      if (uuid) return `cmt-${uuid.slice(0, 8)}`;
+    } catch {
+      /* ignore */
+    }
+    return `cmt-${Math.random().toString(36).slice(2, 10)}`;
+  },
+
+  removeAnnotation(index) {
+    if (!this._annotations) return;
+    this._annotations.splice(index, 1);
+    this._renderAnnotationTray();
+    this._applyCommentHighlights(this._previewProseEl());
+  },
+
+  _closeAnnotationTray() {
+    document.getElementById('annotationTray')?.remove();
+  },
+
+  clearAnnotations() {
+    this._annotations = [];
+    this._closeAnnotationTray();
+  },
+
+  _renderAnnotationTray() {
+    this._closeAnnotationTray();
+    const items = this._annotations || [];
+    if (!items.length) return;
+    const tray = document.createElement('div');
+    tray.className = 'annotation-tray';
+    tray.id = 'annotationTray';
+    const rows = items
+      .map((a, i) => {
+        const passage = a.passage || a.anchor?.quote || '';
+        const snippet = passage.length > 80 ? `${passage.slice(0, 80)}…` : passage;
+        return `<li class="annotation-tray-item">
+            <button class="annotation-tray-remove" title="Remove" onclick="app.removeAnnotation(${i})">×</button>
+            <div class="annotation-tray-passage">“${escapeHtml(snippet)}”</div>
+            <div class="annotation-tray-note">${escapeHtml(a.note)}</div>
+          </li>`;
+      })
+      .join('');
+    tray.innerHTML = `
+      <div class="annotation-tray-title">Review comments (${items.length})</div>
+      <ul class="annotation-tray-list">${rows}</ul>
+      <div class="annotation-tray-actions">
+        <button type="button" class="btn-icon-sm" onclick="app.clearAnnotations()">Clear</button>
+        <button type="button" class="btn-icon-sm" onclick="app.saveAnnotationsToReviewFile()">Save to review file</button>
+        <button type="button" class="btn-icon-sm annotation-send" onclick="app.sendAnnotationsAsPrompt()">Send as prompt</button>
+      </div>`;
+    document.body.appendChild(tray);
+  },
+
+  _annotationTargetBody() {
+    const st = this.filePreviewState;
+    return st && st.attachmentId ? { attachmentId: st.attachmentId } : { path: st?.filePath };
+  },
+
+  /** Send all collected annotations as one consolidated single-line instruction (COD-69). */
+  async sendAnnotationsAsPrompt() {
+    const st = this.filePreviewState;
+    const items = this._annotations || [];
+    if (!st || !items.length) return;
+    const fileName = (st.filePath || '').split('/').pop() || 'the document';
+    const list = items
+      .map((a, i) => {
+        const p = a.passage.length > 160 ? `${a.passage.slice(0, 160)}…` : a.passage;
+        return `(${i + 1}) "${p}" — ${a.note}`;
+      })
+      .join('; ');
+    const message = `Please apply these edits to ${fileName}: ${list}`.replace(/\s+/g, ' ').trim();
+    if (await this._postSessionInput(st.sessionId, message)) {
+      this.showToast?.(`Sent ${items.length} comment${items.length === 1 ? '' : 's'} to the session`, 'success');
+      this.clearAnnotations();
+    }
+  },
+
+  /** Write the collected annotations to a review file and ask the agent to apply it (COD-69). */
+  async saveAnnotationsToReviewFile() {
+    const st = this.filePreviewState;
+    const items = this._annotations || [];
+    if (!st || !items.length) return;
+    try {
+      const res = await fetch(`/api/sessions/${st.sessionId}/documents/review`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...this._annotationTargetBody(), annotations: items }),
+      });
+      if (!res.ok) {
+        this.showToast?.('Failed to write review file', 'error');
+        return;
+      }
+      const reviewPath = (await res.json()).data?.path;
+      const fileName = (st.filePath || '').split('/').pop() || 'the document';
+      const message = `Please apply the review comments in ${reviewPath} to ${fileName}.`;
+      if (await this._postSessionInput(st.sessionId, message)) {
+        this.showToast?.(`Saved ${items.length} comments to ${reviewPath} and asked the agent to apply them`, 'success');
+        this.clearAnnotations();
+        // COD-74: close the preview window and surface the prompt to the user.
+        this.closeFilePreview();
+        this.terminal?.focus();
+      }
+    } catch {
+      this.showToast?.('Failed to write review file', 'error');
+    }
+  },
+
+  async _postSessionInput(sessionId, input) {
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/input`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ input, useMux: true }),
+      });
+      if (!res.ok) this.showToast?.('Failed to send to session', 'error');
+      return res.ok;
+    } catch {
+      this.showToast?.('Failed to send to session', 'error');
+      return false;
+    }
+  },
+
+  // ── Authoring actions (COD-64) ───────────────────────────────────────────
+  // User-configured one-click actions surfaced in the document preview footer.
+  // Each action sends a templated single-line instruction to the open document's
+  // agent session. Ships empty — the user authors these in App Settings → Authoring.
+
+  /** Read the user's configured authoring actions from the cached app-settings store. */
+  _authoringActions() {
+    const list = this.loadAppSettingsFromStorage?.().authoringActions;
+    return Array.isArray(list) ? list : [];
+  },
+
+  /**
+   * Build the instruction sent to the agent: replace every `{path}` in the template
+   * with the document path; if the template has no `{path}`, append ` <path>`. Pure;
+   * kept single-line (writeViaMux is single-line only).
+   */
+  buildActionInstruction(template, path) {
+    const t = String(template ?? '');
+    const p = String(path ?? '');
+    const out = t.includes('{path}') ? t.split('{path}').join(p) : `${t} ${p}`;
+    return out.replace(/\s+/g, ' ').trim();
+  },
+
+  /**
+   * Normalize editor rows into the persisted shape: trim label/instruction, drop
+   * rows missing either, assign a stable id when absent, and cap at 20. Pure.
+   */
+  normalizeAuthoringActions(rows) {
+    if (!Array.isArray(rows)) return [];
+    const out = [];
+    for (const row of rows) {
+      const label = String(row?.label ?? '').trim();
+      const instruction = String(row?.instruction ?? '').trim();
+      if (!label || !instruction) continue;
+      const id = String(row?.id ?? '').trim() || this._newAuthoringActionId();
+      out.push({ id, label, instruction });
+      if (out.length >= 20) break;
+    }
+    return out;
+  },
+
+  /** Short, stable id for a new authoring action (crypto.randomUUID with fallback). */
+  _newAuthoringActionId() {
+    try {
+      const uuid = globalThis.crypto?.randomUUID?.();
+      if (uuid) return `act-${uuid.slice(0, 8)}`;
+    } catch {
+      /* ignore */
+    }
+    return `act-${Math.random().toString(36).slice(2, 10)}`;
+  },
+
+  /** Footer control: an "Authoring ▾" button revealing the configured actions. */
+  _renderAuthoringControl() {
+    const actions = this._authoringActions();
+    if (!actions.length || !this.filePreviewState?.sessionId) return '';
+    const items = actions
+      .map(
+        (a) =>
+          `<button class="authoring-action-item" onclick="app.runAuthoringAction(${escapeHtml(JSON.stringify(a.id))})">${escapeHtml(
+            a.label
+          )}</button>`
+      )
+      .join('');
+    return (
+      ` <span class="document-authoring-wrap">` +
+      `<button class="btn-icon-sm document-authoring-btn" onclick="app.toggleAuthoringMenu(event)">Authoring ▾</button>` +
+      `<div class="authoring-action-menu" hidden>${items}</div>` +
+      `</span>`
+    );
+  },
+
+  /** Toggle the authoring actions dropdown open/closed. */
+  toggleAuthoringMenu(event) {
+    event?.stopPropagation?.();
+    const wrap = event?.currentTarget?.closest?.('.document-authoring-wrap');
+    const menu = wrap?.querySelector('.authoring-action-menu');
+    if (!menu) return;
+    const open = menu.hasAttribute('hidden');
+    if (open) {
+      menu.removeAttribute('hidden');
+      const close = (e) => {
+        if (!wrap.contains(e.target)) {
+          menu.setAttribute('hidden', '');
+          document.removeEventListener('click', close, true);
+        }
+      };
+      document.addEventListener('click', close, true);
+    } else {
+      menu.setAttribute('hidden', '');
+    }
+  },
+
+  /** Look up an action by id, interpolate the path, and send it to the session. */
+  async runAuthoringAction(actionId) {
+    const st = this.filePreviewState;
+    const action = this._authoringActions().find((a) => a.id === actionId);
+    if (!action) return;
+    if (!st?.sessionId) {
+      this.showToast?.('No active session for this document', 'error');
+      return;
+    }
+    const instruction = this.buildActionInstruction(action.instruction, st.filePath || '');
+    if (!instruction) return;
+    if (await this._postSessionInput(st.sessionId, instruction)) {
+      this.showToast?.(`Sent "${action.label}" to the session`, 'success');
+    }
+  },
+
+  _fitFilePreviewImage() {
+    const img = document.querySelector('.document-preview-image');
+    const stage = img?.closest('.document-preview-stage');
+    if (!img || !stage) return false;
+    const body = stage.parentElement;
+    const toolbar = body?.querySelector('.document-preview-toolbar');
+    const style = getComputedStyle(stage);
+    // The stage's auto height can grow to the intrinsic image height. Measure
+    // the fixed preview body instead so a tall image is fitted to the visible
+    // viewport, not to the overflow area it created itself.
+    const containerWidth = body?.clientWidth || stage.clientWidth;
+    const containerHeight = body?.clientHeight
+      ? body.clientHeight - (toolbar?.offsetHeight || 0)
+      : stage.clientHeight;
+    const availableWidth = containerWidth - parseFloat(style.paddingLeft || '0') - parseFloat(style.paddingRight || '0');
+    const availableHeight = containerHeight - parseFloat(style.paddingTop || '0') - parseFloat(style.paddingBottom || '0');
+    const imageWidth = img.offsetWidth;
+    const imageHeight = img.offsetHeight;
+    if (availableWidth <= 0 || availableHeight <= 0 || imageWidth <= 0 || imageHeight <= 0) return false;
+
+    this.filePreviewZoom = Math.min(1, availableWidth / imageWidth, availableHeight / imageHeight);
+    img.style.transform = `scale(${this.filePreviewZoom})`;
+    return true;
+  },
+
+  setFilePreviewZoom(action) {
+    const img = document.querySelector('.document-preview-image');
+    if (!img) return;
+    if (action === 'fit') {
+      this.filePreviewZoomMode = 'fit';
+      this._fitFilePreviewImage();
+      return;
+    }
+    const currentZoom = this.filePreviewZoom || 1;
+    const zoomFactor = 1.25;
+    if (action === 'in') {
+      this.filePreviewZoom = Math.min(4, currentZoom * zoomFactor);
+    } else if (action === 'out') {
+      this.filePreviewZoom = currentZoom / zoomFactor;
+    }
+    this.filePreviewZoomMode = 'manual';
+    img.style.transform = `scale(${this.filePreviewZoom})`;
+  },
+
+  openAttachmentInNewTab(sessionId, filePath, attachmentId = null) {
+    const url = withBasePath(
+      attachmentId
+        ? `/api/sessions/${sessionId}/attachments/${encodeURIComponent(attachmentId)}/raw`
+        : `/api/sessions/${sessionId}/file-raw?path=${encodeURIComponent(filePath)}`
+    );
+    window.open(url, '_blank');
+  },
+
+  /** Restore the persisted preview size and keep saving it as the user resizes (COD-67). */
+  _restorePreviewSize() {
+    const win = this.$('filePreviewOverlay')?.querySelector?.('.file-preview-window');
+    if (!win) return;
+    try {
+      const saved = JSON.parse(localStorage.getItem('codeman.filePreviewSize') || 'null');
+      if (saved && saved.w && saved.h) {
+        win.style.width = `${saved.w}px`;
+        win.style.height = `${saved.h}px`;
+      }
+    } catch {
+      /* ignore corrupt setting */
+    }
+    if (!this._filePreviewResizeObs && typeof ResizeObserver !== 'undefined') {
+      this._filePreviewResizeObs = new ResizeObserver(() => {
+        if (this.filePreviewZoomMode === 'fit') this._fitFilePreviewImage();
+        clearTimeout(this._filePreviewResizeSaveTimer);
+        this._filePreviewResizeSaveTimer = setTimeout(() => {
+          try {
+            localStorage.setItem(
+              'codeman.filePreviewSize',
+              JSON.stringify({ w: Math.round(win.offsetWidth), h: Math.round(win.offsetHeight) })
+            );
+          } catch {
+            /* storage full / unavailable */
+          }
+        }, 300);
+      });
+      this._filePreviewResizeObs.observe(win);
     }
   },
 
@@ -4420,7 +7099,7 @@ Object.assign(CodemanApp.prototype, {
     // Drop the tiles: lazy <img>s still loading would keep fetching otherwise.
     if (body) body.innerHTML = '';
     this.folderGrid = null;
-    this._updateFolderPreviewNav(null);
+    this._updateFolderPreviewNav?.(null);
   },
 
   folderGridUp() {
@@ -4525,7 +7204,7 @@ Object.assign(CodemanApp.prototype, {
     // After openFilePreview: it resets the index for previews from elsewhere.
     grid.index = index;
     grid.lastIndex = index;
-    this._updateFolderPreviewNav(null);
+    this._updateFolderPreviewNav?.(null);
   },
 
   /** Page through the open folder from its preview (‹ › buttons, ←/→). */
@@ -4612,11 +7291,23 @@ Object.assign(CodemanApp.prototype, {
   },
 
   closeFilePreview() {
+    // Closing with an unsaved edit buffer would discard it silently — the buffer
+    // lives only in the textarea. Ask first, and abort the close on Cancel.
     if (this.filePreviewEdit?.dirty && !confirm('Discard unsaved changes?')) return;
+    this._stopFilePreviewPolling();
+    this.filePreviewDetachUrl = '';
+    const detachButton = this.$('filePreviewDetachBtn');
+    if (detachButton) detachButton.hidden = true;
+    this._filePreviewLoad = (this._filePreviewLoad || 0) + 1;
     this._resetFilePreviewEdit();
     // Back on the grid (if one is open underneath): its current tile stays marked.
     if (this.folderGrid) this.folderGrid.index = null;
-    this._updateFolderPreviewNav(null);
+    this._updateFolderPreviewNav?.(null);
+    this._resetFilePreviewExternalAction?.();
+    this._hideFilePreviewNavigation();
+    this._teardownOutlineScrollSpy();
+    this._closeAnnotationPopover();
+    this._closeAnnotationTray();
     const overlay = this.$('filePreviewOverlay');
     if (overlay) {
       overlay.classList.remove('visible');
@@ -4624,24 +7315,42 @@ Object.assign(CodemanApp.prototype, {
     // The overlay is hidden with display:none, which stops it being PAINTED and
     // nothing else: a <video>/<audio> inside it keeps playing, keeps its audio
     // audible and keeps streaming from the server. Closing has to stop it.
-    this._stopFilePreviewMedia();
+    this._stopFilePreviewMedia?.();
     this.filePreviewContent = '';
     this.filePreviewText = null;
-    this._updateFilePreviewToolbar('none');
-    this.filePreviewDetachUrl = '';
-    const detachBtn = this.$('filePreviewDetachBtn');
-    if (detachBtn) detachBtn.hidden = true;
+    this._updateFilePreviewToolbar?.('none');
   },
 
-  /**
-   * Open the previewed file in a browser tab and close the overlay.
-   *
-   * window.open is called WITHOUT the 'noopener' feature string: with it the
-   * call returns null even on success, which would make a blocked pop-up
-   * indistinguishable from a working one. The opener link is severed by hand
-   * instead, and a null return then reliably means the browser blocked it, in
-   * which case the overlay stays up so the user has not lost the file.
-   */
+  _isFilePreviewOpen() {
+    return !!this.$('filePreviewOverlay')?.classList.contains('visible');
+  },
+
+  // Escape-key seam (COD-474), the file-preview twin of the Response Viewer's
+  // COD-229 seam. Returns true when the key belongs to the preview, so the global
+  // handler stops there and ESC never reaches xterm/the CLI. Innermost layer first:
+  // the annotation popover, then anything inside the preview that already took the
+  // key (an open docx comment card), then the preview itself.
+  _maybeCloseFilePreviewOnEscape(e) {
+    if (!this._isFilePreviewOpen()) return false;
+    if (e?.defaultPrevented) return true;
+    e?.preventDefault();
+    e?.stopPropagation();
+    if (document.getElementById('annotationPopover')) {
+      this._closeAnnotationPopover();
+      return true;
+    }
+    this.closeFilePreview();
+    // Cancelling the unsaved-edits prompt keeps the preview open; keep focus there.
+    if (!this._isFilePreviewOpen()) {
+      try {
+        this.terminal?.focus();
+      } catch {
+        /* terminal may be detached mid-teardown */
+      }
+    }
+    return true;
+  },
+
   detachFilePreview() {
     if (!this.filePreviewDetachUrl) return;
     const hosted = this.openInHostWindow?.(this.filePreviewDetachUrl) ?? null;
@@ -4659,6 +7368,270 @@ Object.assign(CodemanApp.prototype, {
     this.closeFilePreview();
   },
 
+
+  copyFilePreviewContent() {
+    if (this.filePreviewState?.previewKind === 'image') {
+      return this._copyFilePreviewImage();
+    }
+    if (this.filePreviewContent) {
+      navigator.clipboard
+        .writeText(this.filePreviewContent)
+        .then(() => {
+          this.showToast('Copied to clipboard', 'success');
+        })
+        .catch(() => {
+          this.showToast('Failed to copy', 'error');
+        });
+    } else {
+      this.showToast('Nothing to copy in this preview', 'info');
+    }
+  },
+
+  async _copyFilePreviewImage() {
+    const imageUrl = this.filePreviewState?.previewCopyUrl;
+    if (!imageUrl) {
+      this.showToast('Failed to copy image to clipboard', 'error');
+      return false;
+    }
+    try {
+      if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') {
+        throw new Error('Image clipboard API unavailable');
+      }
+      const res = await fetch(imageUrl);
+      if (!res.ok) throw new Error(`Failed to fetch image (${res.status})`);
+      let blob = await res.blob();
+      const contentType = res.headers?.get?.('content-type') || '';
+      if ((!blob.type || blob.type === 'application/octet-stream') && contentType.startsWith('image/')) {
+        blob = new Blob([blob], { type: contentType });
+      }
+      if (!blob.type.startsWith('image/')) {
+        throw new Error(`Unexpected clipboard type: ${blob.type || 'unknown'}`);
+      }
+      const item = new ClipboardItem({ [blob.type]: blob });
+      await navigator.clipboard.write([item]);
+      this.showToast('Copied image to clipboard', 'success');
+      return true;
+    } catch (err) {
+      console.error('Failed to copy preview image:', err);
+      this.showToast('Failed to copy image to clipboard', 'error');
+      return false;
+    }
+  },
+
+  // ───────────────────────── Document preview: outline / reading view / word count (COD-62) ─────────
+
+  /** Collapse whitespace and count words, dropping empties. Pure. */
+  _countWords(text) {
+    if (!text) return 0;
+    return text
+      .trim()
+      .split(/\s+/)
+      .filter((w) => w.length > 0).length;
+  },
+
+  /** Format the footer reading meta: "1,234 words · ~6 min read" (200 wpm, min 1 min). Pure. */
+  _formatReadingMeta(words) {
+    const minutes = Math.max(1, Math.round(words / 200));
+    return `${words.toLocaleString()} words · ~${minutes} min read`;
+  },
+
+  /** Slugify heading text into a DOM id; dedupe via the provided used-id set. */
+  _slugifyHeading(text, used) {
+    let base =
+      String(text || '')
+        .toLowerCase()
+        .trim()
+        .replace(/[^\w\s-]/g, '')
+        .replace(/\s+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '') || 'section';
+    let id = base;
+    let i = 1;
+    while (used.has(id)) id = `${base}-${i++}`;
+    used.add(id);
+    return id;
+  },
+
+  /**
+   * Build a nested outline <nav> from the already-rendered+sanitized prose container.
+   * Assigns stable ids to headings that lack one. Returns null when fewer than 2 headings.
+   * Heading text is read via textContent only (never innerHTML).
+   */
+  _buildDocumentOutline(prose) {
+    if (!prose) return null;
+    const headings = [...prose.querySelectorAll('h1,h2,h3,h4,h5,h6')];
+    if (headings.length < 2) return null;
+    const used = new Set();
+    headings.forEach((h) => {
+      if (h.id) used.add(h.id);
+    });
+    const nav = document.createElement('nav');
+    nav.className = 'document-outline';
+    nav.id = 'documentOutline';
+    const list = document.createElement('ul');
+    list.className = 'document-outline-list';
+    headings.forEach((h) => {
+      if (!h.id) h.id = this._slugifyHeading(h.textContent, used);
+      const level = Number(h.tagName.slice(1)) || 1;
+      const li = document.createElement('li');
+      li.className = `document-outline-item document-outline-l${level}`;
+      const a = document.createElement('a');
+      a.className = 'document-outline-link';
+      a.href = `#${h.id}`;
+      a.dataset.outlineTarget = h.id;
+      a.textContent = h.textContent || '';
+      li.appendChild(a);
+      list.appendChild(li);
+    });
+    nav.appendChild(list);
+    nav.addEventListener('click', (e) => {
+      const link = e.target.closest('a[data-outline-target]');
+      if (!link) return;
+      e.preventDefault();
+      const target = prose.querySelector(`#${CSS.escape(link.dataset.outlineTarget)}`);
+      if (target) target.scrollIntoView({ block: 'start' });
+    });
+    return nav;
+  },
+
+  /** (Re)create the scroll-spy IntersectionObserver tying headings to nav entries. */
+  _setupOutlineScrollSpy(nav, prose) {
+    this._teardownOutlineScrollSpy();
+    const scroller = this.$('filePreviewBody');
+    if (!nav || !prose || !scroller || typeof IntersectionObserver === 'undefined') return;
+    const headings = [...prose.querySelectorAll('h1,h2,h3,h4,h5,h6')].filter((h) => h.id);
+    const linkFor = (id) => nav.querySelector(`a[data-outline-target="${CSS.escape(id)}"]`);
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const visible = entries.find((en) => en.isIntersecting);
+        if (!visible) return;
+        nav.querySelectorAll('a.active').forEach((a) => a.classList.remove('active'));
+        const link = linkFor(visible.target.id);
+        if (link) link.classList.add('active');
+      },
+      { root: scroller, rootMargin: '0px 0px -70% 0px', threshold: 0 }
+    );
+    headings.forEach((h) => observer.observe(h));
+    this._documentOutlineObserver = observer;
+  },
+
+  _teardownOutlineScrollSpy() {
+    if (this._documentOutlineObserver) {
+      this._documentOutlineObserver.disconnect();
+      this._documentOutlineObserver = null;
+    }
+  },
+
+  _readPreviewPref(key) {
+    try {
+      return localStorage.getItem(key) === '1';
+    } catch {
+      return false;
+    }
+  },
+
+  _writePreviewPref(key, on) {
+    try {
+      localStorage.setItem(key, on ? '1' : '0');
+    } catch {
+      /* jsdom / private mode */
+    }
+  },
+
+  /** Toggle the outline sidebar open/closed and persist the preference. */
+  toggleDocumentOutline() {
+    const layout = this.$('filePreviewBody')?.querySelector('.document-preview-layout');
+    const nav = this.$('documentOutline');
+    if (!layout || !nav) return;
+    const open = !layout.classList.contains('outline-open');
+    layout.classList.toggle('outline-open', open);
+    const btn = this.$('filePreviewFooter')?.querySelector('.document-outline-btn');
+    if (btn) btn.classList.toggle('active', open);
+    this._writePreviewPref('codeman.preview.outlineOpen', open);
+  },
+
+  /** Toggle reading-view (constrained measure) on the prose container and persist the preference. */
+  toggleReadingView() {
+    const overlay = this.$('filePreviewOverlay');
+    const prose = overlay?.querySelector('.document-preview-markdown, .document-preview-text');
+    if (!prose) return;
+    const on = !this.readingViewActive;
+    this.readingViewActive = on;
+    prose.classList.toggle('reading-view', on);
+    const btn = this.$('filePreviewFooter')?.querySelector('.document-reading-btn');
+    if (btn) btn.classList.toggle('active', on);
+    this._writePreviewPref('codeman.preview.readingView', on);
+  },
+
+  getFileIcon(ext) {
+    if (!ext) return '\uD83D\uDCC4';
+
+    const icons = {
+      ts: '\uD83D\uDCD8',
+      tsx: '\uD83D\uDCD8',
+      js: '\uD83D\uDCD2',
+      jsx: '\uD83D\uDCD2',
+      mjs: '\uD83D\uDCD2',
+      cjs: '\uD83D\uDCD2',
+      py: '\uD83D\uDC0D',
+      pyx: '\uD83D\uDC0D',
+      pyw: '\uD83D\uDC0D',
+      rs: '\uD83E\uDD80',
+      go: '\uD83D\uDC39',
+      c: '\u2699\uFE0F',
+      cpp: '\u2699\uFE0F',
+      h: '\u2699\uFE0F',
+      hpp: '\u2699\uFE0F',
+      html: '\uD83C\uDF10',
+      htm: '\uD83C\uDF10',
+      css: '\uD83C\uDFA8',
+      scss: '\uD83C\uDFA8',
+      sass: '\uD83C\uDFA8',
+      less: '\uD83C\uDFA8',
+      json: '\uD83D\uDCCB',
+      yaml: '\uD83D\uDCCB',
+      yml: '\uD83D\uDCCB',
+      xml: '\uD83D\uDCCB',
+      toml: '\uD83D\uDCCB',
+      csv: '\uD83D\uDCCB',
+      md: '\uD83D\uDCDD',
+      markdown: '\uD83D\uDCDD',
+      txt: '\uD83D\uDCDD',
+      rst: '\uD83D\uDCDD',
+      png: '\uD83D\uDDBC\uFE0F',
+      jpg: '\uD83D\uDDBC\uFE0F',
+      jpeg: '\uD83D\uDDBC\uFE0F',
+      gif: '\uD83D\uDDBC\uFE0F',
+      svg: '\uD83D\uDDBC\uFE0F',
+      webp: '\uD83D\uDDBC\uFE0F',
+      ico: '\uD83D\uDDBC\uFE0F',
+      bmp: '\uD83D\uDDBC\uFE0F',
+      mp4: '\uD83C\uDFAC',
+      webm: '\uD83C\uDFAC',
+      mov: '\uD83C\uDFAC',
+      mp3: '\uD83C\uDFB5',
+      wav: '\uD83C\uDFB5',
+      ogg: '\uD83C\uDFB5',
+      sh: '\uD83D\uDCBB',
+      bash: '\uD83D\uDCBB',
+      zsh: '\uD83D\uDCBB',
+      env: '\uD83D\uDD10',
+      gitignore: '\uD83D\uDEAB',
+      dockerfile: '\uD83D\uDC33',
+      lock: '\uD83D\uDD12',
+    };
+
+    return icons[ext.toLowerCase()] || '\uD83D\uDCC4';
+  },
+
+  formatFileSize(bytes) {
+    if (bytes === undefined || bytes === null) return '';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  },
+
   /**
    * Pause and unload every media element in the preview body, then empty it.
    *
@@ -4668,12 +7641,11 @@ Object.assign(CodemanApp.prototype, {
    * the in-flight network fetch and puts the element back in NETWORK_EMPTY.
    */
   _stopFilePreviewMedia() {
-    // A spreadsheet preview owns a fetch and a Web Worker; emptying the body
-    // leaves both running, so tear them down with the rest of the media.
-    this._disposeSpreadsheetPreview();
     const bodyEl = this.$('filePreviewBody');
     if (!bodyEl) return;
-    for (const media of bodyEl.querySelectorAll('video, audio')) {
+    // `?? []`: the unit harnesses hand this a partial body stub, matching how the
+    // sibling preview resets are called with `?.`.
+    for (const media of bodyEl.querySelectorAll?.('video, audio') ?? []) {
       try {
         media.pause();
         media.removeAttribute('src');
@@ -4683,42 +7655,6 @@ Object.assign(CodemanApp.prototype, {
       }
     }
     bodyEl.innerHTML = '';
-  },
-
-  /**
-   * Render an XLSX into the preview body via spreadsheet-preview.js, which
-   * parses it in a Web Worker (the ExcelJS bundle loads there, on demand, and
-   * never on page load). `url` is a raw route; the renderer adds `?preview=true`
-   * so the server applies its preview size cap. Superseded by the next
-   * _stopFilePreviewMedia(), which runs on every open and on close.
-   */
-  _openSpreadsheetPreview(bodyEl, url, size) {
-    this._disposeSpreadsheetPreview();
-    const renderer = window.CodemanSpreadsheetPreview;
-    if (!renderer?.open) {
-      bodyEl.innerHTML = '<div class="binary-message">Spreadsheet preview is unavailable.</div>';
-      return;
-    }
-    bodyEl.textContent = '';
-    const token = {};
-    this._spreadsheetPreviewToken = token;
-    this._spreadsheetPreview = renderer.open({
-      container: bodyEl,
-      url,
-      size,
-      isCurrent: () => this._spreadsheetPreviewToken === token,
-    });
-  },
-
-  _disposeSpreadsheetPreview() {
-    const handle = this._spreadsheetPreview;
-    this._spreadsheetPreview = null;
-    this._spreadsheetPreviewToken = null;
-    try {
-      handle?.dispose();
-    } catch (err) {
-      console.warn('Failed to dispose spreadsheet preview:', err);
-    }
   },
 
   // ═══════════════════════════════════════════════════════════════
@@ -4932,6 +7868,17 @@ Object.assign(CodemanApp.prototype, {
 
   toggleFilePreviewMd() {
     this._setFilePreviewPref('mdRendered', !this._filePreviewPref('mdRendered'));
+    const info = this.filePreviewText;
+    // Downstream document viewer (_renderFilePreviewBody's text branch): re-run
+    // that branch from the text it already holds, so the outline, reading view,
+    // comment highlights and footer actions are rebuilt for the new view.
+    if (info?.data && typeof info.text === 'string') {
+      return this._renderFilePreviewBody(
+        info.data,
+        { sessionId: info.sessionId, filePath: info.filePath, attachmentId: info.attachmentId, cachedText: info.text },
+        info.state || null
+      );
+    }
     this._renderFilePreviewText();
   },
 
@@ -5020,7 +7967,7 @@ Object.assign(CodemanApp.prototype, {
     bodyEl.innerHTML = '';
     bodyEl.appendChild(textarea);
     // The MD/Lines/Wrap toggles act on the text view this textarea replaced.
-    this._updateFilePreviewToolbar('none');
+    this._updateFilePreviewToolbar?.('none');
     // Deliberately no autofocus: on phones that would pop the OS keyboard
     // before the user has scrolled to the line they want to change.
 
@@ -5121,511 +8068,6 @@ Object.assign(CodemanApp.prototype, {
   },
 
   // ═══════════════════════════════════════════════════════════════
-  // Attachment Cards (detected documents/images)
-  // ═══════════════════════════════════════════════════════════════
-
-  // SSE `attachment:detected` consumer: surface a dismissible card for the file
-  // and bump the per-session history unread count (refreshing the open drawer).
-  _onAttachmentDetected(data) {
-    console.log('[Attachment Detected]', data);
-    this.addAttachmentCard(data);
-    if (data.sessionId) {
-      const current =
-        this.attachmentHistoryCounts.get(data.sessionId) ??
-        this.sessions.get(data.sessionId)?.attachmentHistory?.length ??
-        0;
-      this.attachmentHistoryCounts.set(data.sessionId, Math.min(current + 1, 100));
-      if (data.sessionId === this.activeSessionId) {
-        this.updateAttachmentHistoryBadge();
-        if (this.attachmentHistoryDrawerOpen) {
-          this._debouncedCall(
-            'attachmentHistoryRefresh',
-            () => {
-              // The drawer may have closed or the active session changed during
-              // the debounce window — don't refresh for a stale session.
-              if (this.attachmentHistoryDrawerOpen && this.activeSessionId === data.sessionId) {
-                this.loadAttachmentHistory(data.sessionId);
-              }
-            },
-            250
-          );
-        }
-      }
-    }
-  },
-
-  // Lazily create the floating stack the cards live in (appended to <body>).
-  ensureAttachmentCardStack() {
-    let stack = this.attachmentCardStack || document.getElementById('attachmentCardStack');
-    if (!stack) {
-      stack = document.createElement('div');
-      stack.id = 'attachmentCardStack';
-      stack.className = 'attachment-card-stack';
-      document.body.appendChild(stack);
-    }
-    this.attachmentCardStack = stack;
-    return stack;
-  },
-
-  openAttachmentInNewTab(sessionId, filePath, attachmentId = null) {
-    const url = CodemanBase.url(
-      attachmentId
-        ? `/api/sessions/${sessionId}/attachments/${encodeURIComponent(attachmentId)}/raw`
-        : `/api/sessions/${sessionId}/file-raw?path=${encodeURIComponent(filePath)}`
-    );
-    window.open(url, '_blank');
-  },
-
-  addAttachmentCard(attachmentEvent) {
-    const {
-      sessionId,
-      relativePath,
-      fileName,
-      timestamp,
-      size,
-      attachmentType,
-      extension,
-      attachmentId,
-      rawUrl,
-      previewUrl,
-      thumbnailUrl,
-    } = attachmentEvent;
-    const filePath = relativePath || fileName;
-    const cardId = attachmentId || `${sessionId}-${timestamp}-${fileName}`;
-
-    if (this.attachmentCards.has(cardId)) {
-      const existing = this.attachmentCards.get(cardId);
-      existing.element.focus?.();
-      return;
-    }
-
-    const MAX_ATTACHMENT_CARDS = 10;
-    if (this.attachmentCards.size >= MAX_ATTACHMENT_CARDS) {
-      const oldestId = this.attachmentCards.keys().next().value;
-      if (oldestId) this.closeAttachmentCard(oldestId);
-    }
-
-    const stack = this.ensureAttachmentCardStack();
-    const session = this.sessions.get(sessionId);
-    const sessionName = session?.name || sessionId.substring(0, 8);
-    const attachmentRawUrl = CodemanBase.url(
-      rawUrl ||
-        (attachmentId
-          ? `/api/sessions/${sessionId}/attachments/${encodeURIComponent(attachmentId)}/raw`
-          : `/api/sessions/${sessionId}/file-raw?path=${encodeURIComponent(filePath)}`)
-    );
-    const attachmentPreviewUrl = CodemanBase.url(
-      previewUrl ||
-        (attachmentId ? `/api/sessions/${sessionId}/attachments/${encodeURIComponent(attachmentId)}/preview` : null)
-    );
-    const attachmentThumbnailUrl = CodemanBase.url(
-      thumbnailUrl ||
-        (attachmentId
-          ? `/api/sessions/${sessionId}/attachments/${encodeURIComponent(attachmentId)}/thumbnail`
-          : `/api/sessions/${sessionId}/file-thumbnail?path=${encodeURIComponent(filePath)}`)
-    );
-    const downloadUrl = attachmentId ? `${attachmentRawUrl}?download=true` : `${attachmentRawUrl}&download=true`;
-    const typeLabel = (extension || attachmentType || 'file').toUpperCase();
-
-    const card = document.createElement('article');
-    card.className = `attachment-card attachment-${escapeHtml(attachmentType || 'file')}`;
-    card.tabIndex = 0;
-    card.dataset.attachmentId = cardId;
-    card.dataset.previewUrl = attachmentPreviewUrl || '';
-    card.innerHTML = `
-      <div class="attachment-thumbnail">
-        ${attachmentThumbnailUrl ? `<img class="attachment-thumbnail-img" src="${escapeHtml(attachmentThumbnailUrl)}" alt="">` : ''}
-        <div class="attachment-thumbnail-fallback ${attachmentThumbnailUrl ? '' : 'visible'}">${escapeHtml(typeLabel)}</div>
-      </div>
-      <div class="attachment-card-main">
-        <div class="attachment-file-name" title="${escapeHtml(filePath)}">${escapeHtml(fileName)}</div>
-        <div class="attachment-file-meta">
-          <span>${escapeHtml(sessionName)}</span>
-          <span>${this.formatFileSize(size || 0)}</span>
-        </div>
-        <div class="attachment-actions">
-          <button type="button" class="attachment-preview-btn">Preview</button>
-          <a href="${escapeHtml(downloadUrl)}">Download</a>
-          <button type="button" class="attachment-open-btn">Open</button>
-        </div>
-      </div>
-      <button type="button" class="attachment-close-btn" title="Dismiss">&times;</button>
-    `;
-
-    const attachmentThumbnailImg = card.querySelector('.attachment-thumbnail-img');
-    if (attachmentThumbnailImg) {
-      attachmentThumbnailImg.onerror = () => {
-        attachmentThumbnailImg.remove();
-        card.querySelector('.attachment-thumbnail-fallback')?.classList.add('visible');
-      };
-    }
-
-    card.querySelector('.attachment-preview-btn')?.addEventListener('click', () => {
-      this.openFilePreview(filePath, sessionId, attachmentId || null);
-    });
-    card.querySelector('.attachment-open-btn')?.addEventListener('click', () => {
-      this.openAttachmentInNewTab(sessionId, filePath, attachmentId || null);
-    });
-    card.querySelector('.attachment-close-btn')?.addEventListener('click', () => {
-      this.closeAttachmentCard(cardId);
-    });
-
-    stack.prepend(card);
-    this.attachmentCards.set(cardId, { element: card, sessionId, filePath });
-    this._refreshAttachmentClearAll();
-  },
-
-  // Centralized show/hide for the stack's "Clear all" control. Both addAttachmentCard and
-  // closeAttachmentCard call this so the control appears on the 2nd card and hides at <=1.
-  _refreshAttachmentClearAll() {
-    const stack = this.attachmentCardStack;
-    if (!stack) return;
-    let control = stack.querySelector('.attachment-clear-all');
-    if (this.attachmentCards.size < 2) {
-      if (control) control.hidden = true;
-      return;
-    }
-    if (!control) {
-      control = document.createElement('button');
-      control.type = 'button';
-      control.className = 'attachment-clear-all';
-      control.textContent = 'Clear all';
-      control.title = 'Dismiss all attachment cards';
-      control.addEventListener('click', () => this.closeAllAttachmentCards());
-      stack.prepend(control);
-    }
-    control.hidden = false;
-  },
-
-  closeAttachmentCard(attachmentId) {
-    const cardData = this.attachmentCards.get(attachmentId);
-    if (!cardData) return;
-    cardData.element.remove();
-    this.attachmentCards.delete(attachmentId);
-    if (this.attachmentCardStack && this.attachmentCards.size === 0) {
-      this.attachmentCardStack.remove();
-      this.attachmentCardStack = null;
-    } else {
-      this._refreshAttachmentClearAll();
-    }
-  },
-
-  closeAllAttachmentCards() {
-    for (const attachmentId of [...this.attachmentCards.keys()]) {
-      this.closeAttachmentCard(attachmentId);
-    }
-  },
-
-  closeSessionAttachmentCards(sessionId) {
-    const toClose = [];
-    for (const [attachmentId, data] of this.attachmentCards) {
-      if (data.sessionId === sessionId) toClose.push(attachmentId);
-    }
-    for (const attachmentId of toClose) {
-      this.closeAttachmentCard(attachmentId);
-    }
-  },
-
-  // ═══════════════════════════════════════════════════════════════
-  // Attachment History Drawer
-  // ═══════════════════════════════════════════════════════════════
-
-  updateAttachmentHistoryBadge(count = null) {
-    const badge = document.getElementById('attachmentHistoryBadge');
-    const button = document.getElementById('attachmentsHistoryBtn');
-    const sessionId = this.activeSessionId;
-    const nextCount = count ?? (sessionId ? this.attachmentHistoryCounts.get(sessionId) || 0 : 0);
-    if (badge) {
-      badge.textContent = nextCount > 99 ? '99+' : String(nextCount);
-      badge.style.display = nextCount > 0 ? '' : 'none';
-    }
-    if (button) {
-      button.classList.toggle('active', this.attachmentHistoryDrawerOpen);
-      button.setAttribute('aria-expanded', this.attachmentHistoryDrawerOpen ? 'true' : 'false');
-    }
-  },
-
-  ensureAttachmentHistoryDrawer() {
-    let drawer = document.getElementById('attachmentHistoryDrawer');
-    if (drawer) return drawer;
-
-    drawer = document.createElement('aside');
-    drawer.id = 'attachmentHistoryDrawer';
-    drawer.className = 'attachment-history-drawer';
-    drawer.setAttribute('aria-label', 'Attachment history');
-    drawer.innerHTML = `
-      <div class="attachment-history-header">
-        <div>
-          <div class="attachment-history-title">Attachments</div>
-          <div class="attachment-history-subtitle" id="attachmentHistorySubtitle">0 files</div>
-        </div>
-        <div class="attachment-history-header-actions">
-          <button type="button" class="btn-icon-sm" id="attachmentHistoryRefreshBtn" title="Refresh" aria-label="Refresh attachments">&#x21BB;</button>
-          <button type="button" class="btn-icon-sm" id="attachmentHistoryCloseBtn" title="Close" aria-label="Close attachments">&times;</button>
-        </div>
-      </div>
-      <div class="attachment-history-list" id="attachmentHistoryList"></div>
-    `;
-    document.body.appendChild(drawer);
-    drawer.querySelector('#attachmentHistoryRefreshBtn')?.addEventListener('click', () => {
-      this.loadAttachmentHistory(this.activeSessionId);
-    });
-    drawer.querySelector('#attachmentHistoryCloseBtn')?.addEventListener('click', () => {
-      this.closeAttachmentHistory();
-    });
-    return drawer;
-  },
-
-  async toggleAttachmentHistory() {
-    if (this.attachmentHistoryDrawerOpen) {
-      this.closeAttachmentHistory();
-      return;
-    }
-    await this.openAttachmentHistory();
-  },
-
-  async openAttachmentHistory() {
-    const drawer = this.ensureAttachmentHistoryDrawer();
-    this.attachmentHistoryDrawerOpen = true;
-    drawer.classList.add('open');
-    this.updateAttachmentHistoryBadge();
-    await this.loadAttachmentHistory(this.activeSessionId);
-  },
-
-  closeAttachmentHistory() {
-    const drawer = document.getElementById('attachmentHistoryDrawer');
-    this.attachmentHistoryDrawerOpen = false;
-    drawer?.classList.remove('open');
-    // Cancel any pending debounced refresh so it can't fire against a closed drawer.
-    if (this._debounceTimers?.attachmentHistoryRefresh) {
-      clearTimeout(this._debounceTimers.attachmentHistoryRefresh);
-      this._debounceTimers.attachmentHistoryRefresh = null;
-    }
-    this.updateAttachmentHistoryBadge();
-  },
-
-  async loadAttachmentHistory(sessionId = this.activeSessionId) {
-    const drawer = this.ensureAttachmentHistoryDrawer();
-    const list = drawer.querySelector('#attachmentHistoryList');
-    const subtitle = drawer.querySelector('#attachmentHistorySubtitle');
-    if (!list || !subtitle) return;
-
-    if (!sessionId) {
-      this.attachmentHistoryItems = [];
-      subtitle.textContent = 'No session';
-      list.innerHTML = '<div class="attachment-history-empty">No active session</div>';
-      this.updateAttachmentHistoryBadge(0);
-      return;
-    }
-
-    list.innerHTML = '<div class="attachment-history-empty">Loading...</div>';
-    try {
-      const res = await fetch(`/api/sessions/${sessionId}/attachments`);
-      if (!res.ok) throw new Error('Failed to load attachments');
-      const result = await res.json();
-      if (!result.success) throw new Error(result.error || 'Failed to load attachments');
-      const items = result.data?.items || [];
-      this.attachmentHistoryItems = items;
-      this.attachmentHistoryCounts.set(sessionId, items.length);
-      this.updateAttachmentHistoryBadge(items.length);
-      this.renderAttachmentHistory(items);
-    } catch (err) {
-      console.error('Failed to load attachment history:', err);
-      subtitle.textContent = 'Unavailable';
-      list.innerHTML = `<div class="attachment-history-empty">Error: ${escapeHtml(err.message)}</div>`;
-    }
-  },
-
-  renderAttachmentHistory(items = this.attachmentHistoryItems || []) {
-    const drawer = this.ensureAttachmentHistoryDrawer();
-    const list = drawer.querySelector('#attachmentHistoryList');
-    const subtitle = drawer.querySelector('#attachmentHistorySubtitle');
-    if (!list || !subtitle) return;
-
-    subtitle.textContent = `${items.length} ${items.length === 1 ? 'file' : 'files'}`;
-    if (items.length === 0) {
-      list.innerHTML = `
-        <div class="attachment-history-empty">
-          <div class="attachment-history-empty-title">No attachments yet</div>
-          <div>Show a file here by running:</div>
-          <code>codeman attach /absolute/path/to/file.pptx</code>
-          <div>Supports .pptx, .docx, .xlsx, .pdf, .png, .md, and .txt.</div>
-        </div>
-      `;
-      return;
-    }
-
-    list.innerHTML = items.map((item) => this.renderAttachmentHistoryItem(item)).join('');
-    list.querySelectorAll('.attachment-history-thumb-img').forEach((img) => {
-      img.onerror = () => {
-        img.remove();
-        const fallback = img.closest('.attachment-history-thumb')?.querySelector('.attachment-history-thumb-fallback');
-        fallback?.classList.add('visible');
-      };
-    });
-    list.querySelectorAll('[data-attachment-action]').forEach((button) => {
-      button.addEventListener('click', () => {
-        const id = button.getAttribute('data-history-id');
-        const action = button.getAttribute('data-attachment-action');
-        if (!id || !action) return;
-        if (action === 'preview') this.previewAttachmentHistoryItem(id);
-        if (action === 'download') this.downloadAttachmentHistoryItem(id);
-        if (action === 'open') this.openAttachmentHistoryItem(id);
-        if (action === 'reshow') this.reshowAttachmentCard(id);
-      });
-    });
-  },
-
-  renderAttachmentHistoryItem(item) {
-    const typeLabel = (item.extension || item.attachmentType || 'file').toUpperCase();
-    const meta = [
-      item.source === 'external' ? 'published' : 'workspace',
-      this.formatFileSize(item.size || 0),
-      item.missing ? 'missing' : '',
-    ]
-      .filter(Boolean)
-      .join(' • ');
-    const thumb =
-      item.thumbnailUrl && !item.missing
-        ? `<img class="attachment-history-thumb-img" src="${escapeHtml(CodemanBase.url(item.thumbnailUrl))}" alt="">`
-        : '';
-    const disabled = item.missing ? 'disabled aria-disabled="true"' : '';
-    return `
-      <div class="attachment-history-item ${item.missing ? 'missing' : ''}" data-history-item="${escapeHtml(item.id)}">
-        <div class="attachment-history-thumb">
-          ${thumb}
-          <div class="attachment-history-thumb-fallback ${thumb ? '' : 'visible'}">${escapeHtml(typeLabel)}</div>
-        </div>
-        <div class="attachment-history-item-main">
-          <div class="attachment-history-file-name" title="${escapeHtml(item.fileName)}">${escapeHtml(item.fileName)}</div>
-          <div class="attachment-history-meta">${escapeHtml(meta)}</div>
-          <div class="attachment-history-actions">
-            <button type="button" data-attachment-action="preview" data-history-id="${escapeHtml(item.id)}" ${disabled}>Preview</button>
-            <button type="button" data-attachment-action="download" data-history-id="${escapeHtml(item.id)}" ${disabled}>Download</button>
-            <button type="button" data-attachment-action="open" data-history-id="${escapeHtml(item.id)}" ${disabled}>Open</button>
-            <button type="button" data-attachment-action="reshow" data-history-id="${escapeHtml(item.id)}" ${disabled}>Card</button>
-          </div>
-        </div>
-      </div>
-    `;
-  },
-
-  getAttachmentHistoryItem(itemId) {
-    return (this.attachmentHistoryItems || []).find((item) => item.id === itemId) || null;
-  },
-
-  previewAttachmentHistoryItem(itemId) {
-    const item = this.getAttachmentHistoryItem(itemId);
-    if (!item || item.missing) return;
-    const path = item.relativePath || item.fileName;
-    this.openFilePreview(path, item.sessionId, item.attachmentId || null);
-    // Close the drawer so the preview window is unobstructed.
-    this.closeAttachmentHistory();
-  },
-
-  openAttachmentHistoryItem(itemId) {
-    const item = this.getAttachmentHistoryItem(itemId);
-    if (!item || item.missing) return;
-    if (item.rawUrl || item.url) {
-      window.open(CodemanBase.url(item.rawUrl || item.url), '_blank');
-      return;
-    }
-    this.openAttachmentInNewTab(item.sessionId, item.relativePath || item.fileName, item.attachmentId || null);
-  },
-
-  downloadAttachmentHistoryItem(itemId) {
-    const item = this.getAttachmentHistoryItem(itemId);
-    if (!item || item.missing || !item.downloadUrl) return;
-    window.open(CodemanBase.url(item.downloadUrl), '_blank');
-  },
-
-  reshowAttachmentCard(itemId) {
-    const item = this.getAttachmentHistoryItem(itemId);
-    if (!item || item.missing) return;
-    this.addAttachmentCard({
-      sessionId: item.sessionId,
-      relativePath: item.relativePath,
-      fileName: item.fileName,
-      // Use the item's own timestamp (not Date.now()) so the derived cardId is
-      // stable across clicks — re-showing focuses the existing card instead of
-      // stacking a duplicate.
-      timestamp: item.timestamp ?? Date.now(),
-      size: item.size,
-      attachmentType: item.attachmentType,
-      extension: item.extension,
-      attachmentId: item.attachmentId,
-      rawUrl: item.rawUrl,
-      previewUrl: item.previewUrl,
-      thumbnailUrl: item.thumbnailUrl,
-    });
-  },
-
-  copyFilePreviewContent() {
-    // While editing, copy the live editor buffer (not the stale preview text).
-    const editTextarea = this.filePreviewEdit
-      ? this.$('filePreviewBody')?.querySelector('textarea.file-preview-editor')
-      : null;
-    const content = editTextarea ? editTextarea.value : this.filePreviewContent;
-    if (content) {
-      navigator.clipboard.writeText(content).then(() => {
-        this.showToast('Copied to clipboard', 'success');
-      }).catch(() => {
-        this.showToast('Failed to copy', 'error');
-      });
-    } else {
-      // Media/PDF/binary previews have no text buffer. Saying so beats the
-      // dead-button silence this used to be.
-      this.showToast('Nothing to copy in this preview', 'info');
-    }
-  },
-
-  getFileIcon(ext) {
-    if (!ext) return '\uD83D\uDCC4'; // Default file
-
-    const icons = {
-      // TypeScript/JavaScript
-      'ts': '\uD83D\uDCD8', 'tsx': '\uD83D\uDCD8', 'js': '\uD83D\uDCD2', 'jsx': '\uD83D\uDCD2',
-      'mjs': '\uD83D\uDCD2', 'cjs': '\uD83D\uDCD2',
-      // Python
-      'py': '\uD83D\uDC0D', 'pyx': '\uD83D\uDC0D', 'pyw': '\uD83D\uDC0D',
-      // Rust/Go/C
-      'rs': '\uD83E\uDD80', 'go': '\uD83D\uDC39', 'c': '\u2699\uFE0F', 'cpp': '\u2699\uFE0F',
-      'h': '\u2699\uFE0F', 'hpp': '\u2699\uFE0F',
-      // Web
-      'html': '\uD83C\uDF10', 'htm': '\uD83C\uDF10', 'css': '\uD83C\uDFA8', 'scss': '\uD83C\uDFA8',
-      'sass': '\uD83C\uDFA8', 'less': '\uD83C\uDFA8',
-      // Data
-      'json': '\uD83D\uDCCB', 'yaml': '\uD83D\uDCCB', 'yml': '\uD83D\uDCCB', 'xml': '\uD83D\uDCCB',
-      'toml': '\uD83D\uDCCB', 'csv': '\uD83D\uDCCB',
-      // Docs
-      'md': '\uD83D\uDCDD', 'markdown': '\uD83D\uDCDD', 'txt': '\uD83D\uDCDD', 'rst': '\uD83D\uDCDD',
-      // Images
-      'png': '\uD83D\uDDBC\uFE0F', 'jpg': '\uD83D\uDDBC\uFE0F', 'jpeg': '\uD83D\uDDBC\uFE0F',
-      'gif': '\uD83D\uDDBC\uFE0F', 'svg': '\uD83D\uDDBC\uFE0F', 'webp': '\uD83D\uDDBC\uFE0F',
-      'ico': '\uD83D\uDDBC\uFE0F', 'bmp': '\uD83D\uDDBC\uFE0F',
-      // Video/Audio
-      'mp4': '\uD83C\uDFAC', 'webm': '\uD83C\uDFAC', 'mov': '\uD83C\uDFAC',
-      'mp3': '\uD83C\uDFB5', 'wav': '\uD83C\uDFB5', 'ogg': '\uD83C\uDFB5',
-      // Config/Shell
-      'sh': '\uD83D\uDCBB', 'bash': '\uD83D\uDCBB', 'zsh': '\uD83D\uDCBB',
-      'env': '\uD83D\uDD10', 'gitignore': '\uD83D\uDEAB', 'dockerfile': '\uD83D\uDC33',
-      // Lock files
-      'lock': '\uD83D\uDD12',
-    };
-
-    return icons[ext.toLowerCase()] || '\uD83D\uDCC4';
-  },
-
-  formatFileSize(bytes) {
-    if (bytes === undefined || bytes === null) return '';
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-    return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-  },
-
-
-  // ═══════════════════════════════════════════════════════════════
   // Log Viewer Windows (Floating File Streamers)
   // ═══════════════════════════════════════════════════════════════
 
@@ -5682,7 +8124,7 @@ Object.assign(CodemanApp.prototype, {
 
     // Connect to SSE stream
     const eventSource = new EventSource(
-      CodemanBase.url(`/api/sessions/${sessionId}/tail-file?path=${encodeURIComponent(filePath)}&lines=50`)
+      withBasePath(`/api/sessions/${sessionId}/tail-file?path=${encodeURIComponent(filePath)}&lines=50`)
     );
 
     eventSource.onmessage = (e) => {
@@ -5780,6 +8222,434 @@ Object.assign(CodemanApp.prototype, {
 
 
   // ═══════════════════════════════════════════════════════════════
+  // Attachment Cards (detected documents/images)
+  // ═══════════════════════════════════════════════════════════════
+
+  updateAttachmentHistoryCountFromSession(session) {
+    if (!session?.id) return;
+    const count = Array.isArray(session.attachmentHistory) ? session.attachmentHistory.length : 0;
+    if (count > 0) {
+      this.attachmentHistoryCounts.set(session.id, count);
+    } else {
+      this.attachmentHistoryCounts.delete(session.id);
+    }
+    if (session.id === this.activeSessionId) {
+      this.updateAttachmentHistoryBadge();
+    }
+  },
+
+  updateAttachmentHistoryBadge(count = null) {
+    const badge = document.getElementById('attachmentHistoryBadge');
+    const button = document.getElementById('attachmentsHistoryBtn');
+    const sessionId = this.activeSessionId;
+    const nextCount = count ?? (sessionId ? this.attachmentHistoryCounts.get(sessionId) || 0 : 0);
+    if (badge) {
+      badge.textContent = String(Math.min(nextCount, 99));
+      badge.style.display = nextCount > 0 ? '' : 'none';
+    }
+    if (button) {
+      button.classList.toggle('active', this.attachmentHistoryDrawerOpen);
+      button.setAttribute('aria-expanded', this.attachmentHistoryDrawerOpen ? 'true' : 'false');
+    }
+  },
+
+  ensureAttachmentHistoryDrawer() {
+    let drawer = document.getElementById('attachmentHistoryDrawer');
+    if (drawer) return drawer;
+
+    drawer = document.createElement('aside');
+    drawer.id = 'attachmentHistoryDrawer';
+    drawer.className = 'attachment-history-drawer';
+    drawer.setAttribute('aria-label', 'Attachment history');
+    drawer.innerHTML = `
+      <div class="attachment-history-header">
+        <div>
+          <div class="attachment-history-title">Attachments</div>
+          <div class="attachment-history-subtitle" id="attachmentHistorySubtitle">0 files</div>
+        </div>
+        <div class="attachment-history-header-actions">
+          <button type="button" class="btn-icon-sm" id="attachmentHistoryAddBtn" title="Add files" aria-label="Add files">&#x2795;</button>
+          <button type="button" class="btn-icon-sm" id="attachmentHistoryRefreshBtn" title="Refresh" aria-label="Refresh attachments">&#x21BB;</button>
+          <button type="button" class="btn-icon-sm" id="attachmentHistoryCloseBtn" title="Close" aria-label="Close attachments">&times;</button>
+        </div>
+      </div>
+      <div class="attachment-history-list" id="attachmentHistoryList"></div>
+    `;
+    document.body.appendChild(drawer);
+    drawer.querySelector('#attachmentHistoryAddBtn')?.addEventListener('click', () => {
+      this.pickDocumentsForUpload();
+    });
+    drawer.querySelector('#attachmentHistoryRefreshBtn')?.addEventListener('click', () => {
+      this.loadAttachmentHistory(this.activeSessionId);
+    });
+    drawer.querySelector('#attachmentHistoryCloseBtn')?.addEventListener('click', () => {
+      this.closeAttachmentHistory();
+    });
+    return drawer;
+  },
+
+  async toggleAttachmentHistory() {
+    if (this.attachmentHistoryDrawerOpen) {
+      this.closeAttachmentHistory();
+      return;
+    }
+    await this.openAttachmentHistory();
+  },
+
+  async openAttachmentHistory() {
+    const drawer = this.ensureAttachmentHistoryDrawer();
+    this.attachmentHistoryDrawerOpen = true;
+    drawer.classList.add('open');
+    this.updateAttachmentHistoryBadge();
+    await this.loadAttachmentHistory(this.activeSessionId);
+  },
+
+  closeAttachmentHistory() {
+    const drawer = document.getElementById('attachmentHistoryDrawer');
+    this.attachmentHistoryDrawerOpen = false;
+    drawer?.classList.remove('open');
+    this.updateAttachmentHistoryBadge();
+  },
+
+  async loadAttachmentHistory(sessionId = this.activeSessionId) {
+    const drawer = this.ensureAttachmentHistoryDrawer();
+    const list = drawer.querySelector('#attachmentHistoryList');
+    const subtitle = drawer.querySelector('#attachmentHistorySubtitle');
+    if (!list || !subtitle) return;
+
+    if (!sessionId) {
+      this.attachmentHistoryItems = [];
+      subtitle.textContent = 'No session';
+      list.innerHTML = '<div class="attachment-history-empty">No active session</div>';
+      this.updateAttachmentHistoryBadge(0);
+      return;
+    }
+
+    list.innerHTML = '<div class="attachment-history-empty">Loading...</div>';
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/attachments`);
+      if (!res.ok) throw new Error('Failed to load attachments');
+      const result = await res.json();
+      if (!result.success) throw new Error(result.error || 'Failed to load attachments');
+      const items = result.data?.items || [];
+      this.attachmentHistoryItems = items;
+      this.attachmentHistoryCounts.set(sessionId, items.length);
+      this.updateAttachmentHistoryBadge(items.length);
+      this.renderAttachmentHistory(items);
+    } catch (err) {
+      console.error('Failed to load attachment history:', err);
+      subtitle.textContent = 'Unavailable';
+      list.innerHTML = `<div class="attachment-history-empty">Error: ${escapeHtml(err.message)}</div>`;
+    }
+  },
+
+  renderAttachmentHistory(items = this.attachmentHistoryItems || []) {
+    const drawer = this.ensureAttachmentHistoryDrawer();
+    const list = drawer.querySelector('#attachmentHistoryList');
+    const subtitle = drawer.querySelector('#attachmentHistorySubtitle');
+    if (!list || !subtitle) return;
+
+    subtitle.textContent = `${items.length} ${items.length === 1 ? 'file' : 'files'}`;
+    if (items.length === 0) {
+      // COD-103: reference the Codeman CLI alias actually on PATH (default label
+      // 'aicodeman' when status not yet loaded / nothing on PATH), and warn when
+      // neither alias resolves so the `attach` instruction isn't silently broken.
+      const cli = this.codemanCli || { onPath: true, name: 'aicodeman' };
+      const cliName = cli.name || 'aicodeman';
+      const warning = cli.onPath
+        ? ''
+        : `<div class="cli-path-warning">⚠ Codeman CLI not found on PATH — add <code>~/.local/bin</code> to your PATH to use this.</div>`;
+      list.innerHTML = `
+        <div class="attachment-history-empty">
+          <div class="attachment-history-empty-title">No attachments yet</div>
+          <div>Show a file here by running:</div>
+          <code>${cliName} attach /absolute/path/to/file.pptx</code>
+          ${warning}
+          <div>Supports .pptx, .docx, .xlsx, .pdf, .png, .md, and .txt.</div>
+        </div>
+      `;
+      return;
+    }
+
+    list.innerHTML = items.map((item) => this.renderAttachmentHistoryItem(item)).join('');
+    list.querySelectorAll('.attachment-history-thumb-img').forEach((img) => {
+      img.onerror = () => {
+        img.remove();
+        const fallback = img.closest('.attachment-history-thumb')?.querySelector('.attachment-history-thumb-fallback');
+        fallback?.classList.add('visible');
+      };
+    });
+    list.querySelectorAll('[data-attachment-action]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const id = button.getAttribute('data-history-id');
+        const action = button.getAttribute('data-attachment-action');
+        if (!id || !action) return;
+        if (action === 'preview') this.previewAttachmentHistoryItem(id);
+        if (action === 'download') this.downloadAttachmentHistoryItem(id);
+        if (action === 'open') this.openAttachmentHistoryItem(id);
+        if (action === 'reshow') this.reshowAttachmentCard(id);
+        if (action === 'remove') {
+          const it = this.getAttachmentHistoryItem(id);
+          if (it && it.relativePath) this.deleteUploadedAttachment(it.sessionId, it.relativePath);
+        }
+      });
+    });
+  },
+
+  renderAttachmentHistoryItem(item) {
+    const typeLabel = (item.extension || item.attachmentType || 'file').toUpperCase();
+    const meta = [
+      item.source === 'external' ? 'published' : 'workspace',
+      this.formatFileSize(item.size || 0),
+      item.missing ? 'missing' : '',
+    ].filter(Boolean).join(' \u2022 ');
+    const thumb = item.thumbnailUrl && !item.missing
+      ? `<img class="attachment-history-thumb-img" src="${escapeHtml(withBasePath(item.thumbnailUrl))}" alt="">`
+      : '';
+    const disabled = item.missing ? 'disabled aria-disabled="true"' : '';
+    // COD-241 unit 3: only Codeman-uploaded copies (inside .codeman-attachments/)
+    // are removable; a detected/external reference to the user's own file is not.
+    const isOwnedUpload =
+      typeof item.relativePath === 'string' && item.relativePath.startsWith('.codeman-attachments/');
+    const removeBtn = isOwnedUpload
+      ? `<button type="button" data-attachment-action="remove" data-history-id="${escapeHtml(
+          item.id
+        )}" title="Remove uploaded file" aria-label="Remove uploaded file ${escapeHtml(item.fileName)}" ${disabled}>Remove</button>`
+      : '';
+    return `
+      <div class="attachment-history-item ${item.missing ? 'missing' : ''}" data-history-item="${escapeHtml(item.id)}">
+        <div class="attachment-history-thumb">
+          ${thumb}
+          <div class="attachment-history-thumb-fallback ${thumb ? '' : 'visible'}">${escapeHtml(typeLabel)}</div>
+        </div>
+        <div class="attachment-history-item-main">
+          <div class="attachment-history-file-name" title="${escapeHtml(item.fileName)}">${escapeHtml(item.fileName)}</div>
+          <div class="attachment-history-meta">${escapeHtml(meta)}</div>
+          <div class="attachment-history-actions">
+            <button type="button" data-attachment-action="preview" data-history-id="${escapeHtml(item.id)}" ${disabled}>Preview</button>
+            <button type="button" data-attachment-action="download" data-history-id="${escapeHtml(item.id)}" ${disabled}>Download</button>
+            <button type="button" data-attachment-action="open" data-history-id="${escapeHtml(item.id)}" ${disabled}>Open</button>
+            <button type="button" data-attachment-action="reshow" data-history-id="${escapeHtml(item.id)}" ${disabled}>Card</button>
+            ${removeBtn}
+          </div>
+        </div>
+      </div>
+    `;
+  },
+
+  getAttachmentHistoryItem(itemId) {
+    return (this.attachmentHistoryItems || []).find((item) => item.id === itemId) || null;
+  },
+
+  previewAttachmentHistoryItem(itemId) {
+    const item = this.getAttachmentHistoryItem(itemId);
+    if (!item || item.missing) return;
+    const path = item.relativePath || item.fileName;
+    this.openFilePreview(path, item.sessionId, item.attachmentId || null);
+    // COD-72: close the drawer so the preview window is unobstructed
+    this.closeAttachmentHistory();
+  },
+
+  openAttachmentHistoryItem(itemId) {
+    const item = this.getAttachmentHistoryItem(itemId);
+    if (!item || item.missing) return;
+    if (item.rawUrl || item.url) {
+      window.open(withBasePath(item.rawUrl || item.url), '_blank');
+      return;
+    }
+    this.openAttachmentInNewTab(item.sessionId, item.relativePath || item.fileName, item.attachmentId || null);
+  },
+
+  downloadAttachmentHistoryItem(itemId) {
+    const item = this.getAttachmentHistoryItem(itemId);
+    if (!item || item.missing || !item.downloadUrl) return;
+    window.open(withBasePath(item.downloadUrl), '_blank');
+  },
+
+  reshowAttachmentCard(itemId) {
+    const item = this.getAttachmentHistoryItem(itemId);
+    if (!item || item.missing) return;
+    this.addAttachmentCard({
+      sessionId: item.sessionId,
+      relativePath: item.relativePath,
+      fileName: item.fileName,
+      timestamp: Date.now(),
+      size: item.size,
+      attachmentType: item.attachmentType,
+      extension: item.extension,
+      attachmentId: item.attachmentId,
+      rawUrl: item.rawUrl,
+      previewUrl: item.previewUrl,
+      thumbnailUrl: item.thumbnailUrl,
+    });
+  },
+
+  ensureAttachmentCardStack() {
+    let stack = this.attachmentCardStack || document.getElementById('attachmentCardStack');
+    if (!stack) {
+      stack = document.createElement('div');
+      stack.id = 'attachmentCardStack';
+      stack.className = 'attachment-card-stack';
+      document.body.appendChild(stack);
+    }
+    this.attachmentCardStack = stack;
+    return stack;
+  },
+
+  addAttachmentCard(attachmentEvent) {
+    const {
+      sessionId,
+      relativePath,
+      fileName,
+      timestamp,
+      size,
+      attachmentType,
+      extension,
+      attachmentId,
+      rawUrl,
+      previewUrl,
+      thumbnailUrl,
+    } = attachmentEvent;
+    const filePath = relativePath || fileName;
+    const cardId = attachmentId || `${sessionId}-${timestamp}-${fileName}`;
+
+    if (this.attachmentCards.has(cardId)) {
+      const existing = this.attachmentCards.get(cardId);
+      existing.element.focus?.();
+      return;
+    }
+
+    const MAX_ATTACHMENT_CARDS = 10;
+    if (this.attachmentCards.size >= MAX_ATTACHMENT_CARDS) {
+      const oldestId = this.attachmentCards.keys().next().value;
+      if (oldestId) this.closeAttachmentCard(oldestId);
+    }
+
+    const stack = this.ensureAttachmentCardStack();
+    const session = this.sessions.get(sessionId);
+    const sessionName = session?.name || sessionId.substring(0, 8);
+    const attachmentRawUrl = withBasePath(rawUrl || (attachmentId
+      ? `/api/sessions/${sessionId}/attachments/${encodeURIComponent(attachmentId)}/raw`
+      : `/api/sessions/${sessionId}/file-raw?path=${encodeURIComponent(filePath)}`));
+    const attachmentPreviewUrl = withBasePath(previewUrl || (attachmentId
+      ? `/api/sessions/${sessionId}/attachments/${encodeURIComponent(attachmentId)}/preview`
+      : null));
+    const attachmentThumbnailUrl = withBasePath(thumbnailUrl || (attachmentId
+      ? `/api/sessions/${sessionId}/attachments/${encodeURIComponent(attachmentId)}/thumbnail`
+      : `/api/sessions/${sessionId}/file-thumbnail?path=${encodeURIComponent(filePath)}`));
+    const downloadUrl = attachmentId ? `${attachmentRawUrl}?download=true` : `${attachmentRawUrl}&download=true`;
+    const typeLabel = (extension || attachmentType || 'file').toUpperCase();
+
+    const card = document.createElement('article');
+    card.className = `attachment-card attachment-${escapeHtml(attachmentType || 'file')}`;
+    card.tabIndex = 0;
+    card.dataset.attachmentId = cardId;
+    card.dataset.previewUrl = attachmentPreviewUrl || '';
+    card.innerHTML = `
+      <div class="attachment-thumbnail">
+        ${attachmentThumbnailUrl ? `<img class="attachment-thumbnail-img" src="${escapeHtml(attachmentThumbnailUrl)}" alt="">` : ''}
+        <div class="attachment-thumbnail-fallback ${attachmentThumbnailUrl ? '' : 'visible'}">${escapeHtml(typeLabel)}</div>
+      </div>
+      <div class="attachment-card-main">
+        <div class="attachment-file-name" title="${escapeHtml(filePath)}">${escapeHtml(fileName)}</div>
+        <div class="attachment-file-meta">
+          <span>${escapeHtml(sessionName)}</span>
+          <span>${this.formatFileSize(size || 0)}</span>
+        </div>
+        <div class="attachment-actions">
+          <button type="button" class="attachment-preview-btn">Preview</button>
+          <a href="${escapeHtml(downloadUrl)}">Download</a>
+          <button type="button" class="attachment-open-btn">Open</button>
+          <button type="button" class="attachment-go-session-btn" title="Switch to this session">Go to session</button>
+        </div>
+      </div>
+      <button type="button" class="attachment-close-btn" title="Dismiss">&times;</button>
+    `;
+
+    const attachmentThumbnailImg = card.querySelector('.attachment-thumbnail-img');
+    if (attachmentThumbnailImg) {
+      attachmentThumbnailImg.onerror = () => {
+        attachmentThumbnailImg.remove();
+        card.querySelector('.attachment-thumbnail-fallback')?.classList.add('visible');
+      };
+    }
+
+    card.querySelector('.attachment-preview-btn')?.addEventListener('click', () => {
+      this.openFilePreview(filePath, sessionId, attachmentId || null);
+    });
+    card.querySelector('.attachment-open-btn')?.addEventListener('click', () => {
+      this.openAttachmentInNewTab(sessionId, filePath, attachmentId || null);
+    });
+    card.querySelector('.attachment-go-session-btn')?.addEventListener('click', () => {
+      this.selectSession(sessionId);
+    });
+    card.querySelector('.attachment-close-btn')?.addEventListener('click', () => {
+      this.closeAttachmentCard(cardId);
+    });
+
+    stack.prepend(card);
+    this.attachmentCards.set(cardId, { element: card, sessionId, filePath });
+    this._refreshAttachmentClearAll();
+  },
+
+  // Centralized show/hide for the stack's "Clear all" control. Both addAttachmentCard and
+  // closeAttachmentCard call this so the control appears on the 2nd card and hides at <=1.
+  // The control lives as a header inside #attachmentCardStack; it's created lazily and only
+  // ever shown when >=2 cards are present (absent/hidden at 0 and 1 card).
+  _refreshAttachmentClearAll() {
+    const stack = this.attachmentCardStack;
+    if (!stack) return;
+    let control = stack.querySelector('.attachment-clear-all');
+    if (this.attachmentCards.size < 2) {
+      if (control) control.hidden = true;
+      return;
+    }
+    if (!control) {
+      control = document.createElement('button');
+      control.type = 'button';
+      control.className = 'attachment-clear-all';
+      control.textContent = 'Clear all';
+      control.title = 'Dismiss all attachment cards';
+      control.addEventListener('click', () => this.closeAllAttachmentCards());
+    }
+    stack.prepend(control);
+    control.hidden = false;
+  },
+
+  closeAttachmentCard(attachmentId) {
+    const cardData = this.attachmentCards.get(attachmentId);
+    if (!cardData) return;
+    cardData.element.remove();
+    this.attachmentCards.delete(attachmentId);
+    if (this.attachmentCardStack && this.attachmentCards.size === 0) {
+      this.attachmentCardStack.remove();
+      this.attachmentCardStack = null;
+    } else {
+      this._refreshAttachmentClearAll();
+    }
+  },
+
+  // Dismiss every attachment card at once. Reuses the per-card close path so there are no
+  // leaked DOM nodes or stale map entries; the per-card teardown drops the #attachmentCardStack
+  // container once the map empties (so we don't double-remove it here).
+  closeAllAttachmentCards() {
+    for (const attachmentId of [...this.attachmentCards.keys()]) {
+      this.closeAttachmentCard(attachmentId);
+    }
+  },
+
+  closeSessionAttachmentCards(sessionId) {
+    const toClose = [];
+    for (const [attachmentId, data] of this.attachmentCards) {
+      if (data.sessionId === sessionId) toClose.push(attachmentId);
+    }
+    for (const attachmentId of toClose) {
+      this.closeAttachmentCard(attachmentId);
+    }
+  },
+
+
+  // ═══════════════════════════════════════════════════════════════
   // Image Popup Windows (Auto-popup for Screenshots)
   // ═══════════════════════════════════════════════════════════════
 
@@ -5824,7 +8694,7 @@ Object.assign(CodemanApp.prototype, {
 
     // Build image URL using the existing file-raw endpoint
     // Use relativePath (path from working dir) instead of fileName (basename) for subdirectory images
-    const imageUrl = CodemanBase.url(`/api/sessions/${sessionId}/file-raw?path=${encodeURIComponent(relativePath || fileName)}`);
+    const imageUrl = withBasePath(`/api/sessions/${sessionId}/file-raw?path=${encodeURIComponent(relativePath || fileName)}`);
 
     // Create window element
     const win = document.createElement('div');
@@ -6016,18 +8886,55 @@ Object.assign(CodemanApp.prototype, {
       return;
     }
 
-    let html = '';
+    // COD-97: keep the Monitor list in sync with the real open tabs. A mux entry
+    // whose sessionId is NOT in this.sessions (orphan / restored-* / already-closed
+    // tab) must never be rendered as a normal, clickable tab row — render those
+    // separately under a visually-distinct "not open" treatment so they can't be
+    // silently mistaken for live sessions.
+    const matched = [];
+    const orphans = [];
     for (const muxSession of this.muxSessions) {
+      if (this.sessions.has(muxSession.sessionId)) {
+        matched.push(muxSession);
+      } else {
+        orphans.push(muxSession);
+      }
+    }
+
+    // COD-122: render the secondary identifiers (tmux name + agent session id)
+    // beneath the primary tab-name label. Each is labelled by kind and truncates
+    // independently so the tab name above is never crowded out on narrow widths.
+    const kindMeta = {
+      tmux: { label: 'tmux', title: 'tmux session name' },
+      agent: { label: 'agent', title: 'agent (Claude/Codex) session id' },
+    };
+    const rowIdsHtml = (secondaries) => {
+      if (!secondaries || secondaries.length === 0) return '';
+      const ids = secondaries
+        .map((s) => {
+          const meta = kindMeta[s.kind] || { label: s.kind, title: '' };
+          return `<span class="monitor-id monitor-id-${s.kind}" title="${escapeHtml(meta.title)}: ${escapeHtml(s.label)}"><span class="monitor-id-kind">${escapeHtml(meta.label)}</span><span class="monitor-id-val">${escapeHtml(s.label)}</span></span>`;
+        })
+        .join('');
+      return `<div class="monitor-row-ids">${ids}</div>`;
+    };
+
+    let html = '';
+    for (const muxSession of matched) {
       const stats = muxSession.stats || { memoryMB: 0, cpuPercent: 0, childCount: 0 };
 
       // Look up rich session data by sessionId
       const session = this.sessions.get(muxSession.sessionId);
-      const status = session ? session.status : 'unknown';
+      const activity = session ? window.CodemanSessionActivity?.resolve(session) : null;
+      const status = activity?.effectiveStatus || (session ? session.status : 'unknown');
       const isWorking = session ? session.isWorking : false;
 
       // Status badge
       let statusLabel, statusClass;
-      if (status === 'idle' && !isWorking) {
+      if (status === 'waiting_agents' || status === 'checking_agents') {
+        statusLabel = activity.expandedLabel;
+        statusClass = `status-${activity.cssState}`;
+      } else if (status === 'idle' && !isWorking) {
         statusLabel = 'IDLE';
         statusClass = 'status-idle';
       } else if (status === 'busy' || isWorking) {
@@ -6074,12 +8981,22 @@ Object.assign(CodemanApp.prototype, {
         modelHtml = `<span class="monitor-model-badge ${modelShort}">${modelShort}</span>`;
       }
 
+      // COD-122: tab name is the primary/L1 label; tmux + agent ids are secondary.
+      const labels = window.CodemanMonitorLabels.resolveMonitorRowLabels({
+        tabName: session && session.name,
+        storedName: muxSession.name,
+        muxName: muxSession.muxName,
+        agentSessionId: session && session.claudeSessionId,
+        sessionId: muxSession.sessionId,
+      });
+
       const sid = escapeHtml(JSON.stringify(muxSession.sessionId));
       html += `
-        <div class="process-item process-item-clickable" onclick="app.selectSession(${sid})" title="Switch to session">
+        <div class="process-item process-item-clickable" data-activity-status="${escapeHtml(status)}" onclick="app.selectSession(${sid})" title="Switch to session">
           <span class="monitor-status-badge ${statusClass}">${statusLabel}</span>
           <div class="process-info">
-            <div class="process-name">${modelHtml} ${escapeHtml(muxSession.name || muxSession.muxName)}</div>
+            <div class="process-name">${modelHtml} <span class="monitor-tab-name">${escapeHtml(labels.primary)}</span></div>
+            ${rowIdsHtml(labels.secondaries)}
             <div class="process-meta">
               ${tokenHtml}
               ${costHtml}
@@ -6090,6 +9007,37 @@ Object.assign(CodemanApp.prototype, {
           </div>
           <div class="process-actions">
             <button class="btn-toolbar btn-sm btn-danger" onclick="event.stopPropagation(); app.killMuxSession(${sid})" title="Kill session">Kill</button>
+          </div>
+        </div>
+      `;
+    }
+
+    // COD-97: orphaned mux sessions (no matching open tab) — render distinct,
+    // non-clickable rows so they're never confused for live tabs. These can be
+    // killed (they're real tmux sessions) but selecting them would do nothing.
+    for (const muxSession of orphans) {
+      const stats = muxSession.stats || { memoryMB: 0, cpuPercent: 0, childCount: 0 };
+      // COD-122: no matching UI session, so there's no tab name / agent id — the
+      // persisted mux name (if any) leads, falling back to the tmux name.
+      const labels = window.CodemanMonitorLabels.resolveMonitorRowLabels({
+        storedName: muxSession.name,
+        muxName: muxSession.muxName,
+        sessionId: muxSession.sessionId,
+      });
+      const sid = escapeHtml(muxSession.sessionId);
+      html += `
+        <div class="process-item process-item-orphan" title="Not an open tab (orphaned tmux session)">
+          <span class="monitor-status-badge status-orphan">NOT OPEN</span>
+          <div class="process-info">
+            <div class="process-name"><span class="monitor-tab-name">${escapeHtml(labels.primary)}</span></div>
+            ${rowIdsHtml(labels.secondaries)}
+            <div class="process-meta">
+              <span class="process-stat memory">${stats.memoryMB || 0}MB</span>
+              <span class="process-stat cpu">${stats.cpuPercent || 0}%</span>
+            </div>
+          </div>
+          <div class="process-actions">
+            <button class="btn-toolbar btn-sm btn-danger" onclick="app.killMuxSession('${sid}')" title="Kill orphaned session">Kill</button>
           </div>
         </div>
       `;
@@ -6122,7 +9070,7 @@ Object.assign(CodemanApp.prototype, {
       const desc = agent.description ? escapeHtml(agent.description.substring(0, 40)) : agent.agentId;
 
       html += `
-        <div class="process-item">
+        <div class="process-item" data-agent-key="${escapeHtml(agent.agentKey)}">
           <span class="process-mode ${statusClass}">${agent.status}</span>
           <div class="process-info">
             <div class="process-name">${modelBadge} ${desc}</div>
@@ -6132,7 +9080,7 @@ Object.assign(CodemanApp.prototype, {
             </div>
           </div>
           <div class="process-actions">
-            ${agent.status !== 'completed' ? `<button class="btn-toolbar btn-sm btn-danger" onclick="app.killSubagent(${escapeHtml(JSON.stringify(agent.agentId))})" title="Kill agent">Kill</button>` : ''}
+            ${agent.status !== 'completed' ? `<button class="btn-toolbar btn-sm btn-danger" onclick="app.killSubagent(${escapeHtml(JSON.stringify(agent.agentKey))})" title="Kill agent">Kill</button>` : ''}
           </div>
         </div>
       `;
@@ -6257,6 +9205,14 @@ Object.assign(CodemanApp.prototype, {
         this._toastContainer.className = 'toast-container';
         document.body.appendChild(this._toastContainer);
       }
+    }
+    // a11y: the container is a polite live region so toasts (e.g. document-upload
+    // progress / failure) are announced to screen readers as they appear. Set
+    // once, idempotently, whether the container was just created or adopted.
+    if (this._toastContainer.getAttribute('aria-live') !== 'polite') {
+      this._toastContainer.setAttribute('role', 'status');
+      this._toastContainer.setAttribute('aria-live', 'polite');
+      this._toastContainer.setAttribute('aria-atomic', 'false');
     }
     this._toastContainer.appendChild(toast);
 

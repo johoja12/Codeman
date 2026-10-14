@@ -15,8 +15,8 @@ import type {
   SessionMode,
   OpenCodeConfig,
   CodexConfig,
-  EffortLevel,
   GeminiConfig,
+  EffortLevel,
   AntigravityConfig,
   PiConfig,
   GrokConfig,
@@ -27,6 +27,13 @@ import type {
   PaneExit,
   StatusLineExporter,
 } from './types.js';
+import type { CodexProviderEnvironment } from './codex-provider-identity.js';
+
+export type CommandDeliveryStage = 'text' | 'enter';
+
+export type CommandDeliveryResult =
+  | { ok: true; attempt?: number }
+  | { ok: false; stage: CommandDeliveryStage; error?: string; attempt?: number };
 
 /**
  * Multiplexer session metadata.
@@ -44,6 +51,10 @@ export interface MuxSession {
   workingDir: string;
   /** Remote execution metadata for local tmux sessions wrapping SSH */
   remote?: SessionRemote;
+  /** Worker boot observed while the durable remote session existed (COD-486). */
+  remoteBootId?: string;
+  /** An intentional/missing session observed before a reboot must stay closed. */
+  remoteRecoverySuppressed?: boolean;
   /** Docker execution metadata for local tmux sessions wrapping `docker exec` */
   docker?: SessionDocker;
   /** Owning username in multi-user mode (round-tripped through recovery like remote/docker) */
@@ -60,6 +71,8 @@ export interface MuxSession {
   ralphEnabled?: boolean;
   /** Whether the current launch carries the statusLine exporter; set on every create and respawn. */
   statusLine?: StatusLineExporter;
+  headroomRouted?: boolean;
+  headroomRoutedAt?: number;
   /**
    * This record was rebuilt from the tmux socket rather than from Codeman's own
    * bookkeeping, so everything on it but the name and the pid is a guess. Its
@@ -118,12 +131,21 @@ export interface CreateSessionOptions {
   envOverrides?: Record<string, string>;
   /** Claude CLI effort level, injected as a `--settings` soft default (overridable via /effort in-session) */
   effort?: EffortLevel;
+  /** Opt Claude/non-codex sessions into `export COLORTERM=truecolor` (COD-75). Default off → `unset COLORTERM`. Codex is always truecolor. */
+  truecolorEnabled?: boolean;
   /** Claude advisor model, merged into the same `--settings` JSON (overridable via /advisor in-session) */
   advisorModel?: string;
   /** tmux history-limit (scrollback lines) allocated when this session is created. */
   historyLimit?: number;
   /** Remote execution metadata for local tmux sessions wrapping SSH */
   remote?: SessionRemote;
+  /**
+   * Initial window geometry (COD-179). Spawning at the creating browser's real
+   * dims avoids the 120x40 → real-size resize storm whose mismatched TUI
+   * repaint frames stack stale banner boxes in the byte history (COD-178).
+   */
+  initialCols?: number;
+  initialRows?: number;
   /** Docker execution metadata for local tmux sessions wrapping `docker exec` */
   docker?: SessionDocker;
   /** Owning username in multi-user mode; persisted for recovery. */
@@ -133,6 +155,8 @@ export interface CreateSessionOptions {
 /** Options for respawning a dead pane. */
 export interface RespawnPaneOptions {
   sessionId: string;
+  /** Verified worker reboot: resume exactly, with no fresh-conversation fallback. */
+  remoteResumeOnly?: boolean;
   workingDir: string;
   mode: SessionMode;
   /** Session display name (tab name). */
@@ -169,6 +193,8 @@ export interface RespawnPaneOptions {
   unsetEnvKeys?: string[];
   /** Claude CLI effort level (preserved across respawns, injected via `--settings`) */
   effort?: EffortLevel;
+  /** Opt Claude/non-codex sessions into `export COLORTERM=truecolor` (COD-75, preserved across respawns). Default off. */
+  truecolorEnabled?: boolean;
   /** Claude advisor model (preserved across respawns, merged into the same `--settings` JSON) */
   advisorModel?: string;
   /** Original tmux history-limit retained for config parity; respawn cannot resize the existing pane. */
@@ -192,6 +218,8 @@ export interface PaneCaptureOptions {
   fullHistory?: boolean;
   /** Bound the full-history capture to this many scrollback lines (`-S -<N>`). */
   historyLimitLines?: number;
+  /** Return only the last N lines of the capture (the cheap `?tail=` replay path). */
+  lastLines?: number;
   /**
    * Full-history only: scrollback rows read from somewhere other than this pane
    * (raw `capture-pane -p -e -J` text, oldest first). The pane then contributes
@@ -265,7 +293,7 @@ export interface TerminalMultiplexer extends EventEmitter {
 
   /**
    * Create a new multiplexer session.
-   * The session runs the appropriate command (claude, opencode, or shell) in detached mode.
+   * The session runs the appropriate command (claude, opencode, codex, or shell) in detached mode.
    */
   createSession(options: CreateSessionOptions): Promise<MuxSession>;
 
@@ -274,6 +302,8 @@ export interface TerminalMultiplexer extends EventEmitter {
    * Uses a multi-strategy approach (children → process group → mux kill → SIGKILL).
    */
   killSession(sessionId: string): Promise<boolean>;
+  /** Kill only this host's wrapper pane; never send a remote tmux kill. */
+  detachRemoteWrapper?(sessionId: string): Promise<boolean>;
 
   /** Clean up resources (stop stats collection, etc.) */
   destroy(): void;
@@ -292,12 +322,24 @@ export interface TerminalMultiplexer extends EventEmitter {
   /** Get process stats for a single session */
   getProcessStats(sessionId: string): Promise<ProcessStats | null>;
 
+  /**
+   * Read the closed Codex provider environment from one surviving local tmux session.
+   * `null` means unreadable; `{}` means it was read successfully and uses ambient authentication.
+   */
+  getCodexProviderEnvironment?(muxName: string): Promise<CodexProviderEnvironment | null>;
+
   // ========== Input ==========
 
   /**
    * Send input to a session via tmux send-keys.
    */
   sendInput(sessionId: string, input: string): Promise<boolean>;
+
+  /**
+   * Submit one checkpoint command with duplicate-safe text/Enter acknowledgements.
+   * Unlike generic input, the failed transport stage remains observable.
+   */
+  sendCheckpointCommand(sessionId: string, input: string): Promise<CommandDeliveryResult>;
 
   // ========== Metadata ==========
 
@@ -353,8 +395,12 @@ export interface TerminalMultiplexer extends EventEmitter {
   /** Pin a mux window so client attaches do not automatically dictate its size. */
   setManualWindowSize?(muxName: string): boolean;
 
-  /** Explicitly resize a mux window after Codeman accepts a terminal resize. */
-  resizeWindow?(muxName: string, cols: number, rows: number): boolean;
+  /**
+   * Explicitly resize a mux window after Codeman accepts a terminal resize.
+   * Admission stays synchronous/non-blocking; completion reports whether the
+   * authoritative mux command actually succeeded.
+   */
+  resizeWindow?(muxName: string, cols: number, rows: number, onComplete?: (success: boolean) => void): boolean;
 
   // ========== Availability ==========
 
@@ -362,10 +408,10 @@ export interface TerminalMultiplexer extends EventEmitter {
   isAvailable(): boolean;
 
   /** Check if a multiplexer session actually exists (process-level check, not just tracked) */
-  muxSessionExists(muxName: string): boolean;
+  muxSessionExists(muxName: string): Promise<boolean>;
 
   /** Check if the pane in a session is dead (command exited but remain-on-exit keeps it alive) */
-  isPaneDead(muxName: string): boolean;
+  isPaneDead(muxName: string): Promise<boolean>;
 
   /**
    * What the last pane read saw of this session's agent, or `undefined` for
@@ -397,17 +443,32 @@ export interface TerminalMultiplexer extends EventEmitter {
   respawnPane(options: RespawnPaneOptions): Promise<number | null>;
 
   /**
-   * Capture a pane's current tmux buffer with ANSI escape codes preserved.
-   * Pass `{ fullHistory: true }` to capture the entire scrollback as linear
-   * text instead of just the visible single-screen frame (COD-47).
+   * Every session's active-pane working directory, batched into one query
+   * (COD-386). Optional: a multiplexer that cannot report a pane's cwd simply
+   * leaves relative paths resolving against `workingDir`, which is the
+   * historical behaviour.
    */
-  capturePaneBuffer?(muxName: string, paneTarget?: string, opts?: PaneCaptureOptions): string | null;
+  listPaneCurrentPaths?(): Promise<Map<string, string>>;
+
+  /**
+   * Capture a pane's current tmux buffer with ANSI escape codes preserved.
+   * Pass `{ fullHistory: true }` to capture the entire scrollback (`-S -`)
+   * as linear text instead of just the visible single-screen frame (COD-47).
+   */
+  capturePaneBuffer?(
+    muxName: string,
+    paneTarget?: string,
+    opts?: { fullHistory?: boolean; lastLines?: number }
+  ): string | null;
 
   /**
    * Capture the active pane's current tmux buffer with ANSI escape codes preserved.
    * Pass `{ fullHistory: true }` to capture the entire scrollback (COD-47).
    */
   captureActivePaneBuffer?(muxName: string, opts?: PaneCaptureOptions): string | null;
+
+  /** Current active frame plus liveness, captured in one nonblocking local command. */
+  captureLivePaneFrame?(muxName: string): Promise<string | null>;
 
   /**
    * Plain text of the visible frame: no styles, no cursor query, no repaint
@@ -417,4 +478,30 @@ export interface TerminalMultiplexer extends EventEmitter {
    * pane cannot be read.
    */
   capturePaneText?(muxName: string, paneTarget?: string): string | null;
+
+  /**
+   * Plain text from the active pane's visible screen, captured asynchronously
+   * for activity detection.
+   */
+  capturePaneTextAsync?(muxName: string, opts?: { signal?: AbortSignal; ansi?: boolean }): Promise<string | null>;
+
+  /**
+   * COD-180 — capture a REMOTE session's pane buffer on the remote tmux server
+   * over ssh. The remote history is the canonical scrollback for remote
+   * sessions (the local wrapper accumulates none). Returns null on failure so
+   * callers can fall back to local data.
+   */
+  captureRemotePaneBuffer?(
+    remote: SessionRemote,
+    sessionId: string,
+    muxName: string,
+    opts?: { fullHistory?: boolean; visibleFrame?: boolean; lastLines?: number; owner?: string }
+  ): Promise<string | null>;
+  /**
+   * COD-463 — true while captures for this remote's host are in backoff after an
+   * ssh transport failure, i.e. being served from the local wrapper instead.
+   */
+  isRemoteCaptureDegraded?(remote: SessionRemote): boolean;
+  /** Close only the SSH control masters owned by remote pane capture. */
+  closeRemoteFrameConnections?(): Promise<void>;
 }

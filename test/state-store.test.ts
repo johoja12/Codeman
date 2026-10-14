@@ -15,6 +15,7 @@ import type { AppState, SessionState, TaskState, RalphSessionState } from '../sr
 
 // We need to import without mocking to test the actual implementation
 import { StateStore, getStore } from '../src/state-store.js';
+import type { SessionRecoveryRecord } from '../src/types/session-recovery.js';
 
 describe('StateStore', () => {
   const testDir = join(tmpdir(), 'codeman-test-' + Date.now());
@@ -138,6 +139,245 @@ describe('StateStore', () => {
       expect(Object.keys(sessions)).toHaveLength(2);
       expect(sessions['session-1']).toBeDefined();
       expect(sessions['session-2']).toBeDefined();
+    });
+  });
+
+  describe('session recovery operations', () => {
+    it('clones recovery records at the StateStore boundary', () => {
+      const store = new StateStore(testFilePath);
+      const record = createMockSessionRecoveryRecord('recovery-1');
+
+      store.setSessionRecoveries([record]);
+      record.status = 'recovered';
+      const recoveries = store.getSessionRecoveries();
+      recoveries[0].status = 'recovered';
+
+      expect(store.getSessionRecoveries()[0].status).toBe('pending');
+    });
+
+    it('upserts, removes, and persists recovery records independently of active sessions', () => {
+      const store = new StateStore(testFilePath);
+      const first = createMockSessionRecoveryRecord('first');
+      const updated = { ...first, status: 'resumable' as const, nativeResumeId: 'rollout-1' };
+
+      store.upsertSessionRecovery(first);
+      store.upsertSessionRecovery(updated);
+      store.upsertSessionRecovery(createMockSessionRecoveryRecord('second'));
+      store.removeSessionRecovery('second');
+      store.flushAll();
+
+      expect(store.getSession('session-first')).toBeNull();
+      expect(store.getSessionRecoveries()).toEqual([updated]);
+      expect(JSON.parse(readFileSync(testFilePath, 'utf-8')).sessionRecoveries).toEqual([updated]);
+      expect(new StateStore(testFilePath).getSessionRecoveries()).toEqual([updated]);
+    });
+
+    it('retains at most 200 terminal records per owner without removing pending records', () => {
+      const store = new StateStore(testFilePath);
+      const terminal = Array.from({ length: 201 }, (_, index) => ({
+        ...createMockSessionRecoveryRecord(`terminal-${index}`),
+        status: 'recovered' as const,
+        createdAt: index,
+      }));
+
+      store.setSessionRecoveries([...terminal, createMockSessionRecoveryRecord('pending')]);
+
+      const recoveries = store.getSessionRecoveries();
+      expect(recoveries).toHaveLength(201);
+      expect(recoveries.filter((record) => record.status === 'recovered')).toHaveLength(200);
+      expect(recoveries.some((record) => record.id === 'terminal-0')).toBe(false);
+      expect(recoveries.some((record) => record.id === 'pending')).toBe(true);
+    });
+
+    it('sanitizes manual recovery hints supplied through set and upsert before persistence', () => {
+      const store = new StateStore(testFilePath);
+      const setHint = 'ssh: host=private.example password=set-secret Permission denied';
+      const upsertHint = 'ssh: host=private.example password=upsert-secret Connection timed out';
+
+      store.setSessionRecoveries([
+        {
+          ...createMockSessionRecoveryRecord('set-manual'),
+          status: 'manual_required',
+          launch: { kind: 'manual_required', hint: setHint },
+        },
+      ]);
+      store.upsertSessionRecovery({
+        ...createMockSessionRecoveryRecord('upsert-manual'),
+        status: 'manual_required',
+        launch: { kind: 'manual_required', hint: upsertHint },
+      });
+      store.flushAll();
+
+      expect(store.getSessionRecoveries().map((record) => record.launch)).toEqual([
+        {
+          kind: 'manual_required',
+          hint: 'Manual recovery is required. Start a new session from the original working directory.',
+        },
+        {
+          kind: 'manual_required',
+          hint: 'Manual recovery is required. Start a new session from the original working directory.',
+        },
+      ]);
+      const serialized = readFileSync(testFilePath, 'utf-8');
+      expect(serialized).not.toContain(setHint);
+      expect(serialized).not.toContain(upsertHint);
+      expect(serialized).not.toContain('set-secret');
+      expect(serialized).not.toContain('upsert-secret');
+    });
+  });
+
+  describe('case default groups', () => {
+    it('distinguishes unset defaults from intentional Ungrouped values per owner', () => {
+      const store = new StateStore(testFilePath);
+
+      expect(store.getCaseDefaultGroup('alice', 'nzbdav')).toBeUndefined();
+
+      store.setCaseDefaultGroup('alice', 'nzbdav', 'group-nzbdav');
+      store.setCaseDefaultGroup('bob', 'nzbdav', null);
+
+      expect(store.getCaseDefaultGroup('alice', 'nzbdav')).toBe('group-nzbdav');
+      expect(store.getCaseDefaultGroup('bob', 'nzbdav')).toBeNull();
+    });
+
+    it('moves a default when its case is renamed and removes it when the case is deleted', () => {
+      const store = new StateStore(testFilePath);
+      store.setCaseDefaultGroup('alice', 'nzbdav', 'group-nzbdav');
+
+      store.renameCaseDefaultGroup('alice', 'nzbdav', 'nzbdav-next');
+
+      expect(store.getCaseDefaultGroup('alice', 'nzbdav')).toBeUndefined();
+      expect(store.getCaseDefaultGroup('alice', 'nzbdav-next')).toBe('group-nzbdav');
+
+      store.deleteCaseDefaultGroup('alice', 'nzbdav-next');
+
+      expect(store.getCaseDefaultGroup('alice', 'nzbdav-next')).toBeUndefined();
+    });
+
+    it('treats prototype-collision owner and case names as ordinary record keys', () => {
+      const store = new StateStore(testFilePath);
+      store.setCaseDefaultGroup('seed-owner', 'seed-case', 'seed-group');
+
+      expect(store.getCaseDefaultGroup('constructor', 'toString')).toBeUndefined();
+      expect(store.getCaseDefaultGroup('seed-owner', 'constructor')).toBeUndefined();
+
+      store.setCaseDefaultGroup('__proto__', 'constructor', 'group-prototype');
+      store.setCaseDefaultGroup('constructor', '__proto__', null);
+
+      expect(store.getCaseDefaultGroup('__proto__', 'constructor')).toBe('group-prototype');
+      expect(store.getCaseDefaultGroup('constructor', '__proto__')).toBeNull();
+
+      store.renameCaseDefaultGroup('__proto__', 'constructor', '__proto__');
+
+      expect(store.getCaseDefaultGroup('__proto__', 'constructor')).toBeUndefined();
+      expect(store.getCaseDefaultGroup('__proto__', '__proto__')).toBe('group-prototype');
+
+      store.deleteCaseDefaultGroup('__proto__', '__proto__');
+      store.deleteCaseDefaultGroup('constructor', '__proto__');
+
+      expect(store.getCaseDefaultGroup('__proto__', '__proto__')).toBeUndefined();
+      expect(store.getCaseDefaultGroup('constructor', '__proto__')).toBeUndefined();
+    });
+  });
+
+  describe('Codex command profiles', () => {
+    it('isolates profiles by owner and clones profiles at the store boundary', () => {
+      const store = new StateStore(testFilePath);
+      const aliceProfiles = [{ id: 'personal', name: 'Personal', command: 'exec codx personal' }];
+
+      store.setCodexCommandProfiles('alice', aliceProfiles);
+      store.setCodexCommandProfiles('bob', [{ id: 'work', name: 'Work', command: 'exec codx work' }]);
+      aliceProfiles[0].name = 'Changed input';
+
+      const aliceRead = store.getCodexCommandProfiles('alice');
+      aliceRead[0].name = 'Changed output';
+
+      expect(store.getCodexCommandProfiles('alice')).toEqual([
+        { id: 'personal', name: 'Personal', command: 'exec codx personal' },
+      ]);
+      expect(store.getCodexCommandProfiles('bob')).toEqual([{ id: 'work', name: 'Work', command: 'exec codx work' }]);
+      expect(store.getCodexCommandProfiles('constructor')).toEqual([]);
+    });
+
+    it('persists profiles across restart and includes them in the serialized state', () => {
+      const store = new StateStore(testFilePath);
+      const profiles = [{ id: 'personal', name: 'Personal', command: 'exec codx personal' }];
+
+      store.setCodexCommandProfiles('alice', profiles);
+      store.flushAll();
+
+      expect(JSON.parse(readFileSync(testFilePath, 'utf-8')).codexCommandProfiles).toEqual({ alice: profiles });
+      expect(new StateStore(testFilePath).getCodexCommandProfiles('alice')).toEqual(profiles);
+    });
+  });
+
+  describe('Local case Codex command selections (COD-392)', () => {
+    it('returns empty selections for unknown owners and clones selections at the boundary', () => {
+      const store = new StateStore(testFilePath);
+      expect(store.getCaseCodexCommandSelections('nobody')).toEqual({});
+
+      store.setCaseCodexCommandSelection('alice', 'case-a', { kind: 'custom', command: 'codex a' });
+      const selections = store.getCaseCodexCommandSelections('alice');
+      selections['case-a'] = { kind: 'custom', command: 'mutated' } as never;
+
+      expect(store.getCaseCodexCommandSelection('alice', 'case-a')).toEqual({
+        kind: 'custom',
+        command: 'codex a',
+      });
+    });
+
+    it('isolates selections by owner, clears on default, and survives restart', () => {
+      const store = new StateStore(testFilePath);
+
+      expect(store.getCaseCodexCommandSelection('alice', 'case-a')).toBeUndefined();
+
+      store.setCaseCodexCommandSelection('alice', 'case-a', { kind: 'profile', profileId: 'p1' });
+      store.setCaseCodexCommandSelection('bob', 'case-a', {
+        kind: 'custom',
+        command: 'codex --profile bob',
+      });
+
+      expect(store.getCaseCodexCommandSelection('alice', 'case-a')).toEqual({
+        kind: 'profile',
+        profileId: 'p1',
+      });
+
+      store.setCaseCodexCommandSelection('alice', 'case-a', undefined);
+      expect(store.getCaseCodexCommandSelection('alice', 'case-a')).toBeUndefined();
+      expect(store.getCaseCodexCommandSelection('bob', 'case-a')).toEqual({
+        kind: 'custom',
+        command: 'codex --profile bob',
+      });
+
+      store.setCaseCodexCommandSelection('alice', 'case-b', { kind: 'custom', command: 'codex --yolo' });
+      store.flushAll();
+
+      const persisted = JSON.parse(readFileSync(testFilePath, 'utf-8')).caseCodexCommandSelections;
+      expect(persisted.alice['case-b']).toEqual({ kind: 'custom', command: 'codex --yolo' });
+      expect(new StateStore(testFilePath).getCaseCodexCommandSelection('alice', 'case-b')).toEqual({
+        kind: 'custom',
+        command: 'codex --yolo',
+      });
+    });
+
+    it('renames and deletes selections including prototype-collision keys', () => {
+      const store = new StateStore(testFilePath);
+      store.setCaseCodexCommandSelection('alice', 'old-case', { kind: 'custom', command: 'codex a' });
+
+      store.renameCaseCodexCommandSelection('alice', 'old-case', 'new-case');
+      expect(store.getCaseCodexCommandSelection('alice', 'old-case')).toBeUndefined();
+      expect(store.getCaseCodexCommandSelection('alice', 'new-case')).toEqual({
+        kind: 'custom',
+        command: 'codex a',
+      });
+
+      store.deleteCaseCodexCommandSelection('alice', 'new-case');
+      expect(store.getCaseCodexCommandSelection('alice', 'new-case')).toBeUndefined();
+
+      store.setCaseCodexCommandSelection('__proto__', 'constructor', { kind: 'custom', command: 'codex x' });
+      expect(store.getCaseCodexCommandSelection('__proto__', 'constructor')).toEqual({
+        kind: 'custom',
+        command: 'codex x',
+      });
     });
   });
 
@@ -406,6 +646,42 @@ describe('StateStore', () => {
     });
   });
 
+  describe('circuit breaker recovery (COD-50)', () => {
+    it('recovers via HALF_OPEN trial write after the cooldown', () => {
+      // Fake timers are already active (beforeEach). The store loads cleanly
+      // while testFilePath does not exist yet.
+      const store = new StateStore(testFilePath);
+
+      // Force every write to fail: make the destination a DIRECTORY so the
+      // atomic rename(tempPath, testFilePath) fails with EISDIR while the temp
+      // write succeeds. Real fs, deterministic — no mocks.
+      rmSync(testFilePath, { recursive: true, force: true });
+      mkdirSync(testFilePath, { recursive: true });
+
+      // 3 consecutive failed saves trip the breaker open.
+      for (let i = 0; i < 3; i++) {
+        store.setSession(`s${i}`, createMockSessionState(`s${i}`));
+        store.saveNow();
+      }
+
+      // Fix the fs so writes *could* succeed, but stay within the cooldown
+      // window. A latched breaker (bug) and a cooling-down breaker (fix) both
+      // skip here, so the file must NOT be recreated yet.
+      rmSync(testFilePath, { recursive: true, force: true });
+      store.setSession('within', createMockSessionState('within'));
+      store.saveNow();
+      expect(existsSync(testFilePath)).toBe(false); // still cooling down -> skipped
+
+      // Advance past the 30s cooldown. The fixed breaker must allow a HALF_OPEN
+      // trial write, which now succeeds and recovers persistence. The buggy
+      // (permanently latched) breaker never writes again.
+      vi.advanceTimersByTime(30_000 + 1);
+      store.setSession('after', createMockSessionState('after'));
+      store.saveNow();
+      expect(existsSync(testFilePath)).toBe(true); // recovered via trial write
+    });
+  });
+
   describe('global stats', () => {
     it('should initialize global stats with zero values', () => {
       const store = new StateStore(testFilePath);
@@ -612,6 +888,20 @@ function createMockTaskState(id: string): TaskState {
     completedAt: null,
     output: '',
     error: null,
+  };
+}
+
+function createMockSessionRecoveryRecord(id: string): SessionRecoveryRecord {
+  return {
+    id,
+    sourceSessionId: `session-${id}`,
+    owner: 'alice',
+    mode: 'codex',
+    workingDir: '/tmp/test',
+    transport: 'local',
+    status: 'pending',
+    launch: { kind: 'built-in' },
+    createdAt: Date.now(),
   };
 }
 

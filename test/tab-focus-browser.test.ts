@@ -207,8 +207,8 @@ describe('focused refs for the rail', () => {
     expect(plain(h.focusRefs(base(), options))).toEqual([s('a'), w('web'), s('c')]);
     const flat = { ...base(), groups: [], ungrouped: [s('d', { focus: true }), s('c'), w('web', { focus: true })] };
     expect(plain(h.focusRefs(flat, options))).toEqual([s('d'), w('web')]);
-    // The flat layout still projects to null: the rail itself stays the flat list.
-    expect(h.project(flat, options)).toBeNull();
+    // Focus projects into the ordinary rail even without named groups.
+    expect(plain(h.project(flat, options).focusRefs)).toEqual([s('d'), w('web')]);
   });
 
   it('a gone session or a closed web tab drops out of Focus harmlessly', () => {
@@ -225,7 +225,7 @@ describe('focused refs for the rail', () => {
     const projection = h.project(base(), options);
     expect(plain(projection.focusRefs)).toEqual([s('a'), w('web'), s('c')]);
     // Shortcuts are not rows: the grouped rows are exactly what they were.
-    expect(plain(projection.visibleRefs)).toEqual([s('a'), s('b'), w('web'), s('c'), s('d')]);
+    expect(plain(projection.visibleRefs)).toEqual([s('a'), w('web'), s('c'), s('b'), s('d')]);
   });
 });
 
@@ -244,7 +244,7 @@ describe('Focus collapse is per-device storage', () => {
     const storage = memory();
     expect(h.loadFocusCollapsed(storage)).toEqual({ collapsed: false, ok: true });
     expect(h.saveFocusCollapsed(storage, true)).toEqual({ collapsed: true, ok: true });
-    expect(storage.data.get('codeman:tab-focus-collapsed')).toBe('true');
+    expect(storage.data.get('codeman:focus-group-collapsed')).toBe('true');
     expect(h.loadFocusCollapsed(storage)).toEqual({ collapsed: true, ok: true });
     expect(storage.data.has('codeman:tab-groups-collapsed')).toBe(false);
     // Group collapse GC (ids of groups that no longer exist) leaves it alone.
@@ -254,7 +254,7 @@ describe('Focus collapse is per-device storage', () => {
 
   it('a junk value reads as expanded, and a throwing store reports failure', () => {
     const storage = memory();
-    storage.setItem('codeman:tab-focus-collapsed', '{nope');
+    storage.setItem('codeman:focus-group-collapsed', '{nope');
     expect(h.loadFocusCollapsed(storage)).toEqual({ collapsed: false, ok: true });
     const broken = {
       getItem: () => {

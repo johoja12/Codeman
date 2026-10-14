@@ -8,6 +8,7 @@
  */
 
 import { Command } from 'commander';
+import chalk from 'chalk';
 import { createRequire } from 'module';
 import http from 'node:http';
 import https from 'node:https';
@@ -48,10 +49,173 @@ const pkg = require('../package.json') as { version: string };
 
 const program = new Command();
 
+const CHECKPOINT_WAIT_TIMEOUT_MS = 240_000;
+const CHECKPOINT_WAIT_MAX_MISSING_POLLS = 20;
+const CHECKPOINT_WAIT_REQUEST_TIMEOUT_MS = 5_000;
+const CHECKPOINT_WAIT_MAX_TRANSIENT_FAILURES = 5;
+
+type CheckpointWaitDecision =
+  | { kind: 'waiting'; missing: boolean }
+  | { kind: 'completed' }
+  | { kind: 'failed'; reason: string };
+
+/** Pure checkpoint wait policy shared by the CLI loop and regression tests. */
+export function evaluateCheckpointWait(
+  state: unknown,
+  runId: string,
+  startedAt: number,
+  now = Date.now(),
+  missingPolls = 0
+): CheckpointWaitDecision {
+  const value = state as {
+    checkpoint?: { runId?: string; status?: string; reason?: string };
+    checkpointRuns?: Record<string, { runId?: string; status?: string; reason?: string }>;
+  };
+  const checkpoint =
+    value?.checkpointRuns?.[runId] ?? (value?.checkpoint?.runId === runId ? value.checkpoint : undefined);
+  if (!checkpoint) {
+    if (now - startedAt >= CHECKPOINT_WAIT_TIMEOUT_MS || missingPolls >= CHECKPOINT_WAIT_MAX_MISSING_POLLS) {
+      return { kind: 'failed', reason: `checkpoint run ${runId} is missing or was evicted` };
+    }
+    return { kind: 'waiting', missing: true };
+  }
+  if (checkpoint.status === 'completed') return { kind: 'completed' };
+  if (checkpoint.status === 'failed' || checkpoint.status === 'cancelled') {
+    return {
+      kind: 'failed',
+      reason: `checkpoint run ${runId} ${checkpoint.status}: ${checkpoint.reason || 'unknown reason'}`,
+    };
+  }
+  if (now - startedAt >= CHECKPOINT_WAIT_TIMEOUT_MS) {
+    return { kind: 'failed', reason: `checkpoint run ${runId} timed out` };
+  }
+  return { kind: 'waiting', missing: false };
+}
+
+/** Bound each wait GET by both a short transport timeout and the lifecycle deadline. */
+export function checkpointWaitRequestTimeoutMs(startedAt: number, now = Date.now()): number {
+  return Math.max(0, Math.min(CHECKPOINT_WAIT_REQUEST_TIMEOUT_MS, startedAt + CHECKPOINT_WAIT_TIMEOUT_MS - now));
+}
+
+/** Retry transient wait transport failures, but never indefinitely. */
+export function shouldRetryCheckpointWaitRequest(
+  startedAt: number,
+  consecutiveFailures: number,
+  now = Date.now()
+): boolean {
+  return (
+    checkpointWaitRequestTimeoutMs(startedAt, now) > 0 && consecutiveFailures < CHECKPOINT_WAIT_MAX_TRANSIENT_FAILURES
+  );
+}
+
 program.name('codeman').description('Claude Code session manager with autonomous Ralph Loop').version(pkg.version);
 
 function makeAttachmentMagicLink(filePath: string): string {
   return `codeman://attach?path=${encodeURIComponent(filePath)}`;
+}
+
+function readCodemanEnv(): Record<string, string> {
+  const envPath = dataPath('.env');
+  try {
+    const text = readFileSync(envPath, 'utf-8');
+    const result: Record<string, string> = {};
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      if (!match) continue;
+      let value = match[2].trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      result[match[1]] = value;
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+/** Minimal shape of a `/api/mux-sessions` row used by the `mux` command. */
+interface MuxRow {
+  sessionId: string;
+  muxName: string;
+  name?: string;
+  mode?: string;
+  attached?: boolean;
+  pid?: number;
+  status?: string;
+  activityStatus?: string;
+}
+
+function resolveCliActivity(row: { status?: string; activityStatus?: string }): { status: string; label: string } {
+  const status = row.activityStatus || row.status || 'unknown';
+  const label =
+    status === 'waiting_agents' ? 'WAITING ON AGENTS' : status === 'checking_agents' ? 'CHECKING AGENTS' : status;
+  return { status, label };
+}
+
+/**
+ * Render the tmux <-> Codeman session mapping as an aligned text table.
+ *
+ * Pure helper (no IO) so it can be unit-tested in isolation. Columns:
+ * Display name | tmux session (muxName) | sessionId | mode | status.
+ */
+export function formatMuxTable(rows: MuxRow[]): string {
+  if (!rows || rows.length === 0) {
+    return 'No tmux/Codeman sessions found on the running instance.';
+  }
+
+  const headers = ['Display name', 'tmux session', 'sessionId', 'mode', 'status', 'activity'];
+  const cells = rows.map((r) => [
+    r.name || '(unnamed)',
+    r.muxName || '',
+    r.sessionId || '',
+    r.mode || '',
+    r.attached ? 'attached' : 'detached',
+    resolveCliActivity(r).label,
+  ]);
+
+  const widths = headers.map((h, i) => Math.max(h.length, ...cells.map((row) => row[i].length)));
+  const renderRow = (vals: string[]): string =>
+    vals
+      .map((v, i) => v.padEnd(widths[i]))
+      .join('  ')
+      .trimEnd();
+  const separator = widths.map((w) => '-'.repeat(w)).join('  ');
+
+  return [renderRow(headers), separator, ...cells.map(renderRow)].join('\n');
+}
+
+export function mergeMuxActivity(rows: MuxRow[], statusPayload: unknown): MuxRow[] {
+  const sessions = Array.isArray(statusPayload)
+    ? statusPayload
+    : ((statusPayload as { sessions?: unknown })?.sessions ?? []);
+  const byId = new Map(
+    (Array.isArray(sessions) ? sessions : [])
+      .filter((session): session is { id: string; status?: string; activityStatus?: string } =>
+        Boolean(session && typeof session === 'object' && typeof (session as { id?: unknown }).id === 'string')
+      )
+      .map((session) => [session.id, session])
+  );
+  return (rows || []).map((row) => {
+    const session = byId.get(row.sessionId);
+    return session ? { ...row, status: session.status, activityStatus: session.activityStatus } : row;
+  });
+}
+
+const MUX_STATUS_ENRICH_TIMEOUT_MS = 1500;
+
+export async function enrichMuxActivityForOutput(
+  rows: MuxRow[],
+  options: { json?: boolean; fetchStatus: (timeoutMs: number) => Promise<unknown> }
+): Promise<MuxRow[]> {
+  if (options.json) return rows;
+  try {
+    return mergeMuxActivity(rows, await options.fetchStatus(MUX_STATUS_ENRICH_TIMEOUT_MS));
+  } catch {
+    return rows;
+  }
 }
 
 async function postAttachment(apiUrl: string, sessionId: string, filePath: string): Promise<boolean> {
@@ -91,31 +255,86 @@ async function postAttachment(apiUrl: string, sessionId: string, filePath: strin
   });
 }
 
-program
-  .command('attach <path>')
-  .description('Show an attachment card for a local file')
-  .option('-s, --session <id>', 'Codeman session ID (defaults to CODEMAN_SESSION_ID)')
-  .option('--url <url>', 'Codeman API URL (defaults to CODEMAN_API_URL or https://127.0.0.1:3000)')
-  .action(async (filePath, options) => {
-    const extension = String(filePath).split('.').pop()?.toLowerCase() || '';
-    if (!isAbsolute(filePath) || !isSupportedAttachmentExtension(extension)) {
-      console.error(
-        palette.err(
-          `✗ attach requires an absolute path to an image (png, jpg, gif, webp), document (${DOCUMENT_ATTACHMENT_EXTENSIONS.join(', ')}), audio, video, md, txt or other text file`
-        )
-      );
-      process.exit(1);
-    }
+/** Header carrying the per-instance hook secret on `/api/hook-event`. */
+const HOOK_SECRET_HEADER = 'X-Codeman-Hook-Secret';
 
-    const sessionId = options.session || process.env.CODEMAN_SESSION_ID;
-    const apiUrl = options.url || process.env.CODEMAN_API_URL || 'https://127.0.0.1:3000';
-    if (sessionId && (await postAttachment(apiUrl, sessionId, filePath))) {
-      console.log(palette.ok('✓ Attachment card requested'));
-      return;
-    }
+/**
+ * POST a hook event to `/api/hook-event` using the per-instance hook secret
+ * (read from `$CODEMAN_HOOK_SECRET_FILE`) — mirrors how Claude Code hook curls
+ * authenticate. Rejects transport, HTTP, empty, and non-JSON failures so CLI
+ * callers cannot mistake them for a checkpoint refusal.
+ */
+async function postHookEvent(
+  apiUrl: string,
+  event: string,
+  sessionId: string,
+  data: Record<string, unknown>
+): Promise<unknown> {
+  const url = new URL('/api/hook-event', apiUrl);
+  const body = JSON.stringify({ event, sessionId, data });
+  const transport = url.protocol === 'https:' ? https : http;
 
-    console.log(makeAttachmentMagicLink(filePath));
+  let secret = '';
+  const secretFile = process.env.CODEMAN_HOOK_SECRET_FILE;
+  if (secretFile) {
+    try {
+      secret = readFileSync(secretFile, 'utf-8').trim();
+    } catch {
+      secret = '';
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    const headers: Record<string, string | number> = {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+    };
+    if (secret) headers[HOOK_SECRET_HEADER] = secret;
+
+    const req = transport.request(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port,
+        method: 'POST',
+        path: `${url.pathname}${url.search}`,
+        rejectUnauthorized: false,
+        headers,
+      },
+      (res) => {
+        let resBody = '';
+        res.setEncoding('utf-8');
+        res.on('data', (chunk) => (resBody += chunk));
+        res.on('end', () => {
+          if (!resBody.trim()) {
+            reject(new Error(`empty response (HTTP ${res.statusCode ?? '???'})`));
+            return;
+          }
+          let parsed: unknown;
+          try {
+            parsed = JSON.parse(resBody);
+          } catch (err) {
+            reject(new Error(`non-JSON response (HTTP ${res.statusCode ?? '???'}): ${getErrorMessage(err)}`));
+            return;
+          }
+          if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+            const apiError =
+              parsed && typeof parsed === 'object' && typeof (parsed as { error?: unknown }).error === 'string'
+                ? `: ${(parsed as { error: string }).error}`
+                : '';
+            reject(new Error(`HTTP ${res.statusCode ?? '???'}${apiError}`));
+            return;
+          }
+          resolve(parsed);
+        });
+      }
+    );
+    req.on('error', (err) => reject(new Error(`request failed: ${getErrorMessage(err)}`)));
+    req.write(body);
+    req.end();
   });
+}
 
 // ============ Skill Commands ============
 
@@ -391,7 +610,7 @@ function sessionStatusLabel(status: string): string {
  * drifted (it lost the stopped and web-server sections), so it now calls the
  * same renderer and only opts out of those two sections.
  */
-function printSessionList(options: { includeStored: boolean }): void {
+export function printSessionList(options: { includeStored: boolean }): void {
   const manager = getSessionManager();
   const sessions = manager.getAllSessions();
   const stored = manager.getStoredSessions();
@@ -446,7 +665,65 @@ sessionCmd
   .command('list')
   .alias('ls')
   .description('List all sessions')
-  .action(() => printSessionList({ includeStored: true }));
+  .action(() => {
+    const manager = getSessionManager();
+    const sessions = manager.getAllSessions();
+    const stored = manager.getStoredSessions();
+
+    if (sessions.length === 0 && Object.keys(stored).length === 0) {
+      console.log(chalk.yellow('No sessions found'));
+      return;
+    }
+
+    console.log(chalk.bold('\nActive Sessions:'));
+    if (sessions.length === 0) {
+      console.log('  (none)');
+    } else {
+      for (const session of sessions) {
+        const activity = resolveCliActivity(session);
+        const status =
+          activity.status === 'idle'
+            ? chalk.green('idle')
+            : activity.status === 'busy'
+              ? chalk.yellow('busy')
+              : activity.status === 'waiting_agents' || activity.status === 'checking_agents'
+                ? chalk.magenta(activity.label)
+                : chalk.red(activity.label);
+        console.log(`  ${chalk.cyan(session.id.slice(0, 8))} ${status} ${session.workingDir}`);
+      }
+    }
+
+    const stoppedSessions = Object.values(stored).filter((s) => s.status === 'stopped');
+    if (stoppedSessions.length > 0) {
+      console.log(chalk.bold('\nStopped Sessions:'));
+      for (const session of stoppedSessions) {
+        const name = session.name ? ` (${session.name})` : '';
+        console.log(`  ${chalk.gray(session.id.slice(0, 8))} ${chalk.gray('stopped')}${name} ${session.workingDir}`);
+      }
+    }
+
+    // Show active sessions from state (when web server manages them)
+    const activeSessions = Object.values(stored).filter((s) => s.status !== 'stopped');
+    if (sessions.length === 0 && activeSessions.length > 0) {
+      console.log(chalk.bold('\nActive Sessions (from web server):'));
+      for (const session of activeSessions) {
+        const activity = resolveCliActivity(session);
+        const status =
+          activity.status === 'idle'
+            ? chalk.green('idle')
+            : activity.status === 'busy'
+              ? chalk.yellow('busy')
+              : activity.status === 'waiting_agents' || activity.status === 'checking_agents'
+                ? chalk.magenta(activity.label)
+                : chalk.red(activity.label);
+        const name = session.name ? ` (${session.name})` : '';
+        const mode = session.mode === 'shell' ? chalk.gray(' [shell]') : '';
+        const cost = session.totalCost ? chalk.gray(` $${session.totalCost.toFixed(4)}`) : '';
+        console.log(`  ${chalk.cyan(session.id.slice(0, 8))} ${status}${name}${mode}${cost} ${session.workingDir}`);
+      }
+    }
+    console.log('');
+  });
 
 sessionCmd
   .command('logs <id>')
@@ -467,6 +744,483 @@ sessionCmd
     }
 
     console.log(output);
+  });
+
+program
+  .command('attach <path>')
+  .description('Show an attachment card for a local file')
+  .option('-s, --session <id>', 'Codeman session ID (defaults to CODEMAN_SESSION_ID)')
+  .option('--url <url>', 'Codeman API URL (defaults to CODEMAN_API_URL or https://127.0.0.1:3000)')
+  .action(async (filePath, options) => {
+    const extension = String(filePath).split('.').pop()?.toLowerCase() || '';
+    if (!isAbsolute(filePath) || !isSupportedAttachmentExtension(extension)) {
+      console.error(
+        palette.err(
+          `✗ attach requires an absolute path to an image (png, jpg, gif, webp), document (${DOCUMENT_ATTACHMENT_EXTENSIONS.join(', ')}), audio, video, md, txt or other text file`
+        )
+      );
+      process.exit(1);
+    }
+
+    const sessionId = options.session || process.env.CODEMAN_SESSION_ID;
+    const apiUrl = options.url || process.env.CODEMAN_API_URL || 'https://127.0.0.1:3000';
+    if (sessionId && (await postAttachment(apiUrl, sessionId, filePath))) {
+      console.log(palette.ok('✓ Attachment card requested'));
+      return;
+    }
+
+    console.log(makeAttachmentMagicLink(filePath));
+  });
+
+program
+  .command('checkpoint')
+  .alias('compact')
+  .description('Signal Codeman to checkpoint at a clean boundary, then continue')
+  .option('-m, --mode <mode>', 'Checkpoint mode: compact (default), clear, or new', 'compact')
+  .option('-c, --continue <prompt>', 'Prompt to send after the op completes (default: continue)')
+  .option('-s, --session <id>', 'Codeman session ID (defaults to CODEMAN_SESSION_ID)')
+  .option('--status', 'Report the session checkpoint config (read-only — does NOT fire a checkpoint)')
+  .option('--wait', 'Wait for this run to finish (external observers only)')
+  .option('--url <url>', 'Codeman API URL (defaults to CODEMAN_API_URL or https://127.0.0.1:3000)')
+  .action(async (options) => {
+    const mode = String(options.mode);
+    const sessionId = options.session || process.env.CODEMAN_SESSION_ID;
+    const apiUrl = options.url || process.env.CODEMAN_API_URL || 'https://127.0.0.1:3000';
+
+    if (!sessionId) {
+      console.error(chalk.red('✗ checkpoint requires a session id (--session or CODEMAN_SESSION_ID)'));
+      process.exit(1);
+    }
+    if (!['compact', 'clear', 'new'].includes(mode)) {
+      console.error(chalk.red(`✗ unsupported checkpoint mode '${mode}' (use compact, clear, or new)`));
+      process.exit(1);
+    }
+    if (options.wait && sessionId === process.env.CODEMAN_SESSION_ID) {
+      console.error(
+        chalk.red('✗ checkpoint --wait cannot target CODEMAN_SESSION_ID; the target agent must yield first')
+      );
+      process.exit(1);
+    }
+
+    // Read-only status query (COD-111): GET the session state and report the
+    // checkpoint config without POSTing the `checkpoint` hook event — so nothing
+    // is queued or fired. This is the side-effect-free alternative to the old
+    // "probe by running `aicodeman checkpoint`" detection, which compacts/clears
+    // the live session as a side effect.
+    if (options.status) {
+      let state: unknown;
+      try {
+        state = await fetchServerJson(apiUrl, `/api/sessions/${encodeURIComponent(sessionId)}`);
+      } catch (err) {
+        console.error(chalk.red(`✗ could not query session ${sessionId}: ${(err as Error).message}`));
+        process.exit(1);
+      }
+      console.log(formatCheckpointStatus(state));
+      return;
+    }
+
+    const data: Record<string, unknown> = { mode };
+    if (options.continue) data.continuePrompt = String(options.continue);
+
+    let body: unknown;
+    try {
+      body = await postHookEvent(apiUrl, 'checkpoint', sessionId, data);
+    } catch (err) {
+      console.error(chalk.red(`✗ checkpoint request failed: ${getErrorMessage(err)}`));
+      process.exit(1);
+    }
+    const result = interpretCheckpointResponse(body);
+    if (!result.ok) {
+      console.error(chalk.red(`✗ checkpoint request failed: ${result.error}`));
+      process.exit(1);
+    }
+
+    if (result.triggered) {
+      console.log(chalk.green(`✓ checkpoint ${mode} requested (run ${result.runId})`));
+      if (options.wait) {
+        const startedAt = Date.now();
+        let missingPolls = 0;
+        let consecutiveRequestFailures = 0;
+        for (;;) {
+          const requestTimeoutMs = checkpointWaitRequestTimeoutMs(startedAt);
+          if (requestTimeoutMs <= 0) {
+            console.error(chalk.red(`✗ checkpoint run ${result.runId} timed out`));
+            process.exit(1);
+          }
+          let state: unknown;
+          try {
+            state = await fetchServerJson(apiUrl, `/api/sessions/${encodeURIComponent(sessionId)}`, {
+              timeoutMs: requestTimeoutMs,
+            });
+            consecutiveRequestFailures = 0;
+          } catch (err) {
+            consecutiveRequestFailures += 1;
+            if (!shouldRetryCheckpointWaitRequest(startedAt, consecutiveRequestFailures)) {
+              console.error(chalk.red(`✗ checkpoint run ${result.runId} status unavailable: ${getErrorMessage(err)}`));
+              process.exit(1);
+            }
+            await new Promise((resolve) =>
+              setTimeout(resolve, Math.min(500, checkpointWaitRequestTimeoutMs(startedAt)))
+            );
+            continue;
+          }
+          const decision = evaluateCheckpointWait(state, result.runId, startedAt, Date.now(), missingPolls);
+          if (decision.kind === 'completed') {
+            console.log(chalk.green(`✓ checkpoint run ${result.runId} completed`));
+            return;
+          }
+          if (decision.kind === 'failed') {
+            console.error(chalk.red(`✗ ${decision.reason}`));
+            process.exit(1);
+          }
+          missingPolls = decision.missing ? missingPolls + 1 : 0;
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+      }
+      return;
+    }
+
+    // Surface why nothing ran so the agent can adapt (e.g. pick the other mode).
+    const reasonMessage: Record<string, string> = {
+      'not-enabled': 'checkpoint not enabled for this session — enable it in Session Options',
+      'mode-not-allowed': `checkpoint mode '${mode}' is not allowed for this session — allow it in Session Options, or try the other mode`,
+      'no-mode-allowed':
+        'no checkpoint modes are allowed for this session — enable compact and/or clear in Session Options',
+      busy: 'a checkpoint or compact/clear is already running',
+      stopped: 'session is stopped',
+      'session-start-hook-unavailable':
+        'fresh-thread checkpoint unavailable: this restored Claude session lacks a verified managed SessionStart hook — use compact or respawn after migrating hooks',
+      'baseline-identity-unavailable':
+        'fresh-thread checkpoint unavailable: no authoritative Claude conversation identity has been observed — use compact or wait for SessionStart',
+      'remote-identity-unavailable':
+        'fresh-thread checkpoint unavailable: remote Codex rollout identity cannot be verified locally — use compact',
+    };
+    const msg = reasonMessage[result.reason ?? ''] ?? `checkpoint refused${result.reason ? `: ${result.reason}` : ''}`;
+    console.error(chalk.red(`✗ ${msg}`));
+    process.exit(1);
+  });
+
+/**
+ * Unwrap the `{ success, data }` API envelope. Returns `body.data` when the
+ * body looks like an envelope (has a `data` field), otherwise the body as-is.
+ * Pure + defensive: `data` may be an object or a list. Exported for tests.
+ */
+export function unwrapEnvelope(body: unknown): unknown {
+  if (body && typeof body === 'object' && 'data' in (body as Record<string, unknown>)) {
+    return (body as { data: unknown }).data;
+  }
+  return body;
+}
+
+/**
+ * GET an arbitrary JSON path from a running instance, mirroring the attach
+ * command's transport (rejectUnauthorized: false, optional Basic auth from
+ * the local .codeman/.env so localhost works without explicit creds).
+ * Resolves the unwrapped `{ success, data }` envelope (or the parsed body when
+ * there is no envelope), or rejects on connection / non-2xx / invalid-JSON.
+ */
+async function fetchServerJson(apiUrl: string, path: string, options?: { timeoutMs?: number }): Promise<unknown> {
+  const envFile = readCodemanEnv();
+  const username = process.env.CODEMAN_USERNAME || envFile.CODEMAN_USERNAME || 'admin';
+  const password = process.env.CODEMAN_PASSWORD || envFile.CODEMAN_PASSWORD;
+  const url = new URL(path, apiUrl);
+  const transport = url.protocol === 'https:' ? https : http;
+
+  return new Promise((resolve, reject) => {
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (password) {
+      headers.Authorization = `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`;
+    }
+
+    const req = transport.request(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port,
+        method: 'GET',
+        path: `${url.pathname}${url.search}`,
+        rejectUnauthorized: false,
+        headers,
+      },
+      (res) => {
+        let body = '';
+        res.setEncoding('utf-8');
+        res.on('data', (chunk) => (body += chunk));
+        res.on('end', () => {
+          if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+            reject(new Error(`HTTP ${res.statusCode ?? '???'}${body ? `: ${body.slice(0, 200)}` : ''}`));
+            return;
+          }
+          try {
+            resolve(unwrapEnvelope(JSON.parse(body)));
+          } catch (err) {
+            reject(new Error(`Invalid JSON response: ${getErrorMessage(err)}`));
+          }
+        });
+      }
+    );
+    req.on('error', (err) => reject(err));
+    if (options?.timeoutMs !== undefined) {
+      const absoluteDeadline = setTimeout(() => {
+        req.destroy(new Error(`request timed out after ${options.timeoutMs}ms`));
+      }, options.timeoutMs);
+      req.once('close', () => clearTimeout(absoluteDeadline));
+      req.setTimeout(options.timeoutMs, () => {
+        req.destroy(new Error(`request timed out after ${options.timeoutMs}ms`));
+      });
+    }
+    req.end();
+  });
+}
+
+/**
+ * GET /api/mux-sessions from a running instance and resolve the `sessions`
+ * array. Thin wrapper over {@link fetchServerJson}; the unwrapped `data` is
+ * `{ sessions, muxAvailable }` (or, defensively, a bare array).
+ */
+async function fetchMuxSessions(apiUrl: string): Promise<MuxRow[]> {
+  const data = await fetchServerJson(apiUrl, '/api/mux-sessions');
+  const sessions = Array.isArray(data) ? data : ((data as { sessions?: MuxRow[] })?.sessions ?? []);
+  return Array.isArray(sessions) ? (sessions as MuxRow[]) : [];
+}
+
+/**
+ * Resolve the Codeman API base URL with instance scoping: explicit `--url`
+ * wins, then `CODEMAN_API_URL`, then `https://127.0.0.1:<CODEMAN_PORT|3000>`.
+ */
+function resolveApiUrl(optionUrl?: string): string {
+  return optionUrl || process.env.CODEMAN_API_URL || `https://127.0.0.1:${process.env.CODEMAN_PORT || '3000'}`;
+}
+
+/** Minimal session shape rendered by `status`/`ls` (live or stored). */
+interface SessionRow {
+  id?: string;
+  status?: string;
+  workingDir?: string;
+  activityStatus?: string;
+}
+
+/** Aggregated, render-ready summary of a `/api/status` payload. */
+export interface StatusSummary {
+  active: number;
+  idle: number;
+  busy: number;
+  waitingAgents: number;
+  checkingAgents: number;
+  tasks: { total: number; running: number; completed: number; failed: number };
+  ralphActive: boolean;
+}
+
+/** Coerce a `/api/status` payload (or a bare sessions array) into a session list. */
+function extractSessions(payload: unknown): SessionRow[] {
+  if (Array.isArray(payload)) return payload as SessionRow[];
+  const sessions = (payload as { sessions?: unknown })?.sessions;
+  return Array.isArray(sessions) ? (sessions as SessionRow[]) : [];
+}
+
+/**
+ * Summarize a live `/api/status` payload into session/task counts and ralph
+ * state. Pure + defensive: counts are derived from `sessions[]` (each session
+ * carries `status`, `taskStats`, `ralphLoop`); accepts either the full status
+ * object or a bare sessions array. Exported for tests.
+ */
+export function summarizeStatus(payload: unknown): StatusSummary {
+  const sessions = extractSessions(payload);
+  const tasks = { total: 0, running: 0, completed: 0, failed: 0 };
+  let idle = 0;
+  let busy = 0;
+  let waitingAgents = 0;
+  let checkingAgents = 0;
+  let ralphActive = false;
+
+  for (const s of sessions) {
+    const activity = resolveCliActivity(s || {});
+    if (activity.status === 'waiting_agents') waitingAgents++;
+    else if (activity.status === 'checking_agents') checkingAgents++;
+    else if (activity.status === 'idle') idle++;
+    else if (activity.status === 'busy') busy++;
+    const ts = (s as { taskStats?: typeof tasks })?.taskStats;
+    if (ts) {
+      tasks.total += ts.total ?? 0;
+      tasks.running += ts.running ?? 0;
+      tasks.completed += ts.completed ?? 0;
+      tasks.failed += ts.failed ?? 0;
+    }
+    const ralph = (s as { ralphLoop?: { active?: boolean } })?.ralphLoop;
+    if (ralph?.active) ralphActive = true;
+  }
+
+  // "active" = sessions that aren't stopped (live sessions are all non-stopped).
+  const active = sessions.filter((s) => s?.status !== 'stopped').length;
+  return { active, idle, busy, waitingAgents, checkingAgents, tasks, ralphActive };
+}
+
+/**
+ * Render a list of sessions as indented rows (`<shortId> <status> <workingDir>`),
+ * or a `(none)` placeholder when empty. Pure; exported for tests.
+ */
+export function formatSessionRows(sessions: SessionRow[]): string {
+  if (!sessions || sessions.length === 0) {
+    return '  (none)';
+  }
+  return sessions
+    .map((s) => {
+      const id = (s.id || '').slice(0, 8);
+      const activity = resolveCliActivity(s);
+      const status =
+        activity.status === 'idle'
+          ? chalk.green('idle')
+          : activity.status === 'busy'
+            ? chalk.yellow('busy')
+            : activity.status === 'waiting_agents' || activity.status === 'checking_agents'
+              ? chalk.magenta(activity.label)
+              : chalk.red(activity.label);
+      return `  ${chalk.cyan(id)} ${status} ${s.workingDir || ''}`.trimEnd();
+    })
+    .join('\n');
+}
+
+/**
+ * The prompt a checkpoint-and-continue sends after the op completes when the
+ * caller passes no `--continue`. Mirrors `RESUME_PROMPT` in session-auto-ops.ts;
+ * kept as a CLI-local literal so the short-lived CLI process needn't import
+ * server internals. Reported by `checkpoint --status`.
+ */
+const CHECKPOINT_DEFAULT_CONTINUE = 'continue';
+
+export type CheckpointResponseInterpretation =
+  | { ok: true; triggered: true; runId: string }
+  | { ok: true; triggered: false; reason: string }
+  | { ok: false; error: string };
+
+/**
+ * Validate the checkpoint hook response envelope without dereferencing through
+ * null or malformed payloads. Acceptance means only that work was requested;
+ * asynchronous completion is reported by checkpoint lifecycle status/events.
+ */
+export function interpretCheckpointResponse(body: unknown): CheckpointResponseInterpretation {
+  if (body === null || body === undefined) return { ok: false, error: 'empty response from checkpoint API' };
+  if (typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, error: 'malformed response from checkpoint API' };
+  }
+  const envelope = body as { success?: unknown; data?: unknown; error?: unknown };
+  if (envelope.success === false) {
+    return {
+      ok: false,
+      error: typeof envelope.error === 'string' ? envelope.error : 'checkpoint API returned an error response',
+    };
+  }
+  if (envelope.success !== true || !envelope.data || typeof envelope.data !== 'object') {
+    return { ok: false, error: 'malformed success response from checkpoint API' };
+  }
+  const checkpoint = (envelope.data as { checkpoint?: unknown }).checkpoint;
+  if (!checkpoint || typeof checkpoint !== 'object') {
+    return { ok: false, error: 'malformed success response from checkpoint API' };
+  }
+  const result = checkpoint as { triggered?: unknown; reason?: unknown; runId?: unknown };
+  if (result.triggered === true && typeof result.runId === 'string' && result.runId) {
+    return { ok: true, triggered: true, runId: result.runId };
+  }
+  if (result.triggered === true) return { ok: false, error: 'checkpoint API omitted the run ID' };
+  if (result.triggered === false && typeof result.reason === 'string' && result.reason) {
+    return { ok: true, triggered: false, reason: result.reason };
+  }
+  return { ok: false, error: 'malformed success response from checkpoint API' };
+}
+
+/**
+ * Render a session's AGENT CHECKPOINT (checkpoint-and-continue) config as a
+ * human-readable status report (COD-111). Input is the already-unwrapped session
+ * state from `GET /api/sessions/:id` (carrying `checkpointEnabled`,
+ * `checkpointModes`, and the legacy `checkpointMode`). Pure + defensive:
+ * tolerates missing/legacy fields and null input. Exported for tests.
+ *
+ * Read-only: this only formats already-fetched state — it never triggers a
+ * checkpoint (that is the whole point of the `--status` query).
+ */
+export function formatCheckpointStatus(state: unknown): string {
+  const s = (state ?? {}) as {
+    checkpointEnabled?: boolean;
+    checkpointMode?: 'compact' | 'clear' | 'new';
+    checkpointModes?: Array<'compact' | 'clear' | 'new'>;
+    checkpoint?: { runId?: string; status?: string; phase?: string };
+  };
+  const enabled = s.checkpointEnabled === true;
+  // Normalize to the stable display order. Fall back to the
+  // legacy single `checkpointMode` when the modes array is absent.
+  const modes = Array.isArray(s.checkpointModes)
+    ? (['compact', 'clear', 'new'] as const).filter((m) => s.checkpointModes!.includes(m))
+    : s.checkpointMode === 'compact' || s.checkpointMode === 'clear' || s.checkpointMode === 'new'
+      ? [s.checkpointMode]
+      : [];
+  // A bare `checkpoint` (no -m) runs compact when allowed, else clear (mirrors
+  // the server's `checkpointMode` getter); `n/a` when no mode is allowed.
+  const bare = modes.includes('compact')
+    ? 'compact'
+    : modes.includes('clear')
+      ? 'clear'
+      : modes.includes('new')
+        ? 'new'
+        : 'n/a';
+  return [
+    'AGENT CHECKPOINT status:',
+    `  enabled:           ${enabled ? 'yes' : 'no'}`,
+    `  allowed modes:     ${modes.length ? modes.join(', ') : 'none'}`,
+    `  bare checkpoint:   ${bare}`,
+    `  default continue:  ${CHECKPOINT_DEFAULT_CONTINUE}`,
+    ...(s.checkpoint?.runId
+      ? [
+          `  run id:            ${s.checkpoint.runId}`,
+          `  run status:        ${s.checkpoint.status || s.checkpoint.phase || 'unknown'}`,
+        ]
+      : []),
+  ].join('\n');
+}
+
+/**
+ * Choose which session list to render: the live list when present, else the
+ * persisted (stored) sessions as an offline fallback. Returns the chosen rows
+ * and an `offline` flag so the caller can label the output. Pure; exported for
+ * tests. `stored` is the `getStoredSessions()` map keyed by session id.
+ */
+export function selectSessionSource(
+  live: SessionRow[] | null | undefined,
+  stored: Record<string, SessionRow>
+): { sessions: SessionRow[]; offline: boolean } {
+  if (live && live.length > 0) {
+    return { sessions: live, offline: false };
+  }
+  const storedRows = Object.values(stored || {});
+  return { sessions: storedRows, offline: true };
+}
+
+program
+  .command('mux')
+  .alias('mux-sessions')
+  .description('List the tmux↔Codeman session mapping from the running instance')
+  .option('--url <url>', 'Codeman API URL (defaults to CODEMAN_API_URL or https://127.0.0.1:3000)')
+  .option('--json', 'Output the raw mux-sessions array as JSON')
+  .action(async (options) => {
+    const apiUrl = resolveApiUrl(options.url);
+    let rows: MuxRow[];
+    try {
+      rows = await fetchMuxSessions(apiUrl);
+    } catch (err) {
+      console.error(chalk.red(`✗ Failed to reach Codeman at ${apiUrl}: ${getErrorMessage(err)}`));
+      console.error(chalk.gray('  Is the Codeman web server running? Try --url to point at the right instance.'));
+      process.exit(1);
+    }
+    rows = await enrichMuxActivityForOutput(rows, {
+      json: options.json,
+      fetchStatus: (timeoutMs) => fetchServerJson(apiUrl, '/api/status', { timeoutMs }),
+    });
+
+    if (options.json) {
+      console.log(JSON.stringify(rows, null, 2));
+      return;
+    }
+
+    console.log(formatMuxTable(rows));
   });
 
 // ============ Task Commands ============
@@ -832,10 +1586,13 @@ program
     // as such, so the numbers are never silently a different thing.
     if (probe.sessions) {
       const live = probe.sessions;
+      const summary = summarizeStatus(live);
       console.log(heading('Sessions (live, from the server):'));
       console.log(kv('Total', String(live.length)));
-      console.log(kv('Idle', String(live.filter((s) => s.status === 'idle').length)));
-      console.log(kv('Busy', String(live.filter((s) => s.status === 'busy').length)));
+      console.log(kv('Idle', String(summary.idle)));
+      console.log(kv('Busy', String(summary.busy)));
+      console.log(kv('Waiting on agents', String(summary.waitingAgents)));
+      console.log(kv('Checking agents', String(summary.checkingAgents)));
     } else {
       const manager = getSessionManager();
       const storedValues = Object.values(manager.getStoredSessions());
@@ -897,8 +1654,38 @@ program
 program
   .command('list')
   .alias('ls')
-  .description('List active sessions (shorthand; `codeman session list` also shows stopped ones)')
-  .action(() => printSessionList({ includeStored: false }));
+  .description('List all sessions (shorthand)')
+  .option('--url <url>', 'Codeman API URL (defaults to CODEMAN_API_URL or https://127.0.0.1:3000)')
+  .action(async (options) => {
+    const apiUrl = resolveApiUrl(options.url);
+
+    // Query the running server first; only fall back to persisted state on disk
+    // when it's unreachable (the CLI process has no view of live sessions).
+    let live: SessionRow[] | null = null;
+    let offline = false;
+    try {
+      live = extractSessions(await fetchServerJson(apiUrl, '/api/sessions'));
+    } catch {
+      offline = true;
+    }
+
+    const stored = offline ? getSessionManager().getStoredSessions() : {};
+    const { sessions, offline: usedStored } = selectSessionSource(live, stored);
+
+    if (sessions.length === 0) {
+      console.log(chalk.yellow('No sessions found'));
+      return;
+    }
+
+    console.log(chalk.bold(`\n${usedStored ? 'Sessions' : 'Active Sessions'}:`));
+    if (usedStored) {
+      console.log(
+        chalk.dim(`(offline — showing last persisted state from state.json; server at ${apiUrl} unreachable)`)
+      );
+    }
+    console.log(formatSessionRows(sessions));
+    console.log('');
+  });
 
 // ============ TUI ============
 
@@ -1382,7 +2169,8 @@ program
   .option('--category <name>', 'Only check one category (core|office|other)')
   .action(async (options) => {
     const { createRealHost, checkAll } = await import('./utils/dependency-checker.js');
-    const { renderTable, renderJson, computeExitCode } = await import('./utils/dependency-report.js');
+    const { renderTable, renderJson, computeExitCode, applyOfficeConverterProbe } =
+      await import('./utils/dependency-report.js');
     const { dependencyRegistry, TOOL_CATEGORIES } = await import('./config/dependency-registry.js');
 
     if (options.category && !(TOOL_CATEGORIES as readonly string[]).includes(options.category)) {
@@ -1393,7 +2181,20 @@ program
     const host = createRealHost();
     const allTools = dependencyRegistry();
     const registry = options.category ? allTools.filter((t) => t.category === options.category) : allTools;
-    const results = checkAll(registry, host);
+    const rawResults = checkAll(registry, host);
+
+    // COD-426: presence + `--version` is not capability. A LibreOffice that
+    // prints a version but cannot convert anything used to report green here
+    // while every document preview failed, so refine that one row with the SAME
+    // capability probe the converters consult (cached, so this is also what
+    // warms the gate). Only worth spawning when the row is otherwise green.
+    const libreOfficeRow = rawResults.find((r) => r.id === 'libreoffice');
+    let officeProbe = null;
+    if (libreOfficeRow?.status === 'ok') {
+      const { probeOfficeConverter } = await import('./office-converter-runtime.js');
+      officeProbe = await probeOfficeConverter();
+    }
+    const results = applyOfficeConverterProbe(rawResults, officeProbe);
 
     if (options.json) {
       // Raw JSON, never styled: this output is parsed, not read.

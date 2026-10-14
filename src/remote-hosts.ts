@@ -1,9 +1,11 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import fs from 'node:fs/promises';
-import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { join, posix as posixPath } from 'node:path';
 import { homedir } from 'node:os';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
+import { remoteTmuxSessionName } from './tmux-manager.js';
 import { getCli } from './config/cli-registry/registry.js';
 import type {
   RemoteCase,
@@ -39,7 +41,14 @@ async function readJsonArray<T>(path: string): Promise<T[]> {
 
 async function writeJsonArray<T>(configDir: string, path: string, value: T[]): Promise<void> {
   if (!existsSync(configDir)) mkdirSync(configDir, { recursive: true });
-  await fs.writeFile(path, JSON.stringify(value, null, 2));
+  const tempPath = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    await fs.writeFile(tempPath, JSON.stringify(value, null, 2));
+    await fs.rename(tempPath, path);
+  } catch (error) {
+    await fs.unlink(tempPath).catch(() => {});
+    throw error;
+  }
 }
 
 export async function readRemoteHosts(configDir: string): Promise<RemoteHost[]> {
@@ -59,34 +68,33 @@ export async function writeRemoteCases(configDir: string, cases: RemoteCase[]): 
 }
 
 /**
- * The remote user's login shell, defaulted and quoted.
+ * Shell fragment that resolves the remote user's ACTUAL login shell before exec.
  *
- * The default is belt-and-braces, not a live bug: an empty `$SHELL` would expand
- * to `exec  -i -l`, which the shell reads as `exec -i` — "not found", pane dead on
- * arrival, the #208 failure all over again (verified: `sh -c 'exec $SHELL -i -l'`
- * with SHELL unset prints `exec: -i: not found`). In practice tmux always exports
- * SHELL into a pane from its own `default-shell` option, so the command as USED
- * here is safe either way (also verified). The default matters because these
- * strings are the seed values a per-host `commands.*` override is edited from, and
- * nothing constrains where an edited one ends up running. Quoted for a shell path
- * containing spaces. `/bin/sh` exists on every POSIX host.
+ * We must NOT rely on `$SHELL` alone: inside a remote tmux pane, `$SHELL` comes
+ * from the remote tmux SERVER's inherited environment, which is not guaranteed to
+ * be the user's passwd login shell. Confirmed on mac-mini (COD-277): a zsh user's
+ * meridian opencode session launched via `/bin/bash -i -l`, so `~/.zshrc` was never
+ * sourced and a zshrc-only env var (COMPOSIO_CONSUMER_KEY) was missing from the
+ * agent env; `zsh -i -l` carries it. So resolve from the passwd entry instead:
+ * `getent` on Linux, `dscl` on macOS, then `$SHELL`, then `/bin/sh` — each guarded
+ * so a nologin/exotic shell (or an unusable path) falls through rather than dead-
+ * panning on `-i -l`. Ends in `; ` so `exec "$login_shell"` can follow.
  */
-const REMOTE_LOGIN_SHELL = '"${SHELL:-/bin/sh}"';
+export const REMOTE_LOGIN_SHELL_RESOLVE =
+  'login_shell="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)"; ' +
+  '[ -n "$login_shell" ] && [ -x "$login_shell" ] || login_shell="$(dscl . -read "/Users/$(id -un)" UserShell 2>/dev/null | cut -c 12-)"; ' +
+  '[ -n "$login_shell" ] && [ -x "$login_shell" ] || login_shell="${SHELL:-/bin/sh}"; ';
 
 /**
  * Run `command` through the remote user's interactive login shell, so per-user
- * PATH entries (~/.local/bin, ~/.opencode/bin, …) are resolved before the CLI name
- * is looked up. ssh's remote-command execution is neither interactive nor login,
- * so a bare `exec claude` sees only sshd's minimal default PATH and dies with
- * "command not found" (exit 127).
- *
- * Shells that take neither flag (nushell, elvish, …) cannot be detected from here
- * the way `loginShellArgs()` detects them locally, since the shell is whatever the
- * REMOTE passwd says. A host like that is what the per-host `commands.*` override
- * is for.
+ * PATH entries (~/.local/bin, ~/.opencode/bin, …) and rc-file env (~/.zshrc etc.)
+ * are resolved before the CLI name is looked up. ssh's remote-command execution is
+ * neither interactive nor login, so a bare `exec claude` sees only sshd's minimal
+ * default PATH and dies with "command not found" (exit 127). The login shell is
+ * resolved from the passwd entry at runtime (see REMOTE_LOGIN_SHELL_RESOLVE).
  */
 export function remoteLoginShellCommand(command: string): string {
-  return `exec ${REMOTE_LOGIN_SHELL} -i -l -c ${shellescape(command)}`;
+  return `${REMOTE_LOGIN_SHELL_RESOLVE}exec "$login_shell" -i -l -c ${shellescape(command)}`;
 }
 
 /**
@@ -130,13 +138,28 @@ function overlayCliCommand(mode: SessionMode, location: 'remote' | 'docker'): st
  * The per-host `commands.*` override remains the escape hatch for every mode.
  */
 export function defaultRemoteCommandForMode(mode: SessionMode): string {
-  // $SHELL, not a hardcoded bash: sshd sets it from the remote user's /etc/passwd entry, so
-  // this launches their actual login shell (zsh, fish, …). `-i -l` so it sources rc files,
-  // matching the local shell-mode launch. Not templatable as overlay data: the shell is
-  // whatever the REMOTE passwd says, which is why `shell` is the one arm still written here.
-  const shellCommand = `exec ${REMOTE_LOGIN_SHELL} -i -l`;
+  // Upstream (#347) replaced the hardcoded per-mode map with the CLI registry
+  // overlay, and it is the better structure: verified entry-by-entry that it
+  // preserves every command our map spelled out — claude keeps
+  // `--dangerously-skip-permissions` via its remote overlay, deepseek resolves to
+  // `dsh` and antigravity to `agy` through binaries[0], and the rest match their
+  // own names. So the map is dropped rather than kept in parallel.
+  //
+  // ⚠ The `shell` arm keeps the DOWNSTREAM resolution (COD-277). Upstream uses
+  // `$SHELL`, but in a tmux pane that is the tmux SERVER's shell — which was bash
+  // and skipped ~/.zshrc for a zsh user. REMOTE_LOGIN_SHELL_RESOLVE reads the real
+  // login shell from getent/dscl instead. `remoteLoginShellCommand` already uses
+  // it, so the two arms now agree.
+  const shellCommand = `${REMOTE_LOGIN_SHELL_RESOLVE}exec "$login_shell" -i -l`;
   const cli = overlayCliCommand(mode, 'remote');
   return cli === null ? shellCommand : remoteLoginShellCommand(cli);
+}
+
+export const REMOTE_PATH_BOOTSTRAP =
+  'export PATH=$HOME/.opencode/bin:$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH';
+
+export function withRemotePathBootstrap(command: string): string {
+  return `${REMOTE_PATH_BOOTSTRAP}; ${command}`;
 }
 
 export function remoteSshTarget(host: Pick<RemoteHost, 'username' | 'host'>): string {
@@ -182,7 +205,6 @@ function expandIdentityPath(identityFile: string): string {
  * Returns the leading tokens of an ssh command line (NOT including `-t`, the
  * target, or any remote command). Order:
  *   ssh -o BatchMode=yes
- *       [-o ConnectTimeout=10]           (default; suppressed if extraSshOptions sets it)
  *       [-p <port>]
  *       [-i <abs-identity>]              (~/$HOME expanded, then shellescaped)
  *       [-J <jumpHost>]                  (shellescaped, single token)
@@ -193,9 +215,8 @@ function expandIdentityPath(identityFile: string): string {
  *  - The ProxyCommand is emitted as a single shellescaped `-o KEY=VALUE`, so the
  *    whole value (spaces + `%h`/`%p`) reaches ssh as one argument and `%h %p`
  *    survive verbatim — ssh expands them to the real host/port, not the shell.
- *  - A default `-o ConnectTimeout=10` bounds the wait on an unreachable/blackholed
- *    host (else the pane hangs on the OS TCP timeout). It is omitted when the
- *    operator already set ConnectTimeout via extraSshOptions, so their value wins.
+ *  - Empty options ⇒ `['ssh', '-o BatchMode=yes']` (+ `-p` only when set), i.e.
+ *    byte-identical to the historical behavior.
  */
 export function buildSshConnectionArgs(remote: RemoteSshOptions & Pick<RemoteHost, 'port'>): string[] {
   const parts: string[] = ['ssh', '-o BatchMode=yes'];
@@ -213,6 +234,22 @@ export function buildSshConnectionArgs(remote: RemoteSshOptions & Pick<RemoteHos
   return parts;
 }
 
+export function buildSshConnectionArgv(remote: RemoteSshOptions & Pick<RemoteHost, 'port'>): string[] {
+  const args: string[] = ['-o', 'BatchMode=yes'];
+  const hasConnectTimeout = (remote.extraSshOptions ?? []).some((opt) => /^ConnectTimeout=/i.test(opt));
+  if (!hasConnectTimeout) args.push('-o', 'ConnectTimeout=10');
+  if (remote.port) args.push('-p', String(remote.port));
+  if (remote.identityFile) args.push('-i', expandIdentityPath(remote.identityFile));
+  if (remote.jumpHost) args.push('-J', remote.jumpHost);
+  if (remote.socksProxy) {
+    args.push('-o', `ProxyCommand=nc -X 5 -x ${remote.socksProxy} %h %p`);
+  }
+  for (const opt of remote.extraSshOptions ?? []) {
+    args.push('-o', opt);
+  }
+  return args;
+}
+
 /**
  * COD-104 — build the SSH command that checks the remote host has tmux.
  *
@@ -227,8 +264,9 @@ export function buildSshConnectionArgs(remote: RemoteSshOptions & Pick<RemoteHos
 export function buildRemoteTmuxCheckCommand(
   host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions
 ): string {
-  // ConnectTimeout is now a default of buildSshConnectionArgs (shared with the launch).
-  return [...buildSshConnectionArgs(host), remoteSshTarget(host), "'command -v tmux'"].join(' ');
+  const parts = buildSshConnectionArgs(host);
+  parts.push(remoteSshTarget(host), shellescape(withRemotePathBootstrap('command -v tmux')));
+  return parts.join(' ');
 }
 
 export interface RemoteTmuxCheckResult {
@@ -237,6 +275,38 @@ export interface RemoteTmuxCheckResult {
   tmuxPath?: string;
   /** Human-readable failure reason (when !ok). */
   error?: string;
+}
+
+export function buildRemoteSshAccessCheckCommand(
+  host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions
+): string {
+  const parts = buildSshConnectionArgs(host);
+  parts.push(remoteSshTarget(host), shellescape(withRemotePathBootstrap('printf codeman-ssh-ok')));
+  return parts.join(' ');
+}
+
+export interface RemoteSshAccessCheckResult {
+  ok: boolean;
+  error?: string;
+}
+
+export async function checkRemoteSshAccess(
+  host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions
+): Promise<RemoteSshAccessCheckResult> {
+  const command = buildRemoteSshAccessCheckCommand(host);
+  try {
+    const { stdout } = await execAsync(command, { timeout: 15_000, maxBuffer: 1024 * 1024 });
+    if (stdout.includes('codeman-ssh-ok')) return { ok: true };
+    return { ok: false, error: `could not verify SSH access to ${host.host}` };
+  } catch (err) {
+    const stderr =
+      err && typeof err === 'object' && 'stderr' in err ? String((err as { stderr?: unknown }).stderr ?? '') : '';
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      ok: false,
+      error: stderr.trim() || message || `could not verify SSH access to ${host.host}`,
+    };
+  }
 }
 
 /**
@@ -404,6 +474,55 @@ export async function remoteTmuxSessionAlive(
   }
 }
 
+/** Read-only boot and session probe. An SSH failure never means an intentional exit. */
+export interface RemoteWorkerObservation {
+  bootId?: string;
+  alive: boolean;
+  agentRunning?: boolean;
+}
+
+export function buildRemoteWorkerProbeCommand(
+  remote: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions & Pick<SessionRemote, 'owned'>,
+  remoteSessionName: string
+): string {
+  const [ssh, ...args] = buildSshConnectionArgs(remote);
+  const socket = remote.owned === false ? 'codeman' : 'codeman-remote';
+  const command = withRemotePathBootstrap(
+    `if [ -r /proc/sys/kernel/random/boot_id ]; then cat /proc/sys/kernel/random/boot_id; ` +
+      `else sysctl -n kern.boottime 2>/dev/null; fi; ` +
+      `if tmux -L ${socket} has-session -t ${shellescape(remoteSessionName)} 2>/dev/null; ` +
+      `then printf 'ALIVE '; tmux -L ${socket} display-message -p -t ${shellescape(remoteSessionName)} '#{pane_dead}'; ` +
+      `else printf 'GONE\\n'; fi`
+  );
+  return [ssh, ...args, remoteSshTarget(remote), shellescape(command)].join(' ');
+}
+
+export function parseRemoteWorkerObservation(stdout: string): RemoteWorkerObservation | undefined {
+  const lines = stdout.trim().split('\n');
+  const status = lines.pop();
+  if (status !== 'ALIVE 0' && status !== 'ALIVE 1' && status !== 'GONE') return undefined;
+  const boot = lines.join('\n').trim();
+  const bootId =
+    /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(boot) ||
+    /^\{ sec = \d+, usec = \d+ \}.*$/.test(boot)
+      ? boot
+      : undefined;
+  return { alive: status !== 'GONE', agentRunning: status === 'ALIVE 0', bootId };
+}
+
+export async function probeRemoteWorker(
+  remote: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions & Pick<SessionRemote, 'owned'>,
+  remoteSessionName: string
+): Promise<RemoteWorkerObservation | undefined> {
+  if (process.env.VITEST) return { alive: true, agentRunning: true };
+  try {
+    const { stdout } = await execAsync(buildRemoteWorkerProbeCommand(remote, remoteSessionName), { timeout: 15_000 });
+    return parseRemoteWorkerObservation(stdout);
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Map the `has-session` probe's exit status onto the tri-state the watcher
  * reads. Pure, so the mapping is unit-tested even though the probe itself is
@@ -446,15 +565,78 @@ export function classifyRemoteAliveExit(code: number | null, killed: boolean): b
 export function buildRemoteListSessionsCommand(
   host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions
 ): string {
-  const [ssh, ...connectionArgs] = buildSshConnectionArgs(host);
-  const parts = [ssh, connectionArgs[0], '-o ConnectTimeout=10', ...connectionArgs.slice(1)];
+  const parts = buildSshConnectionArgs(host);
   // The tmux list-sessions invocation is passed as ONE shell-quoted argument so
   // the remote login shell runs it verbatim. The `-F` format uses literal `\t`
   // separators (tmux expands them); `2>/dev/null` is inside the quoted command.
   const remoteCmd =
     'tmux -L codeman list-sessions -F "#{session_name}\\t#{session_attached}\\t#{session_created}\\t#{session_windows}" 2>/dev/null';
-  parts.push(remoteSshTarget(host), shellescape(remoteCmd));
+  parts.push(remoteSshTarget(host), shellescape(withRemotePathBootstrap(remoteCmd)));
   return parts.join(' ');
+}
+
+/** Build a bounded, read-only tmux existence probe for an explicit recovery action. */
+export function buildRemoteRecoveryProbeCommand(
+  host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions,
+  target: { owned: boolean; sessionId: string; remoteSessionName?: string }
+): string {
+  // Ownership selects the tmux namespace. An owned reboot recovery carries an
+  // explicit *source* name so it can reattach after Codeman creates a new local
+  // wrapper, but that must not move its read-only probe to the public socket.
+  const socket = target.owned ? 'codeman-remote' : 'codeman';
+  const name = target.remoteSessionName || remoteTmuxSessionName(target.sessionId);
+  return [
+    ...buildSshConnectionArgs(host),
+    remoteSshTarget(host),
+    shellescape(withRemotePathBootstrap(`tmux -L ${socket} has-session -t ${shellescape(name)}`)),
+  ].join(' ');
+}
+
+/** Read-only, bounded probe. It never creates a remote tmux server or pane. */
+export async function probeRemoteRecoveryTarget(
+  host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions,
+  target: { owned: boolean; sessionId: string; remoteSessionName?: string }
+): Promise<boolean> {
+  if (process.env.VITEST) return false;
+  try {
+    await execAsync(buildRemoteRecoveryProbeCommand(host, target), { timeout: 15_000, maxBuffer: 1024 * 1024 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface RemoteDirectoryEntry {
+  name: string;
+  path: string;
+}
+
+export function buildRemoteListDirectoriesCommand(
+  host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions,
+  remotePath: string
+): string {
+  const parts = buildSshConnectionArgs(host);
+  const remoteCmd = `find ${shellescape(remotePath)} -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort`;
+  parts.push(remoteSshTarget(host), shellescape(withRemotePathBootstrap(remoteCmd)));
+  return parts.join(' ');
+}
+
+export function parseRemoteDirectoryList(stdout: string): RemoteDirectoryEntry[] {
+  return stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('/'))
+    .filter((path) => !posixPath.basename(path).startsWith('.'))
+    .map((path) => ({ name: posixPath.basename(path), path }));
+}
+
+export async function listRemoteDirectories(
+  host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions,
+  remotePath: string
+): Promise<RemoteDirectoryEntry[]> {
+  const command = buildRemoteListDirectoriesCommand(host, remotePath);
+  const { stdout } = await execAsync(command, { timeout: 15_000, maxBuffer: 1024 * 1024 });
+  return parseRemoteDirectoryList(stdout);
 }
 
 /**
@@ -574,7 +756,9 @@ export function toSessionRemote(host: RemoteHost, remoteCase: RemoteCase): Sessi
     username: host.username,
     port: host.port,
     remotePath: remoteCase.remotePath,
-    commands: host.commands,
+    commands: remoteCase.commands ?? host.commands,
+    codexCommandProfileId: remoteCase.codexCommandProfileId,
+    codexResumeCommandTemplate: remoteCase.codexResumeCommandTemplate,
     // Wake-on-LAN command/MAC travel with the session so the input route can wake a
     // sleeping host without a second config read (see remote-wake.ts).
     wakeCommand: host.wakeCommand,

@@ -39,7 +39,9 @@ Object.assign(CodemanApp.prototype, {
   readTabRailWidthSetting() {
     const select = document.getElementById('appSettingsTabRailWidth');
     if (!select) return this._getCurrentTabRailWidth();
-    if (select.value === 'custom') return Number(select.dataset.currentWidth) || this._getCurrentTabRailWidth();
+    if (select.value === 'custom') {
+      return Number(select.dataset.currentWidth) || this._getCurrentTabRailWidth();
+    }
     return Number(select.value) || window.CodemanTabRail?.DEFAULT_WIDTH || 256;
   },
 
@@ -139,6 +141,8 @@ Object.assign(CodemanApp.prototype, {
       this._tabRailReleaseRaf = null;
       this._tabRailResizeOwnsObserver = false;
     };
+    // Keep ownership through the ResizeObserver delivery caused by fit(). A
+    // timer fallback still releases it when background tabs pause animation.
     if (typeof requestAnimationFrame === 'function') {
       this._tabRailReleaseRaf = requestAnimationFrame(() => {
         this._tabRailReleaseRaf = requestAnimationFrame(release);
@@ -147,17 +151,17 @@ Object.assign(CodemanApp.prototype, {
     } else release();
   },
 
-  _scheduleTabRailSettle(effective, preferred = effective) {
+  _scheduleTabRailSettle(width, preferredWidth = width) {
     clearTimeout(this._tabRailSettleTimer);
     this._tabRailSettleTimer = setTimeout(async () => {
       this._tabRailSettleTimer = null;
-      this._persistTabRailWidth(preferred);
+      this._persistTabRailWidth(preferredWidth);
       try {
         if (this.activeSessionId && this.sendResize) await this.sendResize(this.activeSessionId);
         else this.syncTerminalGeometry?.();
         this._updateConnectionLinesImmediate?.();
-      } catch (error) {
-        console.warn('Failed to resize terminal after rail resize:', error);
+      } catch (err) {
+        console.warn('Failed to resize terminal after rail resize:', err);
       } finally {
         this._releaseTabRailResize();
       }
@@ -203,7 +207,10 @@ Object.assign(CodemanApp.prototype, {
     try {
       proposed = this.fitAddon?.proposeDimensions?.();
     } catch {}
-    return proposed && proposed.cols < 40 ? this._setTabRailWidth(previous) : width;
+    if (proposed && proposed.cols < 40) {
+      return this._setTabRailWidth(previous);
+    }
+    return width;
   },
 
   _queueTabRailPointerWidth(clientX) {
@@ -252,6 +259,7 @@ Object.assign(CodemanApp.prototype, {
     if (!handle || handle.dataset.ready === '1') return;
     handle.dataset.ready = '1';
     this.applyTabRailWidth();
+
     handle.addEventListener('pointerdown', (event) => {
       if (event.button !== 0) return;
       event.preventDefault();
@@ -271,7 +279,9 @@ Object.assign(CodemanApp.prototype, {
       }
     });
     handle.addEventListener('pointermove', (event) => {
-      if (handle.hasPointerCapture?.(event.pointerId)) this._queueTabRailPointerWidth(event.clientX);
+      if (!handle.hasPointerCapture?.(event.pointerId)) return;
+      this._claimTabRailResize();
+      this._queueTabRailPointerWidth(event.clientX);
     });
     handle.addEventListener('pointerup', (event) => this._finishTabRailDrag(handle, event.pointerId));
     handle.addEventListener('pointercancel', (event) => this._finishTabRailDrag(handle, event.pointerId));
@@ -311,6 +321,11 @@ Object.assign(CodemanApp.prototype, {
       window.removeEventListener('resize', this._tabRailActionMenuViewport);
       this._tabRailActionMenuViewport = null;
     }
+    // COD-367: the trigger is a menu button, so its state must follow the popup
+    // through EVERY close path — Escape, outside click, viewport resize, session
+    // cleanup and rerender all land here, which is why the sync lives in the
+    // close helper rather than beside each caller.
+    trigger?.setAttribute?.('aria-expanded', 'false');
     this._tabRailActionMenuTrigger = null;
     if (options.restoreFocus) trigger?.focus?.();
   },
@@ -328,7 +343,6 @@ Object.assign(CodemanApp.prototype, {
     const actions = [
       { label: 'Session options', run: () => this.openSessionOptions(sessionId) },
       // Focus and group placement (vertical rail with a tab layout only; [] elsewhere).
-      ...(this._tabRefFocusActions?.({ kind: 'session', id: sessionId }) || []),
       ...(this._tabRefMoveActions?.({ kind: 'session', id: sessionId }) || []),
       // A tile (Detach Tiles on) opens its own size, over where it is: the
       // keyboard's way to what dragging its header out of the window does.
@@ -357,8 +371,13 @@ Object.assign(CodemanApp.prototype, {
       button.type = 'button';
       button.setAttribute('role', 'menuitem');
       button.textContent = action.label;
+      if (action.disabled) {
+        button.setAttribute('aria-disabled', 'true');
+        button.classList.add('tab-placement-summary');
+      }
       if (action.className) button.className = action.className;
       button.addEventListener('click', () => {
+        if (action.disabled) return;
         this.closeTabRailActionMenu();
         action.run();
       });
@@ -370,6 +389,7 @@ Object.assign(CodemanApp.prototype, {
     menu.style.left = `${Math.max(8, Math.min(rect.right - menuRect.width, window.innerWidth - menuRect.width - 8))}px`;
     menu.style.top = `${Math.max(8, Math.min(rect.bottom + 4, window.innerHeight - menuRect.height - 8))}px`;
     this._tabRailActionMenuTrigger = trigger;
+    trigger?.setAttribute?.('aria-expanded', 'true');
     this._tabRailActionMenuOutside = (pointerEvent) => {
       if (!menu.contains(pointerEvent.target) && pointerEvent.target !== trigger) this.closeTabRailActionMenu();
     };
@@ -382,11 +402,30 @@ Object.assign(CodemanApp.prototype, {
       if (keyEvent.key === 'Escape') {
         keyEvent.preventDefault();
         this.closeTabRailActionMenu({ restoreFocus: true });
+      } else if (keyEvent.key === 'Tab') {
+        // COD-367: Tab used to walk out of the menu and leave the popup on
+        // screen. Dismiss it and land focus on the TRIGGER rather than letting
+        // the default run — the element it would move from is about to be
+        // removed, which drops focus to <body>. From the trigger the next Tab
+        // continues normally, so nothing is trapped and nothing is lost.
+        keyEvent.preventDefault();
+        this.closeTabRailActionMenu({ restoreFocus: true });
       } else if (keyEvent.key === 'ArrowDown' || keyEvent.key === 'ArrowUp') {
         keyEvent.preventDefault();
         const direction = keyEvent.key === 'ArrowDown' ? 1 : -1;
         buttons[(index + direction + buttons.length) % buttons.length]?.focus();
       }
+    });
+    // COD-367: close when focus leaves the menu by any route — not just Tab, but
+    // a click elsewhere or a programmatic focus move. ⚠ `relatedTarget` inside
+    // the menu must be IGNORED: arrow-key navigation fires focusout on every hop
+    // between items, and closing there would make the menu unusable by keyboard,
+    // which is the opposite of this fix. A null relatedTarget (focus leaving the
+    // document) is also left alone, so switching windows does not dismiss it.
+    menu.addEventListener('focusout', (focusEvent) => {
+      const next = focusEvent.relatedTarget;
+      if (!next || menu.contains(next) || next === trigger) return;
+      this.closeTabRailActionMenu();
     });
     menu.querySelector('button')?.focus();
   },

@@ -8,6 +8,7 @@ import { resolve } from 'node:path';
 import vm from 'node:vm';
 import postcss, { type AtRule } from 'postcss';
 import { describe, expect, it } from 'vitest';
+import { SettingsUpdateSchema } from '../src/web/schemas.js';
 
 function loadRunModeHarness() {
   const elements: Record<string, any> = {};
@@ -34,7 +35,13 @@ function loadRunModeHarness() {
 
   const runModeMenu = { classList: { remove: () => {} } };
   const gearBtn = { className: '' };
-  const runBtn = { className: '', nextElementSibling: gearBtn };
+  const runBtn = {
+    className: '',
+    disabled: false,
+    nextElementSibling: gearBtn,
+    setAttribute: vi.fn(),
+    removeAttribute: vi.fn(),
+  };
   const runBtnLabel = { textContent: '' };
   elements.runModeMenu = runModeMenu;
   elements.runBtn = runBtn;
@@ -46,6 +53,84 @@ function loadRunModeHarness() {
   app._apiPut = () => Promise.resolve();
 
   return { app, storage, runBtnLabel };
+}
+
+function loadSessionLaunchHarness(
+  options: {
+    location?: 'local' | 'remote' | 'docker';
+    tabCount?: string;
+    shellCount?: string;
+    status?: { available: boolean; error?: string };
+  } = {}
+) {
+  const location = options.location ?? 'local';
+  const elements: Record<string, any> = {
+    quickStartCase: { value: 'launch-case' },
+    tabCount: { value: options.tabCount ?? '3' },
+    shellCount: { value: options.shellCount ?? '4' },
+  };
+  const requests: Array<{ url: string; method: string; body?: any }> = [];
+  const CodemanApp = function CodemanApp(this: any) {};
+  let nextSession = 0;
+  const caseData = {
+    name: 'launch-case',
+    path: location === 'local' ? '/tmp/launch-case' : 'host:/work/launch-case',
+    ...(location === 'local' ? {} : { location }),
+  };
+
+  const context = vm.createContext({
+    CodemanApp,
+    localStorage: { getItem: () => null, setItem: () => {} },
+    document: { getElementById: (id: string) => elements[id] ?? null },
+    fetch: async (url: string, init: { method?: string; body?: string } = {}) => {
+      const body = init.body ? JSON.parse(init.body) : undefined;
+      requests.push({ url, method: init.method ?? 'GET', body });
+      if (url === '/api/cases/launch-case') return { json: async () => ({ success: true, data: caseData }) };
+      if (/^\/api\/(opencode|codex|gemini|antigravity|pi)\/status$/.test(url)) {
+        return { json: async () => ({ success: true, data: options.status ?? { available: true } }) };
+      }
+      if (url === '/api/sessions' || url === '/api/quick-start') {
+        nextSession += 1;
+        const session = { id: `sess-${nextSession}`, name: body?.sessionName ?? body?.name };
+        return {
+          json: async () => ({
+            success: true,
+            data: url === '/api/sessions' ? { session } : { sessionId: session.id, session },
+          }),
+        };
+      }
+      if (/^\/api\/sessions\/sess-\d+\/(interactive|ralph-config|shell|resize)$/.test(url)) {
+        return { json: async () => ({ success: true }) };
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+    console,
+  });
+  const sessionUi = readFileSync(resolve(import.meta.dirname, '../src/web/public/session-ui.js'), 'utf8');
+  vm.runInContext(sessionUi, context, { filename: 'session-ui.js' });
+
+  const app = new (CodemanApp as any)();
+  app.terminal = { cols: 120, rows: 40, clear: vi.fn(), writeln: vi.fn(), focus: vi.fn() };
+  app.cases = [caseData];
+  app.sessions = new Map();
+  app._nextCaseSessionStartNumber = () => 1;
+  app._beginSessionLaunchStatus = () => false;
+  app._appendSessionLaunchStatus = vi.fn();
+  app._reportSessionLaunchError = (_owns: boolean, message: string) => {
+    throw new Error(message);
+  };
+  app._ensureCreatedSessionVisible = vi.fn();
+  app.selectSession = vi.fn(async () => {});
+  app.loadQuickStartCases = vi.fn();
+  app.loadAppSettingsFromStorage = () => ({});
+  app.getCaseSettings = () => ({});
+  app.buildEnvOverrides = () => ({});
+  app.getEffortSetting = () => '';
+  app.planUsageChipEnabled = () => false;
+  app.isRalphTrackerEnabledByDefault = () => false;
+  app.getTerminalDimensions = () => null;
+
+  return { app, elements, requests };
 }
 
 describe('run mode UI', () => {
@@ -73,6 +158,21 @@ describe('run mode UI', () => {
     expect(runBtnLabel.textContent).toBe('Run GM');
   });
 
+  it('preserves Shell mode from server sync instead of downgrading to Claude', async () => {
+    // Regression guard: the runMode setter allowlist omitted 'shell', so the
+    // async server-sync path (this.runMode = serverValue) silently reset a
+    // persisted Shell selection back to Claude on every reload.
+    const { app, storage, runBtnLabel } = loadRunModeHarness();
+
+    storage.set('codeman_runMode', 'shell');
+    await app.loadAppSettingsFromServer(Promise.resolve({ runMode: 'shell' }));
+
+    expect(app.runMode).toBe('shell');
+    // Upstream labels shell mode distinctly ('Run SH') since v1.9.x; the guard
+    // here is that the mode survives the sync, not the specific label text.
+    expect(runBtnLabel.textContent).toBe('Run SH');
+  });
+
   it('accepts Antigravity mode from server sync and updates the run button label', async () => {
     const { app, storage, runBtnLabel } = loadRunModeHarness();
 
@@ -95,6 +195,228 @@ describe('run mode UI', () => {
 });
 
 describe('Run launch synchronization', () => {
+  const dispatchedModes = [
+    ['claude', 'runClaude'],
+    ['shell', 'runShell'],
+    ['opencode', 'runOpenCode'],
+    ['codex', 'runCodex'],
+    ['gemini', 'runGemini'],
+    ['antigravity', 'runAntigravity'],
+    ['pi', 'runPi'],
+  ] as const;
+  const creationPaths = [
+    ['runClaude', 'local', '/api/sessions'],
+    ['runClaude', 'remote', '/api/quick-start'],
+    ['runClaude', 'docker', '/api/quick-start'],
+    ['runShell', 'local', '/api/sessions'],
+    ['runShell', 'remote', '/api/quick-start'],
+    ['runShell', 'docker', '/api/quick-start'],
+    ['runOpenCode', 'local', '/api/quick-start'],
+    ['runCodex', 'local', '/api/quick-start'],
+    ['runGemini', 'local', '/api/quick-start'],
+    ['runAntigravity', 'local', '/api/quick-start'],
+    ['runPi', 'local', '/api/quick-start'],
+  ] as const;
+  const statusProbedModes = [
+    [
+      'runOpenCode',
+      '/api/opencode/status',
+      'OpenCode CLI not found. Install with: curl -fsSL https://opencode.ai/install | bash',
+    ],
+    ['runCodex', '/api/codex/status', 'Codex CLI not found. Install with: npm install -g @openai/codex'],
+    ['runGemini', '/api/gemini/status', 'Gemini CLI not found. Install with: npm install -g @google/gemini-cli'],
+    [
+      'runAntigravity',
+      '/api/antigravity/status',
+      'Antigravity CLI not found. Install with: curl -fsSL https://antigravity.google/cli/install.sh | bash',
+    ],
+    [
+      'runPi',
+      '/api/pi/status',
+      'Pi CLI not found. Install with: npm install -g --ignore-scripts @earendil-works/pi-coding-agent',
+    ],
+  ] as const;
+
+  it.each(statusProbedModes)(
+    '%s reports the server resolver diagnostic and does not quick-start',
+    async (method, statusUrl) => {
+      const diagnostic = 'server resolver diagnostic\nServer PATH: /service/bin\nLogin shell: /bin/bash -l';
+      const { app, requests } = loadSessionLaunchHarness({ status: { available: false, error: diagnostic } });
+      app._reportSessionLaunchError = vi.fn();
+
+      await app[method]();
+
+      expect(app._reportSessionLaunchError).toHaveBeenCalledWith(false, diagnostic);
+      expect(requests.map((request) => request.url)).toEqual([statusUrl]);
+    }
+  );
+
+  it.each(statusProbedModes)(
+    '%s retains its static install hint when the server omits error',
+    async (method, statusUrl, hint) => {
+      const { app, requests } = loadSessionLaunchHarness({ status: { available: false } });
+      app._reportSessionLaunchError = vi.fn();
+
+      await app[method]();
+
+      expect(app._reportSessionLaunchError).toHaveBeenCalledWith(false, hint);
+      expect(requests.map((request) => request.url)).toEqual([statusUrl]);
+    }
+  );
+
+  it.each(
+    statusProbedModes.flatMap(([method]) => [
+      [method, 'remote'],
+      [method, 'docker'],
+    ])
+  )('%s skips its local status probe for a %s case and quick-starts', async (method, location) => {
+    const { app, requests } = loadSessionLaunchHarness({ location, tabCount: '1' });
+
+    await app[method]();
+
+    expect(requests.map((request) => request.url)).toEqual(['/api/quick-start']);
+    expect(requests[0]).toMatchObject({ method: 'POST', body: { caseName: 'launch-case' } });
+  });
+
+  it.each(['local', 'remote', 'docker'] as const)(
+    'passes saved Codex launch flags for %s cases only when supported',
+    async (location) => {
+      const { app, requests } = loadSessionLaunchHarness({ location });
+      app.loadAppSettingsFromStorage = () => ({
+        codexDangerouslyBypassApprovals: true,
+        codexAnimationsEnabled: false,
+      });
+      app.buildEnvOverrides = () => ({ CODEX_TEST_FLAG: 'enabled' });
+
+      await app.runCodex();
+
+      const body = requests.find((request) => request.url === '/api/quick-start')?.body;
+      if (location === 'docker') {
+        expect(body.codexConfig).toBeUndefined();
+      } else {
+        expect(body.codexConfig).toEqual({
+          dangerouslyBypassApprovals: true,
+          animations: false,
+          renderMode: 'hybrid',
+        });
+      }
+      expect(body.envOverrides).toEqual(location === 'local' ? { CODEX_TEST_FLAG: 'enabled' } : undefined);
+    }
+  );
+
+  it.each(dispatchedModes)('forwards the same narrow launch options to %s', async (mode, method) => {
+    const { app } = loadRunModeHarness();
+    const launchOptions = { count: 1, tabGroupId: 'work' };
+    app._runMinLockMs = 0;
+    app._runMode = mode;
+    for (const [, candidate] of dispatchedModes) app[candidate] = vi.fn(async () => {});
+
+    await app.run(launchOptions);
+
+    expect(app[method]).toHaveBeenCalledTimes(1);
+    expect(app[method]).toHaveBeenCalledWith(launchOptions);
+    expect(app[method].mock.calls[0][0]).toBe(launchOptions);
+    expect(dispatchedModes.reduce((total, [, candidate]) => total + app[candidate].mock.calls.length, 0)).toBe(1);
+  });
+
+  it('releases the run lock and propagates a dispatched rejection without storing placement state', async () => {
+    const { app } = loadRunModeHarness();
+    const launchOptions = { count: 1, tabGroupId: 'work' };
+    const failure = new Error('rejected before launch');
+    app._runMinLockMs = 0;
+    app._runMode = 'claude';
+    app.runClaude = vi.fn(() => Promise.reject(failure));
+
+    await expect(app.run(launchOptions)).rejects.toBe(failure);
+
+    expect(app._runInFlight).toBe(false);
+    expect(Object.keys(app).filter((key) => /group|placement/i.test(key))).toEqual([]);
+  });
+
+  it.each([
+    ['runClaude', 'tabCount'],
+    ['runShell', 'shellCount'],
+  ] as const)(
+    '%s uses the count override for one local creation without mutating the toolbar input',
+    async (method, inputId) => {
+      const { app, elements, requests } = loadSessionLaunchHarness({ tabCount: '6', shellCount: '7' });
+      const originalValue = elements[inputId].value;
+
+      await app[method]({ count: 1, tabGroupId: 'work' });
+
+      expect(requests.filter((request) => request.url === '/api/sessions')).toHaveLength(1);
+      expect(elements[inputId].value).toBe(originalValue);
+    }
+  );
+
+  it.each([
+    ['runClaude', 'tabCount', 3],
+    // #428 removed the separate #shellCount stepper: Run Shell reads the toolbar count too.
+    ['runShell', 'tabCount', 3],
+  ] as const)('%s retains the toolbar batch count when launch options are omitted', async (method, inputId, count) => {
+    const { app, elements, requests } = loadSessionLaunchHarness({ tabCount: '3', shellCount: '4' });
+    const originalValue = elements[inputId].value;
+
+    await app[method]();
+
+    expect(requests.filter((request) => request.url === '/api/sessions')).toHaveLength(count);
+    expect(elements[inputId].value).toBe(originalValue);
+  });
+
+  it.each(creationPaths)('%s includes tabGroupId in its %s creation request', async (method, location, endpoint) => {
+    const { app, requests } = loadSessionLaunchHarness({ location });
+
+    await app[method]({ count: 1, tabGroupId: 'work' });
+
+    const creationRequests = requests.filter((request) => request.url === endpoint && request.method === 'POST');
+    expect(creationRequests).toHaveLength(1);
+    expect(creationRequests[0].body.tabGroupId).toBe('work');
+  });
+
+  it.each(creationPaths)(
+    '%s includes the selected case name in its %s creation request',
+    async (method, location, endpoint) => {
+      const { app, requests } = loadSessionLaunchHarness({ location });
+
+      await app[method]({ count: 1 });
+
+      const creationRequests = requests.filter((request) => request.url === endpoint && request.method === 'POST');
+      expect(creationRequests).toHaveLength(1);
+      expect(creationRequests[0].body.caseName).toBe('launch-case');
+    }
+  );
+
+  it.each(['runClaude', 'runShell'] as const)(
+    '%s sends both the selected case and resolved working directory for local creation',
+    async (method) => {
+      const { app, requests } = loadSessionLaunchHarness({ location: 'local' });
+
+      await app[method]({ count: 1 });
+
+      const creationRequests = requests.filter(
+        (request) => request.url === '/api/sessions' && request.method === 'POST'
+      );
+      expect(creationRequests).toHaveLength(1);
+      expect(creationRequests[0].body).toMatchObject({
+        caseName: 'launch-case',
+        workingDir: '/tmp/launch-case',
+      });
+    }
+  );
+
+  it.each(creationPaths)(
+    '%s omits tabGroupId from its %s creation request when launch options are absent',
+    async (method, location, endpoint) => {
+      const { app, requests } = loadSessionLaunchHarness({ location });
+
+      await app[method]();
+
+      const creationRequests = requests.filter((request) => request.method === 'POST' && request.url === endpoint);
+      expect(creationRequests.length).toBeGreaterThan(0);
+      for (const request of creationRequests) expect(request.body).not.toHaveProperty('tabGroupId');
+    }
+  );
+
   it('keeps launch progress out of an active session terminal', () => {
     const CodemanApp = function CodemanApp(this: any) {};
     const context = vm.createContext({
@@ -200,7 +522,6 @@ describe('Run launch synchronization', () => {
         'runGemini',
         'runAntigravity',
         'runPi',
-        'runGrok',
       ])
     );
 
@@ -210,6 +531,19 @@ describe('Run launch synchronization', () => {
         'this.terminal.writeln('
       );
     }
+  });
+
+  it('passes the targeted response layout at every shipping session-creation callsite', () => {
+    const src = readFileSync(resolve(import.meta.dirname, '../src/web/public/session-ui.js'), 'utf8');
+    const dataCall = 'data.data.sessionId, data.data.session, data.data.tabLayout, data.data.tabPlacements';
+    const resultCall = 'result.data.session.id, result.data.session, result.data.tabLayout, result.data.tabPlacements';
+    const calls = [...src.matchAll(/await this\._ensureCreatedSessionVisible\(([^)]+)\);/g)].map((match) =>
+      match[1].replace(/\s+/g, ' ').trim()
+    );
+    // Eight CLI wrappers share one quick-start creation path.
+    expect(calls).toHaveLength(5);
+    expect(calls.filter((call) => call === dataCall)).toHaveLength(3);
+    expect(calls.filter((call) => call === resultCall)).toHaveLength(2);
   });
 
   it('coalesces overlapping Run activations and disables the button while the request is active', async () => {
@@ -252,31 +586,6 @@ describe('Run launch synchronization', () => {
     expect(runBtn.removeAttribute).toHaveBeenCalledWith('aria-busy');
   });
 
-  it('renders a POST response session immediately without waiting for SSE', async () => {
-    const CodemanApp = function CodemanApp(this: any) {};
-    const context = vm.createContext({
-      CodemanApp,
-      localStorage: { getItem: () => null, setItem: () => {} },
-      document: { getElementById: () => null },
-      fetch: vi.fn(),
-      console,
-    });
-    const sessionUi = readFileSync(resolve(import.meta.dirname, '../src/web/public/session-ui.js'), 'utf8');
-    vm.runInContext(sessionUi, context, { filename: 'session-ui.js' });
-
-    const app = new (CodemanApp as any)();
-    app.sessions = new Map();
-    app._onSessionCreated = vi.fn((session: any) => app.sessions.set(session.id, session));
-    app._renderSessionTabsImmediate = vi.fn();
-    const snapshot = { id: 'sess-new', name: 'w1-case', workingDir: '/tmp/case' };
-
-    await app._ensureCreatedSessionVisible(snapshot.id, snapshot);
-
-    expect(context.fetch).not.toHaveBeenCalled();
-    expect(app.sessions.get(snapshot.id)).toEqual(snapshot);
-    expect(app._renderSessionTabsImmediate).toHaveBeenCalledTimes(1);
-  });
-
   it('loads the new session when a quick-start response wins the race with SSE', async () => {
     const snapshot = { id: 'sess-race', name: 'w1-remote', workingDir: '/remote/work' };
     const fetchMock = vi.fn(async () => ({
@@ -307,6 +616,42 @@ describe('Run launch synchronization', () => {
 });
 
 describe('Codex quick start settings', () => {
+  it('maps Auto, On, and Off between the settings control and stored preference', () => {
+    const CodemanApp = function CodemanApp(this: any) {};
+    const context: any = vm.createContext({
+      CodemanApp,
+      document: { getElementById: () => null, addEventListener: () => {} },
+      MobileDetection: {},
+      console,
+    });
+    context.window = context;
+    const settingsUi = readFileSync(resolve(import.meta.dirname, '../src/web/public/settings-ui.js'), 'utf8');
+    vm.runInContext(settingsUi, context, { filename: 'settings-ui.js' });
+
+    expect(vm.runInContext('codexAnimationsControlValue(null)', context)).toBe('auto');
+    expect(vm.runInContext('codexAnimationsControlValue(true)', context)).toBe('on');
+    expect(vm.runInContext('codexAnimationsControlValue(false)', context)).toBe('off');
+    expect(vm.runInContext("codexAnimationsPreference('auto')", context)).toBe(null);
+    expect(vm.runInContext("codexAnimationsPreference('on')", context)).toBe(true);
+    expect(vm.runInContext("codexAnimationsPreference('off')", context)).toBe(false);
+  });
+
+  it('keeps the Auto animation preference out of the Codex launch config', async () => {
+    const { app, requests } = loadSessionLaunchHarness();
+    app.loadAppSettingsFromStorage = () => ({ codexAnimationsEnabled: null });
+
+    await app.runCodex();
+
+    const launchConfig = requests.find((request) => request.url === '/api/quick-start')?.body.codexConfig;
+    expect(launchConfig).not.toHaveProperty('animations');
+  });
+
+  it('accepts Auto as a nullable synced setting while retaining booleans', () => {
+    expect(SettingsUpdateSchema.safeParse({ codexAnimationsEnabled: null }).success).toBe(true);
+    expect(SettingsUpdateSchema.safeParse({ codexAnimationsEnabled: false }).success).toBe(true);
+    expect(SettingsUpdateSchema.safeParse({ codexAnimationsEnabled: true }).success).toBe(true);
+  });
+
   it('renders Codex CLI settings in their own group inside Agents & CLIs', () => {
     const html = readFileSync(resolve(import.meta.dirname, '../src/web/public/index.html'), 'utf8');
 
@@ -318,6 +663,9 @@ describe('Codex quick start settings', () => {
     const codexGroup = clis![1].match(/id="appSettingsCodexGroup"([\s\S]*)$/);
     expect(codexGroup?.[1]).toContain('appSettingsCodexDangerouslyBypassApprovals');
     expect(codexGroup?.[1]).toContain('appSettingsCodexAnimations');
+    expect(codexGroup?.[1]).toContain('<option value="auto">Auto</option>');
+    expect(codexGroup?.[1]).toContain('<option value="on">On</option>');
+    expect(codexGroup?.[1]).toContain('<option value="off">Off</option>');
     expect(codexGroup?.[1]).not.toContain('appSettingsCodexRenderMode');
 
     // The Claude settings above it must not have absorbed the codex inputs.
@@ -372,7 +720,7 @@ describe('Codex quick start settings', () => {
 
     it('applies the gating from openAppSettings, not just in isolation', () => {
       const src = readFileSync(resolve(import.meta.dirname, '../src/web/public/settings-ui.js'), 'utf8');
-      const open = src.slice(src.indexOf('\n  openAppSettings() {'));
+      const open = src.slice(src.indexOf('\n  async openAppSettings() {'));
       const body = open.slice(0, open.indexOf('\n  },'));
       expect(body).toContain('_applyCodexSettingsVisibility()');
     });

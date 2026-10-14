@@ -1,5 +1,5 @@
 /**
- * Defaults, bounds, and resolution for terminal history retention.
+ * Defaults and validation for terminal history retention.
  *
  * Raised defaults (the ones actually wired):
  * - tmux history-limit: 50,000 -> 100,000 lines (applied at session spawn)

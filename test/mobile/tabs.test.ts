@@ -175,13 +175,103 @@ describe('Tab Navigation', () => {
           const tabsWidth = await devicePage.evaluate(() => {
             return document.querySelector('.session-tabs')?.clientWidth ?? 0;
           });
+          const visibleTabMetrics = await devicePage.evaluate(() => {
+            return Array.from(document.querySelectorAll('.session-tab')).map((tab) => {
+              const rect = tab.getBoundingClientRect();
+              const style = window.getComputedStyle(tab);
+              return {
+                display: style.display,
+                visibility: style.visibility,
+                opacity: style.opacity,
+                width: rect.width,
+                height: rect.height,
+                top: rect.top,
+                bottom: rect.bottom,
+              };
+            });
+          });
 
           expect(tabsWidth).toBeGreaterThanOrEqual(120);
+          expect(visibleTabMetrics).toHaveLength(3);
+          for (const tab of visibleTabMetrics) {
+            expect(tab.display).not.toBe('none');
+            expect(tab.visibility).toBe('visible');
+            expect(Number(tab.opacity)).toBeGreaterThan(0);
+            expect(tab.width).toBeGreaterThan(24);
+            expect(tab.height).toBeGreaterThan(20);
+            expect(tab.top).toBeGreaterThanOrEqual(0);
+            expect(tab.bottom).toBeLessThanOrEqual(device.viewport.height);
+          }
         } finally {
           await deviceContext.close();
         }
       }
     });
+  });
+
+  // ─── Desktop Tab Hover Stability ─────────────────────────────────────────
+
+  it('keeps the last full-row tab stationary when hover controls appear', async () => {
+    const { context, page } = await createDevicePage(REPRESENTATIVE_DEVICES['large-tablet'], BASE_URL, 'chromium');
+    try {
+      await page.waitForTimeout(WAIT.PAGE_SETTLE);
+      await page.evaluate(() => {
+        const container = document.querySelector('.session-tabs') as HTMLElement;
+        container.className = 'session-tabs';
+        container.style.cssText = 'flex:none;overflow:visible;';
+        container.innerHTML = ['Alpha', 'Bravo', 'Charlie', 'Delta']
+          .map(
+            (name) => `
+              <div class="session-tab">
+                <span class="tab-status idle"></span>
+                <span class="tab-info"><span class="tab-name-row"><span class="tab-name">${name}</span></span></span>
+                <span class="tab-gear" tabindex="0">&#9881;</span>
+                <span class="tab-detach" tabindex="0">&#x29C9;</span>
+                <span class="tab-close" tabindex="0">&times;</span>
+              </div>`
+          )
+          .join('');
+
+        const tabs = Array.from(container.querySelectorAll<HTMLElement>('.session-tab'));
+        const style = getComputedStyle(container);
+        const width =
+          tabs.reduce((sum, tab) => sum + tab.getBoundingClientRect().width, 0) +
+          (parseFloat(style.columnGap) || 0) * (tabs.length - 1) +
+          (parseFloat(style.paddingLeft) || 0) +
+          (parseFloat(style.paddingRight) || 0);
+        container.style.width = `${Math.ceil(width)}px`;
+        container.classList.add('tabs-auto-wrap');
+
+        const last = tabs.at(-1)!;
+        (window as any).__cod247HoverEvents = { enter: 0, leave: 0 };
+        last.addEventListener('mouseenter', () => (window as any).__cod247HoverEvents.enter++);
+        last.addEventListener('mouseleave', () => (window as any).__cod247HoverEvents.leave++);
+      });
+
+      const tab = page.locator('.session-tab').last();
+      const header = page.locator('.header');
+      const beforeTab = await tab.boundingBox();
+      const beforeHeader = await header.boundingBox();
+      expect(beforeTab).not.toBeNull();
+      expect(beforeHeader).not.toBeNull();
+
+      await page.mouse.move(beforeTab!.x + beforeTab!.width / 2, beforeTab!.y + beforeTab!.height / 2);
+      await page.waitForTimeout(500);
+
+      const afterTab = await tab.boundingBox();
+      const afterHeader = await header.boundingBox();
+      const events = await page.evaluate(() => (window as any).__cod247HoverEvents);
+      const gearOpacity = await tab.locator('.tab-gear').evaluate((element) => getComputedStyle(element).opacity);
+
+      expect(events).toEqual({ enter: 1, leave: 0 });
+      expect(afterTab?.x).toBeCloseTo(beforeTab!.x, 1);
+      expect(afterTab?.y).toBeCloseTo(beforeTab!.y, 1);
+      expect(afterTab?.width).toBeCloseTo(beforeTab!.width, 1);
+      expect(afterHeader?.height).toBeCloseTo(beforeHeader!.height, 1);
+      expect(Number(gearOpacity)).toBe(1);
+    } finally {
+      await context.close();
+    }
   });
 
   // ─── Tab Strip Scrolling (issue #257) ────────────────────────────────────

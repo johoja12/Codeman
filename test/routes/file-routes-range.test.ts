@@ -198,13 +198,17 @@ describe('file-raw range requests', () => {
     const res = await harness.app.inject({
       method: 'GET',
       url: rawUrl('huge.mp4'),
-      headers: { range: 'bytes=0-99' },
+      headers: { range: 'bytes=0-9' },
     });
 
     expect(res.statusCode).toBe(413);
   });
 
-  it('serves a 100MB file that the historical 50MB cap would have refused', async () => {
+  it('serves a bounded slice of a 100MB file that the historical 50MB cap refused (COD-18)', async () => {
+    // The old hardcoded 50MB cap existed because the route read the WHOLE file
+    // into memory; COD-18 replaced that with createReadStream and upstream then
+    // raised the cap to 2GB, so a 100MB video is served — and a range request
+    // makes the read smaller still: 100 bytes here, not 100MB sliced afterwards.
     mockedStat.mockResolvedValue({ size: 100 * 1024 * 1024, isFile: () => true } as never);
 
     const res = await harness.app.inject({
@@ -214,5 +218,7 @@ describe('file-raw range requests', () => {
     });
 
     expect(res.statusCode).toBe(206);
+    expect(res.headers['content-range']).toBe(`bytes 0-99/${100 * 1024 * 1024}`);
+    expect(mockedCreateReadStream).toHaveBeenCalledWith(expect.any(String), { start: 0, end: 99 });
   });
 });

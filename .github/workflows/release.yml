@@ -9,6 +9,8 @@ concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 jobs:
   release:
+    # Publishing the upstream npm package is not part of fork branch integration.
+    if: github.repository == 'Ark0N/Codeman'
     name: Release
     runs-on: ubuntu-latest
     permissions:

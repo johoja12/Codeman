@@ -61,7 +61,7 @@ function loadTerminalUiHarness(
   return { app: new (CodemanApp as any)(), logs, windowRef, clock };
 }
 
-/** A session whose local buffer holds exactly one screen (baseY 0) — a hollow pane. */
+/** A session (claude by default) whose local buffer holds exactly one screen (baseY 0). */
 function hollowApp(overrides: { mode?: string; cliVersion?: string; rows?: number; cliMouseTracking?: boolean } = {}) {
   const { app, logs, windowRef, clock } = loadTerminalUiHarness();
   const sent: Array<{ id: string; data: string }> = [];
@@ -721,7 +721,9 @@ describe('the paging gates asked for another pane (a TerminalTile)', () => {
     expect(pageKeysForTravel(0, -1000, 36).keys).toBe('\x1b[5~'.repeat(3));
     expect(pageKeysForTravel(0, 40, 36)).toEqual({ pending: 4, keys: '\x1b[6~'.repeat(2) });
 
-    // The primary pane's own methods agree with them.
+    // The primary pane's wheel math agrees with them. Its PAGING deliberately does
+    // not: downstream COD-470 pre-pays the first page of a gesture (pinned by the
+    // COD-470 tests above), which the tile's pure pageKeysForTravel does not.
     const ev = { deltaY: -250, deltaMode: 2 };
     expect(app._wheelScrollLinesFloat(ev)).toBe(wheelDeltaLines(ev, 36));
     let state: unknown = null;

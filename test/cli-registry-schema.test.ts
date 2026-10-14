@@ -271,7 +271,11 @@ describe('cross-field integrity', () => {
     // shipped entry must be on the param side of that line.
     const codex = STOCK_CLIS.find((e) => (e.id as string) === 'codex');
     expect(codex).toBeDefined();
-    expect(codex!.capabilities.privilegedParams.map((c) => c.param)).toEqual(['bypassApprovals']);
+    // COD-416: `hookTrust` joined `bypassApprovals` here. Both are LAUNCH-param names; the
+    // wire fields are `dangerouslyBypassApprovals` / `dangerouslyBypassHookTrust`, and codex
+    // is the entry where the two namespaces visibly differ — which is the point of this test.
+    expect(codex!.capabilities.privilegedParams.map((c) => c.param)).toEqual(['bypassApprovals', 'hookTrust']);
+    expect(codex!.launch.legacyConfigAliases?.hookTrust).toBe('dangerouslyBypassHookTrust');
     expect(codex!.launch.legacyConfigAliases?.bypassApprovals).toBe('dangerouslyBypassApprovals');
 
     const wrong = baseEntry('codex');
@@ -433,5 +437,20 @@ describe('capability shapes', () => {
     // measured paging their own transcript on PageUp/PageDown; no other stock entry has been.
     const paging = STOCK_CLIS.filter((e) => e.capabilities.transcriptPageKeys === true).map((e) => e.id as string);
     expect(paging.sort()).toEqual(['claude', 'codex', 'opencode']);
+  });
+});
+
+describe('COD-471 overlays.remote.tmuxMouseAtStartupSeconds', () => {
+  const codex = STOCK_CLIS.find((entry) => entry.id === 'codex')!;
+  const withSeconds = (value: unknown) => ({
+    ...codex,
+    overlays: { ...codex.overlays, remote: { fromLaunchSpec: true, tmuxMouseAtStartupSeconds: value } },
+  });
+
+  it('accepts the stock codex value and rejects out-of-range or fractional ones', () => {
+    expect(CliEntrySchema.safeParse(withSeconds(8)).success).toBe(true);
+    for (const bad of [0, -1, 31, 2.5, '8']) {
+      expect(CliEntrySchema.safeParse(withSeconds(bad)).success, String(bad)).toBe(false);
+    }
   });
 });

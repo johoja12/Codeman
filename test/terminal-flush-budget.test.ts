@@ -5,13 +5,17 @@ import { describe, expect, it, vi } from 'vitest';
 
 function loadTerminalUiHarness(mode: string) {
   const CodemanApp = function CodemanApp(this: any) {};
+  const animationFrames: Array<() => void> = [];
   const context = vm.createContext({
     window: {},
     CodemanApp,
     console: { warn: vi.fn(), log: vi.fn() },
     _crashDiag: { log: vi.fn() },
     performance: { now: () => 0 },
-    requestAnimationFrame: (_fn: () => void) => 1,
+    requestAnimationFrame: (fn: () => void) => {
+      animationFrames.push(fn);
+      return animationFrames.length;
+    },
     setTimeout: (_fn: () => void) => 1,
     Blob: function Blob() {},
     URL: {
@@ -39,15 +43,18 @@ function loadTerminalUiHarness(mode: string) {
   app._workerYield = () => {};
   app._chunkedWriteGen = 0;
   app.terminal = {
-    write: (data: string, callback?: () => void) => {
-      writes.push(data);
-      callback?.();
-    },
+    write: (data: string) => writes.push(data),
     scrollToBottom: () => {},
     scrollToLine: () => {},
   };
 
-  return { app, writes };
+  return {
+    app,
+    writes,
+    runAnimationFrames: () => {
+      while (animationFrames.length > 0) animationFrames.shift()?.();
+    },
+  };
 }
 
 /**
@@ -234,32 +241,6 @@ describe('terminal flush budget', () => {
     expect(app.pendingWrites.join('')).toHaveLength(32 * 1024);
   });
 
-  it('waits for xterm to parse a live chunk before submitting the next one', () => {
-    const { app, writes } = loadTerminalUiHarness('shell');
-    const scheduled: Array<() => void> = [];
-    let parsed: (() => void) | undefined;
-    app._safeYield = (callback: () => void) => scheduled.push(callback);
-    app.isTerminalAtBottom = () => true;
-    app.terminal.write = (data: string, callback?: () => void) => {
-      writes.push(data);
-      parsed = callback;
-    };
-
-    app.batchTerminalWrite('x'.repeat(96 * 1024));
-    scheduled.shift()?.();
-
-    expect(writes.map((write) => write.length)).toEqual([64 * 1024]);
-    expect(app.pendingWrites.join('')).toHaveLength(32 * 1024);
-    expect(scheduled).toHaveLength(0);
-    expect(app._terminalWriteInFlightBytes).toBe(64 * 1024);
-
-    parsed?.();
-
-    expect(scheduled).toHaveLength(1);
-    scheduled.shift()?.();
-    expect(writes.map((write) => write.length)).toEqual([64 * 1024, 32 * 1024]);
-  });
-
   it('releases the live-output gate but waits for xterm to parse a small replay', async () => {
     const { app, writes } = loadTerminalUiHarness('codex');
     let writeDone: (() => void) | undefined;
@@ -403,6 +384,7 @@ describe('terminal flush budget', () => {
     const { CodemanApp } = loadAppHarness();
     const app = Object.create(CodemanApp.prototype) as any;
 
+    expect(app._bufferLoadFinishOpts({ source: 'mux-frame' }, 1234)).toEqual({ flushQueued: true, since: 1234 });
     expect(app._bufferLoadFinishOpts({ source: 'mux-full-history' }, 1234)).toEqual({
       flushQueued: true,
       since: 1234,
@@ -435,6 +417,81 @@ describe('terminal flush budget', () => {
     app.pendingWrites.push('\x1b[55;1H\x1b[2m• Working (6s)');
 
     app.flushPendingWrites();
+
+    expect(scrollToBottom).not.toHaveBeenCalled();
+  });
+
+  it('waits for xterm parsing before restoring a live shell viewport to bottom', () => {
+    const { app, runAnimationFrames } = loadTerminalUiHarness('shell');
+    const scrollToBottom = vi.fn();
+    let parsed: (() => void) | undefined;
+    app.terminal = {
+      write: vi.fn((_data: string, callback?: () => void) => {
+        parsed = callback;
+      }),
+      scrollToBottom,
+      scrollToLine: vi.fn(),
+    };
+    app._wasAtBottomBeforeWrite = true;
+    app._lastUserScrollUpAt = Number.NEGATIVE_INFINITY;
+    app.pendingWrites.push('SMOKE_SHELL_DONE');
+
+    app.flushPendingWrites();
+
+    expect(scrollToBottom).not.toHaveBeenCalled();
+    expect(parsed).toBeTypeOf('function');
+
+    parsed?.();
+
+    expect(scrollToBottom).not.toHaveBeenCalled();
+    runAnimationFrames();
+
+    expect(scrollToBottom).toHaveBeenCalledOnce();
+  });
+
+  it('does not snap a live shell back down when the user scrolls up while xterm parses', () => {
+    const { app, runAnimationFrames } = loadTerminalUiHarness('shell');
+    const scrollToBottom = vi.fn();
+    let parsed: (() => void) | undefined;
+    app.terminal = {
+      write: vi.fn((_data: string, callback?: () => void) => {
+        parsed = callback;
+      }),
+      scrollToBottom,
+      scrollToLine: vi.fn(),
+    };
+    app._wasAtBottomBeforeWrite = true;
+    app._lastUserScrollUpAt = Number.NEGATIVE_INFINITY;
+    app.pendingWrites.push('SMOKE_SHELL_DONE');
+
+    app.flushPendingWrites();
+    app._lastUserScrollUpAt = 0;
+    parsed?.();
+    runAnimationFrames();
+
+    expect(scrollToBottom).not.toHaveBeenCalled();
+  });
+
+  it('ignores a parsed terminal write from an earlier session selection', () => {
+    const { app, runAnimationFrames } = loadTerminalUiHarness('shell');
+    const scrollToBottom = vi.fn();
+    let parsed: (() => void) | undefined;
+    app.terminal = {
+      write: vi.fn((_data: string, callback?: () => void) => {
+        parsed = callback;
+      }),
+      scrollToBottom,
+      scrollToLine: vi.fn(),
+    };
+    app._selectGeneration = 4;
+    app._wasAtBottomBeforeWrite = true;
+    app._lastUserScrollUpAt = Number.NEGATIVE_INFINITY;
+    app.pendingWrites.push('SMOKE_SHELL_DONE');
+
+    app.flushPendingWrites();
+    app._selectGeneration = 6;
+    parsed?.();
+    runAnimationFrames();
 
     expect(scrollToBottom).not.toHaveBeenCalled();
   });

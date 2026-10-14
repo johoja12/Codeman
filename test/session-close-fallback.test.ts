@@ -96,6 +96,10 @@ function makeApp(active: string | null, order = [A, B]): TestApp {
   app.renderSessionTabs = vi.fn();
   app.renderRalphStatePanel = vi.fn();
   app.renderProjectInsightsPanel = vi.fn();
+  // Lives in the panels-ui.js mixin, which this vm context does not load —
+  // only constants.js + app.js run here. _onSessionDeleted calls it, so without
+  // the stub the handler throws before reaching anything under test.
+  app.renderMuxSessions = vi.fn();
   app.stopSystemStatsPolling = vi.fn();
   app.showToast = vi.fn();
   app._disconnectWs = vi.fn();

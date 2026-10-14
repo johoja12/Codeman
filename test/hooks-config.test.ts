@@ -39,6 +39,7 @@ import {
   stripCaseEnvKeys,
   updateCaseEnvVars,
   updateCaseModel,
+  verifyClaudeSessionStartHookCapability,
   writeHooksConfig,
 } from '../src/hooks-config.js';
 
@@ -60,6 +61,18 @@ describe('generateHooksConfig', () => {
     expect(config.hooks.Stop).toHaveLength(1);
   });
 
+  it('installs an unrestricted SessionStart hook for startup, resume, clear, compact, and new transitions', () => {
+    const config = generateHooksConfig();
+    const hooks = config.hooks.SessionStart as Array<{
+      matcher?: string;
+      hooks: Array<{ command: string }>;
+    }>;
+    expect(hooks).toHaveLength(1);
+    expect(hooks[0].matcher).toBeUndefined();
+    expect(hooks[0].hooks[0].command).toContain('session_start');
+    expect(hooks[0].hooks[0].command).toContain('-o /dev/null');
+  });
+
   it('reports the live conversation id on every prompt, with stdout discarded', () => {
     const config = generateHooksConfig();
     expect(config.hooks.UserPromptSubmit).toBeInstanceOf(Array);
@@ -69,8 +82,9 @@ describe('generateHooksConfig', () => {
     expect(command).toContain('$CODEMAN_SESSION_ID');
     // ⚠️ Claude Code injects a UserPromptSubmit hook's stdout into the model's
     // context ("Exit code 0 - stdout shown to Claude"), so without this the API
-    // envelope is pasted into the user's own prompt on every turn. Every other
-    // event's stdout is harmless (it feeds SSE).
+    // envelope is pasted into the user's own prompt on every turn. SessionStart
+    // is the other such event, which is why this fork discards stdout for EVERY
+    // hook rather than making it opt-in (see generateHookCommand).
     // ⚠️ Assert curl's OWN flag, not a trailing redirect: the command already
     // ends `… 2>/dev/null || true`, and in `pipeline || true >/dev/null` the
     // shell binds the redirect to `true`, which never runs on the success path.
@@ -79,13 +93,20 @@ describe('generateHooksConfig', () => {
     expect(command.trimEnd().endsWith('>/dev/null')).toBe(false);
   });
 
-  it("leaves every other hook event's command text byte-identical", () => {
-    // The opt-in discard exists so the five SSE-fed events do not change shape:
-    // rewriting their command churns every workspace's settings.local.json.
+  it('discards stdout on every hook event, not just the context-injecting ones', () => {
+    // Upstream keeps the discard opt-in so the SSE-fed events keep byte-identical
+    // command text; this fork discards everywhere instead, so the whole hooks block
+    // has ONE command shape. Pin that, or a half-converted generator ships two.
     const config = generateHooksConfig();
-    const stop = (config.hooks.Stop as Array<{ hooks: Array<{ command: string }> }>)[0].hooks[0].command;
-    expect(stop).toContain('curl -sk -X POST');
-    expect(stop).not.toContain('-o /dev/null');
+    const commands = Object.values(config.hooks)
+      .flat()
+      .flatMap((entry) => (entry as { hooks?: Array<{ command?: string }> }).hooks ?? [])
+      .map((handler) => handler.command ?? '')
+      .filter((command) => command.includes('/api/hook-event'));
+    expect(commands.length).toBeGreaterThan(5);
+    for (const command of commands) {
+      expect(command).toContain('curl -sk -o /dev/null -X POST');
+    }
   });
 
   it('should guard subagent stops while their background work is active', () => {
@@ -169,7 +190,10 @@ describe('generateHooksConfig', () => {
   // endpoints' stop/blocked. The statusline exporter always carried -k; the hooks must too.
   it('every hook curl tolerates a self-signed HTTPS API (curl -sk)', () => {
     const serialized = JSON.stringify(generateHooksConfig());
-    expect(serialized).toContain('curl -sk -X POST');
+    // This fork's hook curl is `curl -sk -o /dev/null -X POST`, so assert the -k
+    // flag itself rather than upstream's exact spelling.
+    expect(serialized).toContain('curl -sk ');
+    expect(serialized).not.toContain('curl -s -o');
     expect(serialized).not.toContain('curl -s -X POST');
   });
 
@@ -329,12 +353,137 @@ describe('writeHooksConfig', () => {
     delete oldHooks.PostToolUse;
     writeFileSync(settingsPath, JSON.stringify({ hooks: oldHooks }, null, 2));
 
-    await refreshStaleCodemanHooks(testDir);
+    await expect(refreshStaleCodemanHooks(testDir)).resolves.toBe(true);
 
     const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
     expect(parsed.hooks.PostToolUse).toHaveLength(1);
     expect(JSON.stringify(parsed.hooks.PostToolUse)).toContain('CODEMAN_BACKGROUND_REWAKE_V3');
     expect(JSON.stringify(parsed.hooks.SubagentStop)).toContain('CODEMAN_SUBAGENT_STOP_GUARD_V1');
+  });
+
+  it('should upgrade otherwise-current Codeman hooks that predate SessionStart identity adoption', async () => {
+    const claudeDir = join(testDir, '.claude');
+    const settingsPath = join(claudeDir, 'settings.local.json');
+    mkdirSync(claudeDir, { recursive: true });
+    const legacyHooks = generateHooksConfig().hooks;
+    delete legacyHooks.SessionStart;
+    writeFileSync(settingsPath, JSON.stringify({ hooks: legacyHooks }, null, 2));
+
+    await expect(refreshStaleCodemanHooks(testDir)).resolves.toBe(true);
+
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(parsed.hooks.SessionStart).toHaveLength(1);
+    expect(JSON.stringify(parsed.hooks.SessionStart)).toContain('session_start');
+  });
+
+  it('does not accept unrelated user session_start text when the managed SessionStart entry is absent', async () => {
+    const claudeDir = join(testDir, '.claude');
+    const settingsPath = join(claudeDir, 'settings.local.json');
+    mkdirSync(claudeDir, { recursive: true });
+    const hooks = generateHooksConfig().hooks;
+    delete hooks.SessionStart;
+    hooks.UserPromptSubmit = [{ hooks: [{ type: 'command', command: 'echo user-session_start-note' }] }];
+    writeFileSync(settingsPath, JSON.stringify({ hooks }, null, 2));
+
+    await expect(refreshStaleCodemanHooks(testDir)).resolves.toBe(true);
+
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    expect(parsed.hooks.SessionStart).toHaveLength(1);
+    // The user's own UserPromptSubmit handler survives untouched (the merge is
+    // add-only); Codeman's own prompt_submitted entry now joins it, since this
+    // fork carries BOTH the SessionStart and UserPromptSubmit hooks.
+    expect(parsed.hooks.UserPromptSubmit).toEqual(
+      expect.arrayContaining(hooks.UserPromptSubmit as Array<Record<string, unknown>>)
+    );
+    expect(JSON.stringify(parsed.hooks.UserPromptSubmit)).toContain('prompt_submitted');
+  });
+
+  it('replaces a restricted managed-looking SessionStart entry before reporting ready', async () => {
+    const claudeDir = join(testDir, '.claude');
+    const settingsPath = join(claudeDir, 'settings.local.json');
+    mkdirSync(claudeDir, { recursive: true });
+    const hooks = generateHooksConfig().hooks;
+    hooks.SessionStart = [{ ...(hooks.SessionStart[0] as object), matcher: 'resume' }];
+    writeFileSync(settingsPath, JSON.stringify({ hooks }, null, 2));
+
+    await expect(refreshStaleCodemanHooks(testDir)).resolves.toBe(true);
+
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const managed = parsed.hooks.SessionStart.find((entry: { hooks?: Array<{ command?: string }> }) =>
+      entry.hooks?.some((handler) => handler.command?.includes('/api/hook-event'))
+    );
+    expect(managed?.matcher).toBeUndefined();
+    expect(managed?.hooks[0]).toMatchObject({ type: 'command' });
+    expect(managed?.hooks[0].command).toContain('"event":"session_start"');
+  });
+
+  it('replaces an unrestricted marker-spoofing command with the exact canonical handler and preserves user siblings', async () => {
+    const claudeDir = join(testDir, '.claude');
+    const settingsPath = join(claudeDir, 'settings.local.json');
+    mkdirSync(claudeDir, { recursive: true });
+    const hooks = generateHooksConfig().hooks;
+    const canonicalEntry = hooks.SessionStart[0] as { hooks: Array<Record<string, unknown>> };
+    const canonicalHandler = canonicalEntry.hooks[0];
+    hooks.SessionStart = [
+      {
+        hooks: [
+          {
+            ...canonicalHandler,
+            command:
+              `exit 0; # printf '{"event":"session_start","sessionId":'; ` +
+              `curl -s -X POST "$CODEMAN_API_URL/api/hook-event"; -H "X-Codeman-Hook-Secret: spoof"`,
+          },
+          { type: 'command', command: './user-session-start.sh' },
+        ],
+      },
+    ];
+    writeFileSync(settingsPath, JSON.stringify({ hooks }, null, 2));
+
+    await expect(refreshStaleCodemanHooks(testDir)).resolves.toBe(true);
+
+    const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    const handlers = parsed.hooks.SessionStart.flatMap((entry: { hooks?: unknown[] }) => entry.hooks ?? []);
+    expect(handlers).toContainEqual(canonicalHandler);
+    expect(handlers).toContainEqual({ type: 'command', command: './user-session-start.sh' });
+    expect(handlers.some((handler: { command?: string }) => handler.command?.startsWith('exit 0;'))).toBe(false);
+  });
+
+  it('keeps a structurally valid managed SessionStart entry idempotent and preserves user siblings', async () => {
+    const claudeDir = join(testDir, '.claude');
+    const settingsPath = join(claudeDir, 'settings.local.json');
+    mkdirSync(claudeDir, { recursive: true });
+    const hooks = generateHooksConfig().hooks;
+    hooks.SessionStart.push({
+      matcher: 'resume',
+      hooks: [{ type: 'command', command: './user-session-start.sh' }],
+    });
+    const before = JSON.stringify({ hooks }, null, 2) + '\n';
+    writeFileSync(settingsPath, before);
+
+    await expect(refreshStaleCodemanHooks(testDir)).resolves.toBe(true);
+
+    expect(readFileSync(settingsPath, 'utf-8')).toBe(before);
+  });
+
+  it('verifies Claude fresh-thread hook capability for absent, current, migrated, and remote cases', async () => {
+    const absent = join(testDir, 'absent');
+    mkdirSync(absent, { recursive: true });
+    await expect(verifyClaudeSessionStartHookCapability('claude', absent, false)).resolves.toBe(false);
+
+    const current = join(testDir, 'current');
+    await writeHooksConfig(current);
+    await expect(verifyClaudeSessionStartHookCapability('claude', current, false)).resolves.toBe(true);
+
+    const migrated = join(testDir, 'migrated');
+    const migratedClaudeDir = join(migrated, '.claude');
+    mkdirSync(migratedClaudeDir, { recursive: true });
+    const legacyHooks = generateHooksConfig().hooks;
+    delete legacyHooks.SessionStart;
+    writeFileSync(join(migratedClaudeDir, 'settings.local.json'), JSON.stringify({ hooks: legacyHooks }, null, 2));
+    await expect(verifyClaudeSessionStartHookCapability('claude', migrated, false)).resolves.toBe(true);
+
+    await expect(verifyClaudeSessionStartHookCapability('claude', current, true)).resolves.toBe(false);
+    await expect(verifyClaudeSessionStartHookCapability('codex', absent, true)).resolves.toBe(true);
   });
 
   it('should replace an older rewake script version without duplicating it', async () => {

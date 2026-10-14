@@ -227,7 +227,7 @@ describe('the in-terminal truncation line is gone (static guard)', () => {
     // scrollback (behaviour pinned in fullscreen-tab-switch-capture.browser.test.ts).
     expect(app).toContain("const shellSession = session?.mode === 'shell';");
     expect(app).toContain(
-      'const useFullHistory = !shellSession && (paneKeepsNoHistory || !this._fullHistoryLoaded.has(sessionId));'
+      'const useFullHistory = !mirror && !shellSession && (paneKeepsNoHistory || !this._fullHistoryLoaded.has(sessionId));'
     );
     expect(app).toContain('!session?.remote && !session?.docker && this._paneHistoryLines?.get(sessionId) === 0;');
     // The shell's bounded load is tmux's rendered history, never the byte recording.

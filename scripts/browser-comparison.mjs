@@ -72,7 +72,7 @@ async function main() {
     await server.start();
     servers.push(server);
   }
-  await new Promise(r => setTimeout(r, 2000));
+  await new Promise((r) => setTimeout(r, 2000));
 
   // ============================================
   // PLAYWRIGHT TESTS
@@ -130,7 +130,6 @@ async function main() {
       }
       await page.close();
     });
-
   } finally {
     if (playwrightBrowser) await playwrightBrowser.close();
   }
@@ -161,8 +160,8 @@ async function main() {
     await runBenchmark('element-selection', 'puppeteer', async () => {
       const page = await puppeteerBrowser.newPage();
       await page.goto(`http://localhost:${PORTS.puppeteer}`);
-      const logo = await page.$eval('.header-brand .logo', el => el.textContent);
-      const version = await page.$eval('#versionDisplay', el => el.textContent);
+      const logo = await page.$eval('.header-brand .logo', (el) => el.textContent);
+      const version = await page.$eval('#versionDisplay', (el) => el.textContent);
       if (logo !== 'Codeman') throw new Error('Logo mismatch');
       if (!version.match(/v\d+/)) throw new Error('Version mismatch');
       await page.close();
@@ -175,7 +174,7 @@ async function main() {
       await page.click('.help-btn');
       await page.waitForSelector('#helpModal .modal-content', { visible: true });
       await page.click('#helpModal .modal-close');
-      await new Promise(r => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 300));
       await page.close();
     });
 
@@ -187,11 +186,10 @@ async function main() {
         await page.click('.help-btn');
         await page.waitForSelector('#helpModal .modal-content', { visible: true });
         await page.click('#helpModal .modal-close');
-        await new Promise(r => setTimeout(r, 200));
+        await new Promise((r) => setTimeout(r, 200));
       }
       await page.close();
     });
-
   } finally {
     if (puppeteerBrowser) await puppeteerBrowser.close();
   }
@@ -204,7 +202,7 @@ async function main() {
   let agentBrowserAvailable = false;
   try {
     agentBrowser(`open http://localhost:${PORTS.agentBrowser}`);
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise((r) => setTimeout(r, 2000));
     const title = agentBrowserJson('get title');
     agentBrowserAvailable = isCodemanTitle(title.title);
     console.log('  Browser launched');
@@ -212,7 +210,7 @@ async function main() {
     // Test 1: Page load
     await runBenchmark('page-load', 'agent-browser', async () => {
       agentBrowser(`open http://localhost:${PORTS.agentBrowser}`);
-      await new Promise(r => setTimeout(r, 1000));
+      await new Promise((r) => setTimeout(r, 1000));
       const title = agentBrowserJson('get title');
       if (!isCodemanTitle(title.title)) throw new Error(`Expected codeman:<hostname>, got ${title.title}`);
     });
@@ -228,27 +226,28 @@ async function main() {
     // Test 3: Modal interaction
     await runBenchmark('modal-interaction', 'agent-browser', async () => {
       agentBrowser('click ".help-btn"');
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise((r) => setTimeout(r, 500));
       const visible = agentBrowserJson('is visible "#helpModal .modal-content"');
       if (!visible.visible) throw new Error('Modal not visible');
       agentBrowser('click "#helpModal .modal-close"');
-      await new Promise(r => setTimeout(r, 300));
+      await new Promise((r) => setTimeout(r, 300));
     });
 
     // Test 4: Rapid operations
     await runBenchmark('rapid-operations', 'agent-browser', async () => {
       for (let i = 0; i < 5; i++) {
         agentBrowser('click ".help-btn"');
-        await new Promise(r => setTimeout(r, 300));
+        await new Promise((r) => setTimeout(r, 300));
         agentBrowser('click "#helpModal .modal-close"');
-        await new Promise(r => setTimeout(r, 300));
+        await new Promise((r) => setTimeout(r, 300));
       }
     });
-
   } catch (e) {
     console.log(`  ⚠️ Agent-browser not available: ${e.message}`);
   } finally {
-    try { agentBrowser('close'); } catch {}
+    try {
+      agentBrowser('close');
+    } catch {}
   }
 
   // ============================================
@@ -259,10 +258,10 @@ async function main() {
   // Group by framework
   const frameworks = ['playwright', 'puppeteer', 'agent-browser'];
   for (const fw of frameworks) {
-    const fwResults = results.filter(r => r.framework === fw);
+    const fwResults = results.filter((r) => r.framework === fw);
     if (fwResults.length === 0) continue;
 
-    const passed = fwResults.filter(r => r.success).length;
+    const passed = fwResults.filter((r) => r.success).length;
     const total = fwResults.length;
     const avgDuration = Math.round(fwResults.reduce((a, r) => a + r.duration, 0) / total);
 
@@ -273,16 +272,19 @@ async function main() {
 
   // Performance ranking
   console.log('\n🏆 PERFORMANCE RANKING (by avg duration)');
-  const stats = frameworks.map(fw => {
-    const fwResults = results.filter(r => r.framework === fw);
-    if (fwResults.length === 0) return null;
-    return {
-      framework: fw,
-      avg: Math.round(fwResults.reduce((a, r) => a + r.duration, 0) / fwResults.length),
-      passed: fwResults.filter(r => r.success).length,
-      total: fwResults.length,
-    };
-  }).filter(Boolean).sort((a, b) => a.avg - b.avg);
+  const stats = frameworks
+    .map((fw) => {
+      const fwResults = results.filter((r) => r.framework === fw);
+      if (fwResults.length === 0) return null;
+      return {
+        framework: fw,
+        avg: Math.round(fwResults.reduce((a, r) => a + r.duration, 0) / fwResults.length),
+        passed: fwResults.filter((r) => r.success).length,
+        total: fwResults.length,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.avg - b.avg);
 
   stats.forEach((s, i) => {
     const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : '🥉';
@@ -299,15 +301,17 @@ async function main() {
 
   // Detailed results table
   console.log('📋 DETAILED RESULTS');
-  console.table(results.map(r => ({
-    Scenario: r.scenario,
-    Framework: r.framework,
-    Duration: `${r.duration}ms`,
-    Status: r.success ? '✅' : '❌',
-  })));
+  console.table(
+    results.map((r) => ({
+      Scenario: r.scenario,
+      Framework: r.framework,
+      Duration: `${r.duration}ms`,
+      Status: r.success ? '✅' : '❌',
+    }))
+  );
 }
 
-main().catch(e => {
+main().catch((e) => {
   console.error('Benchmark failed:', e);
   process.exit(1);
 });

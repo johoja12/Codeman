@@ -7,6 +7,13 @@
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { readFile } from 'node:fs/promises';
+
+vi.mock('node:fs/promises', () => ({
+  readFile: vi.fn(async () => '{}'),
+}));
+
+const mockedReadFile = vi.mocked(readFile);
 
 // Mock state that can be accessed by both mocks and tests
 const mockState = vi.hoisted(() => ({
@@ -50,11 +57,20 @@ vi.mock('../src/session.js', () => {
     workingDir: string;
     _started = false;
     _stopped = false;
+    _parked = false;
+    mode = 'claude';
+    checkpointEnabled: boolean | undefined;
+    blocksIdleAutomation = false;
+    resumeSessionId: string | undefined = undefined;
+    codexProviderIdentityForPersist:
+      | { version: 1; credentialSource: 'restorable' | 'session-key'; codexHome?: string }
+      | undefined;
 
-    constructor(options: { workingDir: string }) {
+    constructor(options: { workingDir: string; checkpointEnabled?: boolean }) {
       super();
       this.id = `session-${Math.random().toString(36).substr(2, 9)}`;
       this.workingDir = options.workingDir;
+      this.checkpointEnabled = options.checkpointEnabled;
       mockState.sessions.set(this.id, this);
     }
 
@@ -68,12 +84,17 @@ vi.mock('../src/session.js', () => {
       this.emit('exit');
     }
 
+    async park() {
+      this._parked = true;
+    }
+
     toState() {
       return {
         id: this.id,
         workingDir: this.workingDir,
-        status: this._stopped ? 'stopped' : this._started ? 'running' : 'pending',
-        pid: this._started && !this._stopped ? 12345 : null,
+        status: this._parked ? 'parked' : this._stopped ? 'stopped' : this._started ? 'running' : 'pending',
+        pid: this._parked || this._stopped ? null : this._started ? 12345 : null,
+        resumeSessionId: this.resumeSessionId,
       };
     }
 
@@ -81,6 +102,17 @@ vi.mock('../src/session.js', () => {
       return undefined;
     }
     getEnvOverridesForPersist() {
+      return undefined;
+    }
+
+    getCodexProviderIdentityForPersist() {
+      return (
+        this.codexProviderIdentityForPersist ??
+        (this.mode === 'codex' ? { version: 1 as const, credentialSource: 'restorable' as const } : undefined)
+      );
+    }
+
+    getAttachmentHistoryForPersist() {
       return undefined;
     }
 
@@ -94,6 +126,10 @@ vi.mock('../src/session.js', () => {
 
     isIdle() {
       return true;
+    }
+
+    isAutonomouslyIdle() {
+      return this.isIdle() && !this.blocksIdleAutomation;
     }
 
     isBusy() {
@@ -134,6 +170,25 @@ describe('SessionManager', () => {
   });
 
   describe('createSession', () => {
+    it('seeds CLI-created sessions from settings.json', async () => {
+      mockedReadFile.mockResolvedValueOnce(JSON.stringify({ checkpointDefaultEnabled: false }) as never);
+
+      const session = await manager.createSession('/tmp/test');
+
+      expect(session.checkpointEnabled).toBe(false);
+    });
+
+    it.each(['null', '[]', '"not a settings object"'])(
+      'falls back to enabled for malformed persisted %s',
+      async (raw) => {
+        mockedReadFile.mockResolvedValueOnce(raw as never);
+
+        const session = await manager.createSession('/tmp/test');
+
+        expect(session.checkpointEnabled).toBe(true);
+      }
+    );
+
     it('should create and start a new session', async () => {
       const session = await manager.createSession('/tmp/test');
 
@@ -239,6 +294,92 @@ describe('SessionManager', () => {
     });
   });
 
+  // COD-124: park() detaches + preserves state, unlike stopSession() which
+  // removes the session from the manager's in-memory map entirely.
+  describe('parkSession', () => {
+    it('should call session.park() and keep the session in the manager (not deleted)', async () => {
+      const session = await manager.createSession('/tmp/test');
+
+      await manager.parkSession(session.id);
+
+      expect((session as any)._parked).toBe(true);
+      expect(manager.hasSession(session.id)).toBe(true);
+      expect(manager.getSession(session.id)).toBe(session);
+    });
+
+    it('should persist the parked status to the store', async () => {
+      const session = await manager.createSession('/tmp/test');
+
+      await manager.parkSession(session.id);
+
+      expect(mockState.store.setSession).toHaveBeenCalledWith(
+        session.id,
+        expect.objectContaining({ status: 'parked', pid: null })
+      );
+    });
+
+    it('persists explicit v1 provenance for a live Codex session without env overrides and strips it from callers', async () => {
+      const session = await manager.createSession('/tmp/test');
+      session.mode = 'codex';
+
+      await manager.parkSession(session.id);
+
+      expect(mockState.store.state.sessions[session.id]).toEqual(
+        expect.objectContaining({
+          __codexProviderIdentity: {
+            version: 1,
+            credentialSource: 'restorable',
+          },
+        })
+      );
+      expect(JSON.stringify(mockState.store.state.sessions[session.id])).not.toContain('api-key-secret');
+      expect(manager.getStoredSessions()[session.id]).not.toHaveProperty('__codexProviderIdentity');
+    });
+
+    it('should handle non-existent session gracefully', async () => {
+      await expect(manager.parkSession('non-existent')).resolves.not.toThrow();
+    });
+  });
+
+  // COD-124: on reboot, parked sessions must survive as 'parked' (they carry a
+  // resumeSessionId a user can resume from later) rather than being force-reset
+  // to 'stopped' the way every other non-stopped status is.
+  describe('loadFromStore (parked exemption)', () => {
+    it('should NOT reset a parked session to stopped on boot', () => {
+      mockState.store.state.sessions['parked-session'] = {
+        id: 'parked-session',
+        status: 'parked',
+        pid: null,
+        resumeSessionId: 'claude-conv-xyz',
+      };
+      vi.clearAllMocks();
+
+      new SessionManager();
+
+      expect(mockState.store.setSession).not.toHaveBeenCalledWith(
+        'parked-session',
+        expect.objectContaining({ status: 'stopped' })
+      );
+      expect(mockState.store.state.sessions['parked-session'].status).toBe('parked');
+    });
+
+    it('should still reset other non-stopped statuses to stopped on boot', () => {
+      mockState.store.state.sessions['running-session'] = {
+        id: 'running-session',
+        status: 'running',
+        pid: 12345,
+      };
+      vi.clearAllMocks();
+
+      new SessionManager();
+
+      expect(mockState.store.setSession).toHaveBeenCalledWith(
+        'running-session',
+        expect.objectContaining({ status: 'stopped', pid: null })
+      );
+    });
+  });
+
   describe('stopAllSessions', () => {
     it('should stop all active sessions', async () => {
       const session1 = await manager.createSession('/tmp/test1');
@@ -287,6 +428,19 @@ describe('SessionManager', () => {
       const idle = manager.getIdleSessions();
 
       expect(idle).toContain(session);
+    });
+
+    it('excludes live and unknown activity but preserves legacy unobservable idle', async () => {
+      const none = await manager.createSession('/tmp/none');
+      const live = await manager.createSession('/tmp/live');
+      const unknown = await manager.createSession('/tmp/unknown');
+      const notObservable = await manager.createSession('/tmp/not-observable');
+
+      live.blocksIdleAutomation = true;
+      unknown.blocksIdleAutomation = true;
+
+      expect(manager.getIdleSessions()).toEqual(expect.arrayContaining([none, notObservable]));
+      expect(manager.getIdleSessions()).not.toEqual(expect.arrayContaining([live, unknown]));
     });
   });
 

@@ -6,7 +6,8 @@
  * number of consecutive reconnects already attempted, it returns the action to
  * take (`reconnect` | `retry-fallback` | `give-up`) and a backoff delay. It is
  * exposed on `window.CodemanWsReconnect` and tested here in a plain node VM
- * context (no jsdom — jsdom env setup is broken on some hosts).
+ * context (no jsdom — jsdom env setup is broken on some hosts), mirroring the
+ * `CodemanMonitorLabels` harness in test/monitor-row-labels.test.ts.
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';

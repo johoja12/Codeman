@@ -16,7 +16,9 @@ import { getDataDir } from '../../config/instance.js';
 import { sessionWaits, hooksAvailableForMode, sessionHookOptions } from '../session-wait-registry.js';
 import { getCli } from '../../config/cli-registry/registry.js';
 import { approvalInbox, type ApprovalKind } from '../approval-inbox.js';
-import type { SessionPort, EventPort, RespawnPort, ConfigPort, InfraPort } from '../ports/index.js';
+import { buildPaneCapture } from '../pane-capture.js';
+import type { SessionPort, EventPort, RespawnPort, ConfigPort, InfraPort, AgentActivityPort } from '../ports/index.js';
+import type { HookKind } from '../../session-agent-activity-coordinator.js';
 
 /** Hook events that open an Approvals Inbox item. */
 const APPROVAL_KIND_BY_EVENT: Record<string, ApprovalKind> = {
@@ -54,15 +56,75 @@ const dshSeqBySession = new Map<string, { seq: number; at: number }>();
 const DSH_SEQ_STALE_WINDOW_MS = 60_000;
 const DSH_SEQ_MAX_SESSIONS = 500;
 
+const ACTIVITY_KIND_BY_EVENT: Partial<Record<string, Exclude<HookKind, 'raw_idle'>>> = {
+  stop: 'stop',
+  idle_prompt: 'idle_prompt',
+  permission_prompt: 'permission',
+  elicitation_dialog: 'elicitation',
+};
+
 export function registerHookEventRoutes(
   app: FastifyInstance,
-  ctx: SessionPort & EventPort & RespawnPort & ConfigPort & InfraPort
+  ctx: SessionPort & EventPort & RespawnPort & ConfigPort & InfraPort & AgentActivityPort
 ): void {
   app.post('/api/hook-event', async (req) => {
     const { event, sessionId, data } = parseBody(HookEventSchema, req.body);
     if (!ctx.sessions.has(sessionId)) {
       return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Session not found');
     }
+
+    // Agent-initiated checkpoint: run compact, clear, or new, then continue once the
+    // op completes. Per-session opt-in (default OFF). The CLI reads the returned
+    // result to learn whether it actually triggered.
+    if (event === 'checkpoint') {
+      const session = ctx.sessions.get(sessionId);
+      const result = session?.checkpointEnabled
+        ? session.requestCheckpoint({
+            mode: data?.mode as 'compact' | 'clear' | 'new' | undefined,
+            continuePrompt: typeof data?.continuePrompt === 'string' ? data.continuePrompt : undefined,
+          })
+        : { triggered: false, reason: 'not-enabled' };
+      return { success: true, data: { checkpoint: result } };
+    }
+
+    // SessionStart is the authoritative startup/resume/fresh-thread identity
+    // signal. Replace the coordinator generation synchronously before transcript
+    // watching, respawn, approval, or broadcast effects can observe the old one.
+    if (event === 'session_start' && data && typeof data.session_id === 'string' && data.session_id) {
+      const session = ctx.sessions.get(sessionId);
+      const prevClaudeSessionId = session?.claudeSessionId;
+      session?.adoptClaudeSessionStartId(data.session_id);
+      if (session) {
+        if (data.session_id !== prevClaudeSessionId) {
+          approvalInbox.resolveForSession(sessionId, 'resolved_in_terminal', ['idle']);
+          approvalInbox.resetSourceSequenceForSession(sessionId, ['permission', 'question']);
+          ctx.agentActivity.identityChanged(session);
+        }
+        ctx.persistSessionState(session);
+      }
+      // Docker sessions: keep the case's resume seed following the LIVE
+      // conversation (post-/clear id switches), so a container stop/reboot
+      // relaunch resumes the right transcript.
+      if (session?.docker && session.claudeSessionId && session.claudeSessionId !== prevClaudeSessionId) {
+        void persistDockerCaseClaudeSessionId(
+          getDataDir(),
+          session.docker.containerName,
+          session.claudeSessionId
+        ).catch(() => {});
+      }
+    }
+
+    const session = ctx.sessions.get(sessionId)!;
+    const safeData = sanitizeHookData(data);
+    const activityKind = ACTIVITY_KIND_BY_EVENT[event];
+    const activityEvent = activityKind ? ctx.agentActivity.allocateEvent(session, activityKind) : undefined;
+    const sourceSequence = activityEvent?.sequence || undefined;
+    const summaryTracker = ctx.runSummaryTrackers.get(sessionId);
+    // `prompt_submitted` is excluded here and recorded at the tail instead: it
+    // fires on EVERY prompt of every Claude pane, and only the ones where the
+    // conversation actually moved carry information (see the tail block).
+    if (summaryTracker && event !== 'stop' && event !== 'prompt_submitted')
+      summaryTracker.recordHookEvent(event, safeData);
 
     // DeepSeek status-bridge ordering: drop a stale retried report (see
     // dshSeqBySession above). Success rather than an error, so the shim exits 0
@@ -96,9 +158,49 @@ export function registerHookEventRoutes(
     if (waitSession && hooksAvailableForMode(waitSession.mode, sessionHookOptions(waitSession))) {
       if (event === 'stop') {
         sessionWaits.notifySignal(sessionId, 'stop');
+        summaryTracker?.recordHookEvent(event, safeData);
       } else if (event === 'permission_prompt' || event === 'elicitation_dialog') {
         sessionWaits.notifySignal(sessionId, 'blocked');
       }
+    }
+    // Even a mode-mismatched stop remains raw evidence in the run summary.
+    if (event === 'stop' && waitSession && !hooksAvailableForMode(waitSession.mode, sessionHookOptions(waitSession)))
+      summaryTracker?.recordHookEvent(event, safeData);
+
+    // Transcript discovery is identity evidence, not a human-facing legacy hook
+    // effect, so preserve it even when the prompt itself is suppressed below.
+    if (data && 'transcript_path' in data) {
+      const transcriptPath = String(data.transcript_path);
+      if (transcriptPath && isValidWorkingDir(transcriptPath)) {
+        ctx.startTranscriptWatcher(sessionId, transcriptPath);
+      }
+    }
+
+    const decision = activityEvent
+      ? await ctx.agentActivity.decideEvent(session, activityEvent)
+      : {
+          presentToHuman: true,
+          quarantined: false,
+          autonomyBlocked: false,
+          ambiguous: false,
+          observation: undefined,
+          liveEvidence: undefined,
+          processReason: undefined,
+        };
+    if (activityEvent && !decision.presentToHuman) {
+      ctx.broadcast('hook:suppressed', {
+        sessionId,
+        timestamp: Date.now(),
+        hookEvent: event,
+        sourceSequence,
+        reason: decision.quarantined ? 'stale_completion' : 'background_agents_live',
+        activityStatus: ctx.agentActivity.project(session).activityStatus,
+        observation: decision.observation,
+        liveEvidence: decision.liveEvidence,
+        processReason: decision.processReason,
+        ...safeData,
+      });
+      return {};
     }
 
     // Signal the respawn controller based on hook event type
@@ -116,20 +218,18 @@ export function registerHookEventRoutes(
       }
     }
 
-    // Start transcript watching if transcript_path is provided and safe
-    if (data && 'transcript_path' in data) {
-      const transcriptPath = String(data.transcript_path);
-      if (transcriptPath && isValidWorkingDir(transcriptPath)) {
-        ctx.startTranscriptWatcher(sessionId, transcriptPath);
-      }
-    }
-
-    // Sync Claude's current conversation id. Interactive PTY mode never emits
-    // `session_id` on stdout, so hooks are the only reliable way to learn that
-    // the user ran `/clear` (which spins up a new conversation jsonl).
+    // Sync Claude's current conversation id from any OTHER hook payload that
+    // carries one. `session_start` already ran through the authoritative branch
+    // at the top of this handler (which owns the coordinator generation reset),
+    // so it is excluded here rather than adopted twice.
+    // Interactive PTY mode never emits `session_id` on stdout, so hooks are the
+    // only reliable way to learn that the user ran `/clear` (which spins up a new
+    // conversation jsonl).
+    // NOTE: transcript watching is NOT repeated here — this fork starts it
+    // earlier in the handler ("Transcript discovery is identity evidence"), so
+    // upstream's copy of that block at this point would be a second call.
     let conversationChanged = false;
-    if (data && typeof data.session_id === 'string' && data.session_id) {
-      const session = ctx.sessions.get(sessionId);
+    if (event !== 'session_start' && data && typeof data.session_id === 'string' && data.session_id) {
       const prevClaudeSessionId = session?.claudeSessionId;
       const prevChainLength = session?.claudeSessionChain.length ?? 0;
       // FIRST-HAND: this payload came from the CLI process itself and reached us
@@ -168,8 +268,6 @@ export function registerHookEventRoutes(
     }
 
     // Sanitize forwarded data: only include known safe fields, limit size
-    const safeData = sanitizeHookData(data);
-    const session = ctx.sessions.get(sessionId);
     const sessionName = session?.name ?? sessionId.slice(0, 8);
 
     // Approvals Inbox: prompt events open an item, dialog-closed/stop events
@@ -197,6 +295,7 @@ export function registerHookEventRoutes(
           sessionId,
           sessionName,
           kind: approvalKind,
+          mode: session.mode,
           toolName: typeof safeData.tool_name === 'string' ? safeData.tool_name : undefined,
           toolSummary: typeof toolSummary === 'string' ? toolSummary : undefined,
           message: typeof safeData.message === 'string' ? safeData.message : undefined,
@@ -211,16 +310,12 @@ export function registerHookEventRoutes(
           watching: session.watching,
           // Visible tmux frame first (it IS the dialog); raw byte-buffer tail as
           // the fallback for direct-PTY sessions and the no-op test mux.
-          capture: () => {
-            const muxName = session.muxName;
-            const frame = muxName ? (ctx.mux.capturePaneBuffer?.(muxName) ?? null) : null;
-            return frame ?? session.terminalBuffer.slice(-8192) ?? null;
-          },
+          capture: buildPaneCapture(session, ctx.mux),
         });
         approvalId = item.id;
         acknowledgedReason = item.acknowledgedReason;
       } else if (APPROVAL_RESOLVING_EVENTS.has(event)) {
-        approvalInbox.resolveForSession(sessionId, 'resolved_in_terminal');
+        approvalInbox.resolveForSession(sessionId, 'resolved_in_terminal', undefined, sourceSequence);
       }
     }
 
@@ -255,13 +350,13 @@ export function registerHookEventRoutes(
       });
     }
 
-    // Track in run summary. `prompt_submitted` fires on EVERY prompt of every
-    // Claude pane; only the ones where the conversation actually moved (a /clear
-    // successor) carry information, and recording the rest would push a row into
-    // the Summary timeline and /api/search per turn and evict useful rows from
-    // the 1000-event FIFO (#367 merge-time fix).
-    const summaryTracker = ctx.runSummaryTrackers.get(sessionId);
-    if (summaryTracker && (event !== 'prompt_submitted' || conversationChanged)) {
+    // Track a `prompt_submitted` in the run summary ONLY when the conversation
+    // actually moved (a /clear successor). It fires on EVERY prompt of every
+    // Claude pane, and recording the rest would push a row into the Summary
+    // timeline and /api/search per turn and evict useful rows from the
+    // 1000-event FIFO (#367 merge-time fix). Every other event was already
+    // recorded above, before the suppression/early-return paths.
+    if (summaryTracker && event === 'prompt_submitted' && conversationChanged) {
       summaryTracker.recordHookEvent(event, safeData);
     }
 

@@ -19,6 +19,8 @@ import { tmpdir } from 'node:os';
 import { createMockRouteContext, createMockSession, type MockRouteContext } from '../mocks/index.js';
 import { installRouteErrorHandler } from '../../src/web/route-error-handler.js';
 import { registerSessionRoutes } from '../../src/web/routes/session-routes.js';
+import { TabLayoutService } from '../../src/tab-layout-service.js';
+import type { TabLayout } from '../../src/tab-layout.js';
 
 const PARENT_ID = 'test-session-1'; // the id the mock context pre-populates
 
@@ -84,6 +86,64 @@ describe('POST /api/sessions parentSessionId', () => {
 
     expect(res.statusCode).toBe(200);
     expect(created(res.body).parentSessionId).toBe(PARENT_ID);
+  });
+
+  it('routes nested Session Bridge children through the real layout coordinator into the parent group', async () => {
+    const layouts: Record<string, TabLayout> = {
+      '@single': {
+        version: 7,
+        updatedAt: '2026-08-16T00:00:00.000Z',
+        groups: [{ id: 'bridge', name: 'Bridge', refs: [{ kind: 'session', id: PARENT_ID }] }],
+        ungrouped: [],
+      },
+    };
+    let sessionOrder: string[] = [];
+    Object.assign(harness.ctx.sessions.get(PARENT_ID)!, { createdAt: 1 });
+    const service = new TabLayoutService({
+      store: {
+        getTabLayout: (owner: string) => layouts[owner] ?? null,
+        getTabLayouts: () => structuredClone(layouts),
+        commitTabLayoutProjection: (
+          updates: Readonly<Record<string, TabLayout>>,
+          projectOrder: (latest: readonly string[]) => readonly string[]
+        ) => {
+          Object.assign(layouts, structuredClone(updates));
+          sessionOrder = [...projectOrder(sessionOrder)];
+          return { layouts: structuredClone(updates), sessionOrder: [...sessionOrder] };
+        },
+        getSessions: () => ({}),
+        getSessionOrder: () => [...sessionOrder],
+      } as never,
+      sessions: harness.ctx.sessions as never,
+      readWebviews: async () => [],
+      broadcast: () => {},
+      broadcastSessionOrder: () => {},
+      now: () => '2026-08-16T12:00:00.000Z',
+    });
+    harness.ctx.tabLayouts = service as never;
+    harness.ctx.addSession = (async (session: any, options = {}) => {
+      harness.ctx.sessions.set(session.id, session);
+      return service.sessionCreated('@single', session.id, options);
+    }) as never;
+
+    const childResponse = await harness.app.inject({
+      method: 'POST',
+      url: '/api/sessions',
+      headers: { 'x-codeman-parent-session': PARENT_ID },
+      payload: { name: 'bridge-child', mode: 'claude', workingDir },
+    });
+    const child = created(childResponse.body);
+    const grandchildResponse = await harness.app.inject({
+      method: 'POST',
+      url: '/api/sessions',
+      headers: { 'x-codeman-parent-session': child.id },
+      payload: { name: 'bridge-grandchild', mode: 'claude', workingDir },
+    });
+    const grandchild = created(grandchildResponse.body);
+
+    expect(child.parentSessionId).toBe(PARENT_ID);
+    expect(grandchild.parentSessionId).toBe(child.id);
+    expect(layouts['@single'].groups[0].refs.map((ref) => ref.id)).toEqual([PARENT_ID, child.id, grandchild.id]);
   });
 
   it('lets the body win when both are present', async () => {

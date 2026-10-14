@@ -585,4 +585,3 @@ The highest-priority path is:
 4. Add background due-job loop.
 5. Add minimal UI.
 6. Verify that scheduled jobs create real Codeman/tmux sessions and send prompts.
-

@@ -1,11 +1,24 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import vm from 'node:vm';
+import { parse, type DefaultTreeAdapterTypes } from 'parse5';
 import { describe, expect, it, vi } from 'vitest';
 
 const appSource = readFileSync('src/web/public/app.js', 'utf8');
 const settingsSource = readFileSync('src/web/public/settings-ui.js', 'utf8');
 const htmlSource = readFileSync('src/web/public/index.html', 'utf8');
+
+function findElementById(node: DefaultTreeAdapterTypes.Node, id: string): DefaultTreeAdapterTypes.Element | null {
+  if ('attrs' in node && node.attrs.some((attribute) => attribute.name === 'id' && attribute.value === id)) {
+    return node;
+  }
+  if (!('childNodes' in node)) return null;
+  for (const child of node.childNodes) {
+    const found = findElementById(child, id);
+    if (found) return found;
+  }
+  return null;
+}
 
 describe('shortcut registry and overlay', () => {
   it('defines shortcut metadata that can be overridden from global settings', () => {
@@ -21,6 +34,32 @@ describe('shortcut registry and overlay', () => {
     expect(appSource).toContain('showShortcutOverlay()');
     expect(appSource).toContain('renderShortcutOverlay()');
     expect(appSource).toContain('closeShortcutOverlay()');
+  });
+
+  it('keeps the shortcut overlay outside the app settings modal so the global shortcut is visible', () => {
+    const document = parse(htmlSource);
+    const shortcutOverlay = findElementById(document, 'shortcutOverlayModal');
+    expect(shortcutOverlay).not.toBeNull();
+
+    let ancestor = shortcutOverlay?.parentNode || null;
+    while (ancestor) {
+      const ancestorId =
+        'attrs' in ancestor ? ancestor.attrs.find((attribute) => attribute.name === 'id')?.value : undefined;
+      expect(ancestorId).not.toBe('appSettingsModal');
+      ancestor = 'parentNode' in ancestor ? ancestor.parentNode : null;
+    }
+  });
+
+  it('keeps the shortcut settings panel as a direct visible child of the settings modal body', () => {
+    const document = parse(htmlSource);
+    const shortcutSettings = findElementById(document, 'settings-shortcuts');
+    expect(shortcutSettings).not.toBeNull();
+
+    const parentClasses =
+      shortcutSettings?.parentNode && 'attrs' in shortcutSettings.parentNode
+        ? shortcutSettings.parentNode.attrs.find((attribute) => attribute.name === 'class')?.value
+        : undefined;
+    expect(parentClasses?.split(/\s+/)).toContain('set-doc');
   });
 
   it('adds Ctrl/Option question-mark bindings for the overlay', () => {
@@ -69,14 +108,13 @@ describe('shortcut registry and overlay', () => {
     );
   });
 
-  it('keeps shortcutOverrides out of the settings PUT (the .strict() schema would 400 the whole save)', async () => {
-    // Overrides are per-device and live only in the localStorage blob. Before this
-    // strip, any device with an override (even an empty {} left by Reset) sent the
-    // key on every App Settings save, and the server refused the whole PUT, so no
-    // synced setting reached it again.
-    expect(settingsSource).toContain('shortcutOverrides: _sco,');
+  it('sends shortcutOverrides with the settings PUT, and the schema accepts them (downstream COD-242)', async () => {
+    // Downstream persists shortcut overrides server-side so they follow the user
+    // across devices (COD-242), so the save must NOT strip them (upstream does,
+    // because its .strict() schema has no such key) and the schema must take them.
+    expect(settingsSource).not.toContain('shortcutOverrides: _sco,');
     const { SettingsUpdateSchema } = await import('../src/web/schemas.js');
-    expect(SettingsUpdateSchema.safeParse({ shortcutOverrides: {} }).success).toBe(false);
+    expect(SettingsUpdateSchema.safeParse({ shortcutOverrides: {} }).success).toBe(true);
   });
 
   it('keeps the full help modal reachable now that Ctrl+? opens the registry overlay', () => {
@@ -86,7 +124,6 @@ describe('shortcut registry and overlay', () => {
     expect(htmlSource).toContain('app.closeShortcutOverlay(); app.showHelp()');
   });
 });
-
 // ─── Functional coverage (vm-sandbox harness, mirrors run-mode-ui.test.ts) ────
 // The grep assertions above pin the wiring; these exercise the actual
 // persistence round-trip and capture flow that were broken in review.

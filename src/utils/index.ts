@@ -26,6 +26,8 @@ export {
 export { MAX_SESSION_TOKENS } from './token-validation.js';
 export { isSafePushEndpoint } from './push-endpoint-validation.js';
 export { stringSimilarity, fuzzyPhraseMatch, todoContentHash } from './string-similarity.js';
+export { compileFileQuery, matchFileQuery } from './file-query.js';
+export type { FileQueryMatcher } from './file-query.js';
 export { assertNever } from './type-safety.js';
 export { wrapWithNice } from './nice-wrapper.js';
 export { resolveLocalShell, loginShellArgs } from './shell-resolver.js';
@@ -52,6 +54,17 @@ export {
   getAntigravityNotFoundMessage,
 } from './antigravity-cli-resolver.js';
 export { resolvePiDir, isPiAvailable, getPiCliVersion, getPiNotFoundMessage } from './pi-cli-resolver.js';
+export {
+  detectEnvironment,
+  extractVersion,
+  compareVersions,
+  checkTool,
+  checkAll,
+  createRealHost,
+} from './dependency-checker.js';
+export type { ProbeHost, ToolResult, ToolStatus } from './dependency-checker.js';
+export { renderTable, renderJson, computeExitCode } from './dependency-report.js';
+export type { DependencyReportJson } from './dependency-report.js';
 export { resolveGrokDir, isGrokAvailable, getGrokCliVersion, getGrokNotFoundMessage } from './grok-cli-resolver.js';
 export {
   resolveDeepSeekDir,
@@ -66,8 +79,6 @@ export {
   profileExists,
 } from './deepseek-cli-resolver.js';
 export type { DeepSeekProfile, DeepSeekProfileKind } from './deepseek-cli-resolver.js';
-export { compileFileQuery, matchFileQuery } from './file-query.js';
-export type { FileQueryMatcher } from './file-query.js';
 export { resolveOmpDir, isOmpAvailable, getOmpNotFoundMessage, getOmpCliVersion } from './omp-cli-resolver.js';
 export {
   boundedPathExists,

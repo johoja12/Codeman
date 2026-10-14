@@ -8,7 +8,7 @@
  * 162 event constants organized by category:
  * - **Core** (1): init
  * - **Transport** (1): sse:heartbeat
- * - **Session lifecycle** (24): created, updated, deleted, terminal, idle, working, ...
+ * - **Session lifecycle** (25): created, updated, deleted, terminal, idle, working, parked, resumed, ...
  * - **Session: Ralph** (6): ralphLoopUpdate, todoUpdate, completionDetected, ...
  * - **Session: Bash tools** (3): bashToolStart, bashToolEnd, bashToolsUpdate
  * - **Session: Plan** (4): planTaskUpdate, planCheckpoint, planRollback, planTaskAdded
@@ -25,7 +25,7 @@
  * - **Plan orchestration** (5): started, progress, subagent, completed, cancelled
  * - **Tunnel** (7): started, stopped, progress, error, qrRotated, qrRegenerated, qrAuthUsed
  * - **Image / attachments** (2): image:detected, attachment:detected
- * - **Hooks** (10): idle_prompt, permission_prompt, elicitation_dialog, elicitation_complete, elicitation_response, stop, agent_working, teammate_idle, task_completed, prompt_submitted
+ * - **Hooks** (11): idle_prompt, permission_prompt, elicitation_dialog, elicitation_complete, elicitation_response, stop, agent_working, teammate_idle, task_completed, suppressed, prompt_submitted
  *   (agent_working is the odd one out: reported by the DeepSeek Harness status bridge, not by a Claude Code hook)
  * - **Approvals** (3): pending, updated, resolved (cross-session Approvals Inbox)
  * - **Custom Model Endpoint Profiles** (1): swapped-out (a session's model got evicted by another session on the same llama-swap endpoint)
@@ -49,6 +49,8 @@
  * 2. Add the matching entry in `src/web/public/constants.js` SSE_EVENTS object
  * 3. Add the frontend listener in the appropriate `addListener()` call
  */
+
+import type { ApprovalResolvedInfo } from './approval-inbox.js';
 
 // ─── Core ────────────────────────────────────────────────────────────────────
 
@@ -83,6 +85,8 @@ export const SessionDeleted = 'session:deleted' as const;
 export const SessionTerminal = 'session:terminal' as const;
 /** Client should re-fetch the full terminal buffer (e.g. after reconnect). */
 export const SessionNeedsRefresh = 'session:needsRefresh' as const;
+/** PTY geometry changed ({id, cols, rows}) — viewers at other dims reconcile via capture rewrite (COD-179). */
+export const SessionResized = 'session:resized' as const;
 /** Terminal buffer cleared (e.g. /clear command). */
 export const SessionClearTerminal = 'session:clearTerminal' as const;
 /** Claude finished a prompt — includes result and cost. */
@@ -99,6 +103,8 @@ export const SessionWorking = 'session:working' as const;
 export const SessionAutoClear = 'session:autoClear' as const;
 /** Auto-compact triggered for the session. */
 export const SessionAutoCompact = 'session:autoCompact' as const;
+/** Agent-initiated checkpoint (compact-or-clear, then continue) state changed. */
+export const SessionCheckpoint = 'session:checkpoint' as const;
 /** Usage-limit pause detected; auto-resume scheduled. */
 export const SessionLimitPauseScheduled = 'session:limitPauseScheduled' as const;
 /** Auto-resume prompt sent after a usage-limit reset. */
@@ -121,6 +127,10 @@ export const SessionRunning = 'session:running' as const;
 export const SessionStatusTelemetry = 'session:statusTelemetry' as const;
 /** Prompt-cache state of one session's main conversation changed (`{ sessionId, ...PromptCacheStatus }`). */
 export const SessionPromptCache = 'session:promptCache' as const;
+/** Session parked (COD-124): detached from mux + CLI stopped gracefully, state preserved for resume. */
+export const SessionParked = 'session:parked' as const;
+/** Parked session resumed (COD-124): relaunched — conversation restored for Claude mode, best-effort otherwise. */
+export const SessionResumed = 'session:resumed' as const;
 
 // ─── Session: Ralph ──────────────────────────────────────────────────────────
 
@@ -386,6 +396,9 @@ export const HookAgentWorking = 'hook:agent_working' as const;
 export const HookTeammateIdle = 'hook:teammate_idle' as const;
 /** Claude Code hook: teammate task completed. */
 export const HookTaskCompleted = 'hook:task_completed' as const;
+/** A hook was received but its human-facing legacy effects were suppressed by exact agent activity evidence. */
+export const HookSuppressed = 'hook:suppressed' as const;
+
 /** UserPromptSubmit fired in a Claude pane (#367): the pane learned its live conversation id first-hand. */
 export const HookPromptSubmitted = 'hook:prompt_submitted' as const;
 
@@ -397,6 +410,11 @@ export const ApprovalPending = 'approval:pending' as const;
 export const ApprovalUpdated = 'approval:updated' as const;
 /** A pending approval left the inbox (answered, superseded, expired, ...). */
 export const ApprovalResolved = 'approval:resolved' as const;
+
+/** Keep the resolved SSE payload aligned with the exact item removed by the inbox. */
+export function approvalResolvedEventPayload(info: ApprovalResolvedInfo): ApprovalResolvedInfo {
+  return { ...info };
+}
 
 // ─── Custom Model Endpoint Profiles ──────────────────────────────────────────
 
@@ -488,7 +506,8 @@ export const SessionOrderChanged = 'session:orderChanged' as const;
  *  tab's owner (`'@single'` when multi-user mode is off); in multi-user mode the
  *  event is delivered only to that owner and admins (`deriveWebviewSseHint`). */
 export const WebviewChanged = 'webview:changed' as const;
-/** Owner-scoped layout invalidation. Payload contains only `{ owner, version }`. */
+/** Owner-scoped layout change. New payloads include `{ owner, version, layout }` for inline adoption;
+ *  legacy `{ owner, version }` payloads remain invalidations that make the client re-fetch. */
 export const TabLayoutChanged = 'tab:layoutChanged' as const;
 
 // ─── Namespace Re-export ─────────────────────────────────────────────────────
@@ -510,6 +529,7 @@ export const SseEvent = {
   SessionDeleted,
   SessionTerminal,
   SessionNeedsRefresh,
+  SessionResized,
   SessionClearTerminal,
   SessionCompletion,
   SessionError,
@@ -518,6 +538,7 @@ export const SseEvent = {
   SessionWorking,
   SessionAutoClear,
   SessionAutoCompact,
+  SessionCheckpoint,
   SessionLimitPauseScheduled,
   SessionLimitResume,
   SessionLimitResumeCancelled,
@@ -529,6 +550,8 @@ export const SseEvent = {
   SessionRunning,
   SessionStatusTelemetry,
   SessionPromptCache,
+  SessionParked,
+  SessionResumed,
 
   // Session: Ralph
   SessionRalphLoopUpdate,
@@ -664,6 +687,7 @@ export const SseEvent = {
   HookAgentWorking,
   HookTeammateIdle,
   HookTaskCompleted,
+  HookSuppressed,
 
   // Approvals Inbox
   ApprovalPending,

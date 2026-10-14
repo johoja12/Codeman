@@ -9,23 +9,27 @@ import { stripAnsi } from './utils/index.js';
 
 const MAGIC_LINK_RE = /codeman:\/\/attach\?([^\s<>"']+)/g;
 const CODEX_SAVED_FILE_RE = /\bSaved to:\s*(file:\/\/[^\s<>"']+)/gi;
+const GENERATED_ARTIFACT_LABEL_RE =
+  /\b(?:Mockup|Screenshot|Artifact|Generated artifact|Generated image):\s*(?:\r?\n\s*)?(\/[^\r\n<>"']+)/gi;
 
 export interface TerminalAttachmentRequest {
   path: string;
   source: 'external' | 'codex-generated';
 }
 
-export interface ParseTerminalAttachmentOptions {
-  /**
-   * Enable the Codex `Saved to: file://...` scanner. Only codex-mode sessions
-   * may set this — the relaxed codex-generated trust policy must never be
-   * reachable from other modes' (prompt-injectable) terminal output.
-   */
-  codexArtifacts?: boolean;
-}
-
 export function parseAttachmentMagicLinks(data: string): string[] {
   return parseMagicAttachmentRequests(data).map((request) => request.path);
+}
+
+export interface ParseTerminalAttachmentOptions {
+  /**
+   * Also scan for codex's GENERATED-artifact announcements (`Saved to: file://…` and the
+   * labeled variant). Off by default: those carry a deliberately relaxed trust policy, and
+   * codex is the only CLI that announces artifacts this way, so enabling it for every mode
+   * widened that policy to panes it was never reasoned about for. The caller passes the
+   * registry capability (`transcript === 'codex-rollout'`) rather than a mode id.
+   */
+  codexArtifacts?: boolean;
 }
 
 export function parseTerminalAttachmentRequests(
@@ -34,11 +38,17 @@ export function parseTerminalAttachmentRequests(
 ): TerminalAttachmentRequest[] {
   const results: TerminalAttachmentRequest[] = [];
   const seen = new Set<string>();
-  const requests = options.codexArtifacts
-    ? [...parseMagicAttachmentRequests(data), ...parseCodexGeneratedArtifactRequests(data)]
-    : parseMagicAttachmentRequests(data);
 
-  for (const request of requests) {
+  // Only the `Saved to: file://…` scanner is gated: that announcement is codex's own, and
+  // it is the one carrying the relaxed trust policy. The LABELED scanner
+  // (`Mockup:`/`Screenshot:`/`Artifact:` …) is deliberately NOT gated — those labels are
+  // generic and are printed by Superpowers under claude too, so gating it would silently
+  // stop detecting artifacts on every non-codex session.
+  for (const request of [
+    ...parseMagicAttachmentRequests(data),
+    ...(options.codexArtifacts ? parseCodexGeneratedArtifactRequests(data) : []),
+    ...parseLabeledGeneratedArtifactRequests(data),
+  ]) {
     const key = `${request.source}:${request.path}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -75,9 +85,8 @@ function parseCodexGeneratedArtifactRequests(data: string): TerminalAttachmentRe
   const results: TerminalAttachmentRequest[] = [];
   const seen = new Set<string>();
 
-  // Codex styles its TUI output — strip ANSI first so a trailing SGR reset
-  // (e.g. `...mockup.png\x1b[0m`) doesn't ride into the captured URL and break
-  // the extension allowlist check.
+  // Codex styles its TUI output. Strip ANSI first so a trailing SGR reset does
+  // not become part of the URL and break extension validation.
   for (const match of stripAnsi(data).matchAll(CODEX_SAVED_FILE_RE)) {
     const rawUrl = trimTrailingPunctuation(match[1] || '');
     try {
@@ -91,6 +100,23 @@ function parseCodexGeneratedArtifactRequests(data: string): TerminalAttachmentRe
     } catch {
       // Ignore malformed terminal text. Generated-artifact links are advisory.
     }
+  }
+
+  return results;
+}
+
+function parseLabeledGeneratedArtifactRequests(data: string): TerminalAttachmentRequest[] {
+  const results: TerminalAttachmentRequest[] = [];
+  const seen = new Set<string>();
+
+  for (const match of data.matchAll(GENERATED_ARTIFACT_LABEL_RE)) {
+    const filePath = trimTrailingPunctuation((match[1] || '').trim());
+    if (!isAbsolute(filePath)) continue;
+    const extension = filePath.split('.').pop()?.toLowerCase() || '';
+    if (!isSupportedAttachmentExtension(extension)) continue;
+    if (seen.has(filePath)) continue;
+    seen.add(filePath);
+    results.push({ path: filePath, source: 'codex-generated' });
   }
 
   return results;

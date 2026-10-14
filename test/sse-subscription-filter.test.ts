@@ -108,7 +108,7 @@ describe('SSE Subscription Filtering', () => {
     expect((initEvent?.data as any).sessions).toBeDefined();
   });
 
-  it('should receive all events when no sessions param is provided (backwards-compatible)', async () => {
+  it('should broadcast lifecycle events while filtering terminal streams', async () => {
     // Start two SSE listeners: one with no filter, one with a filter for a nonexistent session
     const controller1 = new AbortController();
     const controller2 = new AbortController();
@@ -152,8 +152,8 @@ describe('SSE Subscription Filtering', () => {
     // Wait for connections to establish
     await new Promise((resolve) => setTimeout(resolve, 200));
 
-    // Create a session — this emits session:created (a global-ish event that has id but
-    // the nonexistent filter won't match it)
+    // Create a session — this emits session:created, a lifecycle event that is
+    // broadcast to every client even when a terminal-stream filter is active.
     const createRes = await fetch(`${baseUrl}/api/sessions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -258,7 +258,7 @@ describe('SSE Subscription Filtering', () => {
     expect((deletedEvent?.data as any).id).toBe(sessionId);
   });
 
-  it('should filter out events for sessions not in the subscription', async () => {
+  it('should broadcast lifecycle events for sessions not in the subscription', async () => {
     // Create two sessions
     const createRes1 = await fetch(`${baseUrl}/api/sessions`, {
       method: 'POST',

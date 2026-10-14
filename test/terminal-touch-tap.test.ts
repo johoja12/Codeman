@@ -3,8 +3,30 @@ import { resolve } from 'node:path';
 import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 
+const terminalUiSource = readFileSync(resolve(import.meta.dirname, '../src/web/public/terminal-ui.js'), 'utf8');
+
 function loadTerminalUiHarness() {
   const CodemanApp = function CodemanApp(this: any) {};
+  class MockMouseEvent {
+    type: string;
+    bubbles = false;
+    cancelable = false;
+    view: unknown;
+    clientX = 0;
+    clientY = 0;
+    screenX = 0;
+    screenY = 0;
+    button = 0;
+    buttons = 0;
+    detail = 0;
+    isTrusted = false;
+
+    constructor(type: string, options: Record<string, unknown> = {}) {
+      this.type = type;
+      Object.assign(this, options);
+    }
+  }
+
   let now = 1_000;
   let keyboardVisible = false;
   let activeElement: unknown = null;
@@ -21,6 +43,7 @@ function loadTerminalUiHarness() {
       getElementById: () => null,
     },
     CodemanApp,
+    MouseEvent: MockMouseEvent,
     console: { warn: vi.fn(), log: vi.fn(), debug: vi.fn() },
     _crashDiag: { log: vi.fn() },
     performance: { now: () => now },
@@ -47,13 +70,12 @@ function loadTerminalUiHarness() {
     TERMINAL_CHUNK_SIZE: 32 * 1024,
   });
 
-  // constants.js first: the link provider calls absoluteFilePathPattern() and
-  // previewsInFileViewer() at scan time, and the SHIPPED definitions are what keep a tap and
-  // a hover resolving the same links.
+  // constants.js first: the link provider calls absoluteFilePathPattern(),
+  // previewsInFileViewer() and terminalLogicalLine() at scan time, and the SHIPPED
+  // definitions are what keep a tap and a hover resolving the same links.
   const constants = readFileSync(resolve(import.meta.dirname, '../src/web/public/constants.js'), 'utf8');
-  const code = readFileSync(resolve(import.meta.dirname, '../src/web/public/terminal-ui.js'), 'utf8');
   vm.runInContext(constants, context, { filename: 'constants.js' });
-  vm.runInContext(code, context, { filename: 'terminal-ui.js' });
+  vm.runInContext(terminalUiSource, context, { filename: 'terminal-ui.js' });
 
   const app = new (CodemanApp as any)();
   return {
@@ -72,16 +94,27 @@ function loadTerminalUiHarness() {
 }
 
 function createElementHarness() {
-  const listeners = new Map<string, (ev: any) => void>();
+  const listeners = new Map<string, Array<(ev: any) => void>>();
   return {
     element: {
       addEventListener: vi.fn((type: string, listener: (ev: any) => void) => {
-        listeners.set(type, listener);
+        const bucket = listeners.get(type) || [];
+        bucket.push(listener);
+        listeners.set(type, bucket);
+      }),
+      dispatchEvent: vi.fn((event: { type: string }) => {
+        for (const listener of listeners.get(event.type) || []) {
+          listener(event);
+        }
+        return true;
       }),
     },
     dispatch(type: string, event: any) {
-      listeners.get(type)?.(event);
+      for (const listener of listeners.get(type) || []) {
+        listener(event);
+      }
     },
+    listeners,
   };
 }
 
@@ -126,6 +159,19 @@ function createTerminalGrid(lines: string[], cursorY: number, wrappedRows = new 
 }
 
 describe('terminal touch tap mouse guard', () => {
+  it('binds touch listeners to one declared gesture lifecycle', () => {
+    const start = terminalUiSource.indexOf('// COD-283/284: session changes must update native momentum routing too.');
+    const end = terminalUiSource.indexOf('// ── Desktop click-to-position cursor', start);
+    const touchBlock = terminalUiSource.slice(start, end);
+    const touchStart = touchBlock.slice(touchBlock.indexOf("'touchstart'"), touchBlock.indexOf("'touchmove'"));
+    const touchCancel = touchBlock.slice(touchBlock.indexOf("'touchcancel'"));
+
+    expect(touchBlock).toContain('const touchGesture = this._createTerminalTouchGesture();');
+    expect(touchStart).toContain('const touch = this._beginTerminalTouchGesture(touchGesture, ev.touches);');
+    expect(touchStart.indexOf('const touch =')).toBeLessThan(touchStart.indexOf('touchLastX = touch.clientX;'));
+    expect(touchCancel).toContain('this._cancelTerminalTouchGesture(touchGesture);');
+  });
+
   it('recognizes focus only when a terminal input owns the active element', () => {
     const { app, setActiveElement } = loadTerminalUiHarness();
     const textarea = { classList: { contains: () => true } };
@@ -275,13 +321,17 @@ describe('terminal touch tap mouse guard', () => {
     // The toggle is scoped to 'content' on purpose: a second tap on the PROMPT
     // must still position the cursor. This is the guarantee that makes the
     // change safe to make, so it is pinned separately.
-    const { app, setActiveElement } = loadTerminalUiHarness();
+    const { app, setActiveElement, setKeyboardVisible } = loadTerminalUiHarness();
     app.activeSessionId = 'sess-1';
     app.sessions = new Map([['sess-1', { mode: 'claude' }]]);
     app.terminal = createTerminalGrid(['transcript line', '', '', '', '❯ ask', ''], 4);
     app._sendInputAsync = vi.fn();
 
+    // "Second tap" means the keyboard is really UP: focused AND visible. Focused
+    // with the keyboard down is COD-467's stale focus, where blur-then-focus is
+    // what reopens it (test/mobile-keyboard-stale-state.test.ts).
     setActiveElement(app.terminal.textarea);
+    setKeyboardVisible(true);
     expect(app._handleMobileTerminalTap({ clientX: 9, clientY: 65 }, true)).toBe('input');
     expect(app.terminal.textarea.blur).not.toHaveBeenCalled();
     expect(app.terminal.focus).toHaveBeenCalledOnce();
@@ -347,7 +397,7 @@ describe('terminal touch tap mouse guard', () => {
     expect(sent).toEqual([{ id: 'sess-1', data: '\x1b[<0;21;6M\x1b[<0;21;6m' }]);
   });
 
-  it('clamps SGR tap coordinates to the terminal grid', () => {
+  it('rejects SGR tap coordinates outside the terminal grid', () => {
     const { app } = loadTerminalUiHarness();
     const sent: string[] = [];
     app.activeSessionId = 'sess-1';
@@ -357,14 +407,79 @@ describe('terminal touch tap mouse guard', () => {
       cols: 80,
       rows: 24,
       element: {
-        querySelector: () => ({ getBoundingClientRect: () => ({ left: 0, top: 0 }) }),
+        querySelector: () => ({ getBoundingClientRect: () => ({ left: 0, top: 0, width: 640, height: 384 }) }),
       },
       _core: { _renderService: { dimensions: { css: { cell: { width: 8, height: 16 } } } } },
     };
 
     app._sendSyntheticSgrTap(-50, 99999);
 
-    expect(sent).toEqual(['\x1b[<0;1;24M\x1b[<0;1;24m']);
+    expect(sent).toEqual([]);
+  });
+
+  it('rejects link hit tests outside the rendered terminal screen', () => {
+    const { app } = loadTerminalUiHarness();
+    app.terminal = {
+      cols: 80,
+      rows: 24,
+      element: {
+        querySelector: () => ({ getBoundingClientRect: () => ({ left: 10, top: 20, width: 800, height: 480 }) }),
+      },
+      _core: { _renderService: { dimensions: { css: { cell: { width: 10, height: 20 } } } } },
+    };
+
+    expect(app._terminalCellFromClientPoint(9, 40)).toBeNull();
+    expect(app._terminalCellFromClientPoint(50, 19)).toBeNull();
+    expect(app._terminalCellFromClientPoint(810, 40)).toBeNull();
+    expect(app._terminalCellFromClientPoint(50, 500)).toBeNull();
+    expect(app._terminalCellFromClientPoint(10, 20)).toEqual({ col: 1, row: 1 });
+  });
+
+  it('does not dispatch an xterm mouse click for an out-of-grid touch', () => {
+    const { app } = loadTerminalUiHarness();
+    app._dispatchSyntheticTerminalClick = vi.fn();
+    app._sendSyntheticSgrTap = vi.fn();
+    app._suppressTrustedTapMouseEvents = vi.fn();
+    app.terminal = {
+      cols: 80,
+      rows: 24,
+      modes: { mouseTrackingMode: 'vt200' },
+      element: {
+        querySelector: () => ({ getBoundingClientRect: () => ({ left: 10, top: 20, width: 800, height: 480 }) }),
+      },
+      _core: { _renderService: { dimensions: { css: { cell: { width: 10, height: 20 } } } } },
+      focus: vi.fn(),
+    };
+
+    expect(app._handleTerminalTouchTap({ clientX: 900, clientY: 100 })).toBe(false);
+    expect(app._dispatchSyntheticTerminalClick).not.toHaveBeenCalled();
+    expect(app._sendSyntheticSgrTap).not.toHaveBeenCalled();
+    expect(app._suppressTrustedTapMouseEvents).not.toHaveBeenCalled();
+    expect(app.terminal.focus).not.toHaveBeenCalled();
+  });
+
+  it('cancels tap activation after horizontal movement', () => {
+    const { app } = loadTerminalUiHarness();
+    const state = app._createTerminalTouchGesture();
+    const start = { identifier: 7, clientX: 20, clientY: 30 };
+
+    expect(app._beginTerminalTouchGesture(state, [start])).toBe(start);
+    expect(app._updateTerminalTouchGesture(state, [{ identifier: 7, clientX: 40, clientY: 30 }], 8)).not.toBeNull();
+    expect(app._endTerminalTouchGesture(state, [{ identifier: 7, clientX: 40, clientY: 30 }], [])).toBeNull();
+  });
+
+  it('cancels tap activation for multitouch and ignores a different ending finger', () => {
+    const { app } = loadTerminalUiHarness();
+    const first = { identifier: 1, clientX: 20, clientY: 30 };
+    const second = { identifier: 2, clientX: 40, clientY: 50 };
+
+    const multitouch = app._createTerminalTouchGesture();
+    expect(app._beginTerminalTouchGesture(multitouch, [first, second])).toBeNull();
+    expect(app._endTerminalTouchGesture(multitouch, [first], [second])).toBeNull();
+
+    const mismatched = app._createTerminalTouchGesture();
+    app._beginTerminalTouchGesture(mismatched, [first]);
+    expect(app._endTerminalTouchGesture(mismatched, [second], [])).toBeNull();
   });
 
   it('follows the server flag alone, with no mode list of its own', () => {
@@ -542,6 +657,60 @@ describe('terminal touch tap mouse guard', () => {
     app._linkHovered = false; // leave() fired — plain clicks report again
     app._handleDesktopTerminalClick(click);
     expect(sent).toEqual(['\x1b[<0;7;4M\x1b[<0;7;4m']);
+  });
+
+  it('touchend link activation opens preview without synthetic terminal input', () => {
+    const { app } = loadTerminalUiHarness();
+    const activate = vi.fn();
+    const suppressCompat = vi.fn();
+    const sendSgrTap = vi.fn();
+    const dispatchTerminalClick = vi.fn();
+    const sendInput = vi.fn();
+    const screen = {
+      getBoundingClientRect: () => ({ left: 10, top: 20, width: 800, height: 400 }),
+    };
+
+    app.activeSessionId = 'sess-1';
+    app.sessions = new Map([['sess-1', { mode: 'codex' }]]);
+    app._suppressTrustedTapMouseEvents = suppressCompat;
+    app._sendSyntheticSgrTap = sendSgrTap;
+    app._dispatchSyntheticTerminalClick = dispatchTerminalClick;
+    app._sendInputAsync = sendInput;
+    const linkProvider = {
+      provideLinks: vi.fn((line: number, callback: (links: unknown[]) => void) => {
+        expect(line).toBe(14); // viewportY 10 + tapped viewport row 4
+        callback([
+          {
+            text: 'out/report.pdf',
+            range: { start: { x: 6, y: 14 }, end: { x: 20, y: 14 } },
+            activate,
+          },
+        ]);
+      }),
+    };
+    // registerTerminalLinkProvider assigns BOTH fields to the one provider; the
+    // tap path reads _terminalLinkProvider, the file-preview path the other.
+    app._terminalFilePathLinkProvider = linkProvider;
+    app._terminalLinkProvider = linkProvider;
+    app.terminal = {
+      cols: 80,
+      rows: 24,
+      modes: { mouseTrackingMode: 'none' },
+      buffer: { active: { viewportY: 10 } },
+      element: { querySelector: (selector: string) => (selector === '.xterm-screen' ? screen : null) },
+      _core: { _renderService: { dimensions: { css: { cell: { width: 10, height: 20 } } } } },
+      focus: vi.fn(),
+    };
+
+    const handled = app._handleTerminalTouchTap({ clientX: 75, clientY: 90 }); // col 7, viewport row 4
+
+    expect(handled).toBe(true);
+    expect(activate).toHaveBeenCalledOnce();
+    expect(suppressCompat).toHaveBeenCalledOnce();
+    expect(sendSgrTap).not.toHaveBeenCalled();
+    expect(dispatchTerminalClick).not.toHaveBeenCalled();
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(app.terminal.focus).not.toHaveBeenCalled();
   });
 
   it('desktop click: skips the compat click that follows a touch tap', () => {
@@ -750,6 +919,29 @@ describe('terminal touch tap mouse guard', () => {
     expect(app._wheelScrollLines({ deltaY: 0, deltaX: -100, deltaMode: 0, shiftKey: true })).toBe(-4);
   });
 
+  it('wheel: accumulates fractional history deltas before calling xterm with whole rows', () => {
+    const { app } = loadTerminalUiHarness();
+    app.activeSessionId = 'sess-1';
+    app.sessions = new Map([['sess-1', { mode: 'codex' }]]);
+    app._viewMode = 'history';
+    app._isMirrorSession = () => true;
+    app._noteTerminalUserScroll = vi.fn();
+    app.isTerminalAtBottom = () => false;
+    app.terminal = {
+      scrollLines: vi.fn(),
+      buffer: { active: { viewportY: 5 } },
+    };
+
+    expect(app._handleUserScrollIntent(0.4)).toBe('swallowed');
+    expect(app._handleUserScrollIntent(0.4)).toBe('swallowed');
+    expect(app.terminal.scrollLines).not.toHaveBeenCalled();
+
+    expect(app._handleUserScrollIntent(0.4)).toBe('scrolled');
+    expect(app.terminal.scrollLines).toHaveBeenCalledOnce();
+    expect(app.terminal.scrollLines).toHaveBeenCalledWith(1);
+    expect(Number.isInteger(app.terminal.scrollLines.mock.calls[0][0])).toBe(true);
+  });
+
   it('wheel: gates claude forwarding on CLI version 2.1.187+ (unknown or older stays local)', () => {
     const { app } = loadTerminalUiHarness();
     app.activeSessionId = 'sess-1';
@@ -931,6 +1123,179 @@ describe('terminal touch tap mouse guard', () => {
 
     expect(event.preventDefault).not.toHaveBeenCalled();
     expect(event.stopImmediatePropagation).not.toHaveBeenCalled();
+  });
+
+  it('dispatches a synthetic press/release pair when OpenCode tap flow has mouse tracking enabled', () => {
+    const { app } = loadTerminalUiHarness();
+    const { element } = createElementHarness();
+
+    app.terminal = {
+      element,
+      modes: {
+        mouseTrackingMode: '1000',
+      },
+    };
+
+    app._dispatchSyntheticTerminalClick(120, 84);
+
+    expect(element.dispatchEvent).toHaveBeenCalledTimes(2);
+
+    const first = element.dispatchEvent.mock.calls[0]?.[0] as { [key: string]: unknown };
+    const second = element.dispatchEvent.mock.calls[1]?.[0] as { [key: string]: unknown };
+
+    expect(first).toMatchObject({
+      type: 'mousedown',
+      buttons: 1,
+      clientX: 120,
+      clientY: 84,
+      detail: 1,
+      button: 0,
+      bubbles: true,
+      cancelable: true,
+    });
+    expect(second).toMatchObject({
+      type: 'mouseup',
+      buttons: 0,
+      clientX: 120,
+      clientY: 84,
+      detail: 1,
+      button: 0,
+      bubbles: true,
+      cancelable: true,
+    });
+  });
+
+  it('retains trusted tap-mouse suppression for OpenCode-targeted synthetic tap flow', () => {
+    const { app } = loadTerminalUiHarness();
+    const { element, dispatch } = createElementHarness();
+    app.terminal = {
+      element,
+      modes: {
+        mouseTrackingMode: '1000',
+      },
+    };
+
+    app._installMobileTapMouseGuard();
+    app._suppressTrustedTapMouseEvents();
+
+    app._dispatchSyntheticTerminalClick(15, 25);
+
+    const trustedDown = {
+      isTrusted: true,
+      preventDefault: vi.fn(),
+      stopImmediatePropagation: vi.fn(),
+    };
+    const trustedUp = {
+      isTrusted: true,
+      preventDefault: vi.fn(),
+      stopImmediatePropagation: vi.fn(),
+    };
+
+    dispatch('mousedown', trustedDown);
+    dispatch('mouseup', trustedUp);
+
+    expect(trustedDown.preventDefault).toHaveBeenCalledOnce();
+    expect(trustedDown.stopImmediatePropagation).toHaveBeenCalledOnce();
+    expect(trustedUp.preventDefault).toHaveBeenCalledOnce();
+    expect(trustedUp.stopImmediatePropagation).toHaveBeenCalledOnce();
+  });
+
+  it('COD-209: sends SGR wheel reports directly so OpenCode scroll does not depend on xterm mouse mode', () => {
+    const { app } = loadTerminalUiHarness();
+    const screen = {
+      getBoundingClientRect: () => ({ left: 100, top: 50, width: 800, height: 400 }),
+    };
+
+    app.activeSessionId = 'session-1';
+    app._sendInputAsync = vi.fn();
+    app.terminal = {
+      cols: 80,
+      rows: 24,
+      element: {
+        querySelector: vi.fn((selector: string) => (selector === '.xterm-screen' ? screen : null)),
+      },
+      _core: {
+        _renderService: {
+          dimensions: {
+            css: {
+              cell: { width: 10, height: 20 },
+            },
+          },
+        },
+      },
+    };
+
+    app._sendForegroundTuiWheel(60, 120, 84);
+
+    expect(app._sendInputAsync).toHaveBeenCalledWith('session-1', '\x1b[<65;3;2M');
+  });
+
+  it('COD-209: accumulates small wheel deltas so OpenCode scrolling is not too fast', () => {
+    const { app } = loadTerminalUiHarness();
+    const screen = {
+      getBoundingClientRect: () => ({ left: 100, top: 50, width: 800, height: 400 }),
+    };
+
+    app.activeSessionId = 'session-1';
+    app._sendInputAsync = vi.fn();
+    app.terminal = {
+      cols: 80,
+      rows: 24,
+      element: {
+        querySelector: vi.fn((selector: string) => (selector === '.xterm-screen' ? screen : null)),
+      },
+      _core: {
+        _renderService: {
+          dimensions: {
+            css: {
+              cell: { width: 10, height: 20 },
+            },
+          },
+        },
+      },
+    };
+
+    app._sendForegroundTuiWheel(10, 120, 84);
+    app._sendForegroundTuiWheel(10, 120, 84);
+    app._sendForegroundTuiWheel(10, 120, 84);
+    app._sendForegroundTuiWheel(10, 120, 84);
+
+    expect(app._sendInputAsync).not.toHaveBeenCalled();
+
+    app._sendForegroundTuiWheel(10, 120, 84);
+
+    expect(app._sendInputAsync).toHaveBeenCalledTimes(1);
+    expect(app._sendInputAsync).toHaveBeenCalledWith('session-1', '\x1b[<65;3;2M');
+  });
+
+  it('COD-211: sends SGR click reports directly so OpenCode clickable regions work after replay', () => {
+    const { app } = loadTerminalUiHarness();
+    const screen = {
+      getBoundingClientRect: () => ({ left: 100, top: 50, width: 800, height: 400 }),
+    };
+
+    app.activeSessionId = 'session-1';
+    app._sendInputAsync = vi.fn();
+    app.terminal = {
+      cols: 80,
+      rows: 24,
+      element: {
+        querySelector: vi.fn((selector: string) => (selector === '.xterm-screen' ? screen : null)),
+      },
+      _core: {
+        _renderService: {
+          dimensions: {
+            css: {
+              cell: { width: 10, height: 20 },
+            },
+          },
+        },
+      },
+    };
+
+    app._sendForegroundTuiClick(120, 84);
+
+    expect(app._sendInputAsync).toHaveBeenCalledWith('session-1', '\x1b[<0;3;2M\x1b[<0;3;2m');
   });
 });
 

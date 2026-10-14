@@ -164,7 +164,8 @@ describe('refreshStaleCodemanHooks', () => {
     await refreshStaleCodemanHooks(dir);
 
     const after = readFileSync(settingsPath, 'utf-8');
-    expect(after).toContain('curl -sk -X POST');
+    expect(after).toContain('curl -sk ');
+    expect(after).not.toContain('curl -s -o');
     expect(after).not.toContain('curl -s -X POST');
     // and the pass is convergent: a second refresh must not rewrite
     await refreshStaleCodemanHooks(dir);

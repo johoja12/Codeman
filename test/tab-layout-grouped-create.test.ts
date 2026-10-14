@@ -158,6 +158,8 @@ describe('server.ts addSession wiring', () => {
     });
     const server = Object.create(WebServer.prototype) as any;
     server.sessions = sessions;
+    server.attachAgentActivity = vi.fn();
+    server.detachAgentActivity = vi.fn();
     server.tabLayouts = { sessionCreated };
     const session = { id: 'bob-new', owner: 'bob' };
 

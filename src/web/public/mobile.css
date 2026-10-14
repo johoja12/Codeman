@@ -20,6 +20,49 @@ html.mobile-init .file-browser-panel {
   display: none !important;
 }
 
+@media (max-width: 700px) {
+  .spreadsheet-sheet-tabs {
+    padding-inline: 4px;
+    scroll-snap-type: x proximity;
+  }
+
+  .spreadsheet-sheet-tab {
+    min-width: 96px;
+    min-height: 40px;
+    scroll-snap-align: start;
+  }
+
+  .spreadsheet-grid {
+    min-height: 55vh;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-x pan-y;
+  }
+}
+
+@media (max-width: 430px) {
+  .file-preview-header {
+    gap: 0.25rem;
+  }
+
+  .file-preview-title {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .file-preview-navigation,
+  .file-preview-actions {
+    flex-shrink: 0;
+  }
+
+  #filePreviewDownloadOriginal .file-preview-download-label {
+    display: none;
+  }
+
+  #filePreviewDownloadOriginal .file-preview-download-icon {
+    display: inline;
+  }
+}
+
 /* ============================================================================
    iOS Zoom Prevention (all mobile/tablet sizes)
    iOS Safari ignores user-scalable=no since iOS 10.
@@ -44,6 +87,49 @@ html.mobile-init .file-browser-panel {
      html.host-windows. Phone widths hide it again in the 599px block. */
   html:not(.host-windows) .session-tab .tab-detach {
     display: none !important;
+  }
+
+  .mobile-header-utility-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    color: var(--text-dim);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+
+  .mobile-header-utility-toggle:active,
+  .mobile-header-utility-toggle[aria-expanded='true'] {
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.12);
+  }
+
+  .header:not(.mobile-utilities-expanded) .header-right {
+    display: none;
+  }
+
+  .header.mobile-utilities-expanded {
+    flex-wrap: wrap;
+    max-height: none;
+  }
+
+  .header.mobile-utilities-expanded .header-right {
+    display: flex;
+    order: 10;
+    flex: 0 0 100%;
+    width: 100%;
+    margin-left: 0;
+    padding: 0.25rem 0 0;
+    border-left: none;
+    justify-content: flex-end;
+    flex-wrap: wrap;
   }
 }
 
@@ -84,6 +170,14 @@ html.mobile-init .file-browser-panel {
 
   .ios-device .app {
     padding-top: calc(54px + var(--safe-area-top));
+  }
+
+  .app.mobile-header-utilities-expanded {
+    padding-top: 102px;
+  }
+
+  .ios-device .app.mobile-header-utilities-expanded {
+    padding-top: calc(102px + var(--safe-area-top));
   }
 
   /* Font controls - smaller on tablet, visibility controlled by JS */
@@ -531,21 +625,55 @@ html.mobile-init .file-browser-panel {
   }
 
   .main {
-    padding-bottom: calc(40px + var(--safe-area-bottom));
+    padding-bottom: calc(40px + var(--safe-area-bottom) + var(--keyboard-accessory-height, 0px));
+    min-height: calc(var(--app-height, 100dvh) - 42px - var(--safe-area-top) - var(--safe-area-bottom));
   }
 
   /* iOS Safari: the toolbar is lifted by --chrome-overlap where the browser's
      bottom bar would otherwise cover it. Match that offset in main's padding so
-     the terminal doesn't extend behind the toolbar. */
+     the terminal doesn't extend behind the toolbar. The accessory-bar term stays
+     on top of it: the two clear different things (browser chrome vs Codeman's
+     own keyboard bar) and can be present at the same time. */
   .ios-device.safari-browser .main {
-    padding-bottom: calc(40px + var(--safe-area-bottom) + var(--chrome-overlap, 0px));
+    padding-bottom: calc(40px + var(--safe-area-bottom) + var(--keyboard-accessory-height, 0px) + var(--chrome-overlap, 0px));
   }
+
+  /* Mobile Tab Sheet pill — shown when >8 tabs on phone */
+  .mobile-tab-pill{
+    display:inline-flex;align-items:center;gap:6px;
+    padding:5px 9px;border-radius:8px;
+    background:#1b222c;border:1px solid #2b333f;color:#f3f6fa;
+    font-size:.72rem;font-weight:600;cursor:pointer;flex-shrink:1;min-width:0;max-width:100%;
+  }
+  .mobile-tab-pill .pill-mini{flex:0 1 auto;min-width:0;max-width:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#f3f6fa}
+  .mobile-tab-pill .pill-count{background:var(--accent,#38b6f0);color:#04223a;font-size:.68rem;font-weight:800;padding:1px 6px;border-radius:20px}
+  .mobile-tab-pill .pill-chev{color:var(--text-dim,#98a2b1);font-size:.65rem;transition:transform .2s}
+  .mobile-tab-pill[aria-expanded="true"] .pill-chev{transform:rotate(180deg)}
+  .mobile-tab-pill:active{background:#202833}
 
   .header-right {
     padding-left: 0.2rem;
     gap: 0.1rem;
     flex-shrink: 0;
     border-left: none;
+  }
+
+  .mobile-header-utility-toggle {
+    width: 26px;
+    height: 26px;
+  }
+
+  .mobile-header-utility-toggle svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  .app.mobile-header-utilities-expanded {
+    padding-top: 74px;
+  }
+
+  .ios-device .app.mobile-header-utilities-expanded {
+    padding-top: calc(74px + var(--safe-area-top));
   }
 
   /* Smaller header buttons on mobile */
@@ -574,16 +702,18 @@ html.mobile-init .file-browser-panel {
     height: 18px;
   }
 
-  /* Hide header settings gear, lifecycle log, away digest, session manager, and
-     file viewer on mobile - settings moved to toolbar; the others are secondary /
+  /* Hide header settings gear, lifecycle log, away digest, Files, session manager,
+     and file viewer on mobile - settings moved to toolbar; the others are secondary /
      desktop-oriented controls that don't belong on the cramped phone header (the
      session manager stays reachable via the Ctrl+K palette's "Browse all sessions"
      item; the file viewer button is opt-in but its panel is desktop-sized).
      (The attachments button is opt-in / default-hidden everywhere via its own
      --hidden marker, so it needs no mobile-specific rule here.) */
+  .btn-icon-header.btn-assistants,
   .btn-icon-header.btn-settings,
   .btn-icon-header.btn-lifecycle-log,
   .btn-icon-header.btn-away-digest,
+  .btn-icon-header.btn-files,
   .btn-icon-header.btn-session-manager,
   .btn-icon-header.btn-file-viewer,
   /* Approvals bell: phones answer from the overview's NEEDS YOU rows instead
@@ -960,6 +1090,7 @@ html.mobile-init .file-browser-panel {
     height: 32px;
     margin-left: auto;
     opacity: 0.6;
+    pointer-events: auto;
   }
 
   /* Close button on active tab - large for easy tapping */
@@ -972,6 +1103,7 @@ html.mobile-init .file-browser-panel {
     width: 20px;
     height: 18px;
     margin-left: -2px;
+    pointer-events: auto;
   }
 
   /* Clean dark toolbar - positioned near bottom */
@@ -1013,6 +1145,7 @@ html.mobile-init .file-browser-panel {
      distance from the visual-viewport bottom to the layout-viewport bottom
      (keyboard + Safari bar).  Remove the CSS Safari-bar offset to avoid
      double-counting, which otherwise creates a visible gap above the keyboard. */
+  .keyboard-visible .toolbar,
   .keyboard-visible.ios-device.safari-browser .toolbar {
     bottom: var(--safe-area-bottom);
   }
@@ -1020,13 +1153,13 @@ html.mobile-init .file-browser-panel {
     bottom: calc(var(--safe-area-bottom) + 40px);
   }
 
-  /* Show case selector in center */
   .toolbar-center {
-    display: flex !important;
-    align-items: center;
+    display: none !important;
   }
 
-  .toolbar-center .btn-toolbar.btn-voice {
+  .toolbar-center .btn-upload,
+  .toolbar-center .btn-toolbar.btn-voice,
+  #voiceInputBtn {
     display: none !important;
   }
 
@@ -1342,7 +1475,7 @@ html.mobile-init .file-browser-panel {
   .btn-toolbar.btn-case-mobile {
     display: flex !important;
     flex: 1 1 0 !important;
-    min-width: 0;
+    min-width: 36px;
     padding: 0 8px !important;
     order: 2; /* Between Run and Run Shell */
     overflow: hidden;
@@ -1712,21 +1845,31 @@ html.mobile-init .file-browser-panel {
     display: block;
   }
 
-  /* Mobile terminal — JS touch handler (terminal.scrollLines()) drives
-     scrollback because xterm.js DOM renderer doesn't populate xterm-viewport's
-     scroll area.  touch-action:none lets our JS handler own the gesture. */
+  /* Mobile terminal — COD-283: opencode on iPhone uses pan-y for native
+     momentum (threshold 8 + rAF), others keep none to let JS own gesture.
+     COD-284: hidden prevents iOS canvas backing-store bleed (black bars) on
+     keyboard resize; visible allowed overflow to escape terminal bounds. */
   .terminal-container {
     height: 100%;
     min-height: 0;
     position: relative;
-    overflow: visible;
+    overflow: hidden;
     touch-action: none;
+  }
+  .terminal-container[style*='pan-y'] {
+    touch-action: pan-y;
   }
 
   .terminal-container .xterm,
   .terminal-container .xterm-viewport,
   .terminal-container .xterm-screen {
     touch-action: none;
+  }
+  .touch-device .terminal-container[style*='pan-y'],
+  .touch-device .terminal-container[style*='pan-y'] .xterm,
+  .touch-device .terminal-container[style*='pan-y'] .xterm-viewport,
+  .touch-device .terminal-container[style*='pan-y'] .xterm-screen {
+    touch-action: pan-y;
   }
 
   .response-viewer {
@@ -1735,6 +1878,27 @@ html.mobile-init .file-browser-panel {
        the header/close button off-screen); the vh line is the old-engine fallback */
     max-height: 88vh;
     max-height: 92dvh;
+  }
+
+  .response-viewer-header {
+    gap: 8px;
+    padding: 12px;
+  }
+
+  .response-viewer-header > span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .response-viewer-actions {
+    flex-shrink: 0;
+    gap: 4px;
+  }
+
+  .response-viewer-more {
+    padding: 3px 7px;
   }
 
   .response-viewer-body {
@@ -2381,6 +2545,11 @@ html.mobile-init .file-browser-panel {
   /* Touch-friendly form inputs in case modal */
   #createCaseModal .form-row {
     margin-bottom: 1rem;
+  }
+
+  #case-remote {
+    display: grid;
+    gap: 0.5rem;
   }
 
   #createCaseModal .form-row label {
@@ -3129,6 +3298,13 @@ html.mobile-init .file-browser-panel {
     background: var(--text-muted);
     opacity: 0.5;
   }
+  .mobile-overview-dot--waiting_agents,
+  .mobile-overview-dot--checking_agents {
+    background: var(--session-purple);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--session-purple) 20%, transparent);
+  }
+  .mobile-overview-dot--waiting_agents { animation: agent-wait-pulse 3.2s ease-in-out infinite; }
+  .mobile-overview-dot--checking_agents { opacity: 0.72; }
 
   .mobile-overview-pill {
     flex-shrink: 0;
@@ -3159,6 +3335,12 @@ html.mobile-init .file-browser-panel {
   .mobile-overview-pill--working {
     border-color: var(--green);
     color: var(--green);
+  }
+  .mobile-overview-pill--waiting_agents,
+  .mobile-overview-pill--checking_agents {
+    background: color-mix(in srgb, var(--session-purple) 14%, transparent);
+    border-color: color-mix(in srgb, var(--session-purple) 42%, transparent);
+    color: var(--session-purple);
   }
 
   /* An exited agent (Ark0N/Codeman#446): neutral, since nothing is running behind
@@ -3263,6 +3445,11 @@ html.mobile-init .file-browser-panel {
     content: '...';
     animation: none;
   }
+}
+
+html[data-session-list="sidebar"] .session-sidebar .session-tab[data-activity-status="waiting_agents"],
+html[data-session-list="sidebar"] .session-sidebar .session-tab[data-activity-status="checking_agents"] {
+  border-color: color-mix(in srgb, var(--session-purple) 35%, var(--border));
 }
 
 /* Light-skin compatibility for mobile-only chrome. These components predate
@@ -3400,6 +3587,7 @@ html:is([data-skin="paper-gray"], [data-skin="solarized-light"], [data-skin="cat
     padding: 0.15rem 0.25rem;
     align-items: center;
     justify-content: center;
+    pointer-events: auto;
   }
 
   /* Simplify button hover states */
@@ -4114,7 +4302,55 @@ html[data-session-list="sidebar"] .session-sidebar .session-tab .tab-close {
   html[data-session-list="sidebar"] .session-sidebar {
     transition: none;
   }
+  .mobile-overview-dot--waiting_agents,
+  .mobile-overview-dot--checking_agents {
+    animation: none;
+  }
 }
+
+/* Mobile session switcher. Keep these rules outside the phone media query:
+   the sheet and scrim are appended directly to body. */
+.mobile-tab-scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:opacity .22s;z-index:1205}
+.mobile-tab-scrim.open{opacity:1;pointer-events:auto}
+.mobile-tab-sheet{position:fixed;left:0;right:0;bottom:0;z-index:1206;background:#1b222c;border-radius:16px 16px 0 0;border-top:1px solid #2b333f;max-height:72vh;display:flex;flex-direction:column;transform:translateY(100%);transition:transform .28s cubic-bezier(.32,.72,0,1);box-shadow:0 -16px 48px rgba(0,0,0,.5)}
+.mobile-tab-sheet.open{transform:translateY(0)}
+.mobile-tab-sheet .sheet-handle{position:relative;width:36px;height:4px;background:#3a4350;border-radius:2px;margin:8px auto 6px}
+.mobile-tab-sheet .sheet-handle::before{content:'';position:absolute;inset:-8px -12px -6px}
+.mobile-tab-sheet .sheet-search{margin:0 12px 8px;display:flex;gap:8px;align-items:center}
+.mobile-tab-sheet .sheet-search input{flex:1;background:#0a0a0a;border:1px solid #2b333f;border-radius:8px;padding:9px 10px;color:#f3f6fa;font-size:.85rem}
+.mobile-tab-sheet .sheet-search input:focus{outline:2px solid #38b6f0;border-color:#38b6f0}
+.mobile-tab-sheet .sheet-search .sheet-count{font-size:.7rem;color:#98a2b1;flex-shrink:0}
+.mobile-tab-sheet .sheet-filters{display:flex;gap:6px;padding:0 12px 8px;overflow-x:auto;scrollbar-width:none}
+.mobile-tab-sheet .sheet-filters::-webkit-scrollbar{display:none}
+.sheet-chip{flex-shrink:0;padding:5px 10px;border-radius:20px;font-size:.7rem;background:#0a0a0a;border:1px solid #2b333f;color:#98a2b1;cursor:pointer}
+.sheet-chip.active{background:#38b6f0;color:#04223a;border-color:#38b6f0;font-weight:600}
+.mobile-tab-sheet .sheet-list{flex:1;min-height:0;overflow-y:auto;padding:0 8px 8px;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
+.sheet-group{padding:2px 0 6px}
+.sheet-group-header{display:flex;align-items:center;gap:8px;padding:10px 8px 4px;color:#f3f6fa}
+.sheet-group-toggle{width:28px;height:28px;display:grid;place-items:center;border-radius:6px;color:#98a2b1;background:transparent;border:none;cursor:pointer}
+.sheet-group-toggle .chev{display:inline-block;transition:transform .2s}
+.sheet-group-toggle[aria-expanded="false"] .chev{transform:rotate(-90deg)}
+.sheet-group-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.sheet-group-count{font-size:.68rem;color:#98a2b1}
+.sheet-row{display:flex;align-items:center;gap:8px;padding:10px 8px;border-radius:8px;cursor:pointer}
+.sheet-row:hover{background:#202833}
+.sheet-row.active{background:rgba(34,197,94,.12);border:1px solid rgba(0,255,102,.3)}
+.sheet-row .dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;background:#2b333f}
+.sheet-row .dot.busy{background:#44b993;box-shadow:0 0 8px rgba(68,185,147,.6)}
+.sheet-row .dot.idle{background:#f0c25a;box-shadow:0 0 6px rgba(240,194,90,.5);animation:sheet-blink 1.5s infinite}
+.sheet-row .dot.action{background:#e06363;box-shadow:0 0 6px rgba(224,99,99,.6);animation:sheet-blink .9s infinite}
+@keyframes sheet-blink{0%,100%{opacity:1}50%{opacity:.5}}
+.sheet-row .row-info{flex:1;min-width:0}
+.sheet-row .row-name{font-size:.82rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sheet-row .row-meta{font-size:.65rem;color:#98a2b1}
+.sheet-row .badge{font-size:.6rem;padding:1px 5px;border-radius:4px;background:#0a0a0a;border:1px solid #2b333f;color:#98a2b1}
+.sheet-row .badge.opencode{color:#44b993;border-color:rgba(68,185,147,.3)}
+.sheet-row .badge.claude{color:#38b6f0;border-color:rgba(56,182,240,.3)}
+.sheet-row .row-needs{font-size:.65rem;color:#e06363}
+.sheet-row .row-working{font-size:.65rem;color:#44b993}
+.sheet-row .row-close{width:28px;height:28px;display:grid;place-items:center;border-radius:6px;color:#98a2b1;flex-shrink:0;border:none;background:transparent;cursor:pointer}
+.sheet-row .row-close:active{background:rgba(255,255,255,.08)}
+.mobile-tab-sheet .sheet-footer{padding:8px 12px;border-top:1px solid #2b333f;display:flex;justify-content:space-between;font-size:.7rem;color:#98a2b1}
 
 /* Folding devices, tabletop pose: cap the response viewer to the bottom
    segment. Twin of the rule at the end of styles.css, needed here because the

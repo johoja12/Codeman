@@ -2,7 +2,7 @@ import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import { CreateSessionSchema, QuickStartSchema } from '../src/web/schemas.js';
 import { buildSpawnCommand } from '../src/tmux-manager.js';
 import { defaultDockerCommandForMode } from '../src/docker-hosts.js';
-import { defaultRemoteCommandForMode } from '../src/remote-hosts.js';
+import { defaultRemoteCommandForMode, remoteLoginShellCommand } from '../src/remote-hosts.js';
 import { isExternalCliMode, isAltScreenStripMode } from '../src/session.js';
 import { _clampEnvOverridesForOwner } from '../src/web/routes/session-routes.js';
 
@@ -130,7 +130,7 @@ describe('OMP mode gates', () => {
     expect(defaultDockerCommandForMode('omp')).toBe('exec omp');
     // Routed through an interactive login shell so per-user PATH entries resolve —
     // same fix as the other remote agent CLIs (see defaultRemoteCommandForMode).
-    expect(defaultRemoteCommandForMode('omp')).toBe('exec "${SHELL:-/bin/sh}" -i -l -c \'omp\'');
+    expect(defaultRemoteCommandForMode('omp')).toBe(remoteLoginShellCommand('omp'));
   });
 });
 

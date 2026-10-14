@@ -25,6 +25,7 @@ import type { RalphLoopState } from './ralph.js';
 import type { RespawnConfig } from './respawn.js';
 import type { CronJob, CronJobRun } from './cron.js';
 import type { TabLayout } from '../tab-layout.js';
+import type { SessionRecoveryRecord } from './session-recovery.js';
 
 // ========== Global Stats Types ==========
 
@@ -75,6 +76,18 @@ export interface TokenStats {
   lastUpdated: number;
 }
 
+/** A reusable owner-private Codex command. */
+export interface CodexCommandProfile {
+  id: string;
+  name: string;
+  command: string;
+  /** Optional explicit command used to resume this custom Codex launcher. */
+  resumeCommandTemplate?: string;
+}
+
+/** Owner-scoped Codex command choice for a local/linked-local case. */
+export type CaseCodexCommandSelection = { kind: 'profile'; profileId: string } | { kind: 'custom'; command: string };
+
 /**
  * Application configuration
  */
@@ -113,14 +126,22 @@ export interface AppState {
   tokenStats?: TokenStats;
   /** Orchestrator Loop state (phased plan execution) */
   orchestrator?: import('./orchestrator.js').OrchestratorPersistState;
-  /** Cron-style scheduled jobs, keyed by job ID. */
-  cronJobs?: Record<string, CronJob>;
-  /** Scheduled job run history, keyed by run ID. */
-  cronJobRuns?: Record<string, CronJobRun>;
   /** Global tab order shared across devices (ordered list of sessionIds) — COD-131 */
   sessionOrder?: string[];
   /** Owner-scoped authoritative grouped tab layouts. */
   tabLayouts?: Record<string, TabLayout>;
+  /** Owner-and-case scoped default session group. null means intentional Ungrouped. */
+  caseDefaultGroups?: Record<string, Record<string, string | null>>;
+  /** Owner-private reusable Codex command profiles. */
+  codexCommandProfiles?: Record<string, CodexCommandProfile[]>;
+  /** Owner-and-case scoped Codex command selection for local/linked-local cases. Absence means default. */
+  caseCodexCommandSelections?: Record<string, Record<string, CaseCodexCommandSelection>>;
+  /** Cron-style scheduled jobs, keyed by job ID. */
+  cronJobs?: Record<string, CronJob>;
+  /** Scheduled job run history, keyed by run ID. */
+  cronJobRuns?: Record<string, CronJobRun>;
+  /** Durable recovery records retained independently from active sessions. */
+  sessionRecoveries?: SessionRecoveryRecord[];
 }
 
 // ========== Default Configuration ==========

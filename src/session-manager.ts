@@ -23,9 +23,13 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { readFile } from 'node:fs/promises';
 import { Session } from './session.js';
 import { getStore } from './state-store.js';
 import { SessionState } from './types.js';
+import { dataPath } from './config/instance.js';
+import { normalizeSettingsObject } from './config/settings.js';
+import { verifyClaudeSessionStartHookCapability } from './hooks-config.js';
 
 /**
  * Events emitted by SessionManager
@@ -73,12 +77,26 @@ export class SessionManager extends EventEmitter {
     this.loadFromStore();
   }
 
+  /** COD-257: CLI-created sessions use the same settings.json authority as web sessions. */
+  private async getCheckpointDefaultEnabled(): Promise<boolean> {
+    try {
+      const settings = normalizeSettingsObject(JSON.parse(await readFile(dataPath('settings.json'), 'utf-8')));
+      return settings.checkpointDefaultEnabled !== false;
+    } catch {
+      return true;
+    }
+  }
+
   private loadFromStore(): void {
     const storedSessions = this.store.getSessions();
     // Note: We don't restore actual processes, just the state
-    // Dead sessions are marked as stopped
+    // Dead sessions are marked as stopped. COD-124: 'parked' sessions are
+    // exempt — they intentionally have no live process (that's the point of
+    // parking) but must survive a reboot as 'parked' so their preserved
+    // resumeSessionId/workingDir can still be resumed later. Force-resetting
+    // them to 'stopped' here would silently discard that resumability.
     for (const [id, state] of Object.entries(storedSessions)) {
-      if (state.status !== 'stopped') {
+      if (state.status !== 'stopped' && state.status !== 'parked') {
         state.status = 'stopped';
         state.pid = null;
         this.store.setSession(id, state);
@@ -116,7 +134,11 @@ export class SessionManager extends EventEmitter {
         throw new Error(`Maximum concurrent sessions (${config.maxConcurrentSessions}) reached`);
       }
 
-      const session = new Session({ workingDir });
+      const session = new Session({
+        workingDir,
+        checkpointEnabled: await this.getCheckpointDefaultEnabled(),
+        claudeSessionStartHookReady: await verifyClaudeSessionStartHookCapability('claude', workingDir, false),
+      });
 
       // Set up event forwarding with stored handlers for cleanup
       const handlers: SessionHandlers = {
@@ -198,6 +220,28 @@ export class SessionManager extends EventEmitter {
   }
 
   /**
+   * Parks a session by ID (COD-124).
+   *
+   * Unlike {@link stopSession}, this does NOT remove the session from the
+   * manager's in-memory map — a parked session is still "known" to the
+   * manager, just without a live process backing it. The preserved
+   * `resumeSessionId`/`workingDir`/mux metadata (see `Session.park()`) is
+   * persisted so the session can be resumed later. No-op if the session
+   * doesn't exist in memory (nothing live to park).
+   *
+   * @param id - Session ID to park
+   */
+  async parkSession(id: string): Promise<void> {
+    const session = this.sessions.get(id);
+    if (!session) {
+      return;
+    }
+
+    await session.park();
+    this.updateSessionState(session);
+  }
+
+  /**
    * Stops all active sessions.
    * Uses Promise.allSettled to ensure all sessions are stopped even if some fail.
    */
@@ -228,7 +272,7 @@ export class SessionManager extends EventEmitter {
 
   /** Gets all sessions currently idle (not processing). */
   getIdleSessions(): Session[] {
-    return this.getAllSessions().filter((s) => s.isIdle());
+    return this.getAllSessions().filter((s) => s.isAutonomouslyIdle());
   }
 
   /** Gets all sessions currently busy (processing). */
@@ -247,27 +291,40 @@ export class SessionManager extends EventEmitter {
   }
 
   private updateSessionState(session: Session): void {
-    // envOverrides is intentionally NOT on SessionState (API safety). For disk
-    // persistence we augment the stored object with __envOverrides so reboot
-    // recovery can restore them without leaking through any API serializer.
-    // The key uses the reserved `__` prefix so it is visibly "internal" to any
-    // future reader of state.json.
+    // Private recovery fields are intentionally NOT on SessionState. The
+    // reserved `__` records go to disk but are stripped by getStoredSessions().
     const state = session.toState();
     const envOverrides = session.getEnvOverridesForPersist();
     // __customModel: same convention, the disk-only bookkeeping of a custom-model
     // selection (env KEYS, config dir, launch model; never the injected values).
     const customModel = session.getCustomModelForPersist();
+    const codexProviderIdentity = session.getCodexProviderIdentityForPersist();
     const toStore = {
       ...state,
       ...(envOverrides ? { __envOverrides: envOverrides } : {}),
       ...(customModel ? { __customModel: customModel } : {}),
+      ...(codexProviderIdentity ? { __codexProviderIdentity: codexProviderIdentity } : {}),
     };
     this.store.setSession(session.id, toStore as SessionState);
   }
 
   /** Gets all sessions from persistent storage (including stopped). */
   getStoredSessions(): Record<string, SessionState> {
-    return this.store.getSessions();
+    return Object.fromEntries(
+      Object.entries(this.store.getSessions()).map(([id, stored]) => {
+        const {
+          __envOverrides: _envOverrides,
+          __codexProviderIdentity: _codexProviderIdentity,
+          __attachmentHistory: _attachmentHistory,
+          ...publicState
+        } = stored as SessionState & {
+          __envOverrides?: unknown;
+          __codexProviderIdentity?: unknown;
+          __attachmentHistory?: unknown;
+        };
+        return [id, publicState];
+      })
+    );
   }
 
   /**

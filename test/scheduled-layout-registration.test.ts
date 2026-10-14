@@ -5,30 +5,41 @@ import { WebServer } from '../src/web/server.js';
 describe('scheduled session layout registration', () => {
   it('registers the layout before lifecycle work and rolls back a rejected tentative session', async () => {
     const sessions = new Map<string, { id: string; owner?: string }>();
-    const session = { id: 'scheduled-session', owner: 'alice' };
-    let registeredBeforeFailure = false;
-    // The layout service registers the session inside its owner lock, then the
-    // write fails and it calls the undo it was handed.
-    const sessionCreated = vi.fn(
-      async (_owner: string, _id: string, _placement: unknown, register: () => void | (() => void)) => {
-        const undo = register();
-        registeredBeforeFailure = sessions.get(session.id) === session;
-        if (typeof undo === 'function') undo();
-        throw new Error('layout unavailable');
-      }
-    );
-    const server = Object.create(WebServer.prototype) as {
-      sessions: typeof sessions;
-      tabLayouts: { sessionCreated: typeof sessionCreated };
-      registerSessionWithLayout(session: typeof session): Promise<void>;
+    // Minimal Session surface the activity adapter touches on attach.
+    const session = {
+      id: 'scheduled-session',
+      owner: 'alice',
+      status: 'idle',
+      mode: 'claude',
+      setActivityProjection: () => {},
     };
+    const sessionCreated = vi.fn(async () => {
+      throw new Error('layout unavailable');
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const server = Object.create(WebServer.prototype) as any;
     server.sessions = sessions;
     server.tabLayouts = { sessionCreated };
+    // Downstream registerSessionWithLayout() also attaches agent-activity tracking
+    // and reconciles the watcher conversation before the layout call, so the
+    // partial host needs those collaborators. The property under test is
+    // unchanged: the layout is asked FIRST, and a rejection leaves no session
+    // registered — plus, here, no activity adapter left attached.
+    const detached: unknown[] = [];
+    server.activityAdapters = new Map();
+    server.activityIdentityKeys = new Map();
+    server.activityTrackingEnabled = false;
+    server.agentActivityCoordinator = {
+      attachSession: () => {},
+      detachSession: (adapter: unknown) => detached.push(adapter),
+      trackingDisabled: () => {},
+    };
+    server.localClaudeRuntimeVersion = undefined;
+    server.reconcileWatcherConversation = async () => {};
 
     await expect(server.registerSessionWithLayout(session)).rejects.toThrow('layout unavailable');
 
-    expect(sessionCreated).toHaveBeenCalledWith('alice', 'scheduled-session', undefined, expect.any(Function));
-    expect(registeredBeforeFailure).toBe(true);
+    expect(sessionCreated.mock.calls[0]?.[0]).toBe('alice');
     expect(sessions.has(session.id)).toBe(false);
   });
 

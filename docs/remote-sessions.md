@@ -84,6 +84,22 @@ Rules that keep this safe — **do not bypass them by hand-building an ssh line 
 Token construction is unit-tested independently of any live connection (see
 `test/` for `buildSshConnectionArgs` / `buildRemoteTmuxCheckCommand` cases).
 
+### Visible-frame capture connection reuse (COD-441)
+
+The `?frame=1` terminal route uses `RemoteFrameSshPool` to reuse an SSH connection
+across visible-frame captures. It adds `ControlMaster=auto`, a 60-second
+`ControlPersist`, and a `ControlPath` in a process-private mode-0700 temporary
+directory. The socket key includes the authenticated Codeman owner, remote SSH
+target, and effective connection arguments. Saved `ControlMaster`, `ControlPath`,
+or `ControlPersist` options take precedence: those captures use the saved SSH
+behavior without an app-owned socket.
+
+The pool checks an existing master before reuse, removes an unresponsive socket,
+and lets OpenSSH establish a fresh connection. Capture failures retain the
+existing local-wrapper fallback. Web-server shutdown asks each app-owned master
+to exit and removes its private socket directory. Full-history capture, remote
+launch, remote reconnect probes, and SFTP still use their existing SSH paths.
+
 ## Durable launch (COD-104)
 
 `buildRemoteLaunchCommand({ mode, remote, sessionId })` in `tmux-manager.ts`
@@ -617,6 +633,14 @@ Frontend touchpoints: the remote-host management UI is in `session-ui.js` /
 session-create flow, or via the per-host **"Discover existing sessions"** button →
 **Attach** action (creates an `owned: false` session).
 
+### File Viewer (COD-252)
+
+The File Viewer lists remote workspaces and downloads remote files through the
+system OpenSSH `sftp` client. It reuses the saved host's identity, port, jump
+host, SOCKS proxy, and extra SSH options; no separate SFTP configuration is
+required. Directories load as they are expanded. Bounded text previews use the
+same SSH connection contract so a growing remote file cannot exhaust local disk.
+
 ## Security notes
 
 - **`identityFile` is a path only — never key bytes.** Codeman stores the path and
@@ -636,3 +660,23 @@ session-create flow, or via the per-host **"Discover existing sessions"** button
   Key Pattern.
 - `docs/security-architecture.md` — overall network/auth model.
 - COD-104 (tmux prereq + durable launch), COD-105 (discover + attach, detach-not-kill ownership), COD-107 (shell-safe connection args).
+
+### Worker reboot recovery (COD-486)
+
+With both **Remote Auto-Reconnect** and **Auto-recover sessions after reboot** enabled,
+Codeman also watches for a worker reboot while the Codeman server stays running. It
+records the worker boot identity while the remote agent is running and persists that
+baseline in the managed mux record. When an SSH wrapper exits with status 255 and the
+worker returns with a different boot identity, Codeman can resume an owned conversation
+in the same tab even though the worker's tmux session disappeared.
+
+Transport reconnects use attach-only commands. Reboot recovery uses exact resume commands:
+Claude's pinned conversation UUID, or a saved native conversation ID for Codex/OpenCode.
+It never falls back to a new conversation. Failed or unsupported resumes leave a record
+in the Recovery Queue for explicit handling. Existing retry limits still apply.
+
+An intentional close, a session observed missing before the reboot, a retained exited
+agent, a discovered attachment, an opaque custom launcher, an unknown boot identity, or
+a missing native conversation ID does not trigger automatic resume. Sessions already lost
+before this feature learned their original worker boot identity cannot be recovered
+automatically from that past reboot. No worker is woken or rebooted by this recovery path.

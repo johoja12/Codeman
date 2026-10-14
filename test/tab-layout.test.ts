@@ -5,15 +5,19 @@ import {
   MAX_TAB_REFS,
   createGroup,
   deleteGroup,
+  describeTabPlacements,
   flattenOwnerSessionOrder,
   flattenVisibleRefs,
   followParent,
   materializeOrphans,
+  moveFocusRef,
   moveRef,
   normalizeTabLayout,
+  orderedFocusRefs,
   renameGroup,
   reorderGroup,
   setManualPlacement,
+  setTabFocus,
   validateTabLayout,
   type TabLayout,
   type TabRefMetadata,
@@ -141,6 +145,18 @@ describe('tab layout validation and normalization', () => {
     moveRef(input, ref('parent'), { groupId: 'g', index: 0 }, [session('parent', 0), session('child', 1, 'parent')]);
     expect(input).toEqual(snapshot);
   });
+
+  it('accepts only literal true for Focus and preserves it through normalization', () => {
+    const input = layout(
+      [{ id: 'g', name: 'G', refs: [{ ...ref('focused'), focus: true }] }],
+      [{ ...ref('unknown-web', 'webview'), focus: true }]
+    );
+
+    expect(validateTabLayout(input)).toEqual(input);
+    expect(normalizeTabLayout(input, [session('focused', 0)])).toEqual(input);
+    expect(() => validateTabLayout(layout([], [{ ...ref('bad'), focus: false } as never]))).toThrow(/focus/);
+    expect(() => validateTabLayout(layout([], [{ ...ref('bad'), focus: 'yes' } as never]))).toThrow(/focus/);
+  });
 });
 
 describe('tab group operations', () => {
@@ -168,6 +184,79 @@ describe('tab group operations', () => {
     expect(value.ungrouped).toEqual([ref('c'), ref('a')]);
     value = moveRef(value, ref('c'), { groupId: 'g', index: 1 }, metadata);
     expect(value.groups[0].refs).toEqual([ref('b'), ref('c')]);
+  });
+
+  it('sets and clears Focus idempotently while preserving it through structural edits', () => {
+    const metadata = [session('a', 0), session('b', 1, 'a')];
+    let value = layout([{ id: 'g', name: 'G', refs: [ref('a'), ref('b')] }]);
+    value = setTabFocus(value, ref('b'), true);
+    expect(value.groups[0].refs[1]).toEqual({ ...ref('b'), focus: true });
+    expect(setTabFocus(value, ref('b'), true)).toEqual(value);
+
+    value = moveRef(value, ref('b'), { groupId: null, index: 0 }, metadata);
+    expect(value.ungrouped[0]).toEqual({ ...ref('b'), placement: 'manual', focus: true });
+    value = followParent(value, ref('b'), metadata);
+    expect(value.groups[0].refs[1]).toEqual({ ...ref('b'), focus: true });
+    value = deleteGroup(value, 'g');
+    expect(value.ungrouped).toContainEqual({ ...ref('b'), focus: true });
+    expect(setTabFocus(value, ref('b'), false).ungrouped).toContainEqual(ref('b'));
+    expect(() => setTabFocus(value, ref('missing'), true)).toThrow(/unknown ref/);
+  });
+});
+
+describe('Focus order', () => {
+  const focused = (id: string) => ({ ...ref(id), focus: true }) as const;
+
+  it('falls back to stored order and omits focusOrder until an explicit move materializes one', () => {
+    const value = layout([{ id: 'g', name: 'G', refs: [focused('a'), ref('b'), focused('c')] }], [focused('d')]);
+    expect(orderedFocusRefs(value)).toEqual([ref('a'), ref('c'), ref('d')]);
+    expect(validateTabLayout(value).focusOrder).toBeUndefined();
+    expect(setTabFocus(value, ref('b'), true).focusOrder).toBeUndefined();
+  });
+
+  it('reorders Focus without touching group membership or stored positions', () => {
+    const metadata = [session('a', 0), session('b', 1), session('c', 2), session('d', 3)];
+    const value = layout([{ id: 'g', name: 'G', refs: [focused('a'), ref('b'), focused('c')] }], [focused('d')]);
+
+    const moved = moveFocusRef(value, ref('d'), 0);
+    expect(orderedFocusRefs(moved)).toEqual([ref('d'), ref('a'), ref('c')]);
+    expect(moved.focusOrder).toEqual([ref('d'), ref('a'), ref('c')]);
+    expect(moved.groups).toEqual(value.groups);
+    expect(moved.ungrouped).toEqual(value.ungrouped);
+    expect(flattenOwnerSessionOrder(moved)).toEqual(['a', 'b', 'c', 'd']);
+    expect(normalizeTabLayout(moved, metadata).focusOrder).toEqual([ref('d'), ref('a'), ref('c')]);
+
+    expect(orderedFocusRefs(moveFocusRef(moved, ref('d'), 2))).toEqual([ref('a'), ref('c'), ref('d')]);
+    expect(() => moveFocusRef(value, ref('b'), 0)).toThrow(/not in Focus/);
+    expect(() => moveFocusRef(value, ref('missing'), 0)).toThrow(/unknown ref/);
+    expect(() => moveFocusRef(value, ref('a'), 3)).toThrow(/index/);
+    expect(() => moveFocusRef(value, ref('a'), -1)).toThrow(/index/);
+  });
+
+  it('appends a re-added ref at the end and prunes entries that leave Focus', () => {
+    const metadata = [session('a', 0), session('b', 1), session('c', 2)];
+    const value = moveFocusRef(
+      layout([{ id: 'g', name: 'G', refs: [focused('a'), focused('b'), focused('c')] }]),
+      ref('c'),
+      0
+    );
+    expect(orderedFocusRefs(value)).toEqual([ref('c'), ref('a'), ref('b')]);
+
+    const dropped = setTabFocus(value, ref('c'), false);
+    expect(dropped.focusOrder).toEqual([ref('a'), ref('b')]);
+    expect(orderedFocusRefs(setTabFocus(dropped, ref('c'), true))).toEqual([ref('a'), ref('b'), ref('c')]);
+    expect(
+      normalizeTabLayout({ ...value, focusOrder: [ref('c'), ref('gone'), ref('a')] }, metadata).focusOrder
+    ).toEqual([ref('c'), ref('a')]);
+  });
+
+  it('validates focusOrder shape and rejects duplicates', () => {
+    expect(() => validateTabLayout({ ...layout(), focusOrder: 'nope' })).toThrow(/focusOrder/);
+    expect(() => validateTabLayout({ ...layout(), focusOrder: [{ kind: 'nope', id: 'a' }] })).toThrow(/focusOrder/);
+    expect(() => validateTabLayout({ ...layout(), focusOrder: [ref('a'), ref('a')] })).toThrow(/duplicate/);
+    expect(validateTabLayout({ ...layout(), focusOrder: [{ ...ref('a'), focus: true }] }).focusOrder).toEqual([
+      ref('a'),
+    ]);
   });
 });
 
@@ -248,6 +337,49 @@ describe('session lineage', () => {
     expect(() => setManualPlacement(setManualPlacement(input, ref('a'), true), ref('a'), false)).toThrow(
       /followParent/
     );
+  });
+
+  it('authoritatively describes inherited, manual, dangling, cross-owner, and cycle placement', () => {
+    const base = layout(
+      [],
+      [
+        ref('parent'),
+        ref('inherited'),
+        { ...ref('manual'), placement: 'manual' },
+        { ...ref('dangling'), placement: 'manual' },
+        ref('a'),
+        { ...ref('b'), placement: 'manual' },
+      ]
+    );
+    const metadata = [
+      session('parent', 0),
+      session('inherited', 1, 'parent'),
+      session('manual', 2, 'parent'),
+      session('dangling', 3, 'foreign'),
+      { ...session('foreign', 4), ownerValid: false },
+      session('a', 5, 'b'),
+      session('b', 6, 'a'),
+    ];
+
+    expect(describeTabPlacements(base, metadata)).toEqual([
+      { kind: 'session', id: 'inherited', state: 'inherited', parentId: 'parent', canFollow: false },
+      { kind: 'session', id: 'manual', state: 'manual', parentId: 'parent', canFollow: true },
+      { kind: 'session', id: 'dangling', state: 'dangling', parentId: 'foreign', canFollow: false },
+      { kind: 'session', id: 'a', state: 'cycle', parentId: 'b', canFollow: false },
+      { kind: 'session', id: 'b', state: 'cycle', parentId: 'a', canFollow: false },
+    ]);
+  });
+
+  it('uses validated metadata visibility and deterministic first identity when describing placement', () => {
+    const input = layout([], [ref('parent'), { ...ref('child'), placement: 'manual' }]);
+    expect(
+      describeTabPlacements(input, [
+        { ...session('parent', 0), visible: false },
+        session('parent', 99),
+        session('child', 1, 'parent'),
+        session('child', 50, 'wrong-parent'),
+      ])
+    ).toEqual([{ kind: 'session', id: 'child', state: 'manual', parentId: 'parent', canFollow: true }]);
   });
 
   it('rejects stale follow-parent replay and keeps the child manual across later parent ID reuse', () => {

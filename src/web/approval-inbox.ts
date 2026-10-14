@@ -14,8 +14,9 @@
  * - Module-level singleton in the style of `session-wait-registry.ts`: no
  *   `Session` import, no IO; the server injects emit callbacks (`onPending`/
  *   `onUpdated`/`onResolved`), which keeps this unit-testable and cycle-free.
- * - Items are in-memory only. A server restart drops them; the next prompt
- *   re-fires the hook. Claude-mode sessions only (hooks fire for nothing else).
+ * - Items are in-memory only. A server restart drops them; the next prompt or
+ *   detected Codex turn-end creates another item. Claude prompts are hook-fed;
+ *   Codex idle prompts are session-transition-fed.
  * - Answer flow is take-then-write: `take()` removes the item BEFORE keystrokes
  *   are sent so a double-tap cannot double-send; `restore()` re-inserts on a
  *   failed write unless a newer prompt arrived meanwhile.
@@ -30,6 +31,7 @@
  */
 
 import { stripAnsi, CLAUDE_WORKING_LINE_PATTERN } from '../utils/index.js';
+import type { SessionMode } from '../types.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -55,7 +57,11 @@ export interface ApprovalItem {
   sessionId: string;
   sessionName: string;
   kind: ApprovalKind;
+  /** CLI mode that produced the prompt; lets clients localize generated labels. */
+  mode?: SessionMode;
   createdAt: number;
+  /** Coordinator receipt order used to prevent older prompts surviving a newer completion. */
+  sourceSequence?: number;
   /** Sanitized hook fields (already bounded by sanitizeHookData). */
   toolName?: string;
   toolSummary?: string;
@@ -99,12 +105,16 @@ export interface ApprovalResolvedInfo {
   sessionId: string;
   kind: ApprovalKind;
   resolution: ApprovalResolution;
+  /** Sequence of the exact removed item; absent for legacy/generation-neutral items. */
+  sourceSequence?: number;
 }
 
 interface NotePromptArgs {
   sessionId: string;
+  sourceSequence?: number;
   sessionName: string;
   kind: ApprovalKind;
+  mode?: SessionMode;
   toolName?: string;
   toolSummary?: string;
   message?: string;
@@ -268,7 +278,9 @@ export class ApprovalInbox {
       sessionId: args.sessionId,
       sessionName: args.sessionName,
       kind: args.kind,
+      mode: args.mode,
       createdAt: Date.now(),
+      sourceSequence: args.sourceSequence,
       toolName: args.toolName,
       toolSummary: args.toolSummary,
       message: args.message,
@@ -453,11 +465,30 @@ export class ApprovalInbox {
    * transition passes `['idle']` so a mid-turn flap cannot false-clear a
    * pending permission/question dialog.
    */
-  resolveForSession(sessionId: string, resolution: ApprovalResolution, kinds?: ApprovalKind[]): void {
+  resolveForSession(
+    sessionId: string,
+    resolution: ApprovalResolution,
+    kinds?: ApprovalKind[],
+    throughSourceSequence?: number
+  ): void {
     const item = this.items.get(sessionId);
     if (!item) return;
     if (kinds && !kinds.includes(item.kind)) return;
+    if (
+      throughSourceSequence !== undefined &&
+      item.sourceSequence !== undefined &&
+      item.sourceSequence > throughSourceSequence
+    ) {
+      return;
+    }
     this.remove(item, resolution);
+  }
+
+  /** Drop an ordering token that belongs to a replaced coordinator generation. */
+  resetSourceSequenceForSession(sessionId: string, kinds: ApprovalKind[]): void {
+    const item = this.items.get(sessionId);
+    if (!item || !kinds.includes(item.kind)) return;
+    delete item.sourceSequence;
   }
 
   /** Clear all timers (shutdown/tests). Items become inert; no events fire after this. */
@@ -521,7 +552,13 @@ export class ApprovalInbox {
     for (const timer of this.itemTimers.get(item.id) ?? []) clearTimeout(timer);
     this.itemTimers.delete(item.id);
     if (!this.stopped) {
-      this.onResolved?.({ id: item.id, sessionId: item.sessionId, kind: item.kind, resolution });
+      this.onResolved?.({
+        id: item.id,
+        sessionId: item.sessionId,
+        kind: item.kind,
+        resolution,
+        ...(item.sourceSequence !== undefined ? { sourceSequence: item.sourceSequence } : {}),
+      });
     }
   }
 

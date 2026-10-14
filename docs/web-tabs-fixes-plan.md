@@ -122,12 +122,12 @@ Two details that mattered:
   (`CODEMAN_INSTANCE=wvtest`, port 3151), with prod's old build as the negative
   control:
 
-  | | before (prod, old build) | after (fixed) |
-  | --- | --- | --- |
-  | images found | 693 | 693 |
-  | src under the proxy prefix | 0 | 693 |
-  | in-viewport images decoded | 0 / 23 | 23 / 23 |
-  | sample src | `/api/hero?slug=...` | `/webview/<cap>/api/hero?slug=...` |
+  |                            | before (prod, old build) | after (fixed)                      |
+  | -------------------------- | ------------------------ | ---------------------------------- |
+  | images found               | 693                      | 693                                |
+  | src under the proxy prefix | 0                        | 693                                |
+  | in-viewport images decoded | 0 / 23                   | 23 / 23                            |
+  | sample src                 | `/api/hero?slug=...`     | `/webview/<cap>/api/hero?slug=...` |
 
   (The dashboard marks thumbs `loading="lazy"`, so only in-viewport images are
   ever fetched. All 27 proxied image responses returned 200.)
@@ -178,10 +178,10 @@ stylesheet case is unreachable by any relay: a `<style>` element has no URL of i
 own, so Chromium sends an **empty `Referer`** with the image request it triggers
 and there is nothing to key on. Measured directly:
 
-| sink | Referer the browser sends | fixed by |
-| --- | --- | --- |
-| `url()` in a proxied `.css` | the stylesheet's proxied URL | the referer relay |
-| `url()` in a runtime `<style>` | *empty* | `rwCss()` in the shim |
+| sink                           | Referer the browser sends    | fixed by              |
+| ------------------------------ | ---------------------------- | --------------------- |
+| `url()` in a proxied `.css`    | the stylesheet's proxied URL | the referer relay     |
+| `url()` in a runtime `<style>` | _empty_                      | `rwCss()` in the shim |
 
 So the shim also rewrites `url()` inside `<style>` blocks, both when they arrive as
 markup and when a `<style>` node is inserted (via the existing MutationObserver).

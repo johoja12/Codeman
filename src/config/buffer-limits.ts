@@ -9,6 +9,7 @@
  * - Terminal buffer: 32MB max × 20 = 640MB worst case
  * - Text output: 1MB max × 20 = 20MB worst case
  * - Messages: ~1KB each × 1000 × 20 = 20MB worst case
+ * - Total buffer overhead: ~680MB worst case when every session fills replay
  *
  * @module config/buffer-limits
  */
@@ -22,7 +23,7 @@ import { DEFAULT_TERMINAL_BUFFER_MAX_BYTES, DEFAULT_TERMINAL_BUFFER_TRIM_BYTES }
 /**
  * Maximum terminal buffer size in characters.
  * Contains raw terminal output with ANSI escape sequences.
- * Sourced from terminal-history config (env/settings overridable).
+ * Default is 32MB; per-session settings can override this for new sessions.
  * Override: CODEMAN_MAX_TERMINAL_BUFFER (bytes)
  */
 export const MAX_TERMINAL_BUFFER_SIZE = DEFAULT_TERMINAL_BUFFER_MAX_BYTES;
@@ -122,6 +123,37 @@ export const MAX_PASTE_IMAGE_BYTES = parseInt(process.env.CODEMAN_MAX_PASTE_IMAG
  * refuse most clips. Override: CODEMAN_MAX_PASTE_VIDEO_BYTES (bytes)
  */
 export const MAX_PASTE_VIDEO_BYTES = parseInt(process.env.CODEMAN_MAX_PASTE_VIDEO_BYTES || '') || 1024 * 1024 * 1024; // 1GB
+
+// ============================================================================
+// Document Version History Limits (COD-457)
+// ============================================================================
+
+/**
+ * Maximum bytes of revision history kept for ONE previewed document (one
+ * session + file) by `document-version-store.ts`. Oldest versions are evicted
+ * until the history fits; a single version larger than this is not recorded
+ * at all (and the file is not even read for capture).
+ *
+ * 16MB: a full 50-version ring of a typical 20-300KB markdown/docx draft fits
+ * with room to spare, and so does one snapshot of the largest text file the
+ * preview will show (10MB, `MAX_TEXT_FILE_SIZE` in file-routes.ts), while one
+ * pathological document can no longer pin 50 x its size in RSS.
+ * Bytes are counted as UTF-8 content + raw Buffer (docx keeps both).
+ * Override: CODEMAN_DOC_VERSION_MAX_FILE_BYTES (bytes)
+ */
+export const DOCUMENT_VERSION_MAX_FILE_BYTES =
+  parseInt(process.env.CODEMAN_DOC_VERSION_MAX_FILE_BYTES || '') || 16 * 1024 * 1024; // 16MB
+
+/**
+ * Maximum bytes of document revision history across ALL sessions and files.
+ * Past it, the least-recently-touched (session, file) histories are dropped
+ * whole. 64MB = four full per-file histories: the same order as the 1MB text
+ * buffer x 20-session budget above plus headroom, and a small fraction of the
+ * 640MB terminal-buffer worst case, so the feature can never dominate RSS.
+ * Override: CODEMAN_DOC_VERSION_MAX_TOTAL_BYTES (bytes)
+ */
+export const DOCUMENT_VERSION_MAX_TOTAL_BYTES =
+  parseInt(process.env.CODEMAN_DOC_VERSION_MAX_TOTAL_BYTES || '') || 64 * 1024 * 1024; // 64MB
 
 // ============================================================================
 // File Download Limits

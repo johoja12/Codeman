@@ -169,6 +169,15 @@
   **An unreachable mount no longer freezes the server (#516).** A linked case can live on a network mount, and when that mount goes away a hard mount makes `stat()` wait indefinitely; the synchronous probes in the case routes, the workspace hook and statusLine helpers and session creation used to freeze the whole server with it. Those probes now go through one bounded, tri-state probe (present, absent, or unknown when nothing answers in time): a stalled path costs one threadpool worker, paths on the same mount answer "unknown" without a new stat, and unrelated paths keep working. "Unknown" is never treated as "absent": `GET /api/cases/:name` reports an unreachable linked case with `unreachable: true` instead of NOT_FOUND, Run creates a case only on a real NOT_FOUND, and session creation answers OPERATION_FAILED for a folder that did not answer and never scaffolds over it. Tunable with `CODEMAN_PATH_PROBE_TIMEOUT_MS` (default 1500) and `CODEMAN_PATH_PROBE_MAX_STALLED`.
 
   **Fixes applied while landing.** Tab groups: an edit made while an earlier save was still in flight, and made inapplicable by that save's conflict (its group deleted on another device), is no longer dropped silently but reported like every other dropped edit, and the menus stop offering a new group once the 32-group limit is reached instead of failing with an untranslated error. Rail: a static CI check now pins that no rail or sidebar clamp out-ranks the rename unclamp (the browser test that caught it is outside the gate). Git status: a cached repository list is re-checked against the current Docker workspaces on every poll, a diff larger than 8 MB is cut short instead of failing, a diff click refreshes only that repository, a dotfiles repository above the workspace is identified with one `rev-parse` before any full status (a failing status there no longer hides the repositories below), and "Upstream is gone" now reads "Upstream not on remote", which is also true for a branch that was never pushed. Doctor: candidates are judged like the Run menu's own resolver (a wrong binary on the PATH no longer hides the right one in an install directory, a non-executable file or a relative directory reads as missing), probes are killed with SIGKILL on timeout, a missing optional tool shows ○ instead of ✗, and the contract test no longer runs the machine's installed CLIs. Custom-folder cases: the symlink-resolved target is judged against resolved roots too (home reached through a link, macOS `/private/etc`), a target inside the cases directory is refused, the success toast names the folder the server created, the new labels have zh-CN translations, and the route test can no longer delete a real `~/projects` or the live linked-cases registry when run outside `npm test`.
+- b695d6f: Add opt-in named Codex assistants with exact conversation binding, scoped revocable access, durable idempotent requests, native turn attribution and desktop/mobile handoff, takeover and reconciliation controls. Include a separately installed OpenClaw private Telegram connector with a persistent outbox and conservative delivery recovery.
+
+## 1.34.1
+
+### Patch Changes
+
+- COD-486: Resume owned remote conversations in the same tab when a worker reboots while Codeman stays running. Persist worker boot identity and closed-session suppression; require a verified boot change and SSH disconnect; use exact conversation resume with no fresh fallback; confirm remote agent liveness and preserve failed or unsupported resumes in the Recovery Queue. Transport reconnects now attach only, preventing a stale liveness probe from creating a new agent. Serialize mux metadata writes and restore Recovery Queue route registration.
+
+  Integrate origin/local's 1.34.0 release, including per-session Claude model and advisor settings, Codex reasoning effort, grouped tab rail, MCP sync, webhook notifications, newline controls, iOS IME preview, and split-pane improvements. Retain downstream terminal scrolling and remote Codex mouse fixes (COD-464, COD-469, COD-470, COD-471), mobile keyboard recovery (COD-467), conversation recovery names, filters and previews (COD-468), CLI-aware activity labels (COD-473), file-preview Escape handling (COD-474), and pending SSE reconnect retries (COD-483). Preserve newest adopted conversation identities and document existing recovery identity-format exceptions in the CLI registry guard.
 
 ## 1.34.0
 
@@ -1057,6 +1066,8 @@
   - @opticon454 for #350, with a reproduction that made this a confirmation rather than a hunt
   - @timkjr for reporting #352, and for finding it while verifying Docker support for someone else's PR
 
+- Fix terminal file links truncating spaced relative paths to a tail segment. Bullet/marker and labeled (Path:, File:, Saved to:) relative paths with spaces now link the complete path through existing workspace/cwd/external preview routing; unsafe (..) candidates stay unlinked.
+
 ## 1.24.0
 
 ### Minor Changes
@@ -1071,6 +1082,13 @@
 
   ### Thanks
   - @timkjr for #353, and for turning every review finding around within a day
+
+## 1.23.3
+
+### Patch Changes
+
+- 85afdcc: Let the actively used desktop or phone control a shared terminal's size, fit OpenCode into more usable mobile rows without restarting the session, and deliver browser terminal input only after an ownership-capable WebSocket activates. Input queues transiently across reconnects without an HTTP fallback and fails closed when the target session is gone; the HTTP input API remains available to external callers.
+- Recover explicit printable and Enter keyCode 229 terminal input when a browser fails to mutate xterm's helper textarea. Preserve genuine IME composition and suppress only canonically attributed delayed duplicates from the same key token.
 
 ## 1.23.2
 
@@ -1156,9 +1174,25 @@
 ### Patch Changes
 
 - Fix the file preview's dead pop-out control: a real detach button now opens the previewed file in a browser tab (raw route for PDFs/images/media/text, converted-PDF preview for docx/pptx) and the copy button reports when a preview has no text to copy instead of silently doing nothing. Review-driven hardening for the new tab features: PUT /api/session-order drops unknown ids again instead of rejecting the whole write (a session deleted inside the browser's debounce window could silently lose the user's reorder), a failed mux restore no longer blocks explicit session/webview deletion for the process lifetime (the automated stale sweep stays fail-closed), and the vertical rail gains the axis-awareness the sidebar-only predicates missed: correct drag-reorder insertion, active-tab scroll-into-view, floating windows anchored beside rail tabs, connector redraws on rail scroll, server-seeded orientation applied on first load, a pre-paint stamp so vertical mode no longer flashes through the header strip, and a 12px session-name default matching the sidebar's historical size so untouched installs are not restyled.
+- 9851aaf: Add an optional resizable vertical session rail with responsive layout, complete labels, accessible controls, and stable inline rename.
 
-  ### Thanks
-  - **@aakhter** built both halves of the new tab experience: the owner-scoped, server-authoritative tab-layout foundation with recipient-safe SSE publication and an unusually deep test suite (#335), and the resizable vertical session rail with accessible pointer/keyboard sizing and careful FitAddon handoff (#334). Fifth and sixth merged PRs, and the layout work also fixed real multi-user ordering leaks along the way.
+## 1.21.1
+
+### Patch Changes
+
+- 59c709a: Place expanded-sidebar actions beside session names and add persisted 11-18px session-name-only sizing.
+- afa00fd: Apply session-name sizing and compact inline actions to the full-width vertical side rail.
+- 5a5547b: Add owner-scoped default session groups to Case Settings.
+- d9c5d5d: Add reusable private Codex command profiles for remote cases.
+- 702e479: Restore the contextual session actions menu in expanded vertical navigation.
+- 1818ad9: Restore Codex needs-input approvals and tab alerts after completed turns while preserving Claude live-agent suppression.
+- Keep agent checkpoint handoffs active through terminal mouse and focus reports, while preserving immediate manual takeover for keyboard input across WebSocket and HTTP delivery.
+
+## Unreleased
+
+### Thanks
+
+- **@aakhter** built both halves of the new tab experience: the owner-scoped, server-authoritative tab-layout foundation with recipient-safe SSE publication and an unusually deep test suite (#335), and the resizable vertical session rail with accessible pointer/keyboard sizing and careful FitAddon handoff (#334). Fifth and sixth merged PRs, and the layout work also fixed real multi-user ordering leaks along the way.
 
 ## 1.21.0
 
@@ -1261,7 +1295,13 @@
 
 ## 1.19.6
 
-### Patch Changes
+### Minor Changes
+
+- **File Manager: uploads, mkdir, rename, delete (COD-317, COD-318)** — the File Viewer is now a full workspace manager for both local and remote (SFTP) sessions.
+
+  **Upload (COD-317):** `POST /api/sessions/:id/files/upload?path=<relativeDir>` writes any file to the workspace with CSRF (`Origin/Referer==Host` or `X-Codeman-CSRF`), per-`(IP,session)` token bucket (20/min), `sanitizeUploadFilename`, `validateSessionFilePath` confinement, `isSensitivePath`/`isBlockedAttachmentPath`/`.git` guards, symlink-safe `lstat` + `O_EXCL|O_NOFOLLOW` and non-recursive `mkdir` loop, `409` on exists, 50 MB cap via `@fastify/multipart`; remote writes via `writeRemoteFileBytes` (`umask 077`, atomic `mv -n`, 15 s timeout). Header `⬆ Upload` handles multi-file (10/batch, concurrency 3, progress toasts, order-preserving) and drag-drop onto a folder now targets that folder; both now respect the **current folder** (last expanded) and show `· in <dir>` in the status bar.
+
+  **Mkdir / Rename / Delete (COD-318):** `POST /api/sessions/:id/files/mkdir {path}`, `POST /api/sessions/:id/files/rename {from,to}`, `DELETE /api/sessions/:id/files?path=` share the same guards plus recursive `fs.rm` for local deletes and `mkdir -p`/`SFTP rename`/`rm -rf` for remote via new `remote-sftp.ts` helpers (`createRemoteWorkspaceDirectory`, `renameRemoteWorkspacePath`, `deleteRemoteWorkspacePath`). Header `＋ New folder` creates in the current folder (e.g. `src/utils` when that is expanded) and auto-expands it; per-row `✎ Rename` (prompt for new base, moves expanded/current state) and `🗑 Delete` (confirm, recursive for non-empty dirs) appear on hover. All operations refresh the tree and keep `fileBrowserCurrentDir`/`ExpandedDirs` consistent.
 
 - Wiki user manual, a phone tab tap-zone fix, per-parent lineage colours, and two robustness fixes.
   - **Wiki**: `docs/wiki/` is now a 30-page user manual (installation, quick start, the dashboard, agent CLIs, remote/Docker cases, hooks, security, HTTP API, troubleshooting and more), published to the GitHub wiki by a sync workflow on every push that touches it.
@@ -1290,6 +1330,52 @@
   - That drift was a silent hole, not a tidiness problem: a file excluded from CI and added to no runner is tested by NOTHING, and every command stays green, because vitest counts "no files matched" as success. `test/test-suite-partition.test.ts` now fails if any test file is reachable by no runner or by two.
   - ⚠️ A file filter must match its runner: `npm test -- test/mobile/keyboard.test.ts` matches nothing and exits green having run zero tests, because the gate excludes that path. Use `npm run test:mobile -- <file>`. Documented in CLAUDE.md, and the one place that recommended the old form was corrected.
   - Docs synced: CLAUDE.md, AGENTS.md, .github/CONTRIBUTING.md, both READMEs, and two ci.yml comments that claimed only `test/mobile/**` was excluded (it is three suites, and 5 Playwright files rather than 3).
+
+## 1.19.11
+
+### Patch Changes
+
+- Add predictive echo and typing-lag instrumentation for OpenCode, harden agent CLI discovery through login shells, allow code-file source uploads and derive source titles from selected filenames, and add live session-name search to the resizable vertical tab rail with collapsed-group discovery and state restoration.
+
+## 1.19.10
+
+### Patch Changes
+
+- Add atomic creation of new sessions inside an existing tab group, including API validation, lineage propagation, reconnect-safe layout projection, and grouped-launch UI actions.
+
+  Harden the Approvals Inbox and tab-alert propagation across reconnects and disabled-inbox clients, with regression coverage for permission and idle hook state.
+
+  Require positive Codex rendered-pane evidence before declaring a completed turn ready for input. Working, unknown, and unavailable frames now remain active, while verified composers and coherent choice dialogs trigger the input-needed state.
+
+## 1.19.9
+
+### Patch Changes
+
+- e0cab9b: Add Codex turn-end prompts to the Approvals Inbox with answer support, localized mode labels, shared pane capture, live tab and mobile alerts, opt-in actionless push notifications, and restart-safe working-state detection.
+
+## 1.19.8
+
+### Patch Changes
+
+- Fix opencode sessions showing busy when idle (COD-330)
+
+  Idle opencode panes (e.g. w2-tcc) rendered the green pulsing busy indicator (tab-status.busy) even though the TUI was idle. detectExternalCliWorkingFrame only matched codex (\`Working (Ns • esc to interrupt)\`), so the 2s captureActivePaneBuffer poller was a no-op for opencode. The braille spinner fast-path called \_markWorking without re-arming the 5s EXTERNAL_CLI_IDLE_DELAY_MS quiet-window timer, so a stray spinner char in Bubble Tea chrome latched busy forever. Restored sessions also relied solely on that timer.
+
+  Fix: extend detectExternalCliWorkingFrame for opencode to match esc to interrupt / Working / ellipsis timer / spinner, add OPENCODE_WORKING_LINE_PATTERN, and route spinner for external CLIs through \_noteExternalWorkingFrame to re-arm the quiet window. Poller now correctly drives busy/idle via 2s poll re-arming 5s window.
+
+  Files: src/session.ts, src/utils/regex-patterns.ts, test/opencode-working-detection.test.ts (12 new tests).
+
+## 1.19.7
+
+### Patch Changes
+
+- Fix desktop tab and terminal interaction regressions: replace ambiguous tab hamburger drag handles with grip affordances; make F2 inline renames repaint immediately, remain usable in compact rails, preserve group editors, and serialize overlapping saves; keep vertical console placement and tab-list accessibility synchronized; adapt Session Options to narrow viewports; and unblock CJK input while agent output is active.
+
+## 1.19.6
+
+### Patch Changes
+
+- Add persistent Focus flags for session and saved-webview tabs, with a vertical-only smart Focus group, independent local collapse state, accessible mouse and keyboard actions, owner-scoped live synchronization, lifecycle pruning, and compatibility protection for legacy layout writers.
 
 ## 1.19.5
 
@@ -1363,6 +1449,22 @@
 
   ### Thanks
   - @christianhaberl designed and built the collapsible left session sidebar (#307)
+
+## 1.18.6
+
+### Patch Changes
+
+- Document the owner-scoped tab-groups architecture and fix session-lineage rendering in the vertical tab rail by routing parent-child connectors through a reserved left gutter while preserving horizontal U-bridges.
+
+## 1.18.5
+
+### Patch Changes
+
+- Harden attachment access by enforcing session ownership across tail, download, and source routes; requiring trusted
+  attachment roots to be dedicated enclaves; aligning upload and raw-download size limits; and avoiding directory
+  creation during read and delete operations. Add Bitbucket `local` branch CI and the implementation-review checkpoint
+  contract. Make the optional vertical session rail resizable, and hide the redundant homepage Open Tabs rail while
+  vertical tabs are active while retaining its horizontal layout behavior.
 
 ## 1.18.4
 
@@ -2061,6 +2163,14 @@
 
 ### Patch Changes
 
+- - **Remote opencode session does not open (COD-282)** — bare `opencode` relied on remote login-shell PATH alone; added `$HOME/.opencode/bin` to `REMOTE_PATH_BOOTSTRAP`, wired `openCodeConfig` (`--model`/`--session`/`--fork` + inline `OPENCODE_CONFIG_CONTENT`) through `buildRemoteLaunchCommand`/`buildRemoteSessionCommand` and `TmuxManager`, and allowed matching per-CLI config in quick-start remote guard; reconnect via `new-session -A` now streams TUI with no regression for local opencode or remote claude/codex/gemini/shell.
+  - **Upload session source files from browser (COD-281)** — wire session source upload via browser with SFTP for remote hosts.
+  - **Remote history from codeman-remote socket (COD-279)** — capture remote tmux history via `codeman-remote` socket for durable remote sessions.
+  - **Expose shortcut settings panel and make overlay globally visible (COD-278)** — restored UI methods lost during deduplication and exposed shortcut settings; global overlay visibility.
+  - **Resolve remote agent login shell from passwd (COD-277)** — remote agents now resolve real login shell via `getent`/`dscl` and launch with `-i -l` so `~/.zshrc` env is sourced (e.g. `COMPOSIO_CONSUMER_KEY`).
+  - **Source user shell env for agent CLIs (COD-276)** — local and remote agent launches source user shell env via login shell wrapper.
+  - **Clickable file URI previews (COD-273)**, **attachment download (COD-261)**, **preview in new tab (COD-260)**, **checkpoint fresh-thread handoff (COD-262)**, **attachment navigation (COD-259)**, **PWA server name (COD-256)**, **checkpoint default persistence (COD-257)**, **headroom proxy attribution (COD-254)**, **macOS SFTP listing fix (COD-255)**, **codex snapshot pinning (COD-253)**, **native resume ids for opencode/gemini/agy (COD-251)**, **remote SFTP file manager (COD-252)** and **response viewer one-click copy (COD-263)** — all changes since 1.11.0 included in this patch train.
+  - **Config** — `opencode.json` untracked and kept local-only (single build agent).
 - fix(history): Past Sessions data quality, and gate the phone run picker on CLI availability
 
   **Past Sessions data quality (#215).** Three bugs in the transcript scanner behind
@@ -2344,6 +2454,8 @@
 
 ### Patch Changes
 
+- Open supported in-workspace document links from Last Response and expanded transcripts in Codeman's existing file preview overlay. Preserve the originating session, correctly decode filenames containing spaces, and reject traversal, external, malformed, unsupported, or out-of-workspace targets.
+
 - Mobile toolbar: a dedicated Enter button, and Shell moves into the Run dropdown.
 
   Submitting is a constant need on a touch keyboard, so on phones (≤430px) the toolbar slot that held "Shell" now holds a dark blue **Enter** button. Starting a shell, the far rarer action, moves into the expandable Run dropdown as `Terminal / Shell` (the Run button then reads "Run SH"). Desktop and tablet are unchanged: the green Run Shell button stays exactly where it was.
@@ -2355,6 +2467,14 @@
   Default desktop header is cleaner: the file viewer is shown by default and the plan-usage chip is unchanged, while the token-count chip and lifecycle-log button now default off. Stored preferences are still honored.
 
   Docs and repo housekeeping: fresh phone screenshots and a new hero GIF in both READMEs, contributor and total-commit badges, and a much shorter repo root. `SECURITY.md` moved to `.github/` (GitHub resolves it there, so the Security policy tab is unaffected), `SPEEDRUN.md` to `docs/`, the knip config to `config/`, and Prettier's config into the `"prettier"` key of `package.json`. `CLAUDE.md` was split so the always-loaded guidance is roughly half its former size, with the deep implementation detail preserved verbatim in `docs/architecture-invariants.md`.
+
+## 1.3.6
+
+### Patch Changes
+
+- Add XLSX attachment uploads with picker and drag-and-drop support, ZIP-signature validation, binary attachment registration, and Open/Download handling.
+
+  Persist keyboard shortcut overrides across upgrades and upstream refreshes. Fix Files panel path handling when the working directory has a trailing slash, linkify unquoted absolute terminal paths containing spaces, improve multiline prompt and final-response extraction, and make Headroom configuration reconciliation idempotent and reversible.
 
 ## 1.8.0
 
@@ -2598,9 +2718,48 @@
 
   All PRs went through adversarial multi-agent review; ~60 verified findings (including 12 blockers) were fixed on the contributors' branches before merge. Full test suite green: 3,400+ tests.
 
+## 1.2.8
+
 ### Patch Changes
 
-- bf36eb0: Add a **WebGL Renderer** toggle to Settings → Appearance (desktop). WebGL stays on by default; turning it off forces the DOM renderer for users who hit GPU glitches, without needing the `?nowebgl` URL param. Turning it back on (or `?webgl=force`) clears any stale auto-fallback marker. The existing mobile skip and long-task auto-fallback safety net are unchanged. The skip decision is factored into a pure, unit-tested `shouldSkipWebGL()` helper.
+- Forward OpenCode TUI clicks directly so clickable regions expand after replay.
+
+## 1.2.7
+
+### Patch Changes
+
+- Slow OpenCode scroll wheel forwarding by accumulating small trackpad deltas.
+
+## 1.2.6
+
+### Patch Changes
+
+- Send OpenCode scroll wheel reports directly so scrolling survives terminal replay.
+
+## 1.2.5
+
+### Patch Changes
+
+- Fix OpenCode session scrolling by letting OpenCode own its TUI scrollback.
+
+## 1.2.4
+
+### Patch Changes
+
+- Remote-session terminal fidelity: reconcile-after-foreign-resize, canonical remote scrollback, and working-state detection (COD-179, COD-180, COD-181).
+  - COD-179: when another client resizes a shared session's PTY mid-turn, codex/gemini repaint at the new geometry and viewers at other dims rendered those cursor-addressed frames misaligned (orphan stale "Working" rows). `Session.resize()` now emits a `resized` event broadcast as SSE `session:resized`; the frontend debounces foreign resizes on the active codex/gemini tab and rewrites from the tmux capture, plus a final reconcile on `session:idle`. The reconcile path never re-asserts its own dims (no resize ping-pong between two live viewers). Session create also passes the creating browser's cols/rows so new tmux windows spawn at the real size instead of 120x40, removing the startup resize storm.
+  - COD-180: a remote session's canonical scrollback lives only on the remote tmux server — the local wrapper is a nested-tmux client repainted in place with ~one screen of history, so reloads served ~30 lines and live redraw traffic mangled browser scrollback (lost/detached table rows). New `captureRemotePaneBuffer()` captures over ssh on the remote tmux (same connection options as the launcher); `/terminal` prefers it for remote sessions, degrading to byte history + local capture (reported as `mux-visible` so the frontend never replaces scrollback with one screen). The remote launch command now sets `history-limit` before `new-session` (remote default was 2000 lines). Remote codex/gemini tabs also self-heal from the canonical capture on idle and on a 25s at-bottom periodic tick (unchanged capture = no-op).
+  - COD-181: remote codex sessions never flipped to busy — the per-chunk "Working (…esc to interrupt)" match is defeated by nested-tmux partial repaints (prod showed "idle" 34 minutes into a turn, degrading idle detection, respawn cycling, and notifications). Remote external-CLI sessions now poll the local wrapper's rendered visible frame every 2s (local capture-pane, no ssh), strip SGR, and feed matches into the shared busy/quiet-window path. Verified live against a real remote host: busy 2s after turn start, idle 5s after completion.
+
+## 1.2.3
+
+### Patch Changes
+
+- Fix stacked stale Codex banner boxes in terminal replay (COD-178, supersedes COD-177's heuristic).
+  - COD-178: for codex/gemini sessions, `GET /api/sessions/:id/terminal` no longer replays the raw PTY byte history. That history is a pile of full-screen `\x1b[H` redraw frames painted at historical window sizes (session spawns at 120x40, then the browser resizes to its real rows); replaying a frame taller than the browser's current viewport scrolls it, orphaning the previous frame's rows into scrollback — new codex tabs (worst on remote/nested-tmux sessions) showed a stack of empty banner box outlines above the real welcome banner. The route now ships the tmux capture only (full-history capture on both full reload and tab switch — tmux already applied every redraw in place, so the capture is line-based, has no cursor addressing, and replays cleanly at any terminal size), falling back to the byte history when the capture is unavailable. claude/shell/opencode replay is unchanged.
+  - COD-177: interim `hasDuplicateCodexPromptTail` dedupe heuristic for the duplicated Codex prompt tail on full reload — removed again by COD-178's structural fix (the real prod byte stream renders the prompt with erase-char + cursor-forward instead of a literal space, which defeats text comparison).
+
+  Verified with new route tests (heuristic-miss reload, tail capture-only, gemini, capture-unavailable fallback), a Playwright e2e on a live codex session (resize storm across 6 window heights → reload + tab-switch rounds: exactly 1 banner box on the fixed build, stacked duplicates on the old build), and the 212-check realistic smoke harness.
 
 ## 1.2.2
 

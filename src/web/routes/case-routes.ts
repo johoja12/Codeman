@@ -8,9 +8,9 @@
 
 import { FastifyInstance } from 'fastify';
 import { existsSync, lstatSync, mkdirSync, writeFileSync, readdirSync, readFileSync, createReadStream } from 'node:fs';
-import { exec } from 'node:child_process';
+import { exec, execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
-import { join, resolve, basename } from 'node:path';
+import { basename, dirname, join, posix as posixPath, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import type {
@@ -24,6 +24,7 @@ import type {
 } from '../../types.js';
 import { ApiErrorCode, createErrorResponse, getErrorMessage } from '../../types.js';
 import {
+  BrowseDirectoryQuerySchema,
   CreateCaseSchema,
   CloneCaseSchema,
   ClonePreflightSchema,
@@ -31,6 +32,7 @@ import {
   CaseOrderSchema,
   RemoteCaseLinkSchema,
   RemoteHostSchema,
+  UpdateCaseSchema,
   DockerCaseLinkSchema,
   DockerCaseAdoptSchema,
   DockerAdoptPreflightSchema,
@@ -39,6 +41,7 @@ import {
   DockerExportSchema,
   DockerImportSchema,
   DockerQuickCreateSchema,
+  CaseDefaultGroupSchema,
 } from '../schemas.js';
 import { exportDockerCase, importDockerBundle, listDockerExports, exportBundleName } from '../../docker-export.js';
 import {
@@ -66,11 +69,14 @@ import {
   parseBody,
   readJsonConfig,
 } from '../route-helpers.js';
+import { isSensitivePath } from '../sensitive-path.js';
 import { isMultiUserMode } from '../../config/multiuser.js';
-import type { AuthUser } from '../../types.js';
+import { canUsernameRunPrivilegedCommands } from '../../user-store.js';
+import type { AuthUser, CaseCodexCommandSelectionMetadata } from '../../types.js';
 import { SseEvent } from '../sse-events.js';
-import type { EventPort, ConfigPort, SessionPort } from '../ports/index.js';
+import type { EventPort, ConfigPort, SessionPort, TabLayoutPort } from '../ports/index.js';
 import type { FastifyRequest } from 'fastify';
+import { ownerLayoutKey } from '../../tab-layout-persistence.js';
 import { dataPath, getDataDir } from '../../config/instance.js';
 import {
   checkDockerAvailable,
@@ -95,14 +101,77 @@ import {
 import type { AdoptedContainerProbe, DockerBrowseResult, DockerContainerInfo } from '../../docker-hosts.js';
 import { buildDockerRemoveCommand } from '../../tmux-manager.js';
 import {
-  checkRemoteTmuxAvailable,
+  checkRemoteSshAccess,
   listRemoteCodemanSessions,
+  listRemoteDirectories,
   readRemoteCases,
   readRemoteHosts,
   remoteDisplayPath,
   writeRemoteCases,
   writeRemoteHosts,
 } from '../../remote-hosts.js';
+import { promisify } from 'node:util';
+import { readSources, buildCatalog, readUserManifest } from '../../skill-install-reader.js';
+import { classifyScope, summarize, type InstallEntry } from '../../skill-install-classifier.js';
+import { stringify as stringifyToml } from 'smol-toml';
+
+const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+// Must start with alphanumeric or underscore — no leading dash (would be a CLI flag) or dot
+const SAFE_SKILL_ID = /^[a-zA-Z0-9_][a-zA-Z0-9_./-]*$/;
+
+interface SkillEntry {
+  kind: string;
+  name: string;
+  source: string | null;
+  pack: string | null;
+  klass: string;
+  mirrorInstalled: boolean | null; // true=present, false=missing, null=N/A (agents/commands)
+  claudePath: string; // prettified path in ~/.claude/...
+  target: string | null; // symlink target (prettified), null for real files
+  mirrorPath: string | null; // prettified ~/.agents/skills/... path (skills only)
+  description: string; // bundle description if in a pack, else source description
+}
+
+interface SkillDetailResult {
+  hasManifest: boolean;
+  projectEntries: SkillEntry[];
+  userEntries: SkillEntry[];
+}
+
+interface SkillCatalogPack {
+  source: string;
+  name: string;
+  description: string;
+  totalCount: number;
+  installedCount: number;
+}
+
+interface SkillCatalogIndividual {
+  kind: string;
+  name: string;
+  source: string;
+  klass: string;
+}
+
+interface SkillCatalogResult {
+  hasManifest: boolean;
+  packs: SkillCatalogPack[];
+  individuals: SkillCatalogIndividual[];
+}
+
+interface UserSkillsResult {
+  hasManifest: boolean;
+  entries: SkillEntry[];
+}
+
+interface SkillStateResult {
+  hasManifest: boolean;
+  installed: number;
+  missing: number;
+  drifted: number;
+  primaryPack: string | null;
+}
 
 const LINKED_CASES_FILE = dataPath('linked-cases.json');
 const CODEMAN_CONFIG_DIR = getDataDir();
@@ -110,6 +179,11 @@ const SAFE_CASE_NAME = /^[a-zA-Z0-9_-]+$/;
 const DOCKER_EXPORTS_DIR = dataPath('docker-exports');
 /** Auto-created host profile for the one-click "Run in Docker" case flow. */
 const DEFAULT_DOCKER_HOST_ID = 'default';
+const SINGLE_USER_OWNER = '@single';
+
+function codexProfileOwner(owner: string | undefined): string {
+  return owner ?? SINGLE_USER_OWNER;
+}
 
 /** App version for export manifests (best-effort read of package.json). */
 const APP_VERSION = (() => {
@@ -120,6 +194,17 @@ const APP_VERSION = (() => {
     return 'unknown';
   }
 })();
+
+interface DirectoryBrowseEntry {
+  name: string;
+  path: string;
+}
+
+interface DirectoryBrowseResponse {
+  path: string;
+  parentPath: string | null;
+  entries: DirectoryBrowseEntry[];
+}
 
 /**
  * Refusal text for a `local`-transport clone by a non-admin in multi-user mode.
@@ -203,6 +288,64 @@ async function resolveCasePath(name: string, user?: AuthUser): Promise<string> {
   return join(resolveCasesDir(user), name);
 }
 
+function expandLocalBrowsePath(path?: string): string {
+  if (!path || path === '~') return homedir();
+  if (path.startsWith('~/')) return join(homedir(), path.slice(2));
+  return path;
+}
+
+function localParentPath(path: string): string | null {
+  const parent = dirname(path);
+  return parent === path ? null : parent;
+}
+
+function remoteParentPath(path: string): string | null {
+  const normalized = posixPath.normalize(path);
+  const parent = posixPath.dirname(normalized);
+  return parent === normalized ? null : parent;
+}
+
+function toSkillEntry(e: InstallEntry, sources: import('../../skill-install-reader.js').SkillSource[]): SkillEntry {
+  const mirrorInstalled = e.mirrorPath ? existsSync(e.mirrorPath) : null;
+  const home = homedir();
+  const prettify = (p: string | null) => (p ? p.replace(home, '~') : null);
+  let description = '';
+  if (e.source) {
+    const src = sources.find((s) => s.name === e.source);
+    if (e.pack && src) description = src.bundles?.[e.pack]?.description ?? '';
+    if (!description && src) description = src.description;
+  }
+  return {
+    kind: e.kind,
+    name: e.name,
+    source: e.source,
+    pack: e.pack,
+    klass: e.klass,
+    mirrorInstalled,
+    claudePath: prettify(e.claudePath) ?? e.claudePath,
+    target: prettify(e.target),
+    mirrorPath: prettify(e.mirrorPath),
+    description,
+  };
+}
+
+async function getSkillDetail(casePath: string): Promise<SkillDetailResult> {
+  const sources = await readSources();
+  if (!sources.length) return { hasManifest: false, projectEntries: [], userEntries: [] };
+  const catalog = await buildCatalog(sources);
+  const [projectRaw, userRaw] = await Promise.all([
+    classifyScope(sources, catalog, casePath),
+    classifyScope(sources, catalog, homedir()),
+  ]);
+  return {
+    hasManifest: true,
+    projectEntries: projectRaw.map((e) => toSkillEntry(e, sources)),
+    userEntries: userRaw
+      .filter((e) => e.klass === 'linked-managed' || e.klass === 'real')
+      .map((e) => toSkillEntry(e, sources)),
+  };
+}
+
 /**
  * Gate a docker case on its base image, AUTO-BUILDING the default image on first
  * use so a missing image is never a blocker (the user's ask: "create it when it's
@@ -245,7 +388,237 @@ async function ensureCaseImage(
   return { ok: true, imageBuilding: true };
 }
 
-export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & ConfigPort & SessionPort): void {
+export function registerCaseRoutes(
+  app: FastifyInstance,
+  ctx: EventPort & ConfigPort & SessionPort & TabLayoutPort
+): void {
+  const localSelectionMetadata = (
+    owner: string | undefined,
+    viewer: string | undefined,
+    caseName: string
+  ): CaseCodexCommandSelectionMetadata => {
+    const selection = ctx.store.getCaseCodexCommandSelection(codexProfileOwner(owner), caseName);
+    if (!selection) return { kind: 'default' as const };
+    if (selection.kind === 'custom')
+      return { kind: 'custom' as const, commandPreview: selection.command.slice(0, 120) };
+    if (owner !== viewer) return { kind: 'profile' as const, profileId: selection.profileId };
+    const profile = ctx.store
+      .getCodexCommandProfiles(codexProfileOwner(viewer))
+      .find((candidate) => candidate.id === selection.profileId);
+    return profile
+      ? {
+          kind: 'profile' as const,
+          profileId: profile.id,
+          name: profile.name,
+          commandPreview: profile.command.slice(0, 120),
+        }
+      : { kind: 'profile' as const, profileId: selection.profileId };
+  };
+
+  const selectionMetadata = (
+    remoteCase: { codexCommandProfileId?: string; commands?: Record<string, string> },
+    owner: string | undefined,
+    viewer: string | undefined
+  ) => {
+    if (remoteCase.codexCommandProfileId !== undefined) {
+      if (owner !== viewer) return { kind: 'profile' as const, profileId: remoteCase.codexCommandProfileId };
+      const profile = ctx.store
+        .getCodexCommandProfiles(codexProfileOwner(viewer))
+        .find((candidate) => candidate.id === remoteCase.codexCommandProfileId);
+      return profile
+        ? {
+            kind: 'profile' as const,
+            profileId: profile.id,
+            name: profile.name,
+            commandPreview: profile.command.slice(0, 120),
+          }
+        : { kind: 'profile' as const, profileId: remoteCase.codexCommandProfileId };
+    }
+    if (remoteCase.commands?.codex !== undefined) {
+      return { kind: 'custom' as const, commandPreview: remoteCase.commands.codex.slice(0, 120) };
+    }
+    return { kind: 'default' as const };
+  };
+
+  const applyCodexSelection = (
+    remoteCase: { codexCommandProfileId?: string; commands?: Record<string, string> },
+    selection:
+      | { kind: 'default' }
+      | { kind: 'profile'; profileId: string }
+      | { kind: 'custom'; command: string }
+      | undefined,
+    owner: string | undefined
+  ):
+    | { ok: true; value: { codexCommandProfileId?: string; commands?: Record<string, string> } }
+    | { ok: false; error: string } => {
+    if (!selection) {
+      return {
+        ok: true,
+        value: {
+          ...(remoteCase.codexCommandProfileId !== undefined
+            ? { codexCommandProfileId: remoteCase.codexCommandProfileId }
+            : {}),
+          ...(remoteCase.commands && Object.keys(remoteCase.commands).length > 0
+            ? { commands: remoteCase.commands }
+            : {}),
+        },
+      };
+    }
+    const profiles = ctx.store.getCodexCommandProfiles(codexProfileOwner(owner));
+    if (selection.kind === 'profile' && !profiles.some((profile) => profile.id === selection.profileId)) {
+      return { ok: false, error: 'Saved Codex command profile is unavailable' };
+    }
+    const { codex: _codex, ...otherCommands } = remoteCase.commands ?? {};
+    const commands = selection.kind === 'custom' ? { ...otherCommands, codex: selection.command } : otherCommands;
+    return {
+      ok: true,
+      value: {
+        ...(selection.kind === 'profile' ? { codexCommandProfileId: selection.profileId } : {}),
+        ...(Object.keys(commands).length > 0 ? { commands } : {}),
+      },
+    };
+  };
+
+  const validateLocalCodexSelection = async (
+    selection:
+      | { kind: 'default' }
+      | { kind: 'profile'; profileId: string }
+      | { kind: 'custom'; command: string }
+      | undefined,
+    owner: string | undefined
+  ): Promise<{ ok: true } | { ok: false; error: string; errorCode: ApiErrorCode }> => {
+    if (!selection || selection.kind === 'default') return { ok: true };
+    if (selection.kind === 'profile') {
+      const profiles = ctx.store.getCodexCommandProfiles(codexProfileOwner(owner));
+      if (!profiles.some((profile) => profile.id === selection.profileId)) {
+        return {
+          ok: false,
+          error: 'Saved Codex command profile is unavailable',
+          errorCode: ApiErrorCode.OPERATION_FAILED,
+        };
+      }
+    }
+    if (isMultiUserMode() && !(await canUsernameRunPrivilegedCommands(owner))) {
+      return {
+        ok: false,
+        error: 'Custom Codex commands require the can-bypass-permissions grant',
+        errorCode: ApiErrorCode.FORBIDDEN,
+      };
+    }
+    return { ok: true };
+  };
+
+  const persistLocalCodexSelection = (
+    selection:
+      | { kind: 'default' }
+      | { kind: 'profile'; profileId: string }
+      | { kind: 'custom'; command: string }
+      | undefined,
+    owner: string | undefined,
+    caseName: string
+  ): void => {
+    if (!selection || selection.kind === 'default') {
+      ctx.store.deleteCaseCodexCommandSelection(codexProfileOwner(owner), caseName);
+      return;
+    }
+    ctx.store.setCaseCodexCommandSelection(
+      codexProfileOwner(owner),
+      caseName,
+      selection.kind === 'profile'
+        ? { kind: 'profile', profileId: selection.profileId }
+        : { kind: 'custom', command: selection.command }
+    );
+  };
+
+  async function resolveAccessibleCase(
+    req: FastifyRequest,
+    name: string
+  ): Promise<CaseInfo | { unreachableLocal: string } | null> {
+    const user = getAuthUser(req);
+    const remoteCase = (await readRemoteCases(CODEMAN_CONFIG_DIR)).find(
+      (item) => item.name === name && canAccessOwned(user, item.owner)
+    );
+    if (remoteCase) {
+      const host = (await readRemoteHosts(CODEMAN_CONFIG_DIR)).find((item) => item.id === remoteCase.hostId);
+      if (!host) return null;
+      return {
+        name,
+        path: remoteDisplayPath({ username: host.username, host: host.host, path: remoteCase.remotePath }),
+        hasClaudeMd: false,
+        location: 'remote',
+        remote: {
+          hostId: host.id,
+          host: host.host,
+          username: host.username,
+          path: remoteCase.remotePath,
+          commands: remoteCase.commands ?? host.commands,
+          codexCommandSelection: selectionMetadata(remoteCase, remoteCase.owner, ownerFor(req)),
+        },
+      };
+    }
+
+    const dockerCase = (await readDockerCases(CODEMAN_CONFIG_DIR)).find(
+      (item) => item.name === name && canAccessOwned(user, item.owner)
+    );
+    if (dockerCase) {
+      const host = (await readDockerHosts(CODEMAN_CONFIG_DIR)).find((item) => item.id === dockerCase.hostId);
+      if (!host) return null;
+      const container = dockerCase.container ?? dockerContainerName(dockerCase.name);
+      return {
+        name,
+        path: dockerDisplayPath({ container, path: dockerCase.hostWorkspacePath }),
+        hasClaudeMd: await boundedPathExists(join(dockerCase.hostWorkspacePath, 'CLAUDE.md')),
+        location: 'docker',
+        docker: {
+          hostId: host.id,
+          container,
+          image: host.image,
+          path: dockerCase.hostWorkspacePath,
+          network: host.network ?? 'bridge',
+        },
+      };
+    }
+
+    const casePath = await resolveCasePath(name, user);
+    const linked = casePath !== join(resolveCasesDir(user), name);
+    // Null means DEFINITELY absent: the Run button creates a case on it, so a
+    // path that merely did not answer (a dead network mount) must never read as
+    // missing. One path, asked for explicitly: probe it even while unrelated
+    // mounts are dead.
+    const state = await probePath(casePath, { pastCap: true });
+    if (state === 'absent') return null;
+    if (state === 'unknown') {
+      // The linked registry knows where the case lives, so say where, and that
+      // it is not answering. A local case has no such record to fall back on.
+      if (!linked) return { unreachableLocal: describeUnknownPath('Case folder', casePath, { pastCap: true }) };
+      return { name, path: casePath, hasClaudeMd: false, linked: true, location: 'linked-local', unreachable: true };
+    }
+    return {
+      name,
+      path: casePath,
+      // Probed like the folder above, or a healthy case reads as having no CLAUDE.md under the cap.
+      hasClaudeMd: (await probePath(join(casePath, 'CLAUDE.md'), { pastCap: true })) === 'present',
+      ...(linked && { linked: true }),
+      location: linked ? ('linked-local' as const) : ('local' as const),
+      codexCommandSelection: localSelectionMetadata(ownerFor(req), ownerFor(req), name),
+    };
+  }
+
+  const validateCaseName = (req: FastifyRequest, name: string): boolean =>
+    Boolean(validatePathWithinBase(name, resolveCasesDir(getAuthUser(req))));
+
+  const readDefaultGroupResponse = async (req: FastifyRequest, name: string) => {
+    const owner = ownerLayoutKey(ownerFor(req));
+    const snapshot = await ctx.tabLayouts.getSnapshot(owner);
+    const groups = snapshot.layout.groups.map(({ id, name: groupName }) => ({ id, name: groupName }));
+    let groupId = ctx.store.getCaseDefaultGroup(owner, name);
+    if (typeof groupId === 'string' && !groups.some((group) => group.id === groupId)) {
+      ctx.store.setCaseDefaultGroup(owner, name, null);
+      groupId = null;
+    }
+    return { groupId: groupId ?? null, groups };
+  };
+
   // ═══════════════════════════════════════════════════════════════
   // Case CRUD (list, create, link, detail, fix-plan)
   // ═══════════════════════════════════════════════════════════════
@@ -273,6 +646,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
             path: casePath,
             hasClaudeMd: await boundedPathExists(join(casePath, 'CLAUDE.md')),
             location: 'local',
+            codexCommandSelection: localSelectionMetadata(ownerFor(req), ownerFor(req), e.name),
             ...(marker ? { agentCreated: agentCreatedInfo(marker) } : {}),
           });
         }
@@ -297,6 +671,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
           hasClaudeMd: state === 'present' && (await boundedPathExists(join(path, 'CLAUDE.md'))),
           linked: true,
           location: 'linked-local',
+          codexCommandSelection: localSelectionMetadata(ownerFor(req), ownerFor(req), name),
           ...(state === 'unknown' ? { unreachable: true } : {}),
         });
       }
@@ -315,11 +690,14 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
         path: remoteDisplayPath({ username: host.username, host: host.host, path: remoteCase.remotePath }),
         hasClaudeMd: false,
         location: 'remote',
+        codexCommandSelection: selectionMetadata(remoteCase, remoteCase.owner, ownerFor(req)),
         remote: {
           hostId: host.id,
           host: host.host,
           username: host.username,
           path: remoteCase.remotePath,
+          commands: remoteCase.commands ?? host.commands,
+          codexCommandSelection: selectionMetadata(remoteCase, remoteCase.owner, ownerFor(req)),
         },
       };
       const existingIndex = cases.findIndex((item) => item.name === remoteCase.name);
@@ -527,7 +905,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
   }
 
   app.post('/api/cases', async (req, reply): Promise<ApiResponse<{ case: { name: string; path: string } }>> => {
-    const { name, description, path: customPath } = parseBody(CreateCaseSchema, req.body);
+    const { name, description, path: customPath, codexCommandSelection } = parseBody(CreateCaseSchema, req.body);
 
     // A custom folder writes outside the cases directory and registers the path in the shared,
     // ownerless linked-cases registry, so it carries the same bar as POST /api/cases/link.
@@ -546,6 +924,9 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
       return createErrorResponse(ApiErrorCode.ALREADY_EXISTS, 'Case already exists');
     }
 
+    const localSelection = await validateLocalCodexSelection(codexCommandSelection, ownerFor(req));
+    if (!localSelection.ok) return createErrorResponse(localSelection.errorCode, localSelection.error);
+
     try {
       mkdirSync(casePath, { recursive: true });
       mkdirSync(join(casePath, 'src'), { recursive: true });
@@ -557,6 +938,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
 
       // Write .claude/settings.local.json with hooks for desktop notifications
       await writeHooksConfig(casePath);
+      persistLocalCodexSelection(codexCommandSelection, ownerFor(req), name);
 
       ctx.broadcast(SseEvent.CaseCreated, { name, path: casePath });
 
@@ -640,7 +1022,10 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
         warnings: string[];
       }>
     > => {
-      const { name, repository, ref, shallow, description } = parseBody(CloneCaseSchema, req.body);
+      const { name, repository, ref, shallow, description, codexCommandSelection } = parseBody(
+        CloneCaseSchema,
+        req.body
+      );
       const user = getAuthUser(req);
 
       const parsed = parseGitRepositoryUrl(repository);
@@ -677,6 +1062,9 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
       ) {
         return createErrorResponse(ApiErrorCode.ALREADY_EXISTS, 'Case already exists');
       }
+
+      const localSelection = await validateLocalCodexSelection(codexCommandSelection, ownerFor(req));
+      if (!localSelection.ok) return createErrorResponse(localSelection.errorCode, localSelection.error);
 
       // git creates the leaf, not necessarily the case space above it.
       try {
@@ -725,7 +1113,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
         } else {
           warnings.push('Kept the repository’s own CLAUDE.md.');
         }
-        if (repoShipsClaudeSettings(casePath)) {
+        if (await repoShipsClaudeSettings(casePath)) {
           warnings.push(
             'This repository ships its own .claude/settings files. Codeman merged its hooks alongside them without removing anything — review them before starting a session, since repo-supplied hooks run on this machine.'
           );
@@ -749,6 +1137,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
       }
 
       ctx.broadcast(SseEvent.CaseCreated, { name, path: casePath });
+      persistLocalCodexSelection(codexCommandSelection, ownerFor(req), name);
       return {
         success: true,
         data: {
@@ -767,6 +1156,40 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
   app.get('/api/remote-hosts', async (req) =>
     isMultiUserMode() && !isAdmin(req) ? [] : readRemoteHosts(CODEMAN_CONFIG_DIR)
   );
+
+  app.get('/api/cases/browse-local', async (req): Promise<ApiResponse<DirectoryBrowseResponse>> => {
+    const { path: rawPath } = parseBody(BrowseDirectoryQuerySchema, req.query, 'Invalid directory browse query');
+    const requestedPath = expandLocalBrowsePath(rawPath);
+    if (!requestedPath.startsWith('/')) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Directory path must be absolute');
+    }
+
+    try {
+      const realPath = await fs.realpath(requestedPath);
+      if (isSensitivePath(realPath)) {
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this directory is blocked');
+      }
+      const stat = await fs.stat(realPath);
+      if (!stat.isDirectory()) {
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Path is not a directory');
+      }
+      const entries = await fs.readdir(realPath, { withFileTypes: true });
+      const directories = entries
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
+        .map((entry) => ({ name: entry.name, path: join(realPath, entry.name) }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+      return {
+        success: true,
+        data: {
+          path: realPath,
+          parentPath: localParentPath(realPath),
+          entries: directories,
+        },
+      };
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
+    }
+  });
 
   // Hosts are machine-level resources: only admins may define them in multi-user mode.
   const adminOnly = (req: FastifyRequest, reply: { code: (n: number) => unknown }): ApiResponse<never> | null =>
@@ -793,6 +1216,41 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
       return { success: true, data: { sessions } };
     }
   );
+
+  app.get('/api/remote-hosts/:hostId/directories', async (req): Promise<ApiResponse<DirectoryBrowseResponse>> => {
+    const { hostId } = req.params as { hostId: string };
+    const { path: rawPath } = parseBody(BrowseDirectoryQuerySchema, req.query, 'Invalid directory browse query');
+    const remotePath = rawPath || '/';
+    if (!remotePath.startsWith('/')) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Remote path must be absolute');
+    }
+
+    const host = (await readRemoteHosts(CODEMAN_CONFIG_DIR)).find((item) => item.id === hostId);
+    if (!host) return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Remote host not found');
+
+    try {
+      const entries = await listRemoteDirectories(host, remotePath);
+      return {
+        success: true,
+        data: {
+          path: posixPath.normalize(remotePath),
+          parentPath: remoteParentPath(remotePath),
+          entries,
+        },
+      };
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
+    }
+  });
+
+  app.post('/api/remote-hosts/verify', async (req): Promise<ApiResponse<{ ok: boolean }>> => {
+    const host = parseBody(RemoteHostSchema, req.body);
+    const result = await checkRemoteSshAccess(host);
+    if (!result.ok) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, result.error || 'Could not verify SSH access');
+    }
+    return { success: true, data: { ok: true } };
+  });
 
   app.post('/api/remote-hosts', async (req, reply): Promise<ApiResponse<{ host: unknown }>> => {
     const denied = adminOnly(req, reply);
@@ -837,7 +1295,11 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
   });
 
   app.post('/api/cases/remote-link', async (req): Promise<ApiResponse<{ case: unknown }>> => {
-    const remoteCase = { ...parseBody(RemoteCaseLinkSchema, req.body), type: 'remote' as const, owner: ownerFor(req) };
+    const input = parseBody(RemoteCaseLinkSchema, req.body);
+    const selection = applyCodexSelection({ commands: input.commands }, input.codexCommandSelection, ownerFor(req));
+    if (!selection.ok) return createErrorResponse(ApiErrorCode.OPERATION_FAILED, selection.error);
+    const { commands: _commands, codexCommandSelection: _codexCommandSelection, ...remoteInput } = input;
+    const remoteCase = { ...remoteInput, ...selection.value, type: 'remote' as const, owner: ownerFor(req) };
     const hosts = await readRemoteHosts(CODEMAN_CONFIG_DIR);
     const host = hosts.find((item) => item.id === remoteCase.hostId);
     if (!host) return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Remote host not found');
@@ -850,14 +1312,6 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
       existsSync(join(resolveCasesDir(getAuthUser(req)), remoteCase.name))
     ) {
       return createErrorResponse(ApiErrorCode.ALREADY_EXISTS, 'Case already exists');
-    }
-
-    // Courtesy validation: tmux is a hard prerequisite for durable remote sessions.
-    // Verify it up-front so linking surfaces a clear error now instead of a dead pane
-    // at first launch (also confirms the SSH connection actually works).
-    const tmuxCheck = await checkRemoteTmuxAvailable(host);
-    if (!tmuxCheck.ok) {
-      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, tmuxCheck.error || 'remote host is missing tmux');
     }
 
     await writeRemoteCases(CODEMAN_CONFIG_DIR, [...remoteCases, remoteCase]);
@@ -1536,7 +1990,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
     // admin-only in multi-user mode (mirrors host CRUD + the admin-only GET listing).
     const denied = adminOnly(req, reply);
     if (denied) return denied;
-    const { name, path: folderPath } = parseBody(LinkCaseSchema, req.body);
+    const { name, path: folderPath, codexCommandSelection } = parseBody(LinkCaseSchema, req.body);
 
     // Expand ~ to home directory
     const expandedPath = folderPath.startsWith('~') ? join(homedir(), folderPath.slice(1)) : folderPath;
@@ -1563,6 +2017,9 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
       );
     }
 
+    const localSelection = await validateLocalCodexSelection(codexCommandSelection, ownerFor(req));
+    if (!localSelection.ok) return createErrorResponse(localSelection.errorCode, localSelection.error);
+
     // Save the linked case
     linkedCases[name] = expandedPath;
     try {
@@ -1571,11 +2028,208 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
         mkdirSync(codemanDir, { recursive: true });
       }
       await fs.writeFile(LINKED_CASES_FILE, JSON.stringify(linkedCases, null, 2));
+      persistLocalCodexSelection(codexCommandSelection, ownerFor(req), name);
       ctx.broadcast(SseEvent.CaseLinked, { name, path: expandedPath });
       return { success: true, data: { case: { name, path: expandedPath } } };
     } catch (err) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
     }
+  });
+
+  app.put('/api/cases/:name', async (req): Promise<ApiResponse<{ case: CaseInfo }>> => {
+    const { name: originalName } = req.params as { name: string };
+    const update = parseBody(UpdateCaseSchema, req.body, 'Invalid case update');
+    const user = getAuthUser(req);
+    const casesDir = resolveCasesDir(user);
+    const owner = ownerLayoutKey(ownerFor(req));
+
+    if (!validatePathWithinBase(originalName, casesDir)) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid case name');
+    }
+
+    const nextName = update.name ?? originalName;
+    if (!validatePathWithinBase(nextName, casesDir)) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid case name');
+    }
+    if (update.defaultGroupId !== undefined) {
+      const snapshot = await ctx.tabLayouts.getSnapshot(owner);
+      if (
+        update.defaultGroupId !== null &&
+        !snapshot.layout.groups.some((group) => group.id === update.defaultGroupId)
+      ) {
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Default group does not exist');
+      }
+    }
+    const persistDefaultGroupUpdate = () => {
+      ctx.store.renameCaseDefaultGroup(owner, originalName, nextName);
+      if (update.defaultGroupId !== undefined) ctx.store.setCaseDefaultGroup(owner, nextName, update.defaultGroupId);
+    };
+    const persistLocalSelectionUpdate = () => {
+      ctx.store.renameCaseCodexCommandSelection(codexProfileOwner(ownerFor(req)), originalName, nextName);
+    };
+
+    const linkedCases = await readLinkedCases();
+    const remoteCases = await readRemoteCases(CODEMAN_CONFIG_DIR);
+    const dockerCases = await readDockerCases(CODEMAN_CONFIG_DIR);
+    const nameExists = (candidate: string): boolean =>
+      candidate !== originalName &&
+      (Boolean(linkedCases[candidate]) ||
+        remoteCases.some((item) => item.name === candidate) ||
+        dockerCases.some((item) => item.name === candidate) ||
+        existsSync(join(casesDir, candidate)));
+
+    if (nameExists(nextName)) {
+      return createErrorResponse(ApiErrorCode.ALREADY_EXISTS, 'Case already exists');
+    }
+
+    const remoteCaseIndex = remoteCases.findIndex(
+      (item) => item.name === originalName && canAccessOwned(user, item.owner)
+    );
+    if (remoteCaseIndex !== -1) {
+      const hostId = update.hostId ?? remoteCases[remoteCaseIndex].hostId;
+      const remotePath = update.remotePath ?? remoteCases[remoteCaseIndex].remotePath;
+      const currentRemoteCase = remoteCases[remoteCaseIndex];
+      const selected = applyCodexSelection(
+        update.commands === undefined ? currentRemoteCase : { ...currentRemoteCase, commands: update.commands },
+        update.codexCommandSelection,
+        currentRemoteCase.owner ?? ownerFor(req)
+      );
+      if (!selected.ok) return createErrorResponse(ApiErrorCode.OPERATION_FAILED, selected.error);
+      const {
+        codexCommandProfileId: _previousProfileId,
+        commands: _previousCommands,
+        ...remoteWithoutSelection
+      } = currentRemoteCase;
+      const commands = selected.value.commands;
+      const host = (await readRemoteHosts(CODEMAN_CONFIG_DIR)).find((item) => item.id === hostId);
+      if (!host) return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Remote host not found');
+
+      const nextRemoteCase = {
+        ...remoteWithoutSelection,
+        name: nextName,
+        hostId,
+        remotePath,
+        ...selected.value,
+        ...(commands ? { commands } : {}),
+        type: 'remote' as const,
+      };
+      const nextRemoteCases = [...remoteCases];
+      nextRemoteCases[remoteCaseIndex] = nextRemoteCase;
+      await writeRemoteCases(CODEMAN_CONFIG_DIR, nextRemoteCases);
+      const caseInfo: CaseInfo = {
+        name: nextName,
+        path: remoteDisplayPath({ username: host.username, host: host.host, path: remotePath }),
+        hasClaudeMd: false,
+        location: 'remote',
+        remote: {
+          hostId: host.id,
+          host: host.host,
+          username: host.username,
+          path: remotePath,
+          commands: commands ?? host.commands,
+          codexCommandSelection: selectionMetadata(nextRemoteCase, nextRemoteCase.owner, ownerFor(req)),
+        },
+      };
+      persistDefaultGroupUpdate();
+      ctx.broadcast(SseEvent.CaseLinked, { name: nextName, path: remotePath, type: 'remote-updated' });
+      return { success: true, data: { case: caseInfo } };
+    }
+
+    const dockerCaseIndex = dockerCases.findIndex(
+      (item) => item.name === originalName && canAccessOwned(user, item.owner)
+    );
+    if (dockerCaseIndex !== -1) {
+      if (update.path || update.hostId || update.remotePath || update.commands || update.codexCommandSelection) {
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Docker case updates only support renaming');
+      }
+      const currentDockerCase = dockerCases[dockerCaseIndex];
+      const nextDockerCase = {
+        ...currentDockerCase,
+        name: nextName,
+        container: currentDockerCase.container ?? dockerContainerName(originalName),
+      };
+      const host = (await readDockerHosts(CODEMAN_CONFIG_DIR)).find((item) => item.id === nextDockerCase.hostId);
+      if (!host) return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Docker host not found');
+      const nextDockerCases = [...dockerCases];
+      nextDockerCases[dockerCaseIndex] = nextDockerCase;
+      await writeDockerCases(CODEMAN_CONFIG_DIR, nextDockerCases);
+      const container = nextDockerCase.container ?? dockerContainerName(nextName);
+      const caseInfo: CaseInfo = {
+        name: nextName,
+        path: dockerDisplayPath({ container, path: nextDockerCase.hostWorkspacePath }),
+        hasClaudeMd: existsSync(join(nextDockerCase.hostWorkspacePath, 'CLAUDE.md')),
+        location: 'docker',
+        docker: {
+          hostId: host.id,
+          container,
+          image: host.image,
+          path: nextDockerCase.hostWorkspacePath,
+          network: host.network ?? 'bridge',
+        },
+      };
+      persistDefaultGroupUpdate();
+      ctx.broadcast(SseEvent.CaseLinked, {
+        name: nextName,
+        path: nextDockerCase.hostWorkspacePath,
+        type: 'docker-updated',
+      });
+      return { success: true, data: { case: caseInfo } };
+    }
+
+    if (linkedCases[originalName] && (!isMultiUserMode() || isAdmin(req))) {
+      const localSelection = await validateLocalCodexSelection(update.codexCommandSelection, ownerFor(req));
+      if (!localSelection.ok) return createErrorResponse(localSelection.errorCode, localSelection.error);
+      const nextPath = update.path ?? linkedCases[originalName];
+      if (!existsSync(nextPath)) {
+        return createErrorResponse(ApiErrorCode.NOT_FOUND, `Folder not found: ${nextPath}`);
+      }
+      delete linkedCases[originalName];
+      linkedCases[nextName] = nextPath;
+      await fs.writeFile(LINKED_CASES_FILE, JSON.stringify(linkedCases, null, 2));
+      persistLocalSelectionUpdate();
+      if (update.codexCommandSelection !== undefined) {
+        persistLocalCodexSelection(update.codexCommandSelection, ownerFor(req), nextName);
+      }
+      const caseInfo: CaseInfo = {
+        name: nextName,
+        path: nextPath,
+        hasClaudeMd: existsSync(join(nextPath, 'CLAUDE.md')),
+        linked: true,
+        location: 'linked-local',
+        codexCommandSelection: localSelectionMetadata(ownerFor(req), ownerFor(req), nextName),
+      };
+      persistDefaultGroupUpdate();
+      ctx.broadcast(SseEvent.CaseLinked, { name: nextName, path: nextPath, type: 'updated' });
+      return { success: true, data: { case: caseInfo } };
+    }
+
+    const currentPath = join(casesDir, originalName);
+    if (!existsSync(currentPath)) {
+      return createErrorResponse(ApiErrorCode.NOT_FOUND, `Case "${originalName}" not found`);
+    }
+    if (update.path) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Managed case paths cannot be changed');
+    }
+    const localSelection = await validateLocalCodexSelection(update.codexCommandSelection, ownerFor(req));
+    if (!localSelection.ok) return createErrorResponse(localSelection.errorCode, localSelection.error);
+    const nextPath = join(casesDir, nextName);
+    if (nextName !== originalName) {
+      await fs.rename(currentPath, nextPath);
+    }
+    persistLocalSelectionUpdate();
+    if (update.codexCommandSelection !== undefined) {
+      persistLocalCodexSelection(update.codexCommandSelection, ownerFor(req), nextName);
+    }
+    const caseInfo: CaseInfo = {
+      name: nextName,
+      path: nextPath,
+      hasClaudeMd: existsSync(join(nextPath, 'CLAUDE.md')),
+      location: 'local',
+      codexCommandSelection: localSelectionMetadata(ownerFor(req), ownerFor(req), nextName),
+    };
+    persistDefaultGroupUpdate();
+    ctx.broadcast(SseEvent.CaseCreated, { name: nextName, path: nextPath, type: 'updated' });
+    return { success: true, data: { case: caseInfo } };
   });
 
   // ========== Delete / Unlink Case ==========
@@ -1597,6 +2251,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
         CODEMAN_CONFIG_DIR,
         remoteCases.filter((item) => !(item.name === name && canAccessOwned(user, item.owner)))
       );
+      ctx.store.deleteCaseDefaultGroup(ownerLayoutKey(ownerFor(req)), name);
       ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'remote-unlinked' });
       return { success: true, data: { name } };
     }
@@ -1608,6 +2263,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
         CODEMAN_CONFIG_DIR,
         dockerCases.filter((item) => item !== dockerCase)
       );
+      ctx.store.deleteCaseDefaultGroup(ownerLayoutKey(ownerFor(req)), name);
       // Best-effort `docker rm -f` the per-case container (case-delete is the
       // explicit teardown that removes it; the bind-mounted workspace survives).
       // An ADOPTED container is skipped entirely: unlinking the case must leave
@@ -1641,6 +2297,8 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
       delete linkedCases[name];
       try {
         await fs.writeFile(LINKED_CASES_FILE, JSON.stringify(linkedCases, null, 2));
+        ctx.store.deleteCaseDefaultGroup(ownerLayoutKey(ownerFor(req)), name);
+        ctx.store.deleteCaseCodexCommandSelection(codexProfileOwner(ownerFor(req)), name);
         ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'unlinked' });
         return { success: true, data: { name } };
       } catch (err) {
@@ -1656,6 +2314,8 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
 
     try {
       await fs.rm(casePath, { recursive: true, force: true });
+      ctx.store.deleteCaseDefaultGroup(ownerLayoutKey(ownerFor(req)), name);
+      ctx.store.deleteCaseCodexCommandSelection(codexProfileOwner(ownerFor(req)), name);
       ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'deleted' });
       return { success: true, data: { name } };
     } catch (err) {
@@ -1688,10 +2348,9 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
     }
   });
 
-  app.get('/api/cases/:name', async (req) => {
+  app.get('/api/cases/:name/default-group', async (req) => {
     const { name } = req.params as { name: string };
-
-    if (!validatePathWithinBase(name, resolveCasesDir(getAuthUser(req)))) {
+    if (!validateCaseName(req, name)) {
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid case name');
     }
 
@@ -1743,34 +2402,44 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
     }
 
     const casePath = await resolveCasePath(name, getAuthUser(req));
-    const linked = casePath !== join(resolveCasesDir(getAuthUser(req)), name);
-
-    // NOT_FOUND means DEFINITELY absent: the Run button creates a case on it, so
-    // a path that merely did not answer (a dead network mount) must never get it.
-    // One path, asked for explicitly: probe it even while unrelated mounts are dead.
-    const state = await probePath(casePath, { pastCap: true });
-    if (state === 'absent') {
+    if (!(await boundedPathExists(casePath))) {
       return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Case not found');
     }
-    if (state === 'unknown') {
-      // The linked registry knows where the case lives, so say where, and that
-      // it is not answering. A local case has no such record to fall back on.
-      if (!linked) {
-        return createErrorResponse(
-          ApiErrorCode.OPERATION_FAILED,
-          describeUnknownPath('Case folder', casePath, { pastCap: true })
-        );
-      }
-      return { name, path: casePath, hasClaudeMd: false, linked: true, unreachable: true };
-    }
+    return readDefaultGroupResponse(req, name);
+  });
 
-    return {
-      name,
-      path: casePath,
-      // Probed like the folder above, or a healthy case reads as having no CLAUDE.md under the cap.
-      hasClaudeMd: (await probePath(join(casePath, 'CLAUDE.md'), { pastCap: true })) === 'present',
-      ...(linked && { linked: true }),
-    };
+  app.put('/api/cases/:name/default-group', async (req) => {
+    const { name } = req.params as { name: string };
+    if (!validateCaseName(req, name)) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid case name');
+    }
+    if (!(await resolveAccessibleCase(req, name))) {
+      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Case not found');
+    }
+    const { groupId } = parseBody(CaseDefaultGroupSchema, req.body, 'Invalid default group');
+    const owner = ownerLayoutKey(ownerFor(req));
+    const snapshot = await ctx.tabLayouts.getSnapshot(owner);
+    const groups = snapshot.layout.groups.map(({ id, name: groupName }) => ({ id, name: groupName }));
+    if (groupId !== null && !groups.some((group) => group.id === groupId)) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Default group does not exist');
+    }
+    ctx.store.setCaseDefaultGroup(owner, name, groupId);
+    return { groupId, groups };
+  });
+
+  app.get('/api/cases/:name', async (req) => {
+    const { name } = req.params as { name: string };
+    if (!validateCaseName(req, name)) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid case name');
+    }
+    const caseInfo = await resolveAccessibleCase(req, name);
+    if (!caseInfo) {
+      return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Case not found');
+    }
+    if ('unreachableLocal' in caseInfo) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, caseInfo.unreachableLocal);
+    }
+    return caseInfo;
   });
 
   // Read @fix_plan.md from a case directory (for wizard to detect existing plans)
@@ -2003,5 +2672,380 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
         parsed,
       },
     };
+  });
+
+  // ========== Skill Detail (for drawer) ==========
+
+  app.get('/api/cases/:name/skill-detail', async (req): Promise<ApiResponse<SkillDetailResult>> => {
+    const { name } = req.params as { name: string };
+    try {
+      const casePath = await resolveCasePath(name);
+      if (!existsSync(casePath)) {
+        return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Case not found');
+      }
+      return { success: true, data: await getSkillDetail(casePath) };
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
+    }
+  });
+
+  app.post('/api/cases/:name/skill-sync', async (req): Promise<ApiResponse<SkillDetailResult>> => {
+    const { name } = req.params as { name: string };
+    try {
+      const casePath = await resolveCasePath(name);
+      if (!existsSync(casePath)) {
+        return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Case not found');
+      }
+      await execAsync('skill-install sync', { cwd: casePath, timeout: 60000 });
+      return { success: true, data: await getSkillDetail(casePath) };
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
+    }
+  });
+
+  app.post('/api/cases/:name/skill-remove', async (req): Promise<ApiResponse<SkillDetailResult>> => {
+    const { name } = req.params as { name: string };
+    const body = req.body as { skillId?: string };
+    const skillId = body?.skillId;
+    if (!skillId || !SAFE_SKILL_ID.test(skillId)) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid skill ID');
+    }
+    try {
+      const casePath = await resolveCasePath(name);
+      if (!existsSync(casePath)) {
+        return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Case not found');
+      }
+      await execFileAsync('skill-install', ['remove', skillId], { cwd: casePath, timeout: 30000 });
+      return { success: true, data: await getSkillDetail(casePath) };
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
+    }
+  });
+
+  // ========== Skill Catalog (pack browser) ==========
+
+  app.get('/api/cases/:name/skill-catalog', async (req): Promise<ApiResponse<SkillCatalogResult>> => {
+    const { name } = req.params as { name: string };
+    try {
+      const casePath = await resolveCasePath(name);
+      if (!existsSync(casePath)) {
+        return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Case not found');
+      }
+      const sources = await readSources();
+      if (!sources.length) {
+        return { success: true, data: { hasManifest: false, packs: [], individuals: [] } };
+      }
+      const catalog = await buildCatalog(sources);
+      const entries = await classifyScope(sources, catalog, casePath);
+      const klassMap = new Map(entries.map((e) => [`${e.kind}::${e.name}`, e.klass]));
+
+      const packs: SkillCatalogPack[] = catalog.bundles.map((bundle) => {
+        const allItems = [
+          ...bundle.skills.map((n) => ({ kind: 'skill' as const, name: n })),
+          ...bundle.agents.map((n) => ({ kind: 'agent' as const, name: n })),
+          ...bundle.commands.map((n) => ({ kind: 'command' as const, name: n })),
+        ];
+        const installedCount = allItems.filter((it) => {
+          const k = klassMap.get(`${it.kind}::${it.name}`);
+          return k === 'linked-managed' || k === 'real';
+        }).length;
+        return {
+          source: bundle.source,
+          name: bundle.name,
+          description: bundle.description,
+          totalCount: allItems.length,
+          installedCount,
+        };
+      });
+
+      const individuals: SkillCatalogIndividual[] = catalog.entries
+        .filter((e) => e.pack === null)
+        .map((e) => ({
+          kind: e.kind,
+          name: e.name,
+          source: e.source,
+          klass: klassMap.get(`${e.kind}::${e.name}`) ?? 'available-managed',
+        }));
+
+      return { success: true, data: { hasManifest: true, packs, individuals } };
+    } catch (err) {
+      return createErrorResponse(
+        ApiErrorCode.INTERNAL_ERROR,
+        err instanceof Error ? err.message : 'Failed to read catalog'
+      );
+    }
+  });
+
+  // ========== Skill Add ==========
+
+  const SAFE_SKILL_TARGET = /^[a-zA-Z0-9_][a-zA-Z0-9_./:@-]*$/;
+
+  app.post('/api/cases/:name/skill-add', async (req): Promise<ApiResponse<SkillCatalogResult>> => {
+    const { name } = req.params as { name: string };
+    const { target } = (req.body as Record<string, unknown>) ?? {};
+    if (!target || typeof target !== 'string' || !SAFE_SKILL_TARGET.test(target) || target.includes('..')) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Missing or unsafe target');
+    }
+    try {
+      const casePath = await resolveCasePath(name);
+      if (!existsSync(casePath)) {
+        return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Case not found');
+      }
+      await execFileAsync('skill-install', ['add', target], { cwd: casePath, timeout: 60000 });
+      const sources = await readSources();
+      if (!sources.length) {
+        return { success: true, data: { hasManifest: false, packs: [], individuals: [] } };
+      }
+      const catalog = await buildCatalog(sources);
+      const entries = await classifyScope(sources, catalog, casePath);
+      const klassMap = new Map(entries.map((e) => [`${e.kind}::${e.name}`, e.klass]));
+      const packs: SkillCatalogPack[] = catalog.bundles.map((bundle) => {
+        const allItems = [
+          ...bundle.skills.map((n) => ({ kind: 'skill' as const, name: n })),
+          ...bundle.agents.map((n) => ({ kind: 'agent' as const, name: n })),
+          ...bundle.commands.map((n) => ({ kind: 'command' as const, name: n })),
+        ];
+        const installedCount = allItems.filter((it) => {
+          const k = klassMap.get(`${it.kind}::${it.name}`);
+          return k === 'linked-managed' || k === 'real';
+        }).length;
+        return {
+          source: bundle.source,
+          name: bundle.name,
+          description: bundle.description,
+          totalCount: allItems.length,
+          installedCount,
+        };
+      });
+      const individuals: SkillCatalogIndividual[] = catalog.entries
+        .filter((e) => e.pack === null)
+        .map((e) => ({
+          kind: e.kind,
+          name: e.name,
+          source: e.source,
+          klass: klassMap.get(`${e.kind}::${e.name}`) ?? 'available-managed',
+        }));
+      return { success: true, data: { hasManifest: true, packs, individuals } };
+    } catch (err) {
+      return createErrorResponse(
+        ApiErrorCode.INTERNAL_ERROR,
+        err instanceof Error ? err.message : 'Failed to add skill'
+      );
+    }
+  });
+
+  // ========== User-scope skills (App Settings → Skills) ==========
+
+  async function getUserSkills(): Promise<UserSkillsResult> {
+    const sources = await readSources();
+    if (!sources.length) return { hasManifest: false, entries: [] };
+    const catalog = await buildCatalog(sources);
+    const raw = await classifyScope(sources, catalog, homedir());
+    return { hasManifest: true, entries: raw.map((e) => toSkillEntry(e, sources)) };
+  }
+
+  app.get('/api/skills/user', async (): Promise<ApiResponse<UserSkillsResult>> => {
+    try {
+      return { success: true, data: await getUserSkills() };
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.INTERNAL_ERROR, getErrorMessage(err));
+    }
+  });
+
+  app.post('/api/skills/user/add', async (req): Promise<ApiResponse<UserSkillsResult>> => {
+    const { target } = req.body as { target?: string };
+    if (!target || !SAFE_SKILL_TARGET.test(target) || target.includes('..')) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid skill target');
+    }
+    try {
+      await execFileAsync('skill-install', ['--user', '--add', target], { timeout: 60000 });
+      return { success: true, data: await getUserSkills() };
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.INTERNAL_ERROR, getErrorMessage(err));
+    }
+  });
+
+  app.post('/api/skills/user/remove', async (req): Promise<ApiResponse<UserSkillsResult>> => {
+    const { skillId } = req.body as { skillId?: string };
+    if (!skillId || !SAFE_SKILL_ID.test(skillId)) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid skillId');
+    }
+    try {
+      await execFileAsync('skill-install', ['--user', '--remove', skillId], { timeout: 60000 });
+      return { success: true, data: await getUserSkills() };
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.INTERNAL_ERROR, getErrorMessage(err));
+    }
+  });
+
+  // ========== Skill Adopt ==========
+
+  interface AdoptSource {
+    name: string;
+    description: string;
+    skillsDir: string; // prettified resolved path where skills land
+  }
+
+  const SAFE_SKILL_NAME = /^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$/;
+  const SAFE_SOURCE_NAME = /^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$/;
+
+  function expandHome(p: string): string {
+    return p.startsWith('~/') || p === '~' ? join(homedir(), p.slice(2)) : p;
+  }
+
+  app.get('/api/skills/adopt-sources', async (): Promise<ApiResponse<{ sources: AdoptSource[] }>> => {
+    try {
+      const sources = await readSources();
+      const result: AdoptSource[] = [];
+      for (const src of sources) {
+        const skillArtifact = src.artifacts['skill'];
+        if (!skillArtifact?.root) continue;
+        const srcPath = expandHome(src.path);
+        if (!existsSync(srcPath)) continue;
+        const skillsDir = join(srcPath, skillArtifact.root);
+        if (!existsSync(skillsDir)) continue;
+        result.push({ name: src.name, description: src.description, skillsDir: skillsDir.replace(homedir(), '~') });
+      }
+      return { success: true, data: { sources: result } };
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.INTERNAL_ERROR, getErrorMessage(err));
+    }
+  });
+
+  app.post('/api/skills/user/adopt', async (req): Promise<ApiResponse<UserSkillsResult>> => {
+    const body = req.body as Partial<{
+      skillName: string;
+      sourceName: string;
+      forceOverwrite: boolean;
+      codexSupport: boolean;
+      codexYaml: string;
+    }>;
+    const { skillName, sourceName, forceOverwrite = false, codexSupport = false, codexYaml } = body;
+
+    if (!skillName || !SAFE_SKILL_NAME.test(skillName))
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid skillName');
+    if (!sourceName || !SAFE_SOURCE_NAME.test(sourceName))
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid sourceName');
+    if (codexSupport && (!codexYaml || typeof codexYaml !== 'string'))
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'codexYaml required when codexSupport is true');
+
+    try {
+      const sources = await readSources();
+      const source = sources.find((s) => s.name === sourceName);
+      if (!source) return createErrorResponse(ApiErrorCode.NOT_FOUND, `Source '${sourceName}' not found`);
+
+      const skillArtifact = source.artifacts['skill'];
+      if (!skillArtifact?.root)
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Source '${sourceName}' has no skill artifact config`);
+
+      const destDir = join(expandHome(source.path), skillArtifact.root, skillName);
+
+      // Verify the skill exists as a real file in user scope
+      const catalog = await buildCatalog(sources);
+      const userEntries = await classifyScope(sources, catalog, homedir());
+      const entry = userEntries.find(
+        (e) => (e.name === skillName || e.name === `${skillName}.md`) && e.klass === 'real'
+      );
+      if (!entry)
+        return createErrorResponse(
+          ApiErrorCode.NOT_FOUND,
+          `'${skillName}' is not a real (non-symlink) skill in user scope`
+        );
+
+      // Conflict check
+      if (existsSync(destDir) && !forceOverwrite)
+        return createErrorResponse(
+          ApiErrorCode.OPERATION_FAILED,
+          `Destination already exists: ${destDir.replace(homedir(), '~')}`
+        );
+
+      // Create destination and copy content
+      await fs.mkdir(destDir, { recursive: true });
+      const realPath = entry.claudePath;
+      const realStat = await fs.stat(realPath);
+      if (realStat.isDirectory()) {
+        await fs.cp(realPath, destDir, { recursive: true });
+      } else {
+        // Single .md file → place as SKILL.md
+        const content = await fs.readFile(realPath, 'utf-8');
+        await fs.writeFile(join(destDir, 'SKILL.md'), content, 'utf-8');
+      }
+
+      // Write agents/openai.yaml if Codex support requested
+      if (codexSupport && codexYaml) {
+        await fs.mkdir(join(destDir, 'agents'), { recursive: true });
+        await fs.writeFile(join(destDir, 'agents', 'openai.yaml'), codexYaml, 'utf-8');
+      }
+
+      // Remove original real file/dir
+      if (realStat.isDirectory()) {
+        await fs.rm(realPath, { recursive: true, force: true });
+      } else {
+        await fs.unlink(realPath);
+      }
+
+      // Create Claude symlink: ~/.claude/skills/<skillName> → destDir
+      const claudeSkillsDir = join(homedir(), '.claude', 'skills');
+      const claudeLink = join(claudeSkillsDir, skillName);
+      const claudeLinkMd = join(claudeSkillsDir, `${skillName}.md`);
+      if (existsSync(claudeLinkMd)) await fs.unlink(claudeLinkMd);
+      if (existsSync(claudeLink)) await fs.unlink(claudeLink);
+      await fs.symlink(destDir, claudeLink);
+
+      // Create Codex symlink: ~/.agents/skills/<skillName> → destDir
+      if (codexSupport) {
+        const codexSkillsDir = join(homedir(), '.agents', 'skills');
+        await fs.mkdir(codexSkillsDir, { recursive: true });
+        const codexLink = join(codexSkillsDir, skillName);
+        if (existsSync(codexLink)) await fs.unlink(codexLink);
+        await fs.symlink(destDir, codexLink);
+      }
+
+      // Update user-manifest.toml
+      const manifestPath = join(expandHome('~/.config/skill-install'), 'user-manifest.toml');
+      const manifest = await readUserManifest();
+      const newEntry = `${sourceName}/${skillName}`;
+      if (!manifest.skills.includes(newEntry)) {
+        manifest.skills.push(newEntry);
+        const tomlContent = stringifyToml({
+          bundles: manifest.bundles,
+          skills: manifest.skills,
+          agents: manifest.agents,
+          commands: manifest.commands,
+          exclude: manifest.exclude,
+        });
+        await fs.writeFile(
+          manifestPath,
+          '# Managed by skill-install. Run `skill-install --user --sync` to apply.\n\n' + tomlContent
+        );
+      }
+
+      return { success: true, data: await getUserSkills() };
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.INTERNAL_ERROR, getErrorMessage(err));
+    }
+  });
+
+  // ========== Skill State (chip) ==========
+
+  app.get('/api/cases/:name/skill-state', async (req): Promise<ApiResponse<SkillStateResult>> => {
+    const { name } = req.params as { name: string };
+    try {
+      const casePath = await resolveCasePath(name);
+      if (!existsSync(casePath)) {
+        return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Case not found');
+      }
+      const sources = await readSources();
+      if (!sources.length) {
+        return { success: true, data: { hasManifest: false, installed: 0, missing: 0, drifted: 0, primaryPack: null } };
+      }
+      const catalog = await buildCatalog(sources);
+      const entries = await classifyScope(sources, catalog, casePath);
+      const { installed, missing, drifted } = summarize(entries);
+      const primaryPack = catalog.entries[0]?.pack ?? catalog.entries[0]?.source ?? null;
+      return { success: true, data: { hasManifest: true, installed, missing, drifted, primaryPack } };
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
+    }
   });
 }

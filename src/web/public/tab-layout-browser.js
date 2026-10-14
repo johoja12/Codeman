@@ -32,27 +32,41 @@
   'use strict';
 
   const COLLAPSED_STORAGE_KEY = 'codeman:tab-groups-collapsed';
-  // The Focus section's collapse, per device. Its own key, not an entry in the
-  // group list above: that list is garbage-collected against the layout's group
-  // ids, and Focus is not a group.
-  const FOCUS_COLLAPSED_STORAGE_KEY = 'codeman:tab-focus-collapsed';
-
   const refKey = (ref) => `${ref.kind}:${ref.id}`;
   const validRef = (ref) =>
     !!ref && (ref.kind === 'session' || ref.kind === 'webview') && typeof ref.id === 'string' && ref.id.length > 0;
   const asIds = (value) => (Array.isArray(value) ? value.filter((id) => typeof id === 'string' && id) : []);
   const stableIds = (value) => [...new Set(asIds(value))];
   // `placement: 'manual'` and `focus: true` must survive the round trip: the
-  // browser writes whole layouts back, so a field dropped here is erased on the
-  // next save, by whoever saves. Losing placement re-attaches a hand-placed child
-  // session to its parent's subtree; losing focus unpins every Focus shortcut.
-  const copyRef = (r) => {
-    const copy = { kind: r.kind, id: r.id };
-    if (r.placement === 'manual') copy.placement = 'manual';
-    if (r.focus === true) copy.focus = true;
-    return copy;
-  };
+  // browser writes whole layouts back, and dropping either would re-attach a
+  // hand-placed child session to its parent's subtree, or empty Focus, on the
+  // next save of any unrelated edit.
+  const copyRef = (r) => ({
+    kind: r.kind,
+    id: r.id,
+    ...(r.placement === 'manual' ? { placement: 'manual' } : {}),
+    ...(r.focus === true ? { focus: true } : {}),
+  });
   const copyRefs = (value) => (Array.isArray(value) ? value.filter(validRef).map(copyRef) : []);
+  const bareRef = (r) => ({ kind: r.kind, id: r.id });
+  const uniqueBareRefs = (value) => {
+    const seen = new Set();
+    const result = [];
+    for (const ref of Array.isArray(value) ? value.filter(validRef) : []) {
+      if (seen.has(refKey(ref))) continue;
+      seen.add(refKey(ref));
+      result.push(bareRef(ref));
+    }
+    return result;
+  };
+
+  /**
+   * The Focus section's header id. Not a stored group: it rides the group-header
+   * plumbing (keyboard tree, collapse, alert dot) under an id the client's
+   * UUID group ids never take.
+   */
+  const FOCUS_SECTION_ID = ':focus';
+  const FOCUS_COLLAPSED_STORAGE_KEY = 'codeman:focus-group-collapsed';
 
   /** Server limits (src/tab-layout.ts), mirrored so a bad edit fails before the PUT. */
   const MAX_GROUPS = 32;
@@ -76,7 +90,98 @@
           refs: copyRefs(group.refs),
         })),
       ungrouped: copyRefs(value.ungrouped),
+      ...(Array.isArray(value.focusOrder) ? { focusOrder: uniqueBareRefs(value.focusOrder) } : {}),
     };
+  }
+
+  /**
+   * Focus order: explicitly ordered focused refs first, then focused refs the
+   * order does not list yet, in stored position order. Mirrors orderedFocusRefs()
+   * in src/tab-layout.ts. `accept(ref)` narrows to what can be drawn here.
+   */
+  function orderedFocusRefs(layoutInput, accept) {
+    const layout = normalizeLayout(layoutInput);
+    const focused = new Map();
+    for (const { ref } of refLocations(layout)) {
+      if (ref.focus === true && !focused.has(refKey(ref))) focused.set(refKey(ref), bareRef(ref));
+    }
+    const result = [];
+    const emitted = new Set();
+    for (const ref of [...(layout.focusOrder || []), ...focused.values()]) {
+      const key = refKey(ref);
+      if (!focused.has(key) || emitted.has(key)) continue;
+      emitted.add(key);
+      result.push(focused.get(key));
+    }
+    return accept ? result.filter(accept) : result;
+  }
+
+  /** Drop Focus order entries that are no longer stored or no longer focused. */
+  function prunedFocusOrder(layout) {
+    if (!Array.isArray(layout.focusOrder)) return layout;
+    const focusedKeys = new Set(
+      refLocations(layout)
+        .filter((item) => item.ref.focus === true)
+        .map((item) => refKey(item.ref))
+    );
+    const kept = layout.focusOrder.filter((ref) => focusedKeys.has(refKey(ref)));
+    if (kept.length === layout.focusOrder.length) return layout;
+    if (kept.length === 0) {
+      const { focusOrder: _dropped, ...rest } = layout;
+      return rest;
+    }
+    return { ...layout, focusOrder: kept };
+  }
+
+  function hasFocus(layout) {
+    return !!layout && refLocations(layout).some((item) => item.ref.focus === true);
+  }
+
+  /**
+   * Placement facts for every stored child session, the browser twin of
+   * describeTabPlacements() in src/tab-layout.ts: `inherited` (follows its
+   * parent), `manual` (moved by hand, can follow again), `dangling` (parent gone
+   * from the layout) or `cycle`. Computed here rather than read from the server
+   * so the badge tracks the optimistic layout an edit just painted.
+   * `parents` maps a session id to its parent session id.
+   */
+  function describePlacements(layoutInput, parents) {
+    const layout = normalizeLayout(layoutInput);
+    const located = refLocations(layout);
+    const represented = new Set(located.map((item) => refKey(item.ref)));
+    const parentOf = parents || {};
+    const cycleIds = new Set();
+    const state = new Map();
+    const stack = [];
+    const visit = (id) => {
+      if (state.get(id) === 'done') return;
+      if (state.get(id) === 'visiting') {
+        for (const cycleId of stack.slice(Math.max(0, stack.indexOf(id)))) cycleIds.add(cycleId);
+        return;
+      }
+      state.set(id, 'visiting');
+      stack.push(id);
+      const parentId = parentOf[id];
+      if (parentId && represented.has(`session:${parentId}`)) visit(parentId);
+      stack.pop();
+      state.set(id, 'done');
+    };
+    for (const { ref } of located) if (ref.kind === 'session') visit(ref.id);
+    const result = {};
+    for (const { ref } of located) {
+      if (ref.kind !== 'session') continue;
+      const parentId = parentOf[ref.id];
+      if (typeof parentId !== 'string' || !parentId || parentId === ref.id) continue;
+      const placementState = !represented.has(`session:${parentId}`)
+        ? 'dangling'
+        : cycleIds.has(ref.id)
+          ? 'cycle'
+          : ref.placement === 'manual'
+            ? 'manual'
+            : 'inherited';
+      result[refKey(ref)] = { state: placementState, parentId, canFollow: placementState === 'manual' };
+    }
+    return result;
   }
 
   function hasGroups(layout) {
@@ -203,7 +308,7 @@
   function project(layoutInput, options = {}) {
     if (!layoutInput) return null;
     const layout = normalizeLayout(layoutInput);
-    if (!hasGroups(layout)) return null;
+    if (!hasGroups(layout) && !hasFocus(layout)) return null;
     const liveSessionIds = stableIds(options.liveSessionIds);
     const openWebviewIds = stableIds(options.openWebviewIds);
     const live = new Set(liveSessionIds);
@@ -244,6 +349,24 @@
       return { shown, hidden, count };
     };
 
+    // Focus leads the rail. A focused row is drawn there INSTEAD of in its
+    // group (one row per tab, so per-row DOM lookups stay unambiguous); the
+    // server keeps its stored group position for when it leaves Focus.
+    const focusRefs = orderedFocusRefs(layout, renderable);
+    if (!hasGroups(layout) && focusRefs.length === 0) return null;
+    if (focusRefs.length) {
+      const focusCollapsed = options.focusCollapsed === true;
+      const { shown, hidden, count } = place(focusRefs, FOCUS_SECTION_ID, focusCollapsed);
+      sections.push({
+        id: FOCUS_SECTION_ID,
+        focus: true,
+        name: 'Focus',
+        refs: shown,
+        hidden,
+        count,
+        collapsed: focusCollapsed,
+      });
+    }
     for (const group of layout.groups) {
       const isCollapsed = collapsed.has(group.id);
       const { shown, hidden, count } = place(withFollowers(group.refs), group.id, isCollapsed);
@@ -262,9 +385,49 @@
         hidden: [],
         count: ungrouped.count,
         collapsed: false,
+        // With no named group the rest of the rail is not "ungrouped" from
+        // anything: it is drawn without the divider.
+        ...(hasGroups(layout) ? {} : { headless: true }),
       });
     }
-    return { sections, visibleRefs, hiddenTabGroupByRef, sectionByRef, focusRefs: focusRefs(layout, options) };
+    return { sections, visibleRefs, hiddenTabGroupByRef, sectionByRef, focusRefs };
+  }
+
+  /**
+   * Alt+1..9 order: Focus first, then every other live session in tab order,
+   * then open web tabs. Without Focus this is exactly the flat strip's numbering.
+   */
+  function altRefs(projection, liveSessionIds, openWebviewIds) {
+    const focus = projection && Array.isArray(projection.focusRefs) ? projection.focusRefs : [];
+    return uniqueBareRefs([
+      ...focus,
+      ...stableIds(liveSessionIds).map((id) => ({ kind: 'session', id })),
+      ...stableIds(openWebviewIds).map((id) => ({ kind: 'webview', id })),
+    ]);
+  }
+
+  /**
+   * Narrow a projection to the matching sessions (a search or a filter), every
+   * section open. Web tabs never match a session filter.
+   */
+  function filterSessionProjection(projection, matchingSessionIds) {
+    if (!projection) return null;
+    const matches = new Set(asIds(matchingSessionIds));
+    const keep = (ref) => ref && ref.kind === 'session' && matches.has(ref.id);
+    const sections = (projection.sections || [])
+      .map((section) => {
+        const refs = [...(section.refs || []), ...(section.hidden || [])].filter(keep).map(bareRef);
+        return { ...section, refs, hidden: [], count: refs.length, collapsed: false };
+      })
+      .filter((section) => section.count > 0);
+    const visibleRefs = sections.flatMap((section) => section.refs);
+    return {
+      ...projection,
+      sections,
+      visibleRefs,
+      hiddenTabGroupByRef: {},
+      focusRefs: (projection.focusRefs || []).filter(keep).map(bareRef),
+    };
   }
 
   const ALERT_RANK = { action: 2, idle: 1 };
@@ -351,6 +514,8 @@
         section.id,
         section.name,
         section.count,
+        section.collapsed === true,
+        section.headless === true,
         section.refs.map(refKey),
         (section.hidden || []).map(refKey),
       ]),
@@ -379,6 +544,9 @@
     return sections
       .map((section, index) => {
         const rows = section.refs.map((ref) => renderRef(ref)).join('');
+        if (section.id === null && section.headless) {
+          return `<section class="tab-layout-group tab-layout-ungrouped tab-layout-ungrouped--headless" role="presentation" data-tab-group-id=""><div class="tab-layout-group-refs" role="presentation">${rows}</div></section>`;
+        }
         if (section.id === null) {
           return (
             '<section class="tab-layout-group tab-layout-ungrouped" role="presentation" data-tab-group-id="">' +
@@ -388,6 +556,22 @@
         }
         const id = escapeHtml(section.id);
         const refsId = `tab-layout-group-refs-${index}`;
+        if (section.focus) {
+          const nameId = `tab-layout-group-name-${index}`;
+          const expanded = !section.collapsed;
+          // Same header shape as a named group (so the tree keys, collapse and
+          // the hidden-alert dot all apply), minus the group menu: Focus is not
+          // renamed, moved or deleted, only emptied.
+          return (
+            `<section class="tab-layout-group tab-layout-focus-group${section.collapsed ? ' tab-layout-group--collapsed' : ''}" role="presentation" data-tab-group-id="${id}" data-tab-focus-group>` +
+            `<div class="tab-layout-group-header tab-layout-group-toggle tab-layout-focus-header" role="treeitem" tabindex="-1" data-tab-group-header="${id}" aria-expanded="${expanded ? 'true' : 'false'}"${expanded ? ` aria-owns="${refsId}"` : ''} onclick="app.toggleTabGroupCollapsed(this.dataset.tabGroupHeader)">` +
+            '<span class="tab-layout-group-chevron" aria-hidden="true"></span>' +
+            '<span class="tab-layout-focus-star" aria-hidden="true">&#x2605;</span>' +
+            `<span class="tab-layout-group-name" id="${nameId}">Focus</span>` +
+            `<span class="tab-layout-group-count">${section.count}</span></div>` +
+            `<div class="tab-layout-group-refs" id="${refsId}" ${expanded ? `role="group" aria-labelledby="${nameId}"` : 'role="presentation"'}>${rows}</div></section>`
+          );
+        }
         const nameId = `tab-layout-group-name-${index}`;
         const leaf = section.count === 0;
         const expanded = !section.collapsed && !leaf;
@@ -491,6 +675,13 @@
     ];
   }
 
+  /** The stored (mutable) ref in a layout copy; throws when it is not stored. */
+  function storedRef(layout, target) {
+    const found = refLocations(layout).find((item) => refKey(item.ref) === refKey(target));
+    if (!found) editError('unknown row');
+    return found.ref;
+  }
+
   function containerRefs(layout, groupId) {
     if (groupId === null) return layout.ungrouped;
     const group = layout.groups.find((candidate) => candidate.id === groupId);
@@ -585,7 +776,9 @@
   function dropOperation(layoutInput, source, target, parents) {
     const layout = normalizeLayout(layoutInput);
     if (!source || !target) return null;
+    const intoFocus = target.groupId === FOCUS_SECTION_ID;
     if (source.type === 'group') {
+      if (source.groupId === FOCUS_SECTION_ID || intoFocus) return null;
       const from = layout.groups.findIndex((group) => group.id === source.groupId);
       if (from < 0) return null;
       const targetId = target.type === 'ungrouped' ? null : (target.groupId ?? null);
@@ -596,6 +789,28 @@
     if (source.type !== 'ref' || !validRef(source.ref)) return null;
     const location = refLocations(layout).find((item) => refKey(item.ref) === refKey(source.ref));
     if (!location) return null;
+    const ref = bareRef(source.ref);
+    const focused = location.ref.focus === true;
+    if (intoFocus) {
+      // Onto the Focus header: join Focus (at its end). Onto a Focus row: join
+      // if needed, then take that row's slot in the Focus order.
+      const operations = focused ? [] : [{ type: 'setFocus', ref, focused: true }];
+      if (target.type === 'ref' && validRef(target.ref) && refKey(target.ref) !== refKey(ref)) {
+        const others = orderedFocusRefs(layout).filter((candidate) => refKey(candidate) !== refKey(ref));
+        const at = others.findIndex((candidate) => refKey(candidate) === refKey(target.ref));
+        if (at >= 0) operations.push({ type: 'moveFocus', ref, index: target.placement === 'after' ? at + 1 : at });
+      }
+      if (!operations.length) return null;
+      const result = operations.reduce((current, operation) => applyOperation(current, operation), layout);
+      if (contentKey(result) === contentKey(layout)) return null;
+      return operations.length === 1 ? operations[0] : operations;
+    }
+    // A Focus row dragged out leaves Focus, then lands where it was dropped.
+    const leaveFocus = focused ? { type: 'setFocus', ref, focused: false } : null;
+    const withLeave = (operation) => {
+      if (!leaveFocus) return operation;
+      return operation ? [leaveFocus, operation] : leaveFocus;
+    };
     let groupId;
     let anchor = null;
     let placement = 'before';
@@ -607,10 +822,10 @@
       placement = target.placement === 'after' ? 'after' : 'before';
     } else if (target.type === 'group') {
       groupId = target.groupId ?? null;
-      if (groupId === location.groupId) return null;
+      if (groupId === location.groupId) return withLeave(null);
     } else if (target.type === 'ungrouped') {
       groupId = null;
-      if (location.groupId === null) return null;
+      if (location.groupId === null) return withLeave(null);
     } else return null;
     if (groupId !== null && !layout.groups.some((group) => group.id === groupId)) return null;
     const destination = moveDestination(layout, source.ref, groupId, anchor, placement, parents);
@@ -621,7 +836,9 @@
       ...(destination.index === undefined ? {} : { index: destination.index }),
       parents: parents || {},
     };
-    return contentKey(applyOperation(layout, operation)) === contentKey(layout) ? null : operation;
+    return contentKey(applyOperation(layout, operation)) === contentKey(layout)
+      ? withLeave(null)
+      : withLeave(operation);
   }
 
   /**
@@ -691,6 +908,31 @@
         destination.splice(clampIndex(op.index, destination.length), 0, ...block);
         return layout;
       }
+      case 'setFocus': {
+        if (!validRef(op.ref) || typeof op.focused !== 'boolean') editError('invalid Focus state');
+        const stored = storedRef(layout, op.ref);
+        if (op.focused) stored.focus = true;
+        else delete stored.focus;
+        // A ref leaving Focus leaves the explicit order with it; one entering
+        // is unlisted and therefore sorts after the ordered entries.
+        return prunedFocusOrder(layout);
+      }
+      case 'moveFocus': {
+        if (!validRef(op.ref)) editError('invalid row');
+        storedRef(layout, op.ref);
+        const ordered = orderedFocusRefs(layout);
+        const from = ordered.findIndex((ref) => refKey(ref) === refKey(op.ref));
+        if (from < 0) editError('row is not in Focus');
+        const [moved] = ordered.splice(from, 1);
+        ordered.splice(clampIndex(op.index, ordered.length), 0, moved);
+        layout.focusOrder = ordered;
+        return layout;
+      }
+      case 'setManualPlacement': {
+        if (!validRef(op.ref) || op.manual !== true) editError('invalid placement');
+        storedRef(layout, op.ref).placement = 'manual';
+        return layout;
+      }
       case 'followParent': {
         // Clear a hand placement: the child (with the sessions that follow it)
         // goes back after its parent's rows. The server re-derives the exact
@@ -736,7 +978,40 @@
   /** Layout content without version metadata: equal keys mean "nothing to save". */
   function contentKey(layoutInput) {
     const layout = normalizeLayout(layoutInput);
-    return JSON.stringify([layout.groups, layout.ungrouped]);
+    return JSON.stringify([layout.groups, layout.ungrouped, orderedFocusRefs(layout)]);
+  }
+
+  /**
+   * Operations as `PUT /api/tab-layout { operations }` accepts them, replayed
+   * from `base`. The server requires an explicit index on every moveRef, while
+   * the browser's "at the end" move carries none (so a rebase keeps meaning
+   * the end): fill it in with the destination's length at that step, counted
+   * after the moving block is taken out, as the server counts. `parents` is a
+   * browser-side hint and stays behind; the server uses its own lineage.
+   * Operations that no longer apply are dropped, as replayOperations() does.
+   */
+  function wireOperations(base, operations) {
+    let layout = normalizeLayout(base);
+    const result = [];
+    for (const operation of operations) {
+      let wire = operation;
+      if (operation?.type === 'moveRef' || operation?.type === 'followParent') {
+        const { parents: _parents, ...rest } = operation;
+        wire = rest;
+      }
+      try {
+        if (operation?.type === 'moveRef' && !Number.isInteger(operation.index)) {
+          const block = lineageBlock(layout, operation.ref, operation.parents);
+          const remaining = containerRefs(layout, operation.groupId ?? null).filter((ref) => !block.has(refKey(ref)));
+          wire = { ...wire, index: remaining.length };
+        }
+        layout = applyOperation(layout, operation);
+        result.push(wire);
+      } catch (_error) {
+        // Dropped: the same edit replayOperations() drops.
+      }
+    }
+    return result;
   }
 
   /** Replay operations, dropping (and counting) the ones that no longer apply. */
@@ -768,7 +1043,7 @@
    *  - Anything else, or attempts exhausted, drops the batch and reports it; the
    *    caller re-reads so the rail shows the server's truth.
    *
-   * options: { initialLayout, put({ baseVersion, layout }) -> { ok, status,
+   * options: { initialLayout, put({ baseVersion, layout, operations }) -> { ok, status,
    *   layout }, fetchLayout?(), applyLayout(layout, meta), reportError?(message),
    *   onSettled?(), onFailure?(), schedule?(fn), cancel?(handle), maxAttempts? }
    */
@@ -811,7 +1086,11 @@
             inFlight = [];
             break;
           }
-          const response = await options.put({ baseVersion: authoritative.version, layout: desired.layout });
+          const response = await options.put({
+            baseVersion: authoritative.version,
+            layout: desired.layout,
+            operations: wireOperations(authoritative, inFlight),
+          });
           if (disposed) return;
           if (response?.ok && response.layout) {
             authoritative = normalizeLayout(response.layout);
@@ -900,6 +1179,8 @@
       hasPending: () => writing || pending.length > 0,
       /** Every operation not yet confirmed by the server, oldest first. */
       pendingOperations: () => JSON.parse(JSON.stringify([...inFlight, ...pending])),
+      /** The same, in the form the server's semantic PUT accepts (wireOperations). */
+      pendingWireOperations: () => wireOperations(authoritative, [...inFlight, ...pending]),
       baseVersion: () => authoritative.version,
       getLayout: () => normalizeLayout(optimistic),
       dispose() {
@@ -925,12 +1206,18 @@
     dropOperation,
     contentKey,
     createEditCoordinator,
+    wireOperations,
     createLoadCoordinator,
     loadCollapsedGroupIds,
     saveCollapsedGroupIds,
-    focusRefs,
     loadFocusCollapsed,
     saveFocusCollapsed,
+    orderedFocusRefs,
+    focusRefs,
+    describePlacements,
+    altRefs,
+    filterSessionProjection,
+    FOCUS_SECTION_ID,
     MAX_GROUPS,
   };
 })(typeof window !== 'undefined' ? window : globalThis);

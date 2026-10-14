@@ -10,7 +10,8 @@
  * @globals {function} scheduleBackground - scheduler.postTask wrapper (background priority)
  * @globals {function} getEventCoords - Unified mouse/touch coordinate extractor
  * @globals {function} escapeHtml - XSS-safe HTML escaping
- * @globals {object} SSE_EVENTS - Centralized SSE event type constants (157 event types; must match backend src/web/sse-events.ts)
+ * @globals {object} CodemanTabOverflow - Tab overflow layout policy helper
+ * @globals {object} SSE_EVENTS - Centralized SSE event type constants (162 event types; must match backend src/web/sse-events.ts)
  * @globals {Array} BUILTIN_RESPAWN_PRESETS - Built-in respawn configuration presets
  *
  * @dependency None (first in load order)
@@ -100,7 +101,7 @@ function urlBase64ToUint8Array(base64String) {
 // ═══════════════════════════════════════════════════════════════
 
 // Default terminal scrollback (can be changed via settings)
-const DEFAULT_SCROLLBACK = 50000;
+const DEFAULT_SCROLLBACK = 100000;
 
 // Timing constants
 const STUCK_THRESHOLD_DEFAULT_MS = 600000;  // 10 minutes - default for stuck detection
@@ -134,6 +135,13 @@ const SHELL_LOAD_QUERY = `${SHELL_LOAD_BASE_QUERY}&lines=${SHELL_LOAD_HISTORY_LI
 const SYNC_WAIT_TIMEOUT_MS = 50;            // Wait timeout for terminal sync
 const STATS_POLLING_INTERVAL_MS = 2000;     // System stats polling
 const TUI_REDRAW_SETTLE_MS = 400;           // Grace for a TUI to redraw after a real resize, before fetching its buffer
+const FOREIGN_RESIZE_SETTLE_MS = 1200;      // Debounce for reconciling after ANOTHER client resized the shared PTY (COD-179)
+const REMOTE_RECONCILE_TICK_MS = 25000;     // Periodic mid-turn reconcile cadence for busy REMOTE TUI sessions (COD-180)
+const HISTORY_ENTRY_LINES = 3;              // COD-187: accumulated up-scroll lines before a mirror tab opens history
+const HISTORY_ENTRY_WINDOW_MS = 300;        // COD-187: accumulation window for history entry (rejects trackpad jitter)
+const HISTORY_REENTRY_COOLDOWN_MS = 300;    // COD-187: ignore up-scroll right after leaving history (inertia tail)
+const HISTORY_INITIAL_LINES = 2000;         // COD-187: fast first page of the history view; full depth loads on scroll-to-top
+const HISTORY_PREFETCH_TTL_MS = 2500;       // COD-190: speculative history prefetch validity (bottom frame must stay fresh)
 
 // Z-index base values for layered floating windows
 const ZINDEX_SUBAGENT_BASE = 1000;
@@ -192,11 +200,15 @@ function evaluateWebGLLongTaskTrip(recent, entries, now, config = WEBGL_FALLBACK
  * between device type, URL params, the sticky marker, and the user's settings
  * toggle in one testable place (terminal-ui.js calls this).
  *
- * Precedence (desktop only — mobile always skips):
+ * Precedence (desktop + iPhone when not low-power):
  *   1. user toggle OFF        -> skip (one-shot opt-out, sticky untouched)
  *   2. ?nowebgl               -> skip (one-shot opt-out, sticky untouched)
  *   3. ?webgl=force           -> enable + clear stale sticky marker
  *   4. toggle ON / untouched  -> respect the auto-fallback sticky marker
+ *
+ * Mobile: skipped by default except iPhone (isIOS && deviceType==='mobile')
+ * when not in low-power / reduced-motion — COD-283 tries WebGL on iPhone
+ * with canvas fallback on context loss or long-task stalls.
  *
  * A stored `true` is treated like the untouched default here: the checkbox
  * ships checked on desktop, so any unrelated settings save stores `true` —
@@ -204,12 +216,13 @@ function evaluateWebGLLongTaskTrip(recent, entries, now, config = WEBGL_FALLBACK
  * auto-fallback safety net. The marker is only retired by ?webgl=force or by
  * a real OFF->ON toggle flip, which saveAppSettings() detects at save time.
  *
- * @param {{deviceType?: string, noWebglParam?: boolean, forceParam?: boolean,
+ * @param {{deviceType?: string, isIOS?: boolean, isLowPower?: boolean, noWebglParam?: boolean, forceParam?: boolean,
  *          stickyDisabled?: boolean, userPrefEnabled?: (boolean|undefined)}} [input]
  * @returns {{skip: boolean, clearSticky: boolean}}
  */
 function shouldSkipWebGL(input = {}) {
-  if (input.deviceType !== 'desktop') return { skip: true, clearSticky: false };
+  const allowMobileWebGL = input.deviceType === 'mobile' && input.isIOS && !input.isLowPower;
+  if (input.deviceType !== 'desktop' && !allowMobileWebGL) return { skip: true, clearSticky: false };
   if (input.userPrefEnabled === false) return { skip: true, clearSticky: false };
   if (input.noWebglParam) return { skip: true, clearSticky: false };
   if (input.forceParam) return { skip: false, clearSticky: true };
@@ -234,12 +247,26 @@ function shouldAutoWrapTabs(input) {
   return scrollWidth > clientWidth + 1;
 }
 
+// COD-147: When session tabs occupy a second row (manual two-row pin or the
+// auto-wrap signal), allow the header-right cluster to wrap too so the tab area
+// gets more width. Desktop-only; one-row layouts stay unchanged.
+function shouldWrapHeaderRight(input) {
+  if (!input || input.deviceType !== 'desktop') return false;
+  return input.manualTwoRows === true || input.autoWrap === true;
+}
+
+// COD-286: Session tabs render either as the horizontal strip in the header or as
+// a vertical rail beside the terminal. Phones are excluded on purpose — their
+// layout is a fixed header plus the overview home screen, with no room for a rail
+// — so an unknown/absent setting and every phone both fall back to horizontal.
 function resolveTabOrientation(input) {
   if (!input || input.setting !== 'vertical') return 'horizontal';
   if (input.deviceType === 'mobile') return 'horizontal';
   return 'vertical';
 }
 
+// COD-299: vertical-rail sizing policy. Kept pure so restore, viewport clamps,
+// and keyboard behavior do not depend on browser layout timing.
 const TAB_RAIL_MIN_WIDTH = 208;
 const TAB_RAIL_DEFAULT_WIDTH = 256;
 /** Detailed rows carry a third line, and it ellipsizes at 256px — see the
@@ -263,17 +290,52 @@ function resolveTabRailWidth(input = {}) {
 }
 
 function resolveTabRailKeyboardWidth(input = {}) {
+  const key = input.key;
   let width;
-  if (input.key === 'Home') width = TAB_RAIL_MIN_WIDTH;
-  else if (input.key === 'End') width = TAB_RAIL_MAX_WIDTH;
-  // Enter resets to the caller's effective default (the rich rail's is the
-  // Wide preset, not 256 — see _defaultTabRailWidth); absent, the base default.
-  else if (input.key === 'Enter') width = Number(input.defaultWidth) || TAB_RAIL_DEFAULT_WIDTH;
-  else if (input.key === 'ArrowLeft' || input.key === 'ArrowRight') {
-    const direction = input.key === 'ArrowLeft' ? -1 : 1;
+  if (key === 'Home') width = TAB_RAIL_MIN_WIDTH;
+  else if (key === 'End') width = TAB_RAIL_MAX_WIDTH;
+  // Enter resets to the caller's effective default (the rich rail's Wide
+  // preset, not 256 — see _defaultTabRailWidth); absent that, the base default.
+  else if (key === 'Enter') width = Number(input.defaultWidth) || TAB_RAIL_DEFAULT_WIDTH;
+  else if (key === 'ArrowLeft' || key === 'ArrowRight') {
+    const direction = key === 'ArrowLeft' ? -1 : 1;
     width = (Number(input.currentWidth) || TAB_RAIL_DEFAULT_WIDTH) + direction * (input.shiftKey ? 32 : 8);
-  } else return null;
+  } else {
+    return null;
+  }
   return resolveTabRailWidth({ ...input, width });
+}
+
+// COD-122: Monitor "Tmux Sessions" row label policy. A row carries up to three
+// identifiers — the tab name (user-facing L1 label), the tmux session name
+// (e.g. "codeman-1fac7304"), and the agent (Claude/Codex) session id. The tab name
+// must win as the primary label; the other two are secondary metadata shown only
+// when known and not redundant with the primary, so the row degrades gracefully
+// when identifiers are missing.
+function resolveMonitorRowLabels(input) {
+  const clean = (v) => (typeof v === 'string' ? v.trim() : '');
+  const tabName = clean(input && input.tabName);
+  const storedName = clean(input && input.storedName);
+  const muxName = clean(input && input.muxName);
+  const agentId = clean(input && input.agentSessionId);
+  const sessionId = clean(input && input.sessionId);
+
+  // Tab name is the L1 label; fall back through the persisted mux name → tmux name
+  // → a generic placeholder so the primary is never blank.
+  const primary = tabName || storedName || muxName || 'session';
+
+  const secondaries = [];
+  // tmux name — skip when it's already serving as the primary fallback (no dup).
+  if (muxName && muxName !== primary) {
+    secondaries.push({ kind: 'tmux', label: muxName });
+  }
+  // agent session id — show only when genuinely known: non-empty, not the codeman
+  // sessionId placeholder (claudeSessionId is seeded with the session id until a
+  // real agent message arrives), and not redundant with the primary label.
+  if (agentId && agentId !== sessionId && agentId !== primary) {
+    secondaries.push({ kind: 'agent', label: agentId });
+  }
+  return { primary, secondaries };
 }
 
 // Sliver of the neighbouring tab left visible when the strip scrolls a tab into
@@ -635,8 +697,8 @@ function r1(n) {
 //   - 4004 (session not found) / 4009 (session terminated) → 'give-up': the
 //     session is gone, retrying only wastes connections.
 //   - 4008 (too many connections) and any other code >= 4004 → 'retry-fallback':
-//     show the HTTP fallback but keep retrying on a bounded 5s timer so the
-//     transport returns to WS once the transient condition clears (un-stick).
+//     keep browser input queued and retry on a bounded 5s timer so an
+//     ownership-capable WS returns once the transient condition clears.
 // Pure: no DOM, no side effects.
 function planWsReconnect(code, attempt) {
   if (code === 4004 || code === 4009) {
@@ -825,12 +887,78 @@ const SESSION_ACTIVITY_RANK = {
   error: 1,
   waiting: 2,
   working: 3,
-  idle: 4,
-  done: 5,
+  waiting_agents: 4,
+  checking_agents: 5,
+  idle: 6,
+  done: 7,
 };
 
 /** States still in progress, where the OLDEST stamp sorts first. */
-const SESSION_ACTIVITY_OLDEST_FIRST = ['needs', 'error', 'waiting', 'working'];
+const SESSION_ACTIVITY_OLDEST_FIRST = ['needs', 'error', 'waiting', 'working', 'waiting_agents', 'checking_agents'];
+
+const AGENT_ACTIVITY_PRESENTATION = {
+  waiting_agents: {
+    compactLabel: 'AGENTS',
+    expandedLabel: 'WAITING ON AGENTS',
+    ariaPhrase: 'waiting on background agents',
+    cssState: 'waiting-agents',
+  },
+  checking_agents: {
+    compactLabel: 'CHECKING',
+    expandedLabel: 'CHECKING AGENTS',
+    ariaPhrase: 'checking background agents',
+    cssState: 'checking-agents',
+  },
+};
+
+const SESSION_ACTIVITY_ARIA = {
+  needs: 'needs your permission or input',
+  waiting: 'waiting for your input',
+  error: 'has an error',
+  working: 'working',
+  idle: 'idle',
+  done: 'done',
+};
+
+function resolveSessionActivity(session = {}) {
+  const rawStatus = session.status || 'idle';
+  const effectiveStatus = session.activityStatus || rawStatus;
+  const overviewState =
+    effectiveStatus === 'busy'
+      ? 'working'
+      : effectiveStatus === 'stopped'
+        ? 'done'
+        : effectiveStatus === 'parked'
+          ? 'idle'
+          : effectiveStatus;
+  const presentation = AGENT_ACTIVITY_PRESENTATION[effectiveStatus] || {};
+  const activeAt = Number(session.lastActivityAt) || 0;
+  const sortAnchor =
+    effectiveStatus === 'waiting_agents' || effectiveStatus === 'checking_agents'
+      ? Number(session.activityStatusSince) || activeAt
+      : overviewState === 'working'
+        ? Number(session.lastSubmitAt) || activeAt
+        : activeAt;
+  return {
+    rawStatus,
+    effectiveStatus,
+    overviewState,
+    compactLabel: presentation.compactLabel || effectiveStatus.toUpperCase(),
+    expandedLabel: presentation.expandedLabel || effectiveStatus.toUpperCase(),
+    ariaPhrase: presentation.ariaPhrase || SESSION_ACTIVITY_ARIA[effectiveStatus] || effectiveStatus.replaceAll('_', ' '),
+    cssState: presentation.cssState || effectiveStatus.replaceAll('_', '-'),
+    sortAnchor,
+  };
+}
+
+function sessionToOverviewRow(session = {}) {
+  const activity = resolveSessionActivity(session);
+  return { ...session, state: activity.overviewState, activityStatusSince: activity.sortAnchor };
+}
+
+function sessionWireSortAnchor(session = {}) {
+  return session && session.state ? sessionActivityAnchor(session) : resolveSessionActivity(session).sortAnchor;
+}
 
 /**
  * When the row entered the state it is in.
@@ -849,6 +977,9 @@ const SESSION_ACTIVITY_OLDEST_FIRST = ['needs', 'error', 'waiting', 'working'];
  */
 function sessionActivityAnchor(row) {
   const activeAt = Number(row && row.lastActivityAt) || 0;
+  if (row && (row.state === 'waiting_agents' || row.state === 'checking_agents')) {
+    return Number(row.activityStatusSince) || activeAt;
+  }
   if (row && row.state === 'working') return Number(row.lastSubmitAt) || activeAt;
   return activeAt;
 }
@@ -1468,6 +1599,7 @@ if (typeof window !== 'undefined') {
   window.shouldSkipWebGL = shouldSkipWebGL;
   window.CodemanTabOverflow = {
     shouldAutoWrapTabs,
+    shouldWrapHeaderRight,
     resolveTabOrientation,
     computeTabScrollLeft,
     TAB_SCROLL_REVEAL_PX,
@@ -1479,6 +1611,9 @@ if (typeof window !== 'undefined') {
     MAX_WIDTH: TAB_RAIL_MAX_WIDTH,
     resolveWidth: resolveTabRailWidth,
     resolveKeyboardWidth: resolveTabRailKeyboardWidth,
+  };
+  window.CodemanMonitorLabels = {
+    resolveMonitorRowLabels,
   };
   window.CodemanWsReconnect = {
     plan: planWsReconnect,
@@ -1509,6 +1644,12 @@ if (typeof window !== 'undefined') {
     anchor: sessionActivityAnchor,
     compare: compareSessionActivity,
     sort: sortSessionsByActivity,
+  };
+  window.CodemanSessionActivity = {
+    RANK: SESSION_ACTIVITY_RANK,
+    resolve: resolveSessionActivity,
+    toOverviewRow: sessionToOverviewRow,
+    sortAnchor: sessionWireSortAnchor,
   };
   window.CodemanTabClusters = {
     COLORS: TAB_CLUSTER_COLORS,
@@ -1680,6 +1821,7 @@ const SSE_EVENTS = {
   SESSION_DELETED: 'session:deleted',
   SESSION_TERMINAL: 'session:terminal',
   SESSION_NEEDS_REFRESH: 'session:needsRefresh',
+  SESSION_RESIZED: 'session:resized',
   SESSION_CLEAR_TERMINAL: 'session:clearTerminal',
   SESSION_COMPLETION: 'session:completion',
   SESSION_ERROR: 'session:error',
@@ -1688,6 +1830,7 @@ const SSE_EVENTS = {
   SESSION_WORKING: 'session:working',
   SESSION_AUTO_CLEAR: 'session:autoClear',
   SESSION_AUTO_COMPACT: 'session:autoCompact',
+  SESSION_CHECKPOINT: 'session:checkpoint',
   SESSION_LIMIT_PAUSE_SCHEDULED: 'session:limitPauseScheduled',
   SESSION_LIMIT_RESUME: 'session:limitResume',
   SESSION_LIMIT_RESUME_CANCELLED: 'session:limitResumeCancelled',
@@ -1699,6 +1842,8 @@ const SSE_EVENTS = {
   SESSION_RUNNING: 'session:running',
   SESSION_STATUS_TELEMETRY: 'session:statusTelemetry',
   SESSION_PROMPT_CACHE: 'session:promptCache',
+  SESSION_PARKED: 'session:parked',
+  SESSION_RESUMED: 'session:resumed',
 
   // Scheduled runs
   SCHEDULED_CREATED: 'scheduled:created',
@@ -1789,6 +1934,7 @@ const SSE_EVENTS = {
   HOOK_AGENT_WORKING: 'hook:agent_working',
   HOOK_TEAMMATE_IDLE: 'hook:teammate_idle',
   HOOK_TASK_COMPLETED: 'hook:task_completed',
+  HOOK_SUPPRESSED: 'hook:suppressed',
   HOOK_PROMPT_SUBMITTED: 'hook:prompt_submitted',
 
   // Approvals Inbox
@@ -2070,7 +2216,7 @@ function absoluteFilePathPattern() {
  * file in /tmp played fine. test/media-extension-parity.test.ts pins the sync.
  */
 const FILE_PREVIEW_EXTENSIONS = new Set(
-  ('png jpg jpeg gif webp avif bmp ico svg pdf docx pptx xlsx mp4 webm mov m4v ogv mp3 wav ogg oga m4a aac flac opus md markdown').split(' ')
+  ('png jpg jpeg gif webp avif bmp ico svg pdf docx pptx xlsx mp4 webm mov m4v ogv mp3 wav ogg oga m4a aac flac opus md markdown html htm').split(' ')
 );
 
 /** Whether a path's extension is one {@link FILE_PREVIEW_EXTENSIONS} covers. */
@@ -2117,7 +2263,7 @@ const FILE_LINK_EXTENSION_GROUP = /\\\.(\(\?:[^()]*\))\)\\b$/.exec(FILE_PATH_LIN
  * @returns {Array<{path: string, index: number, folder?: true}>} `index` is where `path` starts in
  *   `text`; `folder` marks a folder path (folder grid) rather than a file.
  */
-function findFilePathLinks(text) {
+function findFilePathLinks(text, options = {}) {
   const value = String(text || '');
   const found = [];
   const overlaps = (index, length) => found.some((f) => index < f.index + f.path.length && f.index < index + length);
@@ -2125,11 +2271,12 @@ function findFilePathLinks(text) {
   // `?img=b.png` belong to the URL link, not to a second, overlapping file link.
   // (`file:///home/x.png` is not one of them: its path is the file.)
   const urls = [];
-  const urlPattern = /\bhttps?:\/\/\S+/gi;
+  const webUrlPattern = /\bhttps?:\/\/\S+/gi;
   let match;
-  while ((match = urlPattern.exec(value)) !== null) urls.push({ index: match.index, path: match[0] });
+  while ((match = webUrlPattern.exec(value)) !== null) urls.push({ index: match.index, path: match[0] });
   const inUrl = (index, length) => urls.some((u) => index < u.index + u.path.length && u.index < index + length);
 
+  if (!options.foldersOnly) {
   const absolute = absoluteFilePathPattern();
   while ((match = absolute.exec(value)) !== null) {
     if (!inUrl(match.index, match[1].length)) found.push({ path: match[1], index: match.index });
@@ -2140,6 +2287,7 @@ function findFilePathLinks(text) {
     const index = match.index + match[1].length;
     if (overlaps(index, path.length) || inUrl(index, path.length)) continue;
     found.push({ path, index });
+  }
   }
   const folders = new RegExp(FOLDER_PATH_LINK_PATTERN.source, 'g');
   while ((match = folders.exec(value)) !== null) {
@@ -2286,7 +2434,12 @@ function terminalLogicalLine(buffer, row, cols, maxRows) {
     if (r <= 0) return false;
     if (lineAt(r)?.isWrapped) return true;
     const prev = lineAt(r - 1);
-    return !!prev && (prev.translateToString(true) || '').length >= width;
+    const prevText = prev?.translateToString(true) || '';
+    // A full-width table divider is a row boundary, not a hard-wrapped line.
+    // Treating it as a continuation hides the next row's wrapped URL from the
+    // link provider when a CLI renders a markdown table in scrollback.
+    if (/^[\s─━═╌╍┄┅┈┉-]+$/u.test(prevText)) return false;
+    return prevText.length >= width;
   };
 
   let startRow = row;
@@ -2458,6 +2611,238 @@ function terminalPathLine(buffer, row, cols, maxRows) {
     return -1;
   };
   return { startRow: parts[0].startRow, endRow: parts[parts.length - 1].endRow, text, offsetToCell, cellToOffset };
+}
+
+/**
+ * Ordinary URLs in terminal text (http, https, webexteams).
+ *
+ * A single `&` is part of the URL (query separator); `&&` is the shell operator
+ * and ends it. `)` is allowed INSIDE a URL when it closes a `(` that is also
+ * inside it (COD-448: `…/Sites/Just-In-Time(JIT)Asset…` used to link only as far
+ * as `(JIT`), and an unmatched `)` ends the URL, which keeps the closing paren of
+ * `(https://…)` and `[text](https://…)` out of the link. Trailing sentence
+ * punctuation is trimmed.
+ *
+ * @param {string} text
+ * @returns {Array<{url: string, startIndex: number, endIndex: number, rawEnd: number}>}
+ *          `endIndex` is exclusive; `rawEnd` is where the match ran to before the
+ *          paren/punctuation trim (the URL-continuation test needs it).
+ */
+function findTerminalUrls(text) {
+  // Named `urlPattern` on purpose: test/link-provider-regex.test.ts extracts it
+  // by name to prove it stays linear-time on hostile lines.
+  const urlPattern = /(?:https?|webexteams):\/\/(?:[^\s"'<>|;&\]\x00-\x1f]|&(?!&))+/g;
+  const urls = [];
+  let match;
+  while ((match = urlPattern.exec(text)) !== null) {
+    const raw = match[0];
+    let end = raw.length;
+    let depth = 0;
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] === '(') depth++;
+      else if (raw[i] === ')') {
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+        depth--;
+      }
+    }
+    const url = raw.slice(0, end).replace(/[.,;:!?&]+$/, '');
+    if (!/:\/\/[^/]/.test(url)) continue;
+    urls.push({ url, startIndex: match.index, endIndex: match.index + url.length, rawEnd: match.index + raw.length });
+  }
+  return urls;
+}
+
+/**
+ * COD-448: the row span a URL covers when the CLI wrapped it with its OWN
+ * newlines at a point short of the terminal width.
+ *
+ * terminalLogicalLine() joins soft wraps and full-width hard wraps. A CLI that
+ * word-wraps inside a table cell or a paragraph (codex's markdown tables, for
+ * one) breaks a long URL at `/`, `?`, `-` … well before the right edge and
+ * indents the rest to the cell's column, so neither rule fires and each row
+ * linked a fragment. A row continues the URL above it only when ALL hold:
+ *   - the URL fragment ends on a character a wrapper breaks after
+ *     (`/ ? & = - _ % # + ~`); a following table column may be excluded;
+ *   - the next row is indented no further right than the column the URL
+ *     started in (a table cell or list item continuation, not unrelated text);
+ *   - that row's first token looks like URL material (contains one of
+ *     `% & = / ? . - _` or a digit) and is not itself a new `scheme://`.
+ * The last rule is what stops prose such as "…/files/" + "then run it" from
+ * being glued into one link.
+ *
+ * Bounded by `maxRows`, like the logical line. Pure: reads rows only.
+ *
+ * @param {{getLine: (row: number) => any, length: number}} buffer
+ * @param {number} row 0-based absolute row being examined.
+ * @param {number} cols Terminal width.
+ * @param {number} [maxRows]
+ * @returns {{startRow: number, endRow: number, firstRowUrlEnd?: number} | null}
+ *          `firstRowUrlEnd` excludes adjacent table columns when present; null
+ *          means the row is not part of a URL continued this way.
+ */
+function terminalUrlContinuationExtent(buffer, row, cols, maxRows) {
+  const bound = Math.max(1, maxRows || 12);
+  const here = terminalLogicalLine(buffer, row, cols, bound);
+  if (!here) return null;
+
+  const chainFrom = (start) => {
+    const first = terminalLogicalLine(buffer, start, cols, bound);
+    if (!first || first.startRow !== start) return null;
+    let text = first.text.replace(/\s+$/, '');
+    let endRow = first.endRow;
+    let urlStartCol = -1;
+    let firstRowUrlEnd = null;
+    let extended = false;
+    while (endRow - start + 1 < bound) {
+      const urls = findTerminalUrls(text);
+      const last = urls[urls.length - 1];
+      const trailingColumns =
+        endRow === first.endRow && last && last.rawEnd < text.length && /^ {2,}\S/.test(text.slice(last.rawEnd));
+      const urlText = trailingColumns ? text.slice(0, last.rawEnd) : text;
+      if (!last || last.rawEnd !== urlText.length || !/[/?&=\-_%#+~]$/.test(urlText)) break;
+      if (urlStartCol < 0) urlStartCol = first.offsetToCell(last.startIndex).col;
+      const next = buffer.getLine(endRow + 1);
+      if (!next || next.isWrapped) break;
+      const nextText = next.translateToString(true) || '';
+      const indent = nextText.length - nextText.replace(/^\s+/, '').length;
+      const token = nextText.slice(indent).split(/\s/, 1)[0];
+      if (!token || indent > urlStartCol) break;
+      // When other table columns follow the URL, the next row must align with
+      // the start of its cell. A new numbered row must not become URL text.
+      if (
+        trailingColumns &&
+        (!indent ||
+          first.text[indent - 1] !== ' ' ||
+          first.text[indent] === ' ' ||
+          / {2,}/.test(first.text.slice(indent, last.startIndex)))
+      )
+        break;
+      if (/^[a-z][a-z0-9+.-]*:\/\//i.test(token) || !/^[A-Za-z0-9%_~]/.test(token)) break;
+      if (!/[%&=/?.\-_0-9]/.test(token)) break;
+      const nextLogical = terminalLogicalLine(buffer, endRow + 1, cols, bound);
+      if (!nextLogical) break;
+      if (trailingColumns) firstRowUrlEnd = last.rawEnd;
+      text = urlText + nextLogical.text.slice(indent).replace(/\s+$/, '');
+      endRow = nextLogical.endRow;
+      extended = true;
+    }
+    return { startRow: start, endRow, extended, firstRowUrlEnd };
+  };
+
+  // Walk up through earlier logical lines: the nearest one whose URL chain
+  // reaches this row owns it.
+  let start = here.startRow;
+  while (start >= 0 && here.startRow - start < bound) {
+    const chain = chainFrom(start);
+    if (chain && chain.extended && chain.endRow >= here.startRow) {
+      return {
+        startRow: chain.startRow,
+        endRow: chain.endRow,
+        ...(chain.firstRowUrlEnd === null ? {} : { firstRowUrlEnd: chain.firstRowUrlEnd }),
+      };
+    }
+    if (start === 0) break;
+    const above = terminalLogicalLine(buffer, start - 1, cols, bound);
+    if (!above) break;
+    start = above.startRow;
+  }
+  return null;
+}
+
+/**
+ * Absolute file paths the CLI word-wrapped INSIDE a table cell (codex markdown
+ * tables), returned as one link per path with a segment per row.
+ *
+ *    Before screenshot (/tmp/x/docs/review/          After screenshot (/tmp/x/review/BLDMESH-
+ *    BLDMESH-243/before-overview.png)                243/after-overview.png)
+ *
+ * Neither fragment matches FILE_PATH_LINK_PATTERN alone (the first has no
+ * extension, the second no absolute root), and a linear stitch of the rows
+ * cannot serve a two-column table: each column's continuation sits in the same
+ * next row. So each fragment is followed DOWN ITS OWN CELL: the cell's left
+ * edge is where its text starts after the previous ≥2-space column gap, and the
+ * continuation is the token starting at exactly that column on the next row.
+ * A fragment qualifies only when it is the last thing in its cell on that row
+ * (row end or a ≥2-space gap follows), and the join is accepted only when the
+ * whole joined string matches the path pattern from its first character, which
+ * is what keeps unrelated cell text from being glued on.
+ *
+ * Pure: reads rows only. Cells are taken one per string character (xterm rows
+ * with wide glyphs would shift columns; such rows simply fail the alignment).
+ *
+ * @param {{getLine: (row: number) => any, length: number}} buffer
+ * @param {number} row 0-based absolute row being examined.
+ * @param {number} [maxRows] Bound on rows one path may span.
+ * @returns {Array<{path: string, segments: Array<{row: number, startCol: number, endCol: number}>}>}
+ *          Paths with a segment on `row`; `endCol` is exclusive, columns 0-based.
+ */
+function terminalCellWrappedPaths(buffer, row, maxRows) {
+  const bound = Math.max(2, maxRows || 4);
+  const rootPattern = /\/(?:home|Users|tmp|var|private|opt|mnt|srv|media|data|workspace)\//g;
+  const isPathChar = (ch) => !!ch && !/[\s"'<>|;&\x00-\x1f]/.test(ch);
+  const rowText = (r) => {
+    const line = buffer.getLine(r);
+    return line ? (line.translateToString(true) || '').replace(/\s+$/, '') : null;
+  };
+  // A fragment is the last text in its cell on this row when the row ends or a
+  // column gap (≥2 spaces) follows it.
+  const endsCell = (text, end) => end >= text.length || /^ {2,}/.test(text.slice(end));
+
+  const fromStart = (startRow) => {
+    const found = [];
+    const text = rowText(startRow);
+    if (!text) return found;
+    rootPattern.lastIndex = 0;
+    let m;
+    while ((m = rootPattern.exec(text)) !== null) {
+      const start = m.index;
+      if (start > 0 && !/[\s(\[{"'`<]/.test(text[start - 1])) continue;
+      let end = start;
+      while (end < text.length && isPathChar(text[end])) end++;
+      rootPattern.lastIndex = Math.max(end, start + 1);
+      if (!endsCell(text, end)) continue;
+      // Already a complete path on its own row: the ordinary detector owns it.
+      const alone = absoluteFilePathPattern().exec(text.slice(start, end));
+      if (alone && alone.index === 0 && alone[0].length === end - start) continue;
+      // The cell's left edge: just past the nearest ≥2-space gap before the path.
+      const before = text.slice(0, start);
+      const gap = before.match(/^(.*\S)? {2,}(?=\S)/);
+      const cellCol = gap ? gap[0].length : before.length - before.replace(/^\s+/, '').length;
+
+      let joined = text.slice(start, end);
+      const segments = [{ row: startRow, startCol: start, endCol: end }];
+      for (let r = startRow + 1; r < startRow + bound; r++) {
+        const line = buffer.getLine(r);
+        if (!line || line.isWrapped) break;
+        const next = rowText(r);
+        if (!next || !isPathChar(next[cellCol]) || (cellCol > 0 && next[cellCol - 1] !== ' ')) break;
+        let tokenEnd = cellCol;
+        while (tokenEnd < next.length && isPathChar(next[tokenEnd])) tokenEnd++;
+        const candidate = joined + next.slice(cellCol, tokenEnd);
+        const match = absoluteFilePathPattern().exec(candidate);
+        if (match && match.index === 0 && match[0].length > joined.length) {
+          segments.push({ row: r, startCol: cellCol, endCol: cellCol + match[0].length - joined.length });
+          found.push({ path: match[0], segments });
+          break;
+        }
+        if (!endsCell(next, tokenEnd)) break;
+        joined = candidate;
+        segments.push({ row: r, startCol: cellCol, endCol: tokenEnd });
+      }
+    }
+    return found;
+  };
+
+  const results = [];
+  for (let s = row; s >= 0 && row - s < bound; s--) {
+    for (const hit of fromStart(s)) {
+      if (hit.segments.some((seg) => seg.row === row)) results.push(hit);
+    }
+  }
+  return results;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -3372,16 +3757,43 @@ function describeSessionHarness(session, catalog) {
 if (typeof window !== 'undefined') {
   window.CodemanSessionHarness = { describeSessionHarness, SESSION_MODEL_MAX_CHARS };
   window.CodemanHistoryFormat = { formatHistoryBytes, computeHistoryTruncationNotice, computeRewriteScrollLine };
+  /**
+   * The directory a RELATIVE path is resolved against for a session.
+   *
+   * COD-386 established the rule: `session.workingDir` is recorded once at create
+   * time and never follows a `cd`, so `session.cwd` (the pane's live
+   * `#{pane_current_path}`, published by the server sweep) is the real base.
+   * Remote and Docker sessions are EXCLUDED — their local pane runs the
+   * ssh/docker-exec CLIENT, whose cwd names a host directory the agent was never
+   * in — and an unknown cwd falls back to workingDir.
+   *
+   * COD-387 hoisted it here from a local const in terminal-ui.js: the file-preview
+   * "not found" message has to name the SAME base the link resolved against, and a
+   * second copy of this policy would be a bug waiting to disagree with the first.
+   */
+  function relativeResolutionBase(workingDir, session) {
+    if (session?.remote || session?.docker) return workingDir;
+    const cwd = session?.cwd;
+    return typeof cwd === 'string' && cwd.startsWith('/') ? cwd : workingDir;
+  }
+
   window.CodemanFilePaths = {
     absoluteFilePathPattern,
     findFilePathLinks,
     resolveLinkedFilePath,
-    previewsInFileViewer,
-    FILE_PREVIEW_EXTENSIONS,
     rendersAsPage,
     HTML_PAGE_EXTENSIONS,
+    previewsInFileViewer,
+    FILE_PREVIEW_EXTENSIONS,
+    relativeResolutionBase,
   };
-  window.CodemanTerminalLines = { terminalLogicalLine, terminalPathLine };
+  window.CodemanTerminalLines = {
+    terminalLogicalLine,
+    terminalPathLine,
+    terminalUrlContinuationExtent,
+    findTerminalUrls,
+    terminalCellWrappedPaths,
+  };
   window.CodemanUrlSession = { sessionIdFromFragment };
   window.CodemanSplitPane = {
     clampDividerPercent,

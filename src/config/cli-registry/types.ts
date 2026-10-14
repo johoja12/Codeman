@@ -162,6 +162,18 @@ export interface CliLaunch {
    * append (shell, opencode: opencode's docker resume goes through its own config object).
    */
   resumeAppend?: { style: 'flag'; flag: string } | { style: 'positional'; token: string };
+  /**
+   * The legacy `<Mode>Config` KEY holding a COMPLETE, server-resolved shell command line that
+   * REPLACES the templated launch entirely (codex's COD-392 `baseCommand`).
+   *
+   * ⚠️ Deliberately a config key rather than a `launch.params` entry: the argv engine forbids
+   * shell text BY DESIGN, so there is no `ArgSpec` that could carry this and inventing one
+   * would reopen the injection surface the engine exists to close. Naming the key here lets
+   * the code READ it generically while the value stays outside the engine — and the value is
+   * owner-authored shell on a shared host, so every launch path that honours it must first
+   * re-check the owner's bypass grant.
+   */
+  rawCommandField?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +358,8 @@ export interface CliEnv {
  * Keeping them as separate fields makes that invariant structural rather than commented.
  */
 export interface CliCapabilities {
+  /** Named native conversation adapter used by Codeman assistant bindings. */
+  nativeAssistantProfile?: 'codex' | 'claude' | 'opencode';
   /**
    * Non-Claude run mode that uses its own TUI and output format (`isExternalCliMode`):
    * no Claude transcript, no hooks, no Claude-format token/BashTool parsing. An explicit
@@ -513,21 +527,59 @@ export interface CliCapabilities {
     /** Names a PREDICT_PROFILES key. Unknown or absent degrades to 'buffer', never to broken. */
     predictProfile?: string;
   };
-  /** Forwarding the wheel to the CLI's own transcript. 'never' keeps local scrollback. */
-  wheelForward: { mode: 'never' | 'version-gated'; minVersion?: string };
   /**
-   * The CLI pages its OWN transcript on PageUp/PageDown, so a wheel or touch scroll over
-   * a pane with no local history can be turned into those keys instead of doing nothing
-   * (`_maybePageCliTranscript` in terminal-ui.js). Read by the frontend through
-   * `window.__codemanTranscriptPageKeys`, which the server builds from this field.
+   * The terminal grammar checkpoint automation (COD-101 `/clear` · `/compact` · `/new`) reads
+   * off this CLI's pane: how a pane SHOWS "ready for input" and how it shows "still working".
    *
-   * ⚠ NOT wheel forwarding. `wheelForward` above sends SGR mouse wheel REPORTS; this sends
-   * plain keys, and only when the local buffer is hollow (normal buffer, `baseY === 0`).
-   * A CLI can ignore one and honour the other: codex ignores SGR wheel reports (so its
-   * `wheelForward` stays 'never') yet pages on PageUp/PageDown.
+   * ⚠️ ABSENT is a meaningful third state, not a gap — it means this CLI has no VERIFIED prompt
+   * syntax, and the automation falls back to "ready unless independently known to be working".
+   * Declaring a guessed glyph for a CLI nobody has watched would be worse than declaring none:
+   * a wrong glyph never matches, so `ready` would latch false and every checkpoint would sit in
+   * `waiting-ready` until it timed out.
    *
-   * Absent means no paging, so a CLI nobody has measured keeps plain local scrolling.
+   * `workingFrameProfile` names a CHECKPOINT_FRAME_PROFILES entry rather than carrying a
+   * pattern, because these classifiers are several regexes plus ordering that has been tuned
+   * against real prod frames (COD-175) — genuinely code, which is what a named profile is for.
    */
+  checkpoint?: {
+    /** Composer prompt glyph, matched `^`-anchored per row on a row-restored frame. */
+    promptGlyph: string;
+    /** Names a CHECKPOINT_FRAME_PROFILES key. */
+    workingFrameProfile: string;
+    /**
+     * This CLI has a direct-PTY (no mux) fallback whose readiness comes from a positively
+     * recorded prompt transition instead of a captured frame. Only claude has one: it is the
+     * only CLI Codeman ever runs without tmux.
+     */
+    directPtyPromptTransition?: true;
+  };
+  /**
+   * Forwarding the desktop wheel to the CLI's own transcript as paced SGR wheel
+   * reports (COD-464). 'never' keeps local scrollback / the PageUp fallback.
+   * EVERY forwarding mode also requires the CLI itself to have turned mouse tracking
+   * on (`cliMouseTracking`): that is the CLI saying it handles mouse reports, and it is
+   * false for claude's default inline renderer (#498), older codex and panes Codeman
+   * cannot see into (remote wrappers). 'version-gated' additionally needs `minVersion`;
+   * 'mouse-tracking' needs nothing more.
+   *
+   * Both of the following are MEASURED against the real CLI, never guessed:
+   * `rows`: transcript rows moved per report. Required for forwarding.
+   * `reversalDeadReports`: reports the CLI ignores when one reverses its last effective
+   * scroll direction (a reversal debounce); paid on top of the first reversed batch, or
+   * the first event of every reversed gesture moves nothing.
+   * `streak`: the CLI's own wheel ACCELERATION. `steps[k]` is how many rows the k-th
+   * report of a streak moves (the last entry repeats), and a pause of `resetMs`
+   * starts a new streak. The pacer reads it to keep scrolling linear (send a report
+   * only when the owed rows cover its step). Absent = every report moves `rows`.
+   */
+  wheelForward: {
+    mode: 'never' | 'version-gated' | 'mouse-tracking';
+    minVersion?: string;
+    rows?: number;
+    reversalDeadReports?: number;
+    streak?: { resetMs: number; steps: number[] };
+  };
+  /** CLI supports native PageUp/PageDown transcript paging. */
   transcriptPageKeys?: boolean;
   keyboardAccessory: 'agent' | 'shell';
   /** Multi-user: this CLI is a raw shell, so its commands need the privileged gate. */
@@ -552,6 +604,22 @@ export interface CliCapabilities {
    */
   agentSkillDir?: AgentSkillDir;
   statusLineTelemetry: boolean;
+  /**
+   * Whether this CLI can create and answer Approvals Inbox items
+   * (`approvalsAvailableForMode`).
+   *
+   * ⚠️ A FOURTH independent set, and it lines up with none of `hooks`, `external` or
+   * `transcript` — which is the whole reason it is its own field rather than derived.
+   * Claude qualifies through the hook path (`permission_prompt` etc); codex and opencode
+   * qualify through COD-328's confirmed turn-end transitions, which are inferred rather
+   * than reported, so they are `hooks: 'none'` and still true here. Meanwhile `deepseek`
+   * is `hooks: 'supervised'` and false here, because its bridge feeds the inbox through
+   * its own path in approval-routes.ts rather than through this predicate.
+   *
+   * Deriving this from `hooks` would therefore both admit deepseek and drop codex and
+   * opencode — the exact class of mistake CliCapabilities' header warns about.
+   */
+  approvals: boolean;
   /** Where a model override is delivered. Claude uniquely writes settings.local.json. */
   model: { source: 'flag' | 'claude-settings-file' | 'none'; param?: string };
   /**
@@ -816,6 +884,25 @@ export interface CliCredStore {
   seedWhole?: boolean;
 }
 
+/**
+ * How a resume id reaches an in-container pane, for the CLIs whose docker resume is NOT the
+ * plain `launch.resumeAppend` append.
+ *
+ * `style: 'rebuild'` = the resume is a normal launch param, so the command is re-rendered from
+ * the launch spec with only that param set (opencode's `--session`), rather than having a token
+ * bolted onto an already-built string.
+ *
+ * `refuseWhenOverridden` = when the CASE supplies its own `commands.<mode>` for this CLI, a
+ * resume request is REFUSED (`ManualRecoveryRequiredError`) instead of being applied to it. The
+ * override is opaque text: appending to it, or replacing it, would silently start a fresh
+ * conversation or launch something the user did not ask for. Absent = the resume is appended to
+ * the override, which is what every flag-style CLI does.
+ */
+export interface CliDockerResume {
+  style: 'rebuild' | 'append';
+  refuseWhenOverridden?: true;
+}
+
 export interface CliOverlays {
   /**
    * The remote/docker DEFAULT pane command: just the CLI invocation (e.g. `claude
@@ -823,8 +910,31 @@ export interface CliOverlays {
    * (remote: login-shell `-c`; docker: `exec`). Absent `command` = the bare
    * `discovery.binaries[0]`. `disabled: true` = this location has no story for this CLI at
    * all (docker for `shell`) — distinct from "no override", which still gets a default.
+   *
+   * `fromLaunchSpec: true` says the remote pane command is RENDERED FROM `launch` with this
+   * session's own config (model, resume id, permission flags) instead of the static `command`
+   * above. ⚠️ It is descriptive, not aspirational: the four CLIs that declare it are the four
+   * whose remote arm has always run a per-session builder. The CLIs without it reach a remote
+   * host with their flags dropped — pre-registry behaviour, preserved deliberately here rather
+   * than quietly widened, and parked as a question of its own (COD-416 wave 3e).
+   *
+   * `tmuxMouseAtStartupSeconds` (COD-471) is for a CLI that decides ONCE, at startup, whether to
+   * capture the mouse by reading tmux's `mouse` option: codex 0.159+ turns mouse tracking on only
+   * when it is on. The remote launch sets every session `mouse off`, so such a CLI never tracked
+   * the mouse remotely and the wheel fell back to page keys. Declared, the remote session starts
+   * `mouse on` and is switched `mouse off` this many seconds later (a delayed `run-shell -C`, no
+   * shell), the same end state a local session reaches through the mouse sync. The CLI keeps its
+   * startup decision; tmux then passes the wheel through because the pane asked for it.
    */
-  remote?: { command?: string } | { disabled: true };
+  remote?:
+    | {
+        command?: string;
+        fromLaunchSpec?: true;
+        tmuxMouseAtStartupSeconds?: number;
+        /** COD-486: exact identity source for automatic worker reboot resume. */
+        workerRebootResume?: 'pinned-session' | 'native-session';
+      }
+    | { disabled: true };
   /**
    * `rootCommand` is the same invocation for a container whose exec user is uid 0. Only
    * declare it when the normal `command` would be REFUSED as root: claude's carries
@@ -833,7 +943,7 @@ export interface CliOverlays {
    * the outside. Codeman's own base image runs a non-root user and never selects this; an
    * ADOPTED container belongs to its owner and is frequently root. Absent = use `command`.
    */
-  docker?: { command?: string; rootCommand?: string } | { disabled: true };
+  docker?: { command?: string; rootCommand?: string; resume?: CliDockerResume } | { disabled: true };
   /**
    * ⚠️ DECLARED-FOR-LATER, unlike `remote`/`docker` above, which are live.
    *
@@ -857,7 +967,7 @@ export interface CliOverlays {
 /**
  * ⚠️ DECLARED-FOR-LATER: fields no code reads yet.
  *
- * `accent`, `overlays.credStore`, `capabilities.echo`, `capabilities.wheelForward`,
+ * `accent`, `overlays.credStore`, `capabilities.echo`,
  * `capabilities.keyboardAccessory` and `capabilities.maxFrameBytes` all describe FRONTEND
  * behaviour, and most of the frontend is deliberately untouched by the change that introduced
  * this registry — `app.js`, `terminal-ui.js`, `styles.css` and friends keep their own

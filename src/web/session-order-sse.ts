@@ -1,4 +1,5 @@
 /** @fileoverview Trusted per-recipient payload selection for legacy session-order invalidations. */
+
 import type { SessionOrderProjectionChange } from '../tab-layout-service.js';
 import type { AuthUser } from '../types.js';
 

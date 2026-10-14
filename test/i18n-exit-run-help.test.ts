@@ -206,7 +206,7 @@ describe('the case picker rows and the host-window and dictation toasts in zh-CN
   it('finds the strings it checks (the check is not vacuous)', () => {
     expect(pickerLabels).toEqual(['New or link a case\u2026', 'Case settings\u2026']);
     expect(SESSION_UI).toContain('<div class="case-combobox-empty">No cases match</div>');
-    expect(toasts.sort()).toEqual([
+    expect([...new Set(toasts)].sort()).toEqual([
       'Could not open a new window for this dashboard',
       'Could not open a new window for this preview',
       'Could not open a new window for this session',

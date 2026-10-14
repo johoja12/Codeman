@@ -1,6 +1,4 @@
-/**
- * @fileoverview Atomic StateStore publication tests for tab layouts and their legacy session-order projection.
- */
+/** @fileoverview Atomic StateStore publication tests for tab layouts and their legacy session-order projection. */
 
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,7 +15,9 @@ afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-function createStore(seed: { sessionOrder?: string[]; tabLayouts?: Record<string, TabLayout> } = {}): StateStore {
+function createStore(
+  seed: { sessionOrder?: string[]; tabLayouts?: Record<string, TabLayout>; sessions?: object } = {}
+) {
   const dir = mkdtempSync(join(tmpdir(), 'codeman-state-tab-layout-'));
   tempDirs.push(dir);
   const file = join(dir, 'state.json');
@@ -32,7 +32,14 @@ const ownerLayout = (ids: readonly string[], version = 1): TabLayout => ({
   updatedAt: `2026-08-23T12:00:0${version}.000Z`,
 });
 
-describe('StateStore.commitTabLayoutProjection', () => {
+describe('StateStore tab-layout invariants', () => {
+  it('does not read inherited owner keys as stored layouts', () => {
+    const store = createStore({ tabLayouts: { alice: ownerLayout(['a1']) } });
+
+    expect(store.getTabLayout('constructor')).toBeNull();
+    expect(store.getTabLayout('__proto__')).toBeNull();
+  });
+
   it('returns a defensive snapshot of all stored owner layouts for trusted owner discovery', () => {
     const alice = ownerLayout(['a1'], 1);
     const store = createStore({ tabLayouts: { alice, constructor: ownerLayout(['c1'], 2) } });
@@ -44,7 +51,7 @@ describe('StateStore.commitTabLayoutProjection', () => {
     expect(store.getTabLayout('alice')).toEqual(alice);
   });
 
-  it('validates all layouts and publishes them with a latest-state projection using one save schedule', () => {
+  it('publishes validated layouts and latest-state projection with one save schedule', () => {
     const originalAlice = ownerLayout(['a1'], 1);
     const store = createStore({ sessionOrder: ['a1'], tabLayouts: { alice: originalAlice } });
     const save = vi.spyOn(store, 'save').mockImplementation(() => undefined);
@@ -70,18 +77,14 @@ describe('StateStore.commitTabLayoutProjection', () => {
     expect(save).toHaveBeenCalledTimes(1);
 
     alice.ungrouped[0].id = 'caller-mutated';
-    constructorOwner.ungrouped[0].id = 'caller-mutated';
     projected[0] = 'caller-mutated';
     result.layouts.alice.ungrouped[0].id = 'return-mutated';
-    result.layouts.constructor.ungrouped[0].id = 'return-mutated';
     result.sessionOrder[0] = 'return-mutated';
-
     expect(store.getTabLayout('alice')?.ungrouped[0].id).toBe('a2');
-    expect(store.getTabLayout('constructor')?.ungrouped[0].id).toBe('constructor');
     expect(store.getSessionOrder()).toEqual(['a2', 'a1', 'constructor']);
   });
 
-  it('changes neither representation and does not project or save when any layout is invalid', () => {
+  it('changes neither representation when a layout is invalid or projection throws', () => {
     const original = ownerLayout(['a1'], 1);
     const store = createStore({ sessionOrder: ['a1'], tabLayouts: { alice: original } });
     const save = vi.spyOn(store, 'save').mockImplementation(() => undefined);
@@ -91,33 +94,21 @@ describe('StateStore.commitTabLayoutProjection', () => {
     expect(() => store.commitTabLayoutProjection({ bob: ownerLayout(['b1'], 2), alice: invalid }, project)).toThrow(
       /version/
     );
-
     expect(project).not.toHaveBeenCalled();
+    expect(() =>
+      store.commitTabLayoutProjection({ alice: ownerLayout(['a2'], 2) }, () => {
+        throw new Error('projection rejected');
+      })
+    ).toThrow('projection rejected');
     expect(save).not.toHaveBeenCalled();
     expect(store.getTabLayout('alice')).toEqual(original);
     expect(store.getTabLayout('bob')).toBeNull();
     expect(store.getSessionOrder()).toEqual(['a1']);
   });
 
-  it('changes neither representation and does not save when projection throws', () => {
-    const original = ownerLayout(['a1'], 1);
-    const store = createStore({ sessionOrder: ['a1'], tabLayouts: { alice: original } });
-    const save = vi.spyOn(store, 'save').mockImplementation(() => undefined);
-
-    expect(() =>
-      store.commitTabLayoutProjection({ alice: ownerLayout(['a2'], 2) }, () => {
-        throw new Error('projection rejected');
-      })
-    ).toThrow('projection rejected');
-
-    expect(save).not.toHaveBeenCalled();
-    expect(store.getTabLayout('alice')).toEqual(original);
-    expect(store.getSessionOrder()).toEqual(['a1']);
-  });
-
   it('derives sequential owner projections from the latest committed order', () => {
     const store = createStore({ sessionOrder: ['a1', 'b1', 'a2', 'b2'] });
-    const save = vi.spyOn(store, 'save').mockImplementation(() => undefined);
+    vi.spyOn(store, 'save').mockImplementation(() => undefined);
 
     store.commitTabLayoutProjection({ alice: ownerLayout(['a2', 'a1'], 2) }, (latest) =>
       recomposeGlobalSessionOrder(latest, [{ owner: 'alice', ownedIds: ['a1', 'a2'], order: ['a2', 'a1'] }])
@@ -127,8 +118,23 @@ describe('StateStore.commitTabLayoutProjection', () => {
     );
 
     expect(store.getSessionOrder()).toEqual(['a2', 'b2', 'a1', 'b1']);
-    expect(store.getTabLayout('alice')).toEqual(ownerLayout(['a2', 'a1'], 2));
-    expect(store.getTabLayout('bob')).toEqual(ownerLayout(['b2', 'b1'], 2));
-    expect(save).toHaveBeenCalledTimes(2);
+  });
+
+  it('deletes only explicitly confirmed stale ids and preserves newly pinned records', () => {
+    const store = createStore({
+      sessions: {
+        stale: { id: 'stale', name: 'Stale', status: 'idle' },
+        pinned: { id: 'pinned', name: 'Pinned', status: 'idle', pinned: true },
+        late: { id: 'late', name: 'Late', status: 'idle' },
+      },
+    });
+    vi.spyOn(store, 'save').mockImplementation(() => undefined);
+
+    const result = store.cleanupSessionsByIds(new Set(['stale', 'pinned']));
+
+    expect(result.cleaned.map(({ id }) => id)).toEqual(['stale']);
+    expect(store.getSession('stale')).toBeNull();
+    expect(store.getSession('pinned')).not.toBeNull();
+    expect(store.getSession('late')).not.toBeNull();
   });
 });

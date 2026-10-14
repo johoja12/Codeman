@@ -34,6 +34,7 @@ import { readFile, writeFile, mkdir, lstat, readdir, realpath, rename, unlink, r
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 
 import type { HookEventType } from './types.js';
 import type { AgentSkillDir, CliCapabilities } from './config/cli-registry/types.js';
@@ -115,6 +116,30 @@ const BACKGROUND_WAKE_MARKER = `${BACKGROUND_WAKE_MARKER_PREFIX}3`;
 const SUBAGENT_STOP_GUARD_MARKER_PREFIX = 'CODEMAN_SUBAGENT_STOP_GUARD_V';
 const SUBAGENT_STOP_GUARD_MARKER = `${SUBAGENT_STOP_GUARD_MARKER_PREFIX}1`;
 const BACKGROUND_WAKE_TIMEOUT_SECONDS = 6 * 60 * 60;
+
+function generateHookCommand(event: HookEventType): string {
+  return (
+    `HOOK_DATA=$(cat 2>/dev/null || echo '{}'); ` +
+    `printf '{"event":"${event}","sessionId":"%s","data":%s}' "$CODEMAN_SESSION_ID" "$HOOK_DATA" | ` +
+    // `-k`, same as the statusline exporter: CODEMAN_API_URL is loopback HTTPS with
+    // a self-signed cert on --https/tailscale installs. Without it curl exits 60,
+    // the `|| true` swallows it, and ALL SIX hook events die silently: respawn loses
+    // its definitive idle signals and the wait endpoints lose stop/blocked.
+    `curl -sk -o /dev/null -X POST "$CODEMAN_API_URL/api/hook-event" ` +
+    `-H 'Content-Type: application/json' ` +
+    `-H "X-Codeman-Hook-Secret: $(cat "$CODEMAN_HOOK_SECRET_FILE" 2>/dev/null)" ` +
+    `--data @- ` +
+    `2>/dev/null || true`
+  );
+}
+
+function generateSessionStartHookEntry(): {
+  hooks: Array<{ type: 'command'; command: string; timeout: number }>;
+} {
+  return {
+    hooks: [{ type: 'command', command: generateHookCommand('session_start'), timeout: HOOK_TIMEOUT_SECONDS }],
+  };
+}
 
 /**
  * Inline Node helper for Claude Code's `asyncRewake` hook.
@@ -413,32 +438,22 @@ export function generateHooksConfig(): { hooks: Record<string, unknown[]> } {
   // never lands in this config and rotation needs no respawn. If the var/file is
   // missing the header is empty — the middleware then allows the request only on
   // the plain loopback bypass (tunnel down), same as pre-secret behavior.
-  const curlCmd = (event: HookEventType, options: { discardStdout?: boolean } = {}) =>
-    `HOOK_DATA=$(cat 2>/dev/null || echo '{}'); ` +
-    `printf '{"event":"${event}","sessionId":"%s","data":%s}' "$CODEMAN_SESSION_ID" "$HOOK_DATA" | ` +
-    // `-k`, same as the statusline exporter: CODEMAN_API_URL is loopback HTTPS with
-    // a self-signed cert on --https/tailscale installs. Without it curl exits 60,
-    // the `|| true` swallows it, and ALL SIX hook events die silently: respawn loses
-    // its definitive idle signals and the wait endpoints lose stop/blocked.
-    `curl -sk ${options.discardStdout ? '-o /dev/null ' : ''}-X POST "$CODEMAN_API_URL/api/hook-event" ` +
-    `-H 'Content-Type: application/json' ` +
-    `-H "X-Codeman-Hook-Secret: $(cat "$CODEMAN_HOOK_SECRET_FILE" 2>/dev/null)" ` +
-    `--data @- ` +
-    `2>/dev/null || true`;
+  const curlCmd = generateHookCommand;
 
-  // The same POST with stdout DISCARDED, via curl's own `-o`. UserPromptSubmit is
-  // one of the hook events whose stdout Claude Code injects into the model's
-  // context (the CLI's own hook reference: "Exit code 0 - stdout shown to
-  // Claude"), so an undiscarded curl pastes Codeman's `{"success":true,…}`
-  // envelope into the user's prompt on every single turn.
-  // ⚠️ It MUST be curl's flag, not a trailing redirect. `curlCmd` already ends
+  // Upstream keeps stdout-discarding OPT-IN (a `discardStdout` option used only by
+  // UserPromptSubmit). This fork discards it for EVERY event instead — see
+  // `generateHookCommand`, whose curl always carries `-o /dev/null` — because it
+  // also installs a SessionStart hook, and BOTH UserPromptSubmit and SessionStart
+  // are events whose stdout Claude Code injects into the model's context (the CLI's
+  // own hook reference: "Exit code 0 - stdout shown to Claude"). An undiscarded curl
+  // there pastes Codeman's `{"success":true,…}` envelope into the user's prompt on
+  // every single turn. The other events' stdout is harmless either way, so the
+  // superset is the simpler invariant and `curlCmdSilent` is just `curlCmd`.
+  // ⚠️ It MUST be curl's flag, not a trailing redirect. The command already ends
   // `… 2>/dev/null || true`, and in `pipeline || true >/dev/null` the shell binds
   // the redirection to `true` — which never runs on the success path — so the
   // envelope still reaches stdout. Verified in dash and bash.
-  // ⚠️ The flag is opt-in so the other events' command text stays byte-identical:
-  // their stdout feeds the SSE stream harmlessly, and changing it would rewrite
-  // every workspace's settings file for no gain.
-  const curlCmdSilent = (event: HookEventType) => curlCmd(event, { discardStdout: true });
+  const curlCmdSilent = curlCmd;
 
   return {
     hooks: {
@@ -471,6 +486,9 @@ export function generateHooksConfig(): { hooks: Record<string, unknown[]> } {
           hooks: [{ type: 'command', command: curlCmd('stop'), timeout: HOOK_TIMEOUT_SECONDS }],
         },
       ],
+      // No matcher: Claude emits SessionStart for startup/resume and conversation
+      // transitions including /clear, /compact, and supported /new behavior.
+      SessionStart: [generateSessionStartHookEntry()],
       // The pane's LIVE conversation id, reported by the CLI process itself.
       // Without it the response viewer has to guess which `<uuid>.jsonl` a pane
       // is on after a `/clear`, and the only anchor it can guess from is an
@@ -533,6 +551,25 @@ function isCodemanHookHandler(value: unknown): boolean {
   } catch {
     return false;
   }
+}
+
+/** Structurally prove the unrestricted managed SessionStart identity hook exists. */
+function hasManagedSessionStartHook(hooksValue: unknown): boolean {
+  if (!hooksValue || typeof hooksValue !== 'object' || Array.isArray(hooksValue)) return false;
+  const entries = (hooksValue as Record<string, unknown>).SessionStart;
+  if (!Array.isArray(entries)) return false;
+  const expectedHandler = generateSessionStartHookEntry().hooks[0];
+  return entries.some((entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+    const record = entry as Record<string, unknown>;
+    const matcher = record.matcher;
+    if (matcher !== undefined && matcher !== '' && matcher !== '*') return false;
+    if (!Array.isArray(record.hooks)) return false;
+    return record.hooks.some((handler) => {
+      if (!handler || typeof handler !== 'object' || Array.isArray(handler)) return false;
+      return isDeepStrictEqual(handler, expectedHandler);
+    });
+  });
 }
 
 /**
@@ -772,19 +809,23 @@ export async function ensureCodemanHooks(casePath: string): Promise<void> {
  * X-Codeman-Hook-Secret header was added (COD-54, 2026-06-10) keep hook curls in their
  * settings.local.json that POST to /api/hook-event WITHOUT the secret — which, once the
  * gate requires it unconditionally (COD-91), silently 401 on a password-protected install.
- * Older Codeman blocks also lack the current background Bash async-rewake hook or the
- * SubagentStop guard. A further stale shape: hook curls without `-k`, which exit 60 on
- * every --https/tailscale install (the cert is self-signed), swallowed by the hooks'
- * own `|| true` — all six hook events die silently. Refresh any of these stale shapes
- * on launch so existing cases heal.
+ * Older Codeman blocks may also lack the current background Bash async-rewake hook,
+ * the SessionStart identity hook, or the SubagentStop guard. A further stale shape:
+ * hook curls without `-k`, which exit 60 on every --https/tailscale install (the cert
+ * is self-signed), swallowed by the hooks' own `|| true` — all six hook events die
+ * silently. Refresh any of these stale shapes on launch so existing cases heal and
+ * gain all current behaviors.
  *
  * Deliberately surgical: regenerates ONLY when settings.local.json already contains
  * Codeman's own hook curls (they target `/api/hook-event`) and they are stale. No-op
  * when the file/hooks are absent (we never impose hooks on a user who removed them) or
  * when the hooks aren't ours, so it is cheap enough to call on every Claude spawn.
  */
-export async function refreshStaleCodemanHooks(casePath: string): Promise<void> {
-  if (await absentOrUnreachable(join(casePath, '.claude', 'settings.local.json'))) return;
+export async function refreshStaleCodemanHooks(casePath: string): Promise<boolean> {
+  if (await absentOrUnreachable(join(casePath, '.claude', 'settings.local.json'))) return false;
+  // Upstream's wrapper returns void, but verifyClaudeSessionStartHookCapability below
+  // consumes this boolean, so carry the verdict out through a closure flag.
+  let sessionStartReady = false;
   await withSafeSettingsWrite(casePath, 'hooks (refresh)', async (_claudeDir, settingsPath) => {
     let existing: Record<string, unknown>;
     try {
@@ -798,10 +839,13 @@ export async function refreshStaleCodemanHooks(casePath: string): Promise<void> 
     // absence on our own hooks means they predate COD-54 and need regenerating.
     const hasSecret = hooksJson.includes('X-Codeman-Hook-Secret');
     const hasBackgroundWake = hooksJson.includes(BACKGROUND_WAKE_MARKER);
-    // The pre--k curl shape: `curl -sk -X POST` does not contain `curl -s -X POST`
-    // as a substring, so this cleanly identifies hook curls that die with exit 60
-    // on a self-signed HTTPS install.
-    const hasTlsFlaglessCurl = hooksJson.includes('curl -s -X POST');
+    const hasSessionStart = hasManagedSessionStartHook(existing.hooks);
+    // Pre--k hook curls exit 60 on a self-signed HTTPS install and the hooks' own
+    // `|| true` swallows it. Detect by the ABSENCE of `curl -sk` rather than by
+    // upstream's `curl -s -X POST` substring: this fork's curl carries
+    // `-o /dev/null` (see generateHookCommand), so that substring never matches
+    // here and every case would look permanently stale.
+    const hasTlsFlaglessCurl = !hooksJson.includes('curl -sk');
     const hasSubagentStopGuard = hooksJson.includes(SUBAGENT_STOP_GUARD_MARKER);
     // Approvals Inbox needs the elicitation_complete/elicitation_response
     // matchers; their absence marks a pre-inbox hooks block.
@@ -814,23 +858,44 @@ export async function refreshStaleCodemanHooks(casePath: string): Promise<void> 
     // workspace's settings file on every Claude spawn. The sibling markers are
     // quote-free for the same reason.
     const hasPromptSubmit = hooksJson.includes('prompt_submitted');
+    if (!isOurs) return;
     if (
-      !isOurs ||
-      (hasSecret &&
-        hasBackgroundWake &&
-        hasSubagentStopGuard &&
-        hasElicitationComplete &&
-        hasPromptSubmit &&
-        !hasTlsFlaglessCurl)
-    )
+      hasSecret &&
+      hasBackgroundWake &&
+      hasSessionStart &&
+      hasSubagentStopGuard &&
+      hasElicitationComplete &&
+      hasPromptSubmit &&
+      !hasTlsFlaglessCurl
+    ) {
+      sessionStartReady = true;
       return;
+    }
     const generated = generateHooksConfig();
     const merged = {
       ...existing,
       hooks: mergeCodemanHooks(existing.hooks, generated.hooks),
     };
     await writeFile(settingsPath, JSON.stringify(merged, null, 2) + '\n');
+    try {
+      const persisted = JSON.parse(await readFile(settingsPath, 'utf-8')) as Record<string, unknown>;
+      sessionStartReady = hasManagedSessionStartHook(persisted.hooks);
+    } catch {
+      return;
+    }
   });
+  return sessionStartReady;
+}
+
+/** Verify authoritative fresh-thread identity support without imposing hooks on arbitrary projects. */
+export async function verifyClaudeSessionStartHookCapability(
+  mode: string,
+  casePath: string,
+  remote: boolean
+): Promise<boolean> {
+  if (mode !== 'claude') return true;
+  if (remote) return false;
+  return refreshStaleCodemanHooks(casePath).catch(() => false);
 }
 
 /**

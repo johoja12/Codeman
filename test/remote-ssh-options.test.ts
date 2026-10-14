@@ -13,7 +13,7 @@
  *    `-o ProxyCommand=…` token; the local shell must not expand/mangle them).
  *  - a leading `~`/`$HOME` in `identityFile` is expanded to an absolute path at
  *    build time (ssh does NOT expand `~` in `-i`), then shellescaped.
- *  - empty options ⇒ byte-identical ssh to today (full back-compat).
+ *  - every connection has a bounded default timeout unless explicitly overridden.
  *
  * Pure command-string construction; no real tmux, no ssh. Port: N/A.
  */
@@ -23,7 +23,10 @@ import { describe, it, expect } from 'vitest';
 import {
   buildSshConnectionArgs,
   buildRemoteTmuxCheckCommand,
+  REMOTE_PATH_BOOTSTRAP,
+  REMOTE_LOGIN_SHELL_RESOLVE,
   buildRemoteCliVersionProbeCommand,
+  remoteLoginShellCommand,
   remoteSshTarget,
 } from '../src/remote-hosts.js';
 import { buildRemoteLaunchCommand } from '../src/tmux-manager.js';
@@ -56,7 +59,7 @@ const aaDesktop: SessionRemote = {
 const SESSION_ID = 'cod107chk';
 
 describe('COD-107 buildSshConnectionArgs — shared ssh connection tokens', () => {
-  it('always leads with -o BatchMode=yes then the default -o ConnectTimeout=10', () => {
+  it('always leads with -o BatchMode=yes', () => {
     expect(buildSshConnectionArgs(baseRemote)).toEqual(['ssh', '-o BatchMode=yes', '-o ConnectTimeout=10']);
   });
 
@@ -80,13 +83,15 @@ describe('COD-107 buildSshConnectionArgs — shared ssh connection tokens', () =
     // The escape-hatch extra option, shellescaped.
     expect(joined).toContain("-o 'StrictHostKeyChecking=accept-new'");
 
-    // Ordering: BatchMode -> port -> identity -> ProxyCommand -> extras.
+    // Ordering: BatchMode -> timeout -> port -> identity -> ProxyCommand -> extras.
     const idxBatch = joined.indexOf('BatchMode=yes');
+    const idxTimeout = joined.indexOf('ConnectTimeout=10');
     const idxPort = joined.indexOf('-p 2222');
     const idxIdentity = joined.indexOf('-i ');
     const idxProxy = joined.indexOf('ProxyCommand=');
     const idxExtra = joined.indexOf('StrictHostKeyChecking');
-    expect(idxBatch).toBeLessThan(idxPort);
+    expect(idxBatch).toBeLessThan(idxTimeout);
+    expect(idxTimeout).toBeLessThan(idxPort);
     expect(idxPort).toBeLessThan(idxIdentity);
     expect(idxIdentity).toBeLessThan(idxProxy);
     expect(idxProxy).toBeLessThan(idxExtra);
@@ -112,7 +117,7 @@ describe('COD-107 buildSshConnectionArgs — shared ssh connection tokens', () =
     expect(args.join(' ')).toContain(`-i '${HOME}/.ssh/id_ed25519'`);
   });
 
-  it('empty options ⇒ BatchMode + the default ConnectTimeout (+ -p only when set)', () => {
+  it('adds a default timeout and allows an explicit timeout override', () => {
     expect(buildSshConnectionArgs(baseRemote)).toEqual(['ssh', '-o BatchMode=yes', '-o ConnectTimeout=10']);
     expect(buildSshConnectionArgs({ ...baseRemote, port: 2200 })).toEqual([
       'ssh',
@@ -120,19 +125,31 @@ describe('COD-107 buildSshConnectionArgs — shared ssh connection tokens', () =
       '-o ConnectTimeout=10',
       '-p 2200',
     ]);
-  });
-
-  it('omits the default ConnectTimeout when extraSshOptions already sets it (operator wins)', () => {
-    const args = buildSshConnectionArgs({ ...baseRemote, extraSshOptions: ['ConnectTimeout=3'] });
-    expect(args.filter((a) => a.includes('ConnectTimeout'))).toEqual(["-o 'ConnectTimeout=3'"]);
+    expect(buildSshConnectionArgs({ ...baseRemote, extraSshOptions: ['ConnectTimeout=3'] })).toEqual([
+      'ssh',
+      '-o BatchMode=yes',
+      "-o 'ConnectTimeout=3'",
+    ]);
   });
 });
 
 describe('COD-107 buildRemoteLaunchCommand — threads connection args', () => {
+  it('bootstraps common remote binary paths before tmux and the pane command', () => {
+    const command = buildRemoteLaunchCommand({
+      mode: 'codex',
+      remote: { ...baseRemote, commands: { codex: 'exec /Users/me/.local/bin/codx personal' } },
+      sessionId: SESSION_ID,
+    });
+
+    expect(command).toContain(`${REMOTE_PATH_BOOTSTRAP}; tmux -L codeman`);
+    expect(command).toContain(`&& ${REMOTE_PATH_BOOTSTRAP}; exec /Users/me/.local/bin/codx personal`);
+  });
+
   it('emits the aa-desktop ssh connection options ahead of -t and the target', () => {
     const command = buildRemoteLaunchCommand({ mode: 'shell', remote: aaDesktop, sessionId: SESSION_ID });
 
     expect(command).toContain('-p 2222');
+    expect(command).toContain('-o ConnectTimeout=10');
     expect(command).toContain(`-i '${HOME}/.ssh/remote_ed25519'`);
     expect(command).toContain("-o 'ProxyCommand=nc -X 5 -x 127.0.0.1:1080 %h %p'");
     expect(command).toContain("-o 'StrictHostKeyChecking=accept-new'");
@@ -146,17 +163,15 @@ describe('COD-107 buildRemoteLaunchCommand — threads connection args', () => {
     expect(idxProxy).toBeLessThan(idxTarget);
   });
 
-  it('a remote with no advanced options is byte-identical to the expected form', () => {
+  it('builds the exact default remote launch command with the PATH bootstrap', () => {
     const command = buildRemoteLaunchCommand({ mode: 'shell', remote: baseRemote, sessionId: SESSION_ID });
-    // Reconstruct the command using the SAME nested POSIX single-quote escaping the
-    // production code uses, to prove byte-identity. Session runs on the DEDICATED
-    // `-L codeman-remote` socket under a `codeman-ssh-` name that a remote Codeman's
-    // discovery ignores; set-options are scoped per-session (never `-g`).
+    // Reconstruct the command using the SAME nested POSIX
+    // single-quote escaping the production code uses, to prove byte-identity.
     const sh = (s: string) => "'" + s.replace(/'/g, "'\\''") + "'";
     const remoteName = `codeman-ssh-${SESSION_ID.slice(0, 8)}`;
     const path = sh('/home/ubuntu/work');
-    const paneCommand = `cd ${path} && exec "\${SHELL:-/bin/sh}" -i -l`;
-    const tmuxInvocation = [
+    const paneCommand = `cd ${path} && ${REMOTE_PATH_BOOTSTRAP}; ${REMOTE_LOGIN_SHELL_RESOLVE}exec "$login_shell" -i -l`;
+    const tmuxInvocation = `${REMOTE_PATH_BOOTSTRAP}; ${[
       `tmux -L codeman-remote new-session -A -s ${remoteName} -c ${path} ${sh(paneCommand)}`,
       `set -t ${remoteName} status off`,
       `set -t ${remoteName} mouse off`,
@@ -168,23 +183,27 @@ describe('COD-107 buildRemoteLaunchCommand — threads connection args', () => {
       // also strand a pane after a clean `exit`), and LAST because tmux aborts the
       // remaining commands of a `\;` chain on error and `failed` needs tmux >= 3.2.
       `set -t ${remoteName} remain-on-exit failed`,
-    ].join(' \\; ');
-    // Connection args (with the default -o ConnectTimeout=10) sit after -t.
-    const expected = `ssh -o BatchMode=yes -t -o ConnectTimeout=10 ${remoteSshTarget(baseRemote)} ${sh(tmuxInvocation)}`;
+    ].join(' \\; ')}`;
+    const expected = `ssh -o BatchMode=yes -o ConnectTimeout=10 -t ${remoteSshTarget(baseRemote)} ${sh(tmuxInvocation)}`;
     expect(command).toBe(expected);
   });
 
-  it('port-only remote places -p after the -t/ConnectTimeout tokens', () => {
+  it('back-compat: port-only remote matches the historical -p placement', () => {
     const command = buildRemoteLaunchCommand({
       mode: 'shell',
       remote: { ...baseRemote, port: 2222 },
       sessionId: SESSION_ID,
     });
-    expect(command).toMatch(/^ssh -o BatchMode=yes -t -o ConnectTimeout=10 -p 2222 ubuntu@10\.0\.0\.42 /);
+    expect(command).toMatch(/^ssh -o BatchMode=yes -o ConnectTimeout=10 -p 2222 -t ubuntu@10\.0\.0\.42 /);
   });
 });
 
 describe('COD-107 buildRemoteTmuxCheckCommand — same connection options as the launch', () => {
+  it('bootstraps common remote binary paths before probing for tmux', () => {
+    const cmd = buildRemoteTmuxCheckCommand({ username: 'saqebakhter', host: '192.168.21.109' });
+    expect(cmd).toContain(`'${REMOTE_PATH_BOOTSTRAP}; command -v tmux'`);
+  });
+
   it('uses the shared connection args (proxy/identity/port) plus ConnectTimeout', () => {
     const cmd = buildRemoteTmuxCheckCommand(aaDesktop);
     expect(cmd).toContain('-o BatchMode=yes');
@@ -193,12 +212,12 @@ describe('COD-107 buildRemoteTmuxCheckCommand — same connection options as the
     expect(cmd).toContain(`-i '${HOME}/.ssh/remote_ed25519'`);
     expect(cmd).toContain("-o 'ProxyCommand=nc -X 5 -x 127.0.0.1:1080 %h %p'");
     expect(cmd).toContain('aakht@192.168.55.170');
-    expect(cmd).toContain("'command -v tmux'");
+    expect(cmd).toContain(`'${REMOTE_PATH_BOOTSTRAP}; command -v tmux'`);
   });
 
-  it('back-compat: no advanced options ⇒ unchanged probe string', () => {
+  it('keeps default ssh options while adding the remote PATH bootstrap', () => {
     expect(buildRemoteTmuxCheckCommand({ username: 'ubuntu', host: '10.0.0.42' })).toBe(
-      "ssh -o BatchMode=yes -o ConnectTimeout=10 ubuntu@10.0.0.42 'command -v tmux'"
+      `ssh -o BatchMode=yes -o ConnectTimeout=10 ubuntu@10.0.0.42 '${REMOTE_PATH_BOOTSTRAP}; command -v tmux'`
     );
     expect(buildRemoteTmuxCheckCommand({ username: 'ubuntu', host: '10.0.0.42', port: 2222 })).toContain('-p 2222');
   });
@@ -209,10 +228,13 @@ describe('buildRemoteCliVersionProbeCommand: remote CLI version over the same co
     const cmd = buildRemoteCliVersionProbeCommand(baseRemote, 'claude');
     // Same PATH-resolution wrapper as defaultRemoteCommandForMode: a bare
     // `claude --version` over ssh sees only sshd's minimal PATH (exit 127).
-    expect(cmd).toBe(
-      'ssh -o BatchMode=yes -o ConnectTimeout=10 ubuntu@10.0.0.42 ' +
-        `'exec "\${SHELL:-/bin/sh}" -i -l -c '\\''claude --version'\\'''`
-    );
+    // Built from the shared helper rather than a copied literal — COD-277 moved
+    // the wrapper from a bare `${SHELL:-/bin/sh}` to a passwd-resolved login
+    // shell, and the point of this test is that the probe uses whatever wrapper
+    // the LAUNCH uses, not one particular spelling of it.
+    expect(cmd).toContain('ssh -o BatchMode=yes -o ConnectTimeout=10 ubuntu@10.0.0.42 ');
+    expect(cmd).toContain(REMOTE_LOGIN_SHELL_RESOLVE.slice(0, 40));
+    expect(cmd.endsWith(`'${remoteLoginShellCommand('claude --version').replace(/'/g, "'\\''")}'`)).toBe(true);
   });
 
   it('uses the shared connection args (proxy/identity/port), so it reaches what the launch reaches', () => {

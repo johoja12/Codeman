@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { CreateSessionSchema, QuickStartSchema } from '../src/web/schemas.js';
 import { buildSpawnCommand } from '../src/tmux-manager.js';
 import { defaultDockerCommandForMode } from '../src/docker-hosts.js';
-import { defaultRemoteCommandForMode } from '../src/remote-hosts.js';
+import { defaultRemoteCommandForMode, remoteLoginShellCommand } from '../src/remote-hosts.js';
 import { isExternalCliMode, isAltScreenStripMode } from '../src/session.js';
 
 describe('Grok mode schemas', () => {
@@ -154,6 +154,6 @@ describe('Grok mode gates', () => {
     expect(defaultDockerCommandForMode('grok')).toBe('exec grok');
     // Routed through an interactive login shell so ~/.grok/bin resolves,
     // the same fix as the other remote agent CLIs (see defaultRemoteCommandForMode).
-    expect(defaultRemoteCommandForMode('grok')).toBe('exec "${SHELL:-/bin/sh}" -i -l -c \'grok\'');
+    expect(defaultRemoteCommandForMode('grok')).toBe(remoteLoginShellCommand('grok'));
   });
 });

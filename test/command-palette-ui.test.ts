@@ -43,6 +43,7 @@ function loadPaletteHarness(overrides: Record<string, any> = {}) {
       listeners[`list:${event}`] = handler;
     }),
   };
+  elements.sessionRecoveryList = { replaceChildren: vi.fn(), appendChild: vi.fn() };
   elements.quickStartCase = {
     value: 'plex-previews',
   };
@@ -107,6 +108,7 @@ function loadPaletteHarness(overrides: Record<string, any> = {}) {
   app.cases = [{ name: 'plex-previews' }, { name: 'flux-player' }, { name: 'api-tools' }];
   app.selectSession = vi.fn();
   app.run = vi.fn();
+  app.closeMobileHeaderUtilities = vi.fn();
   app.getShortId = (id: string) => id.slice(0, 8);
   app.getSessionName = (session: any) =>
     session.name || session.workingDir?.split('/').pop() || app.getShortId(session.id);
@@ -115,6 +117,35 @@ function loadPaletteHarness(overrides: Record<string, any> = {}) {
 }
 
 describe('Command-K session palette', () => {
+  it('includes effective agent activity in subtitle and search tokens', () => {
+    const { app } = loadPaletteHarness({
+      CodemanSessionActivity: {
+        resolve: (session: any) => ({
+          effectiveStatus: session.activityStatus || session.status,
+          expandedLabel:
+            session.activityStatus === 'waiting_agents' ? 'WAITING ON AGENTS' : session.status.toUpperCase(),
+        }),
+      },
+    });
+    app.sessions.get('sess-beta').activityStatus = 'waiting_agents';
+    const item = app
+      .buildCommandPaletteItems('waiting on agents')
+      .find((entry: any) => entry.sessionId === 'sess-beta');
+    expect(item.subtitle).toContain('WAITING ON AGENTS');
+  });
+
+  it('refreshes only while the command palette modal is active', () => {
+    const { app, elements } = loadPaletteHarness();
+    app.renderCommandPalette = vi.fn();
+
+    app._refreshCommandPaletteIfOpen();
+    expect(app.renderCommandPalette).not.toHaveBeenCalled();
+
+    elements.commandPaletteModal.classList.add('active');
+    app._refreshCommandPaletteIfOpen();
+    expect(app.renderCommandPalette).toHaveBeenCalledOnce();
+  });
+
   it('recognizes Cmd/Ctrl-K outside text-entry contexts only', () => {
     const { app } = loadPaletteHarness();
 
@@ -176,7 +207,7 @@ describe('Command-K session palette', () => {
     ).toBe(true);
   });
 
-  it('rejects the palette chord when extra modifiers are held (Ctrl+Shift+K is the Firefox devtools console)', () => {
+  it('rejects the palette chord when extra modifiers are held', () => {
     const { app } = loadPaletteHarness();
 
     expect(
@@ -187,7 +218,6 @@ describe('Command-K session palette', () => {
   it('honors a disabled or rebound palette shortcut from the registry', () => {
     const { app } = loadPaletteHarness();
 
-    // Disabled entry → never opens, even for the default chord.
     app.getShortcutRegistry = () => [
       { id: 'command-palette', disabled: true, bindings: [{ modifiers: ['ctrl'], key: 'k', code: 'KeyK' }] },
     ];
@@ -196,9 +226,8 @@ describe('Command-K session palette', () => {
       false
     );
 
-    // Rebound entry → the new chord opens, the old default no longer does.
     app.getShortcutRegistry = () => [{ id: 'command-palette', bindings: [{ modifiers: ['ctrl'], code: 'KeyP' }] }];
-    app.matchesShortcutEvent = (e: any, s: any) => e.code === s.bindings[0].code;
+    app.matchesShortcutEvent = (e: any, shortcut: any) => e.code === shortcut.bindings[0].code;
     expect(app.shouldOpenCommandPaletteFromShortcut({ key: 'k', code: 'KeyK', ctrlKey: true, target: null })).toBe(
       false
     );
@@ -297,8 +326,6 @@ describe('Command-K session palette', () => {
     app.commandPaletteActiveIndex = 0;
     await app.activateCommandPaletteItem();
 
-    // Keeps the searchable combobox, dir display, and lastUsedCase in sync
-    // instead of silently mutating the hidden native <select>.
     expect(app.selectQuickStartCase).toHaveBeenCalledWith('flux-player');
     expect(app.run).toHaveBeenCalledTimes(1);
   });
@@ -342,9 +369,12 @@ describe('Command-K session palette', () => {
 });
 
 describe('Session Manager unified list', () => {
-  it('maps UnifiedSessionItem fields to the history-record shape and routes clicks by liveness', async () => {
+  it('maps unified fields to history records and routes clicks by liveness', async () => {
     const { app, elements } = loadPaletteHarness({
       fetch: async (url: string) => {
+        if (url === '/api/session-recoveries') {
+          return { ok: true, status: 200, json: async () => ({ recoveries: [] }) };
+        }
         expect(url).toBe('/api/sessions/unified?limit=200&q=api');
         return {
           ok: true,
@@ -392,7 +422,6 @@ describe('Session Manager unified list', () => {
     expect(new Date(liveRecord.lastModified).getTime()).toBe(1751000000000);
     expect(liveOptions.showViewAll).toBe(false);
 
-    // Live row → switch to the session (resuming it would spawn a duplicate).
     liveOptions.onActivate();
     expect(app.selectSession).toHaveBeenCalledWith('sess-alpha');
     expect(app.resumeHistorySession).not.toHaveBeenCalled();
@@ -470,7 +499,7 @@ describe('Session Manager unified list', () => {
         json: async () => ({ success: false, error: 'unified list unavailable', errorCode: 'OPERATION_FAILED' }),
       }),
     });
-    elements.sessionManagerList = { replaceChildren: vi.fn(), appendChild: (el: any) => appended.push(el) };
+    elements.sessionManagerList = { replaceChildren: vi.fn(), appendChild: (element: any) => appended.push(element) };
 
     await app._loadSessionManagerList('');
 

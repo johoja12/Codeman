@@ -22,6 +22,7 @@ import { join } from 'node:path';
 import { RESEARCH_AGENT_PROMPT, PLANNER_PROMPT } from './prompts/index.js';
 import { applyWorkspaceHooks } from './hooks-config.js';
 import { getErrorMessage, type PlanItem, type ClaudeMode } from './types.js';
+import { verifyClaudeSessionStartHookCapability } from './hooks-config.js';
 
 // Re-export for backward compatibility
 export type { PlanItem };
@@ -137,13 +138,14 @@ export class PlanOrchestrator {
   private claudeMode?: ClaudeMode;
   private owner?: string;
   private allowedTools?: string;
+  private checkpointEnabled?: boolean;
 
   constructor(
     mux: TerminalMultiplexer,
     workingDir: string = process.cwd(),
     outputDir?: string,
     modelConfig?: { defaultModel?: string; agentTypeOverrides?: Record<string, string> },
-    security?: { claudeMode?: ClaudeMode; owner?: string; allowedTools?: string }
+    security?: { claudeMode?: ClaudeMode; owner?: string; allowedTools?: string; checkpointEnabled?: boolean }
   ) {
     this.mux = mux;
     this.workingDir = workingDir;
@@ -153,6 +155,7 @@ export class PlanOrchestrator {
     this.claudeMode = security?.claudeMode;
     this.owner = security?.owner;
     this.allowedTools = security?.allowedTools;
+    this.checkpointEnabled = security?.checkpointEnabled;
   }
 
   private saveAgentOutput(agentType: string, prompt: string, result: unknown, durationMs: number): void {
@@ -434,7 +437,7 @@ export class PlanOrchestrator {
     // hooks-config): claude-mode, local workingDir, and the helper itself skips a
     // vanished dir + swallows failures — the plan run must never fail on hooks.
     await applyWorkspaceHooks(this.workingDir);
-
+    const claudeSessionStartHookReady = await verifyClaudeSessionStartHookCapability('claude', this.workingDir, false);
     const session = new Session({
       workingDir: this.workingDir,
       mux: this.mux,
@@ -446,6 +449,8 @@ export class PlanOrchestrator {
       claudeMode: this.claudeMode,
       allowedTools: this.allowedTools,
       owner: this.owner,
+      checkpointEnabled: this.checkpointEnabled,
+      claudeSessionStartHookReady,
     });
 
     this.runningSessions.add(session);
@@ -600,7 +605,7 @@ export class PlanOrchestrator {
     // Workspace hooks: same rationale as the research one-shot above (idempotent —
     // the helper short-circuits when the hooks block is already current).
     await applyWorkspaceHooks(this.workingDir);
-
+    const claudeSessionStartHookReady = await verifyClaudeSessionStartHookCapability('claude', this.workingDir, false);
     const session = new Session({
       workingDir: this.workingDir,
       mux: this.mux,
@@ -610,6 +615,8 @@ export class PlanOrchestrator {
       claudeMode: this.claudeMode,
       allowedTools: this.allowedTools,
       owner: this.owner,
+      checkpointEnabled: this.checkpointEnabled,
+      claudeSessionStartHookReady,
     });
 
     this.runningSessions.add(session);

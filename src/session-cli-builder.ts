@@ -1,6 +1,6 @@
 /**
  * @fileoverview Pure functions for building CLI arguments and environment variables
- * for Claude and OpenCode CLI spawning.
+ * for Claude, OpenCode, and Codex CLI spawning.
  *
  * Extracted from Session to keep argument construction logic testable and
  * separate from PTY lifecycle management.
@@ -193,9 +193,12 @@ export function buildPromptArgs(
  * - Codeman session identification vars
  *
  * @param sessionId - The Codeman session ID
+ * @param truecolorEnabled - When true, set COLORTERM=truecolor (COD-75 opt-in);
+ *   otherwise leave COLORTERM unset (default — avoids tmux→PTY→xterm.js glitches).
+ *   Must mirror buildEnvExports() so the tmux and direct-PTY paths agree.
  * @returns Environment variables object for pty.spawn
  */
-export function buildClaudeEnv(sessionId: string): Record<string, string | undefined> {
+export function buildClaudeEnv(sessionId: string, truecolorEnabled?: boolean): Record<string, string | undefined> {
   const env: Record<string, string | undefined> = {
     ...process.env,
     LANG: 'en_US.UTF-8',
@@ -232,6 +235,8 @@ export function buildClaudeEnv(sessionId: string): Record<string, string | undef
   Object.assign(env, {
     PATH: getAugmentedPath(),
     TERM: 'xterm-256color',
+    COLORTERM: truecolorEnabled ? 'truecolor' : undefined,
+    CLAUDECODE: undefined,
     // Inform Claude it's running within Codeman (helps prevent self-termination)
     CODEMAN_MUX: '1',
     CODEMAN_SESSION_ID: sessionId,

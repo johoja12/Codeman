@@ -74,17 +74,17 @@ The single source of truth is `ErrorStatus` / `httpStatusForErrorCode()` in
 `src/types/api.ts`. Clients should branch on `errorCode` (stable) and may rely on
 the HTTP status.
 
-| `errorCode` | HTTP | Meaning |
-|-------------|------|---------|
-| `INVALID_INPUT` | 400 | Malformed request / failed validation |
-| `UNAUTHORIZED` | 401 | Authentication required or failed |
-| `NOT_FOUND` | 404 | Resource does not exist |
-| `SESSION_BUSY` | 409 | Session is busy |
-| `CONFLICT` | 409 | Conflicts with current state (e.g. already running) |
-| `ALREADY_EXISTS` | 409 | Resource already exists |
-| `OPERATION_FAILED` | 422 | Well-formed but could not be completed |
-| `RATE_LIMITED` | 429 | Too many requests |
-| `INTERNAL_ERROR` | 500 | Unexpected server error |
+| `errorCode`        | HTTP | Meaning                                             |
+| ------------------ | ---- | --------------------------------------------------- |
+| `INVALID_INPUT`    | 400  | Malformed request / failed validation               |
+| `UNAUTHORIZED`     | 401  | Authentication required or failed                   |
+| `NOT_FOUND`        | 404  | Resource does not exist                             |
+| `SESSION_BUSY`     | 409  | Session is busy                                     |
+| `CONFLICT`         | 409  | Conflicts with current state (e.g. already running) |
+| `ALREADY_EXISTS`   | 409  | Resource already exists                             |
+| `OPERATION_FAILED` | 422  | Well-formed but could not be completed              |
+| `RATE_LIMITED`     | 429  | Too many requests                                   |
+| `INTERNAL_ERROR`   | 500  | Unexpected server error                             |
 
 Adding a new error code is non-breaking; removing or renaming one is a major change.
 
@@ -828,12 +828,15 @@ clients other than the one that clicked pick it up without refetching.
 ## Read My Mind intent profiles
 
 Per-case profiles of what the user is trying to accomplish: user/agent-stated
-goals plus the user's recently submitted prompts, captured from the Claude
-session transcript while the opt-in `readMyMindEnabled` setting is on (default
-OFF). Keyed by owner + workingDir, so the profile survives `/clear`, respawns,
-and session churn. Stored in `~/.codeman/intents.json` (mode 0600); never fed
-into `/api/v1/search`. Design: [`readmymind-plan.md`](readmymind-plan.md);
-user guide: [`readmymind.md`](readmymind.md).
+goals plus recently submitted Claude prompts captured from the Claude session
+transcript while the opt-in `readMyMindEnabled` setting is on (default OFF).
+Codex recent prompts are read on demand from the strictly owned rollout for
+prediction and are never persisted into the profile. User-authored goals and
+the profile's existing Claude history remain available for the case. Keyed by
+owner + workingDir, the profile survives `/clear`, respawns, and session churn.
+Stored in `~/.codeman/intents.json` (mode 0600); never fed into
+`/api/v1/search`. Design: [`readmymind-plan.md`](readmymind-plan.md); user
+guide: [`readmymind.md`](readmymind.md).
 
 - `GET /api/v1/sessions/:id/intent` -> `{ intent: IntentProfile }` for the
   session's case. `IntentProfile`: `{ key, workingDir, updatedAt, goals,
@@ -845,18 +848,25 @@ user guide: [`readmymind.md`](readmymind.md).
   `400 INVALID_INPUT` on over-long or unknown fields.
 - `DELETE /api/v1/sessions/:id/intent` -> `{ deleted: boolean }` forgets the
   case's profile entirely.
-- `POST /api/v1/sessions/:id/readmymind` predicts the user's next prompt:
-  a one-shot model call over the intent profile plus live session signals
-  (pending approval dialog, transcript tail, git state, run-summary events,
-  sibling sessions). Body is optional; the rethink flow passes
-  `{ steer?, rejected? }` (strict schema: `steer` <= 2000 chars, `rejected`
-  up to 10 strings <= 1000 chars). Answers
+- `POST /api/v1/sessions/:id/readmymind` predicts the user's next prompt for a
+  Claude session or a **local** Codex session. Claude uses its transcript
+  signals and one-shot Claude predictor. Codex conversation-history signals
+  come only from the requesting session's strictly owned rollout; the assembled
+  context also includes case intent/goals, pending dialog, workspace, away,
+  sibling, and rethink signals. Its predictor is a separate ephemeral
+  noninteractive Codex invocation, not a new interactive tab. There is no
+  cross-provider fallback. Body is optional; the
+  rethink flow passes `{ steer?, rejected? }` (strict schema: `steer` <= 2000
+  chars, `rejected` up to 10 strings <= 1000 chars). It cannot select a
+  provider, model, environment, or rollout. Answers
   `{ suggestions: { prompt, why, kind }[], durationMs }` with 1-3 suggestions
   (`kind`: `continue` | `verify` | `redirect`; prompts are single-line).
-  Claude-mode sessions only (`400 INVALID_INPUT` otherwise); one prediction in
-  flight per session (`409 CONFLICT`); predictor failures answer
-  `502 OPERATION_FAILED`. Takes 5-90 s and costs real tokens. Suggestions are
-  only ever returned, never sent: submitting one is the caller's explicit act.
+  Remote-SSH/Docker Codex and every other mode return `400 INVALID_INPUT`; one
+  prediction in flight per session returns `409 CONFLICT`; provider,
+  timeout, or output-contract failures return `502 OPERATION_FAILED`. Takes
+  5-90 s and costs real tokens. Suggestions are only ever returned, never
+  sent. A separate input request can submit text, so API clients must obtain
+  explicit user authorization before doing so.
 
 All four enforce session ownership in multi-user mode; a foreign session id
 answers `404 NOT_FOUND` (no existence leak), and profiles of two owners of the
@@ -1100,6 +1110,19 @@ message is `event: <name>` + `data: <json>`. The event-name registry
 the stable contract — event names are not renamed without a major bump. An
 optional `?sessions=<id,...>` filter suppresses only the high-volume terminal
 stream; lifecycle/metadata events are delivered to all clients regardless.
+
+`session:checkpoint` reports confirmed checkpoint lifecycle transitions. New
+lifecycle payloads include `sessionId`, `mode`, `phase`, and `updatedAt`; `step`,
+`attempt`, `stage`, and `reason` appear when meaningful. Phases are `requested`,
+`waiting-ready`, `command-submitted`, `operation-started`, `operation-complete`,
+`continue-submitted`, and the terminal `done`, `failed`, or `aborted`. `done`
+means the continuation was delivered and the new agent turn positively entered
+working state, not merely that text was written to tmux.
+
+For compatibility, each request first emits the legacy payload
+`{ sessionId, mode, phase: "start" }`. This legacy event intentionally precedes
+`requested` and omits `updatedAt`; consumers that need confirmed progress should
+use the lifecycle phases above.
 
 ### `sse:heartbeat` (liveness)
 

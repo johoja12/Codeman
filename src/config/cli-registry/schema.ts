@@ -14,10 +14,10 @@
 
 import { z } from 'zod';
 import { compileVersionRegex, countCaptureGroups, TOKEN_PATTERNS } from './patterns.js';
-import { isKnownLauncherProfile, isKnownSetenvProfile } from './profiles.js';
+import { isKnownCheckpointFrameProfile, isKnownLauncherProfile, isKnownSetenvProfile } from './profiles.js';
 import type { AgentSkillDir, LaunchDefaultSettingKey, McpConfigFormat, ModelConfigResolverName } from './types.js';
 
-/** `capabilities.agentSkillDir`: every value must stay a fixed, relative, `..`-free path. */
+/** Fixed relative paths for installed agent skills. */
 export const AGENT_SKILL_DIRS = ['.claude/skills', '.agents/skills'] as const satisfies readonly AgentSkillDir[];
 
 /** A bare CLI id: lowercase, starts with a letter, at most 24 chars. Also used as a CSS/URL token. */
@@ -119,6 +119,14 @@ const launchSchema = z
         z.object({ style: z.literal('flag'), flag: flagToken }).strict(),
         z.object({ style: z.literal('positional'), token: shellToken }).strict(),
       ])
+      .optional(),
+    // A legacy-config KEY name, not shell text and not a param name — see the type's comment
+    // for why the raw command line deliberately never enters the argv engine.
+    rawCommandField: z
+      .string()
+      .min(1)
+      .max(60)
+      .regex(/^[A-Za-z][A-Za-z0-9]*$/, 'must be a plain identifier naming a legacy config key')
       .optional(),
   })
   .strict()
@@ -273,6 +281,14 @@ const echoSchema = z
   })
   .strict();
 
+const checkpointSchema = z
+  .object({
+    promptGlyph: z.string().min(1).max(4),
+    workingFrameProfile: z.string().max(40),
+    directPtyPromptTransition: z.literal(true).optional(),
+  })
+  .strict();
+
 /**
  * `capabilities.customModelInjection.launchModel`: the `model` launch-param value that
  * selects the injected provider, with `{modelId}` standing for the chosen id. Bounded to
@@ -292,10 +308,30 @@ const capabilitiesSchema = z
     requiresMux: z.boolean(),
     hooks: z.enum(['none', 'always', 'supervised']),
     transcript: z.enum(['claude-jsonl', 'codex-rollout', 'deepseek-zstd', 'omp-jsonl', 'none']),
+    nativeAssistantProfile: z.enum(['codex', 'claude', 'opencode']).optional(),
     altScreen: z.enum(['strip-full', 'strip-mux-only', 'strip-mux-and-mouse', 'preserve']),
     echo: echoSchema,
+    checkpoint: checkpointSchema.optional(),
+    // COD-464: read by the desktop wheel (terminal-ui.js `_shouldPaceWheelToCli`)
+    // through `window.__codemanWheelForward`. `rows` and `reversalDeadReports` are
+    // MEASURED against the real CLI; a mode other than 'never' without `rows` is
+    // never forwarded.
     wheelForward: z
-      .object({ mode: z.enum(['never', 'version-gated']), minVersion: z.string().max(20).optional() })
+      .object({
+        mode: z.enum(['never', 'version-gated', 'mouse-tracking']),
+        minVersion: z.string().max(20).optional(),
+        rows: z.number().int().min(1).max(10).optional(),
+        reversalDeadReports: z.number().int().min(0).max(3).optional(),
+        // The CLI's own wheel acceleration, MEASURED: rows moved by the k-th
+        // report of a streak (last entry repeats), and the pause that resets it.
+        streak: z
+          .object({
+            resetMs: z.number().int().min(10).max(500),
+            steps: z.array(z.number().int().min(1).max(20)).min(1).max(32),
+          })
+          .strict()
+          .optional(),
+      })
       .strict(),
     // Whether a hollow pane's wheel/touch scroll may be turned into PageUp/PageDown for
     // the CLI to page its own transcript. Distinct from wheelForward (SGR reports).
@@ -313,6 +349,7 @@ const capabilitiesSchema = z
     // user-editable, so it can never be a free path (`..`, absolute).
     agentSkillDir: z.enum(AGENT_SKILL_DIRS).optional(),
     statusLineTelemetry: z.boolean(),
+    approvals: z.boolean().default(false),
     // How many columns this CLI indents its transcript body by, so a copy can take
     // that much off the clipboard. Bounded, because it is the whole strip: a copy
     // never removes more than this, nor more than every selected line shares.
@@ -560,8 +597,26 @@ const commandLine = z
     'must be space-separated bare words with no shell metacharacters'
   );
 
+const dockerResumeSchema = z
+  .object({
+    style: z.enum(['rebuild', 'append']),
+    refuseWhenOverridden: z.literal(true).optional(),
+  })
+  .strict();
+
 const overlayTargetSchema = z.union([
-  z.object({ command: commandLine.optional(), rootCommand: commandLine.optional() }).strict(),
+  z
+    .object({
+      command: commandLine.optional(),
+      rootCommand: commandLine.optional(),
+      fromLaunchSpec: z.literal(true).optional(),
+      workerRebootResume: z.enum(['pinned-session', 'native-session']).optional(),
+      // COD-471: remote only (see CliOverlays.remote); bounded so a config typo cannot leave a
+      // remote session `mouse on` for minutes.
+      tmuxMouseAtStartupSeconds: z.number().int().min(1).max(30).optional(),
+      resume: dockerResumeSchema.optional(),
+    })
+    .strict(),
   z.object({ disabled: z.literal(true) }).strict(),
 ]);
 
@@ -620,6 +675,17 @@ export const CliEntrySchema = z
         code: 'custom',
         message: `discovery.launcherProfile "${launcherProfile}" is not a profile this build implements`,
         path: ['discovery', 'launcherProfile'],
+      });
+    }
+    // Same reasoning as launcherProfile: an unimplemented checkpoint frame profile would make
+    // every checkpoint on that CLI sit in `waiting-ready` until it timed out, with nothing
+    // naming the cause.
+    const checkpoint = entry.capabilities.checkpoint;
+    if (checkpoint !== undefined && !isKnownCheckpointFrameProfile(checkpoint.workingFrameProfile)) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `capabilities.checkpoint.workingFrameProfile "${checkpoint.workingFrameProfile}" is not a profile this build implements`,
+        path: ['capabilities', 'checkpoint', 'workingFrameProfile'],
       });
     }
     // An env var exported from a param that does not exist would silently export nothing,

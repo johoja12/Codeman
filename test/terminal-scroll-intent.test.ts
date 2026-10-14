@@ -54,12 +54,20 @@ function loadKeyboardHandler(opts: { viewportY: number; baseY: number }) {
     relayoutMobileSubagentWindows: () => {},
   };
   let pendingTimer: (() => void) | null = null;
+  // COD-284: the settle body runs inside a double requestAnimationFrame so iOS has
+  // committed the keyboard layout first. Queue the callbacks and drain them in
+  // settle(), which is what makes the nested pair run to completion here.
+  const rafQueue: Array<() => void> = [];
   const context = vm.createContext({
     console,
     window: { scrollTo: () => {}, matchMedia: () => ({ matches: false }), addEventListener: () => {} },
     document: { body: { classList: { add: () => {}, remove: () => {} } }, addEventListener: () => {} },
     navigator: { userAgent: 'test', maxTouchPoints: 0 },
     app,
+    requestAnimationFrame: (fn: () => void) => {
+      rafQueue.push(fn);
+      return rafQueue.length;
+    },
     setTimeout: (fn: () => void) => {
       pendingTimer = fn;
       return 1;
@@ -84,6 +92,11 @@ function loadKeyboardHandler(opts: { viewportY: number; baseY: number }) {
       const fn = pendingTimer;
       pendingTimer = null;
       fn?.();
+      // Drain the rAF chain, including frames queued from inside a frame.
+      for (let guard = 0; rafQueue.length && guard < 10; guard++) {
+        const frame = rafQueue.shift();
+        frame?.();
+      }
     },
   };
 }

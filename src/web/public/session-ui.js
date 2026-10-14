@@ -31,30 +31,36 @@
  */
 const RUN_MODE_LAUNCH = {
   opencode: {
+    runMethod: 'runOpenCode',
     label: 'OpenCode',
     installHint: 'OpenCode CLI not found. Install with: curl -fsSL https://opencode.ai/install | bash',
     supportsCustomModel: true,
     buildConfig: () => ({ openCodeConfig: { autoAllowTools: true } }),
   },
   codex: {
+    runMethod: 'runCodex',
     label: 'Codex',
     installHint: 'Codex CLI not found. Install with: npm install -g @openai/codex',
     supportsCustomModel: true,
     buildConfig: (globalSettings) => ({
       codexConfig: {
         dangerouslyBypassApprovals: globalSettings.codexDangerouslyBypassApprovals ?? false,
-        animations: globalSettings.codexAnimationsEnabled ?? false,
+        ...(typeof globalSettings.codexAnimationsEnabled === 'boolean'
+          ? { animations: globalSettings.codexAnimationsEnabled }
+          : {}),
         renderMode: 'hybrid',
       },
     }),
   },
   gemini: {
+    runMethod: 'runGemini',
     label: 'Gemini',
     installHint: 'Gemini CLI not found. Install with: npm install -g @google/gemini-cli',
     supportsCustomModel: true,
     buildConfig: () => ({ geminiConfig: { approvalMode: 'yolo' } }),
   },
   antigravity: {
+    runMethod: 'runAntigravity',
     label: 'Antigravity',
     installHint: 'Antigravity CLI not found. Install with: curl -fsSL https://antigravity.google/cli/install.sh | bash',
     // antigravity has no customModelInjection recipe (docs/custom-model-endpoints-plan.md
@@ -63,6 +69,7 @@ const RUN_MODE_LAUNCH = {
     buildConfig: () => ({ antigravityConfig: { dangerouslySkipPermissions: true } }),
   },
   pi: {
+    runMethod: 'runPi',
     label: 'Pi',
     installHint: 'Pi CLI not found. Install with: npm install -g --ignore-scripts @earendil-works/pi-coding-agent',
     supportsCustomModel: true,
@@ -74,12 +81,14 @@ const RUN_MODE_LAUNCH = {
     buildConfig: () => null,
   },
   omp: {
+    runMethod: 'runOmp',
     label: 'OMP',
     installHint: 'OMP CLI not found. Install with: curl -fsSL https://omp.sh/install | sh',
     supportsCustomModel: true,
     buildConfig: () => null,
   },
   grok: {
+    runMethod: 'runGrok',
     label: 'Grok',
     installHint: 'Grok CLI not found. Install with: curl -fsSL https://x.ai/cli/install.sh | bash',
     supportsCustomModel: true,
@@ -91,6 +100,7 @@ const RUN_MODE_LAUNCH = {
     buildConfig: () => ({ grokConfig: { alwaysApprove: true } }),
   },
   deepseek: {
+    runMethod: 'runDeepSeek',
     label: 'DeepSeek',
     installHint: 'DeepSeek Harness CLI (dsh) not found. Install with: npm install -g @deepseek-ai/dsh',
     // The two-part availability check is deliberate. `dsh` being installed is
@@ -432,6 +442,7 @@ Object.assign(CodemanApp.prototype, {
     this.updateCasePickerInput(select.value);
     this.closeCasePicker();
     this.updateDirDisplayForCase(select.value);
+    this.updateSkillsChipForCase(select.value);
     this.updateMobileCaseLabel(select.value);
     // Warm the container's CLI list HERE rather than when the run menu opens.
     // The probe is a `docker exec` round trip, so gating it on the menu meant the
@@ -540,6 +551,7 @@ Object.assign(CodemanApp.prototype, {
       console.log('[loadQuickStartCases] Loaded cases:', cases.map(c => c.name), 'lastUsedCase:', lastUsedCase);
 
       const select = document.getElementById('quickStartCase');
+      select?.blur?.();
 
       const options = this.getCasePickerOptions();
       this.renderQuickStartCaseSelectOptions(select, options);
@@ -549,17 +561,20 @@ Object.assign(CodemanApp.prototype, {
       if (selectCaseName) {
         select.value = selectCaseName;
         this.updateDirDisplayForCase(selectCaseName);
+        this.updateSkillsChipForCase(selectCaseName);
         this.updateMobileCaseLabel(selectCaseName);
       } else if (lastUsedCase && cases.some(c => c.name === lastUsedCase)) {
         // Use lastUsedCase if available and exists
         select.value = lastUsedCase;
         this.updateDirDisplayForCase(lastUsedCase);
+        this.updateSkillsChipForCase(lastUsedCase);
         this.updateMobileCaseLabel(lastUsedCase);
       } else if (cases.length > 0) {
         // Fallback to testcase or first case
         const firstCase = cases.find(c => c.name === 'testcase') || cases[0];
         select.value = firstCase.name;
         this.updateDirDisplayForCase(firstCase.name);
+        this.updateSkillsChipForCase(firstCase.name);
         this.updateMobileCaseLabel(firstCase.name);
       } else {
         // No cases exist yet - show the default case name as directory
@@ -592,6 +607,12 @@ Object.assign(CodemanApp.prototype, {
 
   async updateDirDisplayForCase(caseName) {
     try {
+      const matchingCase = (this.cases || []).find(c => c.name === caseName);
+      if (matchingCase?.path) {
+        document.getElementById('dirDisplay').textContent = matchingCase.path;
+        document.getElementById('dirInput').value = matchingCase.path;
+        return;
+      }
       const res = await fetch(`/api/cases/${caseName}`);
       const data = (await res.json()).data;
       if (data.path) {
@@ -600,6 +621,32 @@ Object.assign(CodemanApp.prototype, {
       }
     } catch (err) {
       document.getElementById('dirDisplay').textContent = caseName;
+    }
+  },
+
+  async updateSkillsChipForCase(caseName) {
+    const btn = document.getElementById('skillsChipBtn');
+    if (!btn) return;
+    try {
+      const res = await fetch(`/api/cases/${encodeURIComponent(caseName)}/skill-state`);
+      if (!res.ok) { btn.classList.add('hidden'); return; }
+      const { data } = await res.json();
+      if (!data?.hasManifest) { btn.classList.add('hidden'); return; }
+      btn.classList.remove('hidden');
+      if (data.missing > 0 || data.drifted > 0) {
+        const n = (data.missing || 0) + (data.drifted || 0);
+        btn.textContent = `Skills: ⚠ ${n} missing`;
+        btn.dataset.state = 'drift';
+      } else if (data.installed > 0) {
+        const suffix = data.primaryPack ? ` · ${data.primaryPack}` : '';
+        btn.textContent = `Skills: ${data.installed}${suffix}`;
+        btn.dataset.state = 'clean';
+      } else {
+        btn.textContent = 'Skills: not set up';
+        btn.dataset.state = 'empty';
+      }
+    } catch {
+      btn.classList.add('hidden');
     }
   },
 
@@ -621,12 +668,10 @@ Object.assign(CodemanApp.prototype, {
 
   /** Ensure a newly-created session is visible without waiting for the SSE event.
    *  The POST response and session:created can arrive in either order, so the
-   *  normal idempotent SSE handler remains the single state-upsert path.
-   *  `tabLayout` is the layout a grouped creation returns (see run()'s
-   *  `tabGroupId`): adopting it first draws the new tab inside its group. */
-  async _ensureCreatedSessionVisible(sessionId, sessionSnapshot, tabLayout) {
+   *  normal idempotent SSE handler remains the single state-upsert path. */
+  async _ensureCreatedSessionVisible(sessionId, sessionSnapshot, tabLayout, tabPlacements) {
     if (!sessionId) return;
-    if (tabLayout) this._applyTabLayout?.(tabLayout);
+    if (tabLayout) this._applyTabLayout(tabLayout);
 
     let session = sessionSnapshot;
     if (!session && !this.sessions?.has(sessionId)) {
@@ -665,14 +710,18 @@ Object.assign(CodemanApp.prototype, {
     }
 
     try {
-      const mode = this._runMode || 'claude';
+      const requestedMode = options.mode;
+      const mode = requestedMode === 'claude' || requestedMode === 'shell' || isExternalCliRunMode(requestedMode)
+        ? requestedMode
+        : this._runMode || 'claude';
       if (mode === 'shell') {
         return await this.runShell(options);
       }
       if (mode === 'claude' || !isExternalCliRunMode(mode)) {
         return await this.runClaude(options);
       }
-      return await this._runCliMode(mode, options);
+      const runMethod = RUN_MODE_LAUNCH[mode]?.runMethod;
+      return await (runMethod ? this[runMethod](options) : this._runCliMode(mode, options));
     } finally {
       const remaining = minLockMs - (Date.now() - startedAt);
       if (remaining > 0) await new Promise(resolve => setTimeout(resolve, remaining));
@@ -684,9 +733,8 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
-  // Note: `runMode` is an accessor defined via Object.defineProperty at the bottom of
-  // this file — an object-literal getter here would be flattened to a static value by
-  // Object.assign (it copies values, not accessor descriptors).
+  /** Get/set the run mode, persisted in localStorage */
+  get runMode() { return this._runMode || 'claude'; },
 
   setRunMode(mode) {
     this._runMode = mode;
@@ -1920,8 +1968,7 @@ Object.assign(CodemanApp.prototype, {
 
   async runClaude(options = {}) {
     const caseName = document.getElementById('quickStartCase').value || 'testcase';
-    const tabCount = this._readTabCount(options.count);
-    const group = options.tabGroupId ? { tabGroupId: options.tabGroupId } : {};
+    const tabCount = options.count ?? this._readTabCount();
 
     const ownsLaunchTerminal = this._beginSessionLaunchStatus(
       `Starting ${tabCount} Claude session(s) in ${caseName}...`
@@ -1954,6 +2001,8 @@ Object.assign(CodemanApp.prototype, {
         caseData = createCaseData.data.case;
       }
 
+      const selectedCase = (this.cases || []).find(c => c.name === caseName);
+      const isRemoteCase = caseData.location === 'remote' || selectedCase?.location === 'remote';
       const workingDir = caseData.path;
       if (!workingDir) throw new Error('Case path not found');
 
@@ -1981,7 +2030,7 @@ Object.assign(CodemanApp.prototype, {
         for (let i = 0; i < tabCount; i++) {
           const quickStartBody = JSON.stringify({
             caseName, mode: 'claude', sessionName: `w${startNumber + i}-${caseName}`,
-            ...group,
+            ...(options.tabGroupId ? { tabGroupId: options.tabGroupId } : {}),
             ...(dockerModelOverride !== undefined ? { modelOverride: dockerModelOverride } : {})
           });
           const doQuickStart = async () => {
@@ -2010,7 +2059,12 @@ Object.assign(CodemanApp.prototype, {
             }
           }
           if (!data.success) throw new Error(data.error || 'Failed to start remote Claude session');
-          await this._ensureCreatedSessionVisible(data.data.sessionId, data.data.session, data.data.tabLayout);
+          await this._ensureCreatedSessionVisible(
+            data.data.sessionId,
+            data.data.session,
+            data.data.tabLayout,
+            data.data.tabPlacements
+          );
           remoteIds.push(data.data.sessionId);
         }
         this._appendSessionLaunchStatus(ownsLaunchTerminal, `All ${tabCount} remote session(s) ready`);
@@ -2043,9 +2097,8 @@ Object.assign(CodemanApp.prototype, {
       const hasEnvOverrides = Object.keys(envOverrides).length > 0;
       const effort = this.getEffortSetting(globalSettings);
       const advisorModel = this.getAdvisorSetting(globalSettings);
-      // Explicit Claude Model choice (App Settings) wins over the legacy 1M Opus
-      // toggles; both flow as `modelOverride` → the case's .claude/settings.local.json
       const useOpus1m = caseSettings.opusContext1m || globalSettings.opusContext1mEnabled;
+      // Explicit Claude Model choice (App Settings) wins over the legacy 1M Opus toggle.
       const modelOverride = globalSettings.claudeModel || (useOpus1m ? 'opus[1m]' : '');
 
       // Step 1: Create all sessions in parallel
@@ -2055,8 +2108,10 @@ Object.assign(CodemanApp.prototype, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            workingDir, name,
-            ...group,
+            caseName,
+            ...(!isRemoteCase ? { workingDir } : {}),
+            name,
+            ...(options.tabGroupId ? { tabGroupId: options.tabGroupId } : {}),
             ...(hasEnvOverrides ? { envOverrides } : {}),
             ...(effort ? { effort } : {}),
             ...(advisorModel ? { advisorModel } : {}),
@@ -2070,7 +2125,12 @@ Object.assign(CodemanApp.prototype, {
       const sessionIds = [];
       for (const result of createResults) {
         if (!result.success) throw new Error(result.error);
-        await this._ensureCreatedSessionVisible(result.data.session.id, result.data.session, result.data.tabLayout);
+        await this._ensureCreatedSessionVisible(
+          result.data.session.id,
+          result.data.session,
+          result.data.tabLayout,
+          result.data.tabPlacements
+        );
         sessionIds.push(result.data.session.id);
       }
       firstSessionId = sessionIds[0];
@@ -2143,8 +2203,7 @@ Object.assign(CodemanApp.prototype, {
     const caseName = document.getElementById('quickStartCase').value || 'testcase';
     // Run Shell reads the toolbar's one instance stepper, like every other run*();
     // its own second `− 1 +` group (#shellCount) was removed (#428).
-    const shellCount = this._readTabCount(options.count);
-    const group = options.tabGroupId ? { tabGroupId: options.tabGroupId } : {};
+    const shellCount = Math.min(20, Math.max(1, options.count ?? this._readTabCount()));
 
     const ownsLaunchTerminal = this._beginSessionLaunchStatus(
       `Starting ${shellCount} Shell session(s) in ${caseName}...`,
@@ -2190,11 +2249,21 @@ Object.assign(CodemanApp.prototype, {
           const res = await fetch('/api/quick-start', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ caseName, mode: 'shell', sessionName: `s${startNumber + i}-${caseName}`, ...group })
+            body: JSON.stringify({
+              caseName,
+              mode: 'shell',
+              sessionName: `s${startNumber + i}-${caseName}`,
+              ...(options.tabGroupId ? { tabGroupId: options.tabGroupId } : {})
+            })
           });
           const data = await res.json();
           if (!data.success) throw new Error(data.error || 'Failed to start remote shell session');
-          await this._ensureCreatedSessionVisible(data.data.sessionId, data.data.session, data.data.tabLayout);
+          await this._ensureCreatedSessionVisible(
+            data.data.sessionId,
+            data.data.session,
+            data.data.tabLayout,
+            data.data.tabPlacements
+          );
           remoteIds.push(data.data.sessionId);
         }
         if (remoteIds[0]) {
@@ -2220,7 +2289,14 @@ Object.assign(CodemanApp.prototype, {
         fetch('/api/sessions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...(isRemoteCase ? { caseName } : { workingDir }), mode: 'shell', name, ...group })
+          body: JSON.stringify({
+            caseName,
+            ...(!isRemoteCase ? { workingDir } : {}),
+            mode: 'shell',
+            name,
+            ...(options.tabGroupId ? { tabGroupId: options.tabGroupId } : {}),
+            ...(this.terminal ? { cols: this.terminal.cols, rows: this.terminal.rows } : {}),
+          })
         }).then(r => r.json())
       );
       const createResults = await Promise.all(createPromises);
@@ -2228,7 +2304,12 @@ Object.assign(CodemanApp.prototype, {
       const sessionIds = [];
       for (const result of createResults) {
         if (!result.success) throw new Error(result.error);
-        await this._ensureCreatedSessionVisible(result.data.session.id, result.data.session, result.data.tabLayout);
+        await this._ensureCreatedSessionVisible(
+          result.data.session.id,
+          result.data.session,
+          result.data.tabLayout,
+          result.data.tabPlacements
+        );
         sessionIds.push(result.data.session.id);
       }
 
@@ -2249,10 +2330,10 @@ Object.assign(CodemanApp.prototype, {
         ));
       }
 
-      // Switch to first session. Don't pre-set activeSessionId — selectSession
-      // early-returns when the IDs match, skipping the buffer load, tab
-      // activation, and focus (see runCodex), which left the new shell tab
-      // created but not shown until the user manually clicked it.
+      // Switch to first session. Do NOT pre-set activeSessionId — that trips
+      // selectSession's same-session early-return, leaving the WebSocket, SSE
+      // subscription, and terminal paint on the PREVIOUS tab (typing appears
+      // dead and the new shell renders stale content — COD-187 e2e catch).
       if (sessionIds.length > 0) {
         await this.selectSession(sessionIds[0]);
       }
@@ -2282,7 +2363,7 @@ Object.assign(CodemanApp.prototype, {
    * launched exactly one session, with no error, just the wrong count.
    * `buildBody(sessionName)` returns that mode's quick-start POST body.
    */
-  async _launchQuickStartInstances(caseName, tabCount, label, buildBody, ownsLaunchTerminal) {
+  async _launchQuickStartInstances(caseName, tabCount, label, buildBody, ownsLaunchTerminal, options = {}) {
     const startNumber = this._nextCaseSessionStartNumber(caseName);
     let firstSessionId = null;
     // A custom-model launch can ask up to two questions before it starts anything: the
@@ -2295,7 +2376,7 @@ Object.assign(CodemanApp.prototype, {
     let customModelAnswered = false;
     for (let i = 0; i < tabCount; i++) {
       const sessionName = `w${startNumber + i}-${caseName}`;
-      const body = buildBody(sessionName);
+      const body = { ...buildBody(sessionName), ...(options.tabGroupId ? { tabGroupId: options.tabGroupId } : {}) };
       const data = await this._quickStartWithCustomModelConfirm(
         customModelAnswered && body.customModel
           ? { ...body, customModel: { ...body.customModel, confirmedContext: true, confirmedSwap: true } }
@@ -2303,7 +2384,12 @@ Object.assign(CodemanApp.prototype, {
       );
       if (!data.success) throw new Error(data.error || `Failed to start ${label}`);
       customModelAnswered = true;
-      await this._ensureCreatedSessionVisible(data.data.sessionId, data.data.session, data.data.tabLayout);
+      await this._ensureCreatedSessionVisible(
+        data.data.sessionId,
+        data.data.session,
+        data.data.tabLayout,
+        data.data.tabPlacements
+      );
       if (!firstSessionId) firstSessionId = data.data.sessionId;
     }
     if (tabCount > 1) {
@@ -2332,13 +2418,13 @@ Object.assign(CodemanApp.prototype, {
       });
     if (!entry) throw new Error(`Unknown run mode: ${mode}`);
     const caseName = document.getElementById('quickStartCase').value || 'testcase';
-    // Remote/docker cases run the CLI on the OTHER side — the local status
-    // probe and the local-only config/env below don't apply (quick-start
-    // rejects them for remote cases).
+    // Remote/docker cases run the CLI on the OTHER side, so skip the local
+    // status probe. SSH remote Codex still needs its launch flags; Docker and
+    // remote environment overrides remain excluded.
     const _runLoc = (this.cases || []).find(c => c.name === caseName)?.location;
     const isRemote = _runLoc === 'remote' || _runLoc === 'docker';
 
-    const tabCount = this._readTabCount(options.count);
+    const tabCount = options.count ?? this._readTabCount();
     const ownsLaunchTerminal = this._beginSessionLaunchStatus(
       `Starting ${tabCount} ${entry.label} session(s) in ${caseName}...`
     );
@@ -2350,7 +2436,7 @@ Object.assign(CodemanApp.prototype, {
         const statusRes = await fetch(`/api/${mode}/status`);
         const status = (await statusRes.json()).data;
         if (!status.available) {
-          this._reportSessionLaunchError(ownsLaunchTerminal, entry.installHint);
+          this._reportSessionLaunchError(ownsLaunchTerminal, status.error || entry.installHint);
           return;
         }
         if (entry.unrunnableHint && !status.runnable) {
@@ -2377,6 +2463,7 @@ Object.assign(CodemanApp.prototype, {
           mode,
           sessionName,
           ...(options.tabGroupId ? { tabGroupId: options.tabGroupId } : {}),
+          ...(_runLoc === 'remote' && mode === 'codex' ? (entry.buildConfig(globalSettings) || {}) : {}),
           ...(isRemote ? {} : {
             ...(entry.buildConfig(globalSettings) || {}),
             ...(Object.keys(envOverrides).length > 0 ? { envOverrides } : {}),
@@ -2385,7 +2472,8 @@ Object.assign(CodemanApp.prototype, {
               : {}),
           }),
         }),
-        ownsLaunchTerminal
+        ownsLaunchTerminal,
+        options
       );
 
       // Switch to the new session (don't pre-set activeSessionId — selectSession
@@ -2400,36 +2488,36 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
-  async runOpenCode() {
-    return this._runCliMode('opencode');
+  async runOpenCode(options = {}) {
+    return this._runCliMode('opencode', options);
   },
 
-  async runCodex() {
-    return this._runCliMode('codex');
+  async runCodex(options = {}) {
+    return this._runCliMode('codex', options);
   },
 
-  async runGemini() {
-    return this._runCliMode('gemini');
+  async runGemini(options = {}) {
+    return this._runCliMode('gemini', options);
   },
 
-  async runAntigravity() {
-    return this._runCliMode('antigravity');
+  async runAntigravity(options = {}) {
+    return this._runCliMode('antigravity', options);
   },
 
-  async runPi() {
-    return this._runCliMode('pi');
+  async runPi(options = {}) {
+    return this._runCliMode('pi', options);
   },
 
-  async runOmp() {
-    return this._runCliMode('omp');
+  async runOmp(options = {}) {
+    return this._runCliMode('omp', options);
   },
 
-  async runGrok() {
-    return this._runCliMode('grok');
+  async runGrok(options = {}) {
+    return this._runCliMode('grok', options);
   },
 
-  async runDeepSeek() {
-    return this._runCliMode('deepseek');
+  async runDeepSeek(options = {}) {
+    return this._runCliMode('deepseek', options);
   },
 
 
@@ -2552,6 +2640,23 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('modalAutoClearEnabled').checked = session.autoClearEnabled ?? false;
     document.getElementById('modalAutoClearThreshold').value = session.autoClearThreshold ?? 140000;
 
+    // Populate agent checkpoint. All modes
+    // are allowed by default; an explicit empty set means the operator unticked
+    // everything (kept faithfully). Legacy sessions with no `checkpointModes`
+    // fall back to all three, matching the backend's migration.
+    const cpEnabled = session.checkpointEnabled ?? false;
+    const cpModes = Array.isArray(session.checkpointModes) ? session.checkpointModes : ['compact', 'clear', 'new'];
+    document.getElementById('modalCheckpointEnabled').checked = cpEnabled;
+    const cpCompact = document.getElementById('modalCheckpointModeCompact');
+    const cpClear = document.getElementById('modalCheckpointModeClear');
+    const cpNew = document.getElementById('modalCheckpointModeNew');
+    cpCompact.checked = cpModes.includes('compact');
+    cpClear.checked = cpModes.includes('clear');
+    cpNew.checked = cpModes.includes('new');
+    cpCompact.disabled = !cpEnabled;
+    cpClear.disabled = !cpEnabled;
+    cpNew.disabled = !cpEnabled;
+
     // Populate auto-resume on usage limit (token pause control)
     document.getElementById('modalAutoResumeEnabled').checked = session.autoResumeEnabled ?? false;
     this.updateAutoResumeStatus(sessionId);
@@ -2593,6 +2698,25 @@ Object.assign(CodemanApp.prototype, {
     colorPicker?.querySelectorAll('.color-swatch').forEach(s => {
       s.classList.toggle('selected', s.dataset.color === currentColor);
     });
+
+    // Show the tmux session name for this tab (COD-70) so the user can map a
+    // Codeman tab -> its tmux session. Prefer the real muxName from the cached
+    // /api/mux-sessions list (handles legacy claudeman-/restored- names); fall
+    // back to the deterministic codeman-<first8> derivation only if unavailable.
+    const _muxEl = document.getElementById('modalMuxName');
+    const _muxIdEl = document.getElementById('modalMuxSessionId');
+    const _muxCmdEl = document.getElementById('modalMuxAttachCmd');
+    if (_muxEl) {
+      const cached = (this.muxSessions || []).find(m => m && m.sessionId === sessionId);
+      const muxName = (session.muxName || cached?.muxName || `codeman-${String(sessionId).slice(0, 8)}`);
+      _muxEl.textContent = muxName;
+      _muxEl.title = muxName;
+      // Spell out the full attach command with the real session name (copy-pasteable).
+      if (_muxCmdEl) _muxCmdEl.textContent = `tmux attach -t ${muxName}`;
+    }
+    if (_muxIdEl) {
+      _muxIdEl.textContent = sessionId;
+    }
 
     // Initialize respawn preset dropdown
     this.renderPresetDropdown();
@@ -2784,6 +2908,38 @@ Object.assign(CodemanApp.prototype, {
         threshold: parseInt(document.getElementById('modalAutoClearThreshold').value) || 140000
       });
     } catch { /* silent */ }
+  },
+
+  async autoSaveCheckpoint() {
+    if (!this.editingSessionId) return;
+    const enabled = document.getElementById('modalCheckpointEnabled').checked;
+    const compactEl = document.getElementById('modalCheckpointModeCompact');
+    const clearEl = document.getElementById('modalCheckpointModeClear');
+    const newEl = document.getElementById('modalCheckpointModeNew');
+    let modes = [...(compactEl.checked ? ['compact'] : []), ...(clearEl.checked ? ['clear'] : []), ...(newEl.checked ? ['new'] : [])];
+    // Can't enable with zero modes — fall back to all so the agent has something to run.
+    if (enabled && modes.length === 0) {
+      compactEl.checked = true;
+      clearEl.checked = true;
+      newEl.checked = true;
+      modes = ['compact', 'clear', 'new'];
+    }
+    // Mode ticks only apply while Agent Checkpoint is enabled.
+    compactEl.disabled = !enabled;
+    clearEl.disabled = !enabled;
+    newEl.disabled = !enabled;
+    try {
+      await this._apiPost(`/api/sessions/${this.editingSessionId}/checkpoint`, { enabled, modes });
+      const session = this.sessions.get(this.editingSessionId);
+      if (session) {
+        session.checkpointEnabled = enabled;
+        session.checkpointModes = modes;
+      }
+      const label = enabled ? `enabled (${modes.join(' + ')})` : 'disabled';
+      this.showToast(`Agent checkpoint ${label}`, 'success');
+    } catch (err) {
+      this.showToast('Failed to toggle checkpoint: ' + err.message, 'error');
+    }
   },
 
   async autoSaveAutoResume() {
@@ -3046,6 +3202,10 @@ Object.assign(CodemanApp.prototype, {
     const tabName = document.querySelector(`.tab-name[data-session-id="${sessionId}"]`);
     if (!tabName) return;
 
+    const activeRename = this._activeRename;
+    if (this._inlineRenameActive && activeRename?.ownsRenderGuard !== true) return;
+    activeRename?.cancel();
+
     // Prevent tab re-renders from destroying the input while renaming
     this._inlineRenameActive = true;
     tabName.classList.add('tab-name-renaming');
@@ -3097,7 +3257,8 @@ Object.assign(CodemanApp.prototype, {
     let completed = false;
 
     const releaseRenderGuard = () => {
-      if (this._activeRename !== renameHandle) return;
+      if (!renameHandle.ownsRenderGuard) return;
+      renameHandle.ownsRenderGuard = false;
       this._inlineRenameActive = false;
     };
 
@@ -3113,6 +3274,7 @@ Object.assign(CodemanApp.prototype, {
       if (invalidated || completed) return;
       invalidated = true;
       editSettled = true;
+      if (this._activeRename !== renameHandle) return;
       tabName.classList.remove('tab-name-renaming');
       restoreOriginalChildren();
       completeCurrentRename();
@@ -3155,9 +3317,9 @@ Object.assign(CodemanApp.prototype, {
       completeCurrentRename();
     };
 
-    // Register only after the input is wired so a throw above can't strand state.
     const renameHandle = {
       sessionId,
+      ownsRenderGuard: true,
       cancel: cancelRename,
     };
     this._activeRename = renameHandle;
@@ -3187,6 +3349,294 @@ Object.assign(CodemanApp.prototype, {
   // ═══════════════════════════════════════════════════════════════
   // Case Settings
   // ═══════════════════════════════════════════════════════════════
+
+  openSkillsDrawer() {
+    const caseName = document.getElementById('quickStartCase')?.value;
+    if (!caseName) return;
+    this.ensureSkillsDrawer();
+    document.getElementById('skillsDrawer')?.classList.add('open');
+    this.skillsDrawerOpen = true;
+    this.loadSkillsDrawerContent(caseName);
+  },
+
+  closeSkillsDrawer() {
+    document.getElementById('skillsDrawer')?.classList.remove('open');
+    this.skillsDrawerOpen = false;
+  },
+
+  ensureSkillsDrawer() {
+    if (document.getElementById('skillsDrawer')) return;
+    const el = document.createElement('aside');
+    el.id = 'skillsDrawer';
+    el.className = 'skills-drawer';
+    el.setAttribute('aria-label', 'Skills');
+    el.innerHTML = `
+      <div class="skills-drawer-header">
+        <span class="skills-drawer-title">Skills</span>
+        <div class="skills-drawer-header-actions">
+          <input type="search" id="skillsSearchInput" class="skills-search-input" placeholder="Search…" autocomplete="off">
+          <button type="button" class="btn-icon-sm" data-action="validate" title="Refresh">&#x21BB;</button>
+          <button type="button" class="btn-icon-sm" data-action="close" title="Close">&#x00D7;</button>
+        </div>
+      </div>
+      <div class="skills-drawer-body" id="skillsDrawerBody"></div>
+    `;
+    el.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('[data-action]');
+      if (!btn) return;
+      ev.stopPropagation();
+      const action = btn.dataset.action;
+      if (action === 'close') this.closeSkillsDrawer();
+      else if (action === 'validate') this.validateSkillsDrawer();
+      else if (action === 'sync') this.syncSkills(btn.dataset.case);
+      else if (action === 'remove') this.removeSkill(btn.dataset.case, btn.dataset.skillId);
+      else if (action === 'add') this.addSkill(btn.dataset.case, btn.dataset.target);
+    });
+    document.body.appendChild(el);
+  },
+
+  async loadSkillsDrawerContent(caseName) {
+    const body = document.getElementById('skillsDrawerBody');
+    if (!body) return;
+    body.innerHTML = '<div class="skills-drawer-loading">Loading…</div>';
+    try {
+      const [detailRes, catalogRes] = await Promise.all([
+        fetch(`/api/cases/${encodeURIComponent(caseName)}/skill-detail`),
+        fetch(`/api/cases/${encodeURIComponent(caseName)}/skill-catalog`),
+      ]);
+      if (!detailRes.ok) { body.innerHTML = '<div class="skills-drawer-empty">Failed to load skills.</div>'; return; }
+      const { data } = await detailRes.json();
+      const catalog = catalogRes.ok ? (await catalogRes.json()).data : null;
+      this._skillsCatalog = catalog;
+      body.innerHTML = this._renderSkillsDrawerBody(data, caseName, catalog);
+      this._initSkillsSearch(caseName);
+    } catch {
+      body.innerHTML = '<div class="skills-drawer-empty">Failed to load skills.</div>';
+    }
+  },
+
+  _initSkillsSearch(caseName) {
+    const input = document.getElementById('skillsSearchInput');
+    if (!input) return;
+    if (input._skillsHandler) input.removeEventListener('input', input._skillsHandler);
+    input._skillsHandler = () => this._filterSkillsDrawer(input.value.trim().toLowerCase());
+    input.addEventListener('input', input._skillsHandler);
+  },
+
+  _filterSkillsDrawer(q) {
+    const body = document.getElementById('skillsDrawerBody');
+    if (!body) return;
+    body.querySelectorAll('.skills-pack').forEach((el) => {
+      const text = (el.querySelector('.skills-pack-name')?.textContent ?? '').toLowerCase();
+      const src = (el.dataset.source ?? '').toLowerCase();
+      el.style.display = !q || text.includes(q) || src.includes(q) ? '' : 'none';
+    });
+    body.querySelectorAll('.skills-entry:not(.child)').forEach((el) => {
+      const text = (el.querySelector('.skills-entry-name')?.textContent ?? '').toLowerCase();
+      const kind = (el.querySelector('.skills-entry-kind')?.textContent ?? '').toLowerCase();
+      const src = (el.dataset.source ?? '').toLowerCase();
+      el.style.display = !q || text.includes(q) || kind.includes(q) || src.includes(q) ? '' : 'none';
+    });
+  },
+
+  _renderSkillsDrawerBody(data, caseName, catalog) {
+    const esc = (s) =>
+      String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    if (!data?.hasManifest) {
+      return `<div class="skills-drawer-empty">
+        <p>Skills not set up for this project.</p>
+        <button type="button" class="btn-sm" data-action="init-skills" data-case="${esc(caseName)}">Initialize</button>
+      </div>`;
+    }
+
+    const stateIcon = (klass) => {
+      if (klass === 'linked-managed' || klass === 'real') return '<span class="skill-state ok" title="Installed">[*]</span>';
+      if (klass === 'dangling') return '<span class="skill-state warn" title="Drifted">[!]</span>';
+      if (klass === 'available-managed') return '<span class="skill-state missing" title="Not synced">[ ]</span>';
+      return '<span class="skill-state dim">[?]</span>';
+    };
+
+    // Group by pack
+    const byPack = new Map();
+    const standalone = [];
+    for (const e of data.projectEntries) {
+      if (e.pack) {
+        if (!byPack.has(e.pack)) byPack.set(e.pack, []);
+        byPack.get(e.pack).push(e);
+      } else {
+        standalone.push(e);
+      }
+    }
+
+    const entryRow = (e, isChild) => `
+      <div class="skills-entry${isChild ? ' child' : ''}">
+        ${stateIcon(e.klass)}
+        <span class="skills-entry-name">${esc(e.name)}</span>
+        ${e.kind !== 'skill' ? `<span class="skills-entry-kind">${esc(e.kind)}</span>` : ''}
+        ${!isChild ? `<button type="button" class="btn-skill-remove" data-action="remove" data-case="${esc(caseName)}" data-skill-id="${esc((e.source ? e.source + '/' : '') + e.name)}" title="Remove">&times;</button>` : ''}
+      </div>`;
+
+    const standaloneHtml = standalone.map((e) => entryRow(e, false)).join('');
+
+    const packHtml = [...byPack.entries()].map(([pack, members]) => {
+      const allOk = members.every((m) => m.klass === 'linked-managed' || m.klass === 'real');
+      const anyDrifted = members.some((m) => m.klass === 'dangling' || m.klass === 'foreign');
+      const packKlass = allOk ? 'ok' : anyDrifted ? 'warn' : 'missing';
+      const packIcon = allOk ? '[*]' : anyDrifted ? '[!]' : '[ ]';
+      return `<details class="skills-pack">
+        <summary>
+          <span class="skill-state ${packKlass}">${packIcon}</span>
+          <span class="skills-pack-name">${esc(pack)}</span>
+          <span class="skills-pack-count">${members.length}</span>
+          <button type="button" class="btn-skill-remove" data-action="remove" data-case="${esc(caseName)}" data-skill-id="${esc((members[0]?.source ? members[0].source + '/' : '') + pack)}" title="Remove pack">&times;</button>
+        </summary>
+        <div class="skills-pack-members">${members.map((m) => entryRow(m, true)).join('')}</div>
+      </details>`;
+    }).join('');
+
+    const installed = data.projectEntries.filter((e) => e.klass === 'linked-managed' || e.klass === 'real').length;
+    const missing = data.projectEntries.filter((e) => e.klass === 'available-managed').length;
+
+    const projectSection = `<section class="skills-section">
+      <div class="skills-section-header">
+        <span class="skills-section-title">This project</span>
+        <div class="skills-section-actions">
+          <span class="skills-section-counts">${installed} installed${missing ? `, ${missing} missing` : ''}</span>
+          <button type="button" class="btn-sm-text" data-action="sync" data-case="${esc(caseName)}">Sync</button>
+        </div>
+      </div>
+      <div class="skills-entries">${standaloneHtml}${packHtml}</div>
+    </section>`;
+
+    const userItems = (data.userEntries || []).filter((e) => e.klass === 'linked-managed' || e.klass === 'real');
+    const userSection = `<details class="skills-section skills-section-user">
+      <summary class="skills-section-header">
+        <span class="skills-section-title">User scope</span>
+        <span class="skills-section-counts">${userItems.length} installed</span>
+      </summary>
+      <div class="skills-entries">${userItems.map((e) => entryRow(e, true)).join('') || '<div class="skills-entry-empty">None installed at user scope</div>'}</div>
+    </details>`;
+
+    const browseSection = this._renderBrowseSection(catalog, caseName, esc);
+
+    return projectSection + userSection + browseSection;
+  },
+
+  _renderBrowseSection(catalog, caseName, esc) {
+    if (!catalog?.hasManifest) return '';
+    const esc2 = esc;
+
+    const packHtml = (catalog.packs || []).map((pack) => {
+      const allInstalled = pack.installedCount === pack.totalCount;
+      const partialInstalled = !allInstalled && pack.installedCount > 0;
+      const icon = allInstalled ? '[*]' : partialInstalled ? '[~]' : '[ ]';
+      const klass = allInstalled ? 'ok' : partialInstalled ? 'warn' : 'missing';
+      const target = `${pack.source}:${pack.name}`;
+      return `<details class="skills-pack catalog-pack" data-source="${esc2(pack.source)}">
+        <summary>
+          <span class="skill-state ${klass}">${icon}</span>
+          <span class="skills-pack-name">${esc2(pack.name)}</span>
+          <span class="skills-pack-count">${pack.installedCount}/${pack.totalCount}</span>
+          ${pack.description ? `<span class="skills-pack-desc">${esc2(pack.description)}</span>` : ''}
+          <button type="button" class="btn-sm-text btn-add-skill" data-action="add" data-case="${esc2(caseName)}" data-target="${esc2(target)}" title="Add bundle">+Add</button>
+        </summary>
+      </details>`;
+    }).join('');
+
+    const individualsHtml = (catalog.individuals || []).map((item) => {
+      const installed = item.klass === 'linked-managed' || item.klass === 'real';
+      const target = `${item.source}/${item.name}`;
+      return `<div class="skills-entry" data-source="${esc2(item.source)}">
+        <span class="skill-state ${installed ? 'ok' : 'missing'}">${installed ? '[*]' : '[ ]'}</span>
+        <span class="skills-entry-name">${esc2(item.name)}</span>
+        ${item.kind !== 'skill' ? `<span class="skills-entry-kind">${esc2(item.kind)}</span>` : ''}
+        ${!installed ? `<button type="button" class="btn-sm-text btn-add-skill" data-action="add" data-case="${esc2(caseName)}" data-target="${esc2(target)}" title="Add">+Add</button>` : ''}
+      </div>`;
+    }).join('');
+
+    if (!packHtml && !individualsHtml) return '';
+
+    return `<details class="skills-section skills-section-browse">
+      <summary class="skills-section-header">
+        <span class="skills-section-title">Browse catalog</span>
+        <span class="skills-section-counts">${(catalog.packs || []).length} pack${catalog.packs?.length !== 1 ? 's' : ''}${catalog.individuals?.length ? `, ${catalog.individuals.length} individual` : ''}</span>
+      </summary>
+      <div class="skills-section-browse-body">
+        ${packHtml}
+        ${individualsHtml ? `<div class="skills-browse-individuals">${individualsHtml}</div>` : ''}
+      </div>
+    </details>`;
+  },
+
+  async addSkill(caseName, target) {
+    if (!caseName || !target) return;
+    const addBtn = document.querySelector(`[data-action="add"][data-target="${CSS.escape(target)}"]`);
+    if (addBtn) { addBtn.disabled = true; addBtn.textContent = 'Adding…'; }
+    try {
+      const res = await fetch(`/api/cases/${encodeURIComponent(caseName)}/skill-add`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target }),
+      });
+      const json = await res.json();
+      if (!json.success) {
+        if (addBtn) { addBtn.disabled = false; addBtn.textContent = '+Add'; }
+        return;
+      }
+      await this.loadSkillsDrawerContent(caseName);
+      await this.updateSkillsChipForCase(caseName);
+    } catch {
+      if (addBtn) { addBtn.disabled = false; addBtn.textContent = '+Add'; }
+    }
+  },
+
+  async validateSkillsDrawer() {
+    const caseName = document.getElementById('quickStartCase')?.value;
+    if (!caseName) return;
+    await this.loadSkillsDrawerContent(caseName);
+  },
+
+  async syncSkills(caseName) {
+    if (!caseName) return;
+    const body = document.getElementById('skillsDrawerBody');
+    const syncBtn = body?.querySelector('[data-action="sync"]');
+    if (syncBtn) { syncBtn.disabled = true; syncBtn.textContent = 'Syncing…'; }
+    try {
+      const res = await fetch(`/api/cases/${encodeURIComponent(caseName)}/skill-sync`, { method: 'POST' });
+      const json = await res.json();
+      if (!json.success) {
+        if (syncBtn) { syncBtn.disabled = false; syncBtn.textContent = 'Sync'; }
+        return;
+      }
+      if (body) body.innerHTML = this._renderSkillsDrawerBody(json.data, caseName, this._skillsCatalog);
+      this._initSkillsSearch(caseName);
+      await this.updateSkillsChipForCase(caseName);
+    } catch {
+      if (syncBtn) { syncBtn.disabled = false; syncBtn.textContent = 'Sync'; }
+    }
+  },
+
+  async removeSkill(caseName, skillId) {
+    if (!caseName || !skillId) return;
+    const body = document.getElementById('skillsDrawerBody');
+    try {
+      const res = await fetch(`/api/cases/${encodeURIComponent(caseName)}/skill-remove`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ skillId }),
+      });
+      const json = await res.json();
+      if (!json.success) return;
+      if (body) body.innerHTML = this._renderSkillsDrawerBody(json.data, caseName, this._skillsCatalog);
+      this._initSkillsSearch(caseName);
+      await this.updateSkillsChipForCase(caseName);
+    } catch { /* ignore */ }
+  },
 
   toggleCaseSettings() {
     const popover = document.getElementById('caseSettingsPopover');
@@ -3275,7 +3725,7 @@ Object.assign(CodemanApp.prototype, {
   // Create Case Modal
   // ═══════════════════════════════════════════════════════════════
 
-  showCreateCaseModal() {
+  resetCaseModalFields() {
     document.getElementById('newCaseName').value = '';
     document.getElementById('newCaseDescription').value = '';
     // Custom folder starts off each time, and is not offered to a non-admin in multi-user mode: the
@@ -3293,11 +3743,14 @@ Object.assign(CodemanApp.prototype, {
     const remoteFields = [
       'remoteCaseName',
       'remoteCasePath',
+      'remoteCaseCodexCommandCustomInput',
+      'localCaseCodexCommandCustomInput',
+      'cloneCaseCodexCommandCustomInput',
+      'linkCaseCodexCommandCustomInput',
       'remoteHostId',
       'remoteHostAddress',
       'remoteHostUsername',
       'remoteHostPort',
-      'remoteHostCodexCommand',
       'remoteHostIdentityFile',
       'remoteHostSocksProxy',
       'remoteHostJumpHost',
@@ -3311,11 +3764,57 @@ Object.assign(CodemanApp.prototype, {
       const el = document.getElementById(id);
       if (el) el.value = '';
     });
+    this._caseCodexCommandSelections = {
+      local: 'default',
+      clone: 'default',
+      link: 'default',
+      remote: 'default',
+    };
+    this._codexCommandProfilesRequestToken = (this._codexCommandProfilesRequestToken || 0) + 1;
+    for (const selectId of [
+      'localCaseCodexProfile',
+      'cloneCaseCodexProfile',
+      'linkCaseCodexProfile',
+      'remoteCaseCodexProfile',
+    ]) {
+      const select = document.getElementById(selectId);
+      if (select) select.value = 'default';
+    }
+    this.onCaseCodexProfileChanged(true);
+    const remoteHostId = document.getElementById('remoteHostId');
+    if (remoteHostId) remoteHostId.disabled = false;
+    const remoteHostSavedSelect = document.getElementById('remoteHostSavedSelect');
+    if (remoteHostSavedSelect) remoteHostSavedSelect.value = '';
+    const remoteDiscoverSection = document.getElementById('remoteDiscoverSection');
+    if (remoteDiscoverSection) remoteDiscoverSection.classList.remove('hidden');
     this._resetCloneForm();
     // Cloning needs git ON THE SERVER: hide the whole tab rather than let it fail
     // at submit. Unknown reads as available (isCliAvailable's rule).
     const cloneTabBtn = document.getElementById('caseCloneTabBtn');
     if (cloneTabBtn) cloneTabBtn.style.display = this.isCliAvailable('git') ? '' : 'none';
+    this.closeCaseDirectoryBrowser();
+  },
+
+  resetCaseEditState() {
+    this.caseEditOriginalName = null;
+    this.caseEditOriginalLocation = null;
+    this.caseEditOriginalHostId = null;
+    this._resetCaseEditDefaultGroup();
+    const title = document.getElementById('caseModalTitle');
+    if (title) title.textContent = 'Add Case';
+    const remoteHostId = document.getElementById('remoteHostId');
+    if (remoteHostId) remoteHostId.disabled = false;
+    for (const id of ['dockerWorkspacePath', 'dockerHostId', 'dockerImage', 'dockerNetwork']) {
+      const field = document.getElementById(id);
+      if (field) field.disabled = false;
+    }
+    const remoteDiscoverSection = document.getElementById('remoteDiscoverSection');
+    if (remoteDiscoverSection) remoteDiscoverSection.classList.remove('hidden');
+  },
+
+  showCreateCaseModal() {
+    this.resetCaseEditState();
+    this.resetCaseModalFields();
     // Reset to first tab
     this.caseModalTab = 'case-create';
     this.switchCaseModalTab('case-create');
@@ -3357,6 +3856,7 @@ Object.assign(CodemanApp.prototype, {
         });
       }
     });
+    void this.loadRemoteHostsForCaseModal();
     modal.classList.add('active');
     document.getElementById('newCaseName').focus();
   },
@@ -3364,7 +3864,8 @@ Object.assign(CodemanApp.prototype, {
   switchCaseModalTab(tabName) {
     this.caseModalTab = tabName;
     const modal = document.getElementById('createCaseModal');
-    // Toggle active class on rail entries
+    const isEditing = Boolean(this.caseEditOriginalName);
+    // Toggle active class on tab buttons
     modal.querySelectorAll('.set-rail-item').forEach(btn => {
       btn.classList.toggle('active', btn.dataset.tab === tabName);
     });
@@ -3387,8 +3888,9 @@ Object.assign(CodemanApp.prototype, {
       this.renderCaseManageList();
       this.refreshDockerExports();
     } else {
-      const label =
-        tabName === 'case-create'
+      const label = isEditing
+        ? 'Save'
+        : tabName === 'case-create'
           ? 'Create'
           : tabName === 'case-clone'
             ? 'Clone'
@@ -3410,14 +3912,19 @@ Object.assign(CodemanApp.prototype, {
     } else if (tabName === 'case-link') {
       document.getElementById('linkCaseName').focus();
     } else if (tabName === 'case-remote') {
+      void this.loadRemoteHostsForCaseModal(document.getElementById('remoteHostSavedSelect')?.value || '');
+      void this.loadCodexCommandProfiles(this._selectionValueForScope('remote'));
       document.getElementById('remoteCaseName').focus();
     } else if (tabName === 'case-docker') {
       document.getElementById('dockerCaseName').focus();
+    } else if (tabName === 'case-link' || tabName === 'case-clone' || tabName === 'case-create') {
+      void this.loadCodexCommandProfiles(this._selectionValueForScope(this._currentCaseCodexScope()));
     }
   },
 
   closeCreateCaseModal() {
     document.getElementById('createCaseModal').classList.remove('active');
+    this.resetCaseEditState();
   },
 
   async submitCaseModal() {
@@ -3425,8 +3932,13 @@ Object.assign(CodemanApp.prototype, {
     // other must show the same pending state and be equally unclickable.
     const btns = ['caseModalSubmit', 'caseModalSubmitMobile'].map((id) => document.getElementById(id)).filter(Boolean);
     const originalText = btns.map((btn) => btn.textContent);
-    const pendingText =
-      this.caseModalTab === 'case-create' ? 'Creating...' : this.caseModalTab === 'case-clone' ? 'Cloning...' : 'Linking...';
+    const pendingText = this.caseEditOriginalName
+      ? 'Saving...'
+      : this.caseModalTab === 'case-create'
+        ? 'Creating...'
+        : this.caseModalTab === 'case-clone'
+          ? 'Cloning...'
+          : 'Linking...';
     // A clone holds this request open for minutes; without disabling the button a
     // second click fires a second clone (the loser then fails on ALREADY_EXISTS).
     btns.forEach((btn) => {
@@ -3435,7 +3947,9 @@ Object.assign(CodemanApp.prototype, {
       btn.disabled = true;
     });
     try {
-      if (this.caseModalTab === 'case-create') {
+      if (this.caseEditOriginalName) {
+        await this.updateCase();
+      } else if (this.caseModalTab === 'case-create') {
         await this.createCase();
       } else if (this.caseModalTab === 'case-clone') {
         await this.cloneCase();
@@ -3543,11 +4057,12 @@ Object.assign(CodemanApp.prototype, {
       return;
     }
     const endpoint = inDocker ? '/api/cases/docker-quickcreate' : '/api/cases';
+    const localSelection = this._readCaseCodexCommandFromForm('local');
     const payload = inDocker
       ? { name, description, ...this._collectDockerQuickSettings() }
       : customFolder
-        ? { name, description, path: this._newCaseTargetPath() }
-        : { name, description };
+        ? { name, description, ...localSelection, path: this._newCaseTargetPath() }
+        : { name, description, ...localSelection };
 
     try {
       const res = await fetch(endpoint, {
@@ -3646,7 +4161,7 @@ Object.assign(CodemanApp.prototype, {
       const res = await fetch('/api/cases/link', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, path })
+        body: JSON.stringify({ name, path, ...this._readCaseCodexCommandFromForm('link') })
       });
 
       const data = await res.json();
@@ -3861,7 +4376,13 @@ Object.assign(CodemanApp.prototype, {
         headers: { 'Content-Type': 'application/json' },
         // Zod `.optional()` rejects an explicit null, and JSON.stringify keeps one
         // on the wire — omit the empty fields instead of sending null.
-        body: JSON.stringify({ name, repository: url, ...(ref ? { ref } : {}), ...(shallow ? { shallow: true } : {}) }),
+        body: JSON.stringify({
+          name,
+          repository: url,
+          ...(ref ? { ref } : {}),
+          ...(shallow ? { shallow: true } : {}),
+          ...this._readCaseCodexCommandFromForm('clone'),
+        }),
       });
       const data = await res.json();
       if (!data.success) {
@@ -3968,10 +4489,11 @@ Object.assign(CodemanApp.prototype, {
   async linkRemoteCase() {
     const name = document.getElementById('remoteCaseName').value.trim();
     const remotePath = document.getElementById('remoteCasePath').value.trim();
-    const hostId = document.getElementById('remoteHostId').value.trim();
+    const hostId = document.getElementById('remoteHostId').value.trim()
+      || document.getElementById('remoteHostSavedSelect')?.value.trim();
     const host = document.getElementById('remoteHostAddress').value.trim();
     const username = document.getElementById('remoteHostUsername').value.trim();
-    const codexCommand = document.getElementById('remoteHostCodexCommand').value.trim();
+    const codexSelection = this._readCaseCodexCommandFromForm('remote');
     // COD-107 — port + advanced SSH connection options.
     const portRaw = document.getElementById('remoteHostPort').value.trim();
     const identityFile = document.getElementById('remoteHostIdentityFile').value.trim();
@@ -4034,7 +4556,7 @@ Object.assign(CodemanApp.prototype, {
       const caseRes = await fetch('/api/cases/remote-link', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, hostId, remotePath })
+        body: JSON.stringify({ name, hostId, remotePath, ...codexSelection })
       });
       const caseData = await caseRes.json();
       if (caseData.success) {
@@ -4049,6 +4571,357 @@ Object.assign(CodemanApp.prototype, {
       console.error('Failed to link remote case:', err);
       this.showToast('Failed to link remote case: ' + err.message, 'error');
     }
+  },
+
+  _caseRemoteHostsFromResponse(data) {
+    return Array.isArray(data) ? data : data?.data || [];
+  },
+
+  _fillRemoteHostForm(host) {
+    if (!host) return;
+    document.getElementById('remoteHostId').value = host.id || '';
+    document.getElementById('remoteHostAddress').value = host.host || '';
+    document.getElementById('remoteHostUsername').value = host.username || '';
+    document.getElementById('remoteHostPort').value = host.port ? String(host.port) : '';
+    document.getElementById('remoteHostIdentityFile').value = host.identityFile || '';
+    document.getElementById('remoteHostSocksProxy').value = host.socksProxy || '';
+    document.getElementById('remoteHostJumpHost').value = host.jumpHost || '';
+    document.getElementById('remoteHostExtraSshOptions').value = (host.extraSshOptions || []).join('\n');
+  },
+
+  async loadRemoteHostsForCaseModal(selectedHostId = '') {
+    const select = document.getElementById('remoteHostSavedSelect');
+
+    try {
+      const res = await fetch('/api/remote-hosts');
+      const data = await res.json();
+      const hosts = this._caseRemoteHostsFromResponse(data);
+      this.caseRemoteHosts = hosts;
+      if (select) {
+        select.innerHTML = [
+          '<option value="">New host...</option>',
+          ...hosts.map(host => {
+            const label = host.label || host.id;
+            const target = host.username && host.host ? ` (${host.username}@${host.host})` : '';
+            return `<option value="${escapeHtml(host.id)}">${escapeHtml(label + target)}</option>`;
+          })
+        ].join('');
+        if (selectedHostId) select.value = selectedHostId;
+      }
+    } catch (err) {
+      console.warn('Failed to load remote hosts for case modal:', err);
+      this.caseRemoteHosts = [];
+    }
+  },
+
+  onRemoteHostSelected() {
+    const select = document.getElementById('remoteHostSavedSelect');
+    const hostId = select?.value || '';
+    if (!hostId) return;
+    const host = (this.caseRemoteHosts || []).find(item => item.id === hostId);
+    if (host) this._fillRemoteHostForm(host);
+  },
+
+  startNewRemoteHostConfig() {
+    const select = document.getElementById('remoteHostSavedSelect');
+    if (select) select.value = '';
+    this.remoteHostConfigMode = 'new';
+    this.remoteHostConfigOriginalId = null;
+    [
+      'remoteHostId',
+      'remoteHostAddress',
+      'remoteHostUsername',
+      'remoteHostPort',
+      'remoteHostIdentityFile',
+      'remoteHostSocksProxy',
+      'remoteHostJumpHost',
+      'remoteHostExtraSshOptions',
+    ].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.value = '';
+    });
+    const hostId = document.getElementById('remoteHostId');
+    if (hostId) {
+      hostId.disabled = false;
+      hostId.focus?.();
+    }
+    this.remoteHostVerifiedFingerprint = null;
+    this._setRemoteHostVerificationState(false, 'Test SSH access before saving.');
+    document.getElementById('remoteHostConfigModal')?.classList.add('active');
+    this.closeCaseDirectoryBrowser();
+  },
+
+  editSelectedRemoteHostConfig() {
+    const select = document.getElementById('remoteHostSavedSelect');
+    const hostId = select?.value || '';
+    if (!hostId) {
+      this.showToast('Select a saved SSH profile to edit', 'error');
+      return;
+    }
+    const host = (this.caseRemoteHosts || []).find(item => item.id === hostId);
+    if (!host) {
+      this.showToast('Saved SSH profile not found', 'error');
+      return;
+    }
+    this.remoteHostConfigMode = 'edit';
+    this.remoteHostConfigOriginalId = host.id;
+    this._fillRemoteHostForm(host);
+    const hostIdInput = document.getElementById('remoteHostId');
+    if (hostIdInput) hostIdInput.disabled = true;
+    this.remoteHostVerifiedFingerprint = null;
+    this._setRemoteHostVerificationState(false, 'Test SSH access before saving changes.');
+    document.getElementById('remoteHostConfigModal')?.classList.add('active');
+    this.closeCaseDirectoryBrowser();
+  },
+
+  closeRemoteHostConfigModal() {
+    document.getElementById('remoteHostConfigModal')?.classList.remove('active');
+  },
+
+  _remoteHostFingerprint(hostPayload) {
+    return JSON.stringify(hostPayload);
+  },
+
+  _setRemoteHostVerificationState(verified, message = '') {
+    const saveBtn = document.getElementById('remoteHostSaveBtn');
+    const status = document.getElementById('remoteHostVerifyStatus');
+    if (saveBtn) saveBtn.disabled = !verified;
+    if (status) {
+      status.textContent = message;
+      status.classList.toggle('verified', verified);
+      status.classList.toggle('error', !verified && Boolean(message));
+    }
+  },
+
+  async testRemoteHostConfig() {
+    const hostPayload = this._readRemoteHostFromForm();
+    if (!this._validateRemoteHostFormForBrowse(hostPayload)) return;
+    const verifyBtn = document.getElementById('remoteHostVerifyBtn');
+    if (verifyBtn) verifyBtn.disabled = true;
+    this._setRemoteHostVerificationState(false, 'Testing SSH access...');
+
+    try {
+      const res = await fetch('/api/remote-hosts/verify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(hostPayload)
+      });
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'SSH verification failed');
+      this.remoteHostVerifiedFingerprint = this._remoteHostFingerprint(hostPayload);
+      this._setRemoteHostVerificationState(true, 'SSH access verified.');
+    } catch (err) {
+      this.remoteHostVerifiedFingerprint = null;
+      this._setRemoteHostVerificationState(false, err.message);
+      this.showToast('SSH verification failed: ' + err.message, 'error');
+    } finally {
+      if (verifyBtn) verifyBtn.disabled = false;
+    }
+  },
+
+  async saveRemoteHostConfig() {
+    const hostPayload = this._readRemoteHostFromForm();
+    if (!this._validateRemoteHostFormForBrowse(hostPayload)) return;
+    if (this.remoteHostVerifiedFingerprint !== this._remoteHostFingerprint(hostPayload)) {
+      this._setRemoteHostVerificationState(false, 'Test SSH access before saving.');
+      this.showToast('Test SSH access before saving this profile', 'error');
+      return;
+    }
+
+    const saveBtn = document.getElementById('remoteHostSaveBtn');
+    if (saveBtn) saveBtn.disabled = true;
+    try {
+      if (this.remoteHostConfigMode === 'edit') {
+        const targetId = this.remoteHostConfigOriginalId || hostPayload.id;
+        const updateRes = await fetch(`/api/remote-hosts/${encodeURIComponent(targetId)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(hostPayload)
+        });
+        const updateData = await updateRes.json();
+        if (!updateData.success) throw new Error(updateData.error || 'Failed to update SSH profile');
+      } else {
+        const createRes = await fetch('/api/remote-hosts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(hostPayload)
+        });
+        const createData = await createRes.json();
+        if (!createData.success) {
+          if (createData.errorCode !== 'ALREADY_EXISTS') {
+            throw new Error(createData.error || 'Failed to save SSH profile');
+          }
+          const updateRes = await fetch(`/api/remote-hosts/${encodeURIComponent(hostPayload.id)}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(hostPayload)
+          });
+          const updateData = await updateRes.json();
+          if (!updateData.success) throw new Error(updateData.error || 'Failed to update SSH profile');
+        }
+      }
+      await this.loadRemoteHostsForCaseModal(hostPayload.id);
+      const select = document.getElementById('remoteHostSavedSelect');
+      if (select) select.value = hostPayload.id;
+      this.closeRemoteHostConfigModal();
+      this.showToast(`SSH profile "${hostPayload.id}" saved`, 'success');
+    } catch (err) {
+      this._setRemoteHostVerificationState(true, 'SSH access verified.');
+      this.showToast('Failed to save SSH profile: ' + err.message, 'error');
+    }
+  },
+
+  _validateRemoteHostFormForBrowse(hostPayload) {
+    if (!hostPayload.id || !hostPayload.host || !hostPayload.username) {
+      this.showToast('Fill in Host ID, address, and username first', 'error');
+      return false;
+    }
+    if (!/^[a-zA-Z0-9_-]+$/.test(hostPayload.id)) {
+      this.showToast('Invalid Host ID. Use letters, numbers, hyphens, underscores.', 'error');
+      return false;
+    }
+    const portRaw = document.getElementById('remoteHostPort')?.value.trim() || '';
+    if (portRaw) {
+      const port = Number(portRaw);
+      if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        this.showToast('SSH port must be a number between 1 and 65535', 'error');
+        return false;
+      }
+    }
+    return true;
+  },
+
+  async _ensureRemoteHostSavedForBrowse() {
+    const hostPayload = this._readRemoteHostFromForm();
+    const selectedHostId = document.getElementById('remoteHostSavedSelect')?.value || '';
+    const effectiveHostId = hostPayload.id || selectedHostId;
+    const knownHost = (this.caseRemoteHosts || []).find(host => host.id === effectiveHostId);
+    if (knownHost) {
+      if (!hostPayload.id) this._fillRemoteHostForm(knownHost);
+      return true;
+    }
+    this.showToast('Save this SSH profile before browsing remote directories', 'error');
+    return false;
+  },
+
+  _currentCaseDirectoryPath(target) {
+    if (target === 'remote') {
+      return document.getElementById('remoteCasePath')?.value.trim() || '/';
+    }
+    return document.getElementById('linkCasePath')?.value.trim() || '~';
+  },
+
+  _caseDirectoryBrowseUrl(target, path) {
+    if (target === 'remote') {
+      const hostId = document.getElementById('remoteHostId')?.value.trim()
+        || document.getElementById('remoteHostSavedSelect')?.value.trim();
+      if (!hostId) {
+        this.showToast('Select or enter a saved remote host first', 'error');
+        return null;
+      }
+      return `/api/remote-hosts/${encodeURIComponent(hostId)}/directories?path=${encodeURIComponent(path || '/')}`;
+    }
+    return `/api/cases/browse-local?path=${encodeURIComponent(path || '~')}`;
+  },
+
+  _positionCaseDirectoryBrowser(target, panel) {
+    const inputId = target === 'remote' ? 'remoteCasePath' : 'linkCasePath';
+    const pathRow = document.getElementById(inputId)?.closest?.('.form-row');
+    pathRow?.insertAdjacentElement?.('afterend', panel);
+  },
+
+  async openCaseDirectoryBrowser(target, pathOverride = null) {
+    const panel = document.getElementById('caseDirectoryBrowserPanel');
+    const error = document.getElementById('caseDirectoryBrowserError');
+    const list = document.getElementById('caseDirectoryBrowserList');
+    if (!panel || !list) return;
+
+    const path = pathOverride || this._currentCaseDirectoryPath(target);
+
+    this.caseDirectoryBrowserTarget = target;
+    this._positionCaseDirectoryBrowser(target, panel);
+    if (error) error.textContent = '';
+    list.innerHTML = '<div class="form-hint">Loading...</div>';
+    panel.classList.remove('hidden');
+
+    try {
+      if (target === 'remote') {
+        if (!this.caseRemoteHosts) await this.loadRemoteHostsForCaseModal();
+        const hostSaved = await this._ensureRemoteHostSavedForBrowse();
+        if (!hostSaved) {
+          list.innerHTML = '';
+          return;
+        }
+      }
+      const url = this._caseDirectoryBrowseUrl(target, path);
+      if (!url) {
+        list.innerHTML = '';
+        return;
+      }
+      const res = await fetch(url);
+      const data = await res.json();
+      if (!data.success) throw new Error(data.error || 'Failed to browse directories');
+      this.renderCaseDirectoryBrowser(target, data.data);
+    } catch (err) {
+      console.error('Failed to browse directories:', err);
+      if (error) error.textContent = err.message;
+      list.innerHTML = '';
+    }
+  },
+
+  renderCaseDirectoryBrowser(target, data) {
+    const pathEl = document.getElementById('caseDirectoryBrowserPath');
+    const list = document.getElementById('caseDirectoryBrowserList');
+    const selectBtn = document.getElementById('caseDirectoryBrowserSelect');
+    if (!list) return;
+
+    const currentPath = data?.path || this._currentCaseDirectoryPath(target);
+    this.caseDirectoryBrowserTarget = target;
+    this.caseDirectoryBrowserCurrentPath = currentPath;
+    this.caseDirectoryBrowserParentPath = data?.parentPath || null;
+    if (pathEl) pathEl.textContent = currentPath;
+    if (selectBtn) selectBtn.disabled = false;
+
+    const entries = Array.isArray(data?.entries) ? data.entries : [];
+    if (entries.length === 0) {
+      list.innerHTML = '<div class="form-hint">No subdirectories</div>';
+      return;
+    }
+
+    list.innerHTML = entries.map(entry => {
+      const targetArg = escapeHtml(JSON.stringify(target));
+      const pathArg = escapeHtml(JSON.stringify(entry.path));
+      return `
+        <button type="button" class="case-directory-row" onclick="app.openCaseDirectoryBrowser(${targetArg}, ${pathArg})">
+          <span class="case-directory-icon">/</span>
+          <span class="case-directory-name">${escapeHtml(entry.name)}</span>
+        </button>
+      `;
+    }).join('');
+  },
+
+  openParentCaseDirectory() {
+    if (!this.caseDirectoryBrowserParentPath) return;
+    this.openCaseDirectoryBrowser(this.caseDirectoryBrowserTarget || 'local', this.caseDirectoryBrowserParentPath);
+  },
+
+  selectCaseDirectory(path = null) {
+    const selectedPath = path || this.caseDirectoryBrowserCurrentPath;
+    if (!selectedPath) return;
+    if (this.caseDirectoryBrowserTarget === 'remote') {
+      document.getElementById('remoteCasePath').value = selectedPath;
+    } else {
+      document.getElementById('linkCasePath').value = selectedPath;
+    }
+    this.closeCaseDirectoryBrowser();
+  },
+
+  closeCaseDirectoryBrowser() {
+    const panel = document.getElementById('caseDirectoryBrowserPanel');
+    if (panel) panel.classList.add('hidden');
+    this.caseDirectoryBrowserTarget = null;
+    this.caseDirectoryBrowserCurrentPath = null;
+    this.caseDirectoryBrowserParentPath = null;
   },
 
   /**
@@ -4507,6 +5380,191 @@ Object.assign(CodemanApp.prototype, {
     };
   },
 
+  _readRemoteCaseCommandsFromForm() {
+    return this._readCaseCodexCommandFromForm('remote');
+  },
+
+  _caseCodexFormIds(scope) {
+    if (scope === 'local') {
+      return {
+        select: 'localCaseCodexProfile',
+        preview: 'localCaseCodexProfilePreview',
+        customWrap: 'localCaseCodexCommandCustom',
+        customInput: 'localCaseCodexCommandCustomInput',
+      };
+    }
+    if (scope === 'clone') {
+      return {
+        select: 'cloneCaseCodexProfile',
+        preview: 'cloneCaseCodexProfilePreview',
+        customWrap: 'cloneCaseCodexCommandCustom',
+        customInput: 'cloneCaseCodexCommandCustomInput',
+      };
+    }
+    if (scope === 'link') {
+      return {
+        select: 'linkCaseCodexProfile',
+        preview: 'linkCaseCodexProfilePreview',
+        customWrap: 'linkCaseCodexCommandCustom',
+        customInput: 'linkCaseCodexCommandCustomInput',
+      };
+    }
+    return {
+      select: 'remoteCaseCodexProfile',
+      preview: 'remoteCaseCodexProfilePreview',
+      customWrap: 'remoteCaseCodexCommandCustom',
+      customInput: 'remoteCaseCodexCommandCustomInput',
+    };
+  },
+
+  _caseCodexScopeForInput(element) {
+    const row = element?.closest?.('[data-codex-command-scope]');
+    const scope = row?.dataset?.codexCommandScope;
+    if (scope === 'local') return 'local';
+    if (scope === 'clone') return 'clone';
+    if (scope === 'link') return 'link';
+    return 'remote';
+  },
+
+  _currentCaseCodexScope() {
+    if (this.caseEditOriginalName) {
+      if (this.caseEditOriginalLocation === 'linked-local') return 'link';
+      if (this.caseEditOriginalLocation === 'remote') return 'remote';
+      return 'local';
+    }
+    if (this.caseModalTab === 'case-link') return 'link';
+    if (this.caseModalTab === 'case-clone') return 'clone';
+    if (this.caseModalTab === 'case-remote') return 'remote';
+    return 'local';
+  },
+
+  _selectionValueForScope(scope) {
+    const selections = this._caseCodexCommandSelections || {};
+    if (scope === 'local') return selections.local || 'default';
+    if (scope === 'clone') return selections.clone || 'default';
+    if (scope === 'link') return selections.link || 'default';
+    return selections.remote || 'default';
+  },
+
+  _storeSelectionForScope(scope, value) {
+    this._caseCodexCommandSelections = {
+      local: this._selectionValueForScope('local'),
+      clone: this._selectionValueForScope('clone'),
+      link: this._selectionValueForScope('link'),
+      remote: this._selectionValueForScope('remote'),
+    };
+    if (scope === 'local') this._caseCodexCommandSelections.local = value;
+    else if (scope === 'clone') this._caseCodexCommandSelections.clone = value;
+    else if (scope === 'link') this._caseCodexCommandSelections.link = value;
+    else this._caseCodexCommandSelections.remote = value;
+  },
+
+  _readCaseCodexCommandFromForm(scope = 'remote') {
+    const ids = this._caseCodexFormIds(scope);
+    const value = document.getElementById(ids.select)?.value || 'default';
+    if (value.startsWith('profile:')) return { codexCommandSelection: { kind: 'profile', profileId: value.slice(8) } };
+    if (value === 'custom') { const command = document.getElementById(ids.customInput)?.value.trim() || ''; return { codexCommandSelection: command ? { kind: 'custom', command } : { kind: 'default' } }; }
+    return { codexCommandSelection: { kind: 'default' } };
+  },
+
+  _selectionTokenForApi(selection) {
+    if (!selection || selection.kind === 'default') return 'default';
+    if (selection.kind === 'custom') return 'custom';
+    return `profile:${selection.profileId}`;
+  },
+
+  _caseCodexCustomCommandForEdit(selection) {
+    if (selection?.kind !== 'custom') return '';
+    return selection.commandPreview || '';
+  },
+
+  _renderCaseCodexCommandProfiles(scope, selection = 'default') {
+    const ids = this._caseCodexFormIds(scope);
+    const select = document.getElementById(ids.select);
+    if (!select) return;
+    select.replaceChildren(new Option('Default', 'default'));
+    for (const p of (this._codexCommandProfiles || []).slice().sort((a, b) => a.name.localeCompare(b.name))) select.add(new Option(p.name, `profile:${p.id}`));
+    select.add(new Option('Custom', 'custom'));
+    select.value = [...select.options].some(o => o.value === selection) ? selection : 'default';
+    this._storeSelectionForScope(scope, select.value);
+    // Refresh only this selector; touching the active edit scope here can overwrite its pending choice.
+    this.onCaseCodexProfileChanged(true, scope);
+  },
+
+  _renderCodexCommandProfiles(selection = 'default') {
+    for (const scope of ['local', 'clone', 'link', 'remote']) {
+      this._renderCaseCodexCommandProfiles(scope, scope === 'remote' ? selection : this._selectionValueForScope(scope));
+    }
+  },
+  async loadCodexCommandProfiles(selection) {
+    const scopes = ['local', 'clone', 'link', 'remote'];
+    const selects = scopes
+      .map((scope) => ({ scope, select: document.getElementById(this._caseCodexFormIds(scope).select) }))
+      .filter((entry) => entry.select);
+    const manageButtons = ['manageLocalCodexCommandProfiles', 'manageCloneCodexCommandProfiles', 'manageLinkCodexCommandProfiles', 'manageCodexCommandProfiles']
+      .map((id) => document.getElementById(id))
+      .filter(Boolean);
+    const token = (this._codexCommandProfilesRequestToken || 0) + 1;
+    this._codexCommandProfilesRequestToken = token;
+    for (const { select } of selects) select.disabled = true;
+    for (const manage of manageButtons) manage.disabled = true;
+    try {
+      const res = await fetch('/api/codex-command-profiles');
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.error || 'Could not load Codex command profiles');
+      if (token !== this._codexCommandProfilesRequestToken) return;
+      this._codexCommandProfiles = data.data?.profiles || [];
+      const requested = selection || this._selectionValueForScope('remote') || 'default';
+      for (const { scope } of selects) {
+        this._renderCaseCodexCommandProfiles(scope, scope === 'remote' ? requested : this._selectionValueForScope(scope));
+      }
+      for (const { scope, select } of selects) this._storeSelectionForScope(scope, select.value || 'default');
+      for (const { select } of selects) select.disabled = false;
+    } catch (err) {
+      if (token !== this._codexCommandProfilesRequestToken) return;
+      for (const { scope } of selects) this._renderCaseCodexCommandProfiles(scope, this._selectionValueForScope(scope));
+      for (const { select } of selects) select.disabled = true;
+      this.showToast(err.message || 'Could not load Codex command profiles', 'error');
+    } finally {
+      if (token === this._codexCommandProfilesRequestToken) for (const manage of manageButtons) manage.disabled = false;
+    }
+  },
+  onRemoteCaseCodexProfileChanged(silent = false) { return this.onCaseCodexProfileChanged(silent, 'remote'); },
+  onCaseCodexProfileChanged(silent = false, scopeOverride) {
+    const scope = scopeOverride || this._currentCaseCodexScope();
+    const ids = this._caseCodexFormIds(scope);
+    const select = document.getElementById(ids.select);
+    if (!select) return;
+    this._storeSelectionForScope(scope, select.value);
+    const profile = (this._codexCommandProfiles || []).find(p => `profile:${p.id}` === select.value);
+    document.getElementById(ids.customWrap)?.classList.toggle('hidden', select.value !== 'custom');
+    const preview = document.getElementById(ids.preview);
+    if (preview) preview.value = profile?.command || (select.value === 'custom' ? document.getElementById(ids.customInput)?.value || '' : '');
+    if (!silent) {
+      for (const entry of ['local', 'clone', 'link', 'remote']) {
+        if (entry === scope) continue;
+        const itemIds = this._caseCodexFormIds(entry);
+        const itemSelect = document.getElementById(itemIds.select);
+        if (!itemSelect) continue;
+        const expected = this._selectionValueForScope(entry);
+        if (itemSelect.value !== expected && [...itemSelect.options].some(o => o.value === expected)) {
+          itemSelect.value = expected;
+        }
+        const itemProfile = (this._codexCommandProfiles || []).find(p => `profile:${p.id}` === itemSelect.value);
+        document.getElementById(itemIds.customWrap)?.classList.toggle('hidden', itemSelect.value !== 'custom');
+        const itemPreview = document.getElementById(itemIds.preview);
+        if (itemPreview) itemPreview.value = itemProfile?.command || (itemSelect.value === 'custom' ? document.getElementById(itemIds.customInput)?.value || '' : '');
+      }
+    }
+  },
+  async openCodexCommandProfileManager() { const modal = document.getElementById('codexCommandProfileManager'); if (!modal) return; if (this._codexCommandProfileManagerKeydown) modal.removeEventListener('keydown', this._codexCommandProfileManagerKeydown); this._codexCommandProfileManagerReturnFocus = document.activeElement; modal.classList.add('active'); this._codexCommandProfileManagerKeydown = (event) => { if (event.key === 'Escape') { event.preventDefault(); this.closeCodexCommandProfileManager(); return; } if (event.key !== 'Tab') return; const focusable = [...modal.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])')].filter(element => !element.closest('.hidden')); if (!focusable.length) return; const current = focusable.indexOf(document.activeElement); if (event.shiftKey && current <= 0) { event.preventDefault(); focusable[focusable.length - 1].focus(); } else if (!event.shiftKey && current === focusable.length - 1) { event.preventDefault(); focusable[0].focus(); } }; modal.addEventListener('keydown', this._codexCommandProfileManagerKeydown); document.getElementById('codexCommandProfileNew')?.focus(); await this.loadCodexCommandProfiles(); if (!modal.classList.contains('active')) return; this.renderCodexCommandProfileManager(); },
+  closeCodexCommandProfileManager() { const modal = document.getElementById('codexCommandProfileManager'); if (!modal) return; if (this._codexCommandProfileManagerKeydown) modal.removeEventListener('keydown', this._codexCommandProfileManagerKeydown); this._codexCommandProfileManagerKeydown = null; modal.classList.remove('active'); if (this._codexCommandProfileManagerReturnFocus) { this._codexCommandProfileManagerReturnFocus.disabled = false; this._codexCommandProfileManagerReturnFocus.focus?.(); } this._codexCommandProfileManagerReturnFocus = null; },
+  renderCodexCommandProfileManager() { const list = document.getElementById('codexCommandProfileList'); if (!list) return; list.replaceChildren(); for (const p of this._codexCommandProfiles || []) { const row = document.createElement('button'); row.type = 'button'; row.className = 'btn-toolbar'; row.textContent = `${p.name}${p.usage?.length ? ` — used by ${p.usage.join(', ')}` : ''}`; row.onclick = () => this.editCodexCommandProfile(p.id); list.append(row); } },
+  newCodexCommandProfile() { this._editingCodexCommandProfileId = null; document.getElementById('codexCommandProfileEditor')?.classList.remove('hidden'); document.getElementById('codexCommandProfileName').value = ''; document.getElementById('codexCommandProfileCommand').value = ''; },
+  editCodexCommandProfile(id) { const p = (this._codexCommandProfiles || []).find(x => x.id === id); if (!p) return; this._editingCodexCommandProfileId = id; document.getElementById('codexCommandProfileEditor')?.classList.remove('hidden'); document.getElementById('codexCommandProfileName').value = p.name; document.getElementById('codexCommandProfileCommand').value = p.command; },
+  async saveCodexCommandProfile() { const id = this._editingCodexCommandProfileId, name = document.getElementById('codexCommandProfileName').value.trim(), command = document.getElementById('codexCommandProfileCommand').value.trim(), save = document.getElementById('codexCommandProfileSave'); if (!name || !command) return; save.disabled = true; try { let res = await fetch(id ? `/api/codex-command-profiles/${encodeURIComponent(id)}` : '/api/codex-command-profiles', { method: id ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, command }) }); let data = await res.json(); if (!data.success && data.requiresConfirmation && confirm(`This profile is used by ${data.usage.join(', ')}. Update it?`)) { res = await fetch(`/api/codex-command-profiles/${encodeURIComponent(id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, command, confirmReferencedUpdate: true }) }); data = await res.json(); } if (!data.success) throw new Error(data.error || 'Save failed'); await this.loadCodexCommandProfiles(); this.renderCodexCommandProfileManager(); } catch (err) { this.showToast(err.message, 'error'); } finally { save.disabled = false; } },
+  async deleteCodexCommandProfile() { const id = this._editingCodexCommandProfileId; if (!id) return; try { const res = await fetch(`/api/codex-command-profiles/${encodeURIComponent(id)}`, { method: 'DELETE' }); const data = await res.json(); if (!data.success) throw new Error(`${data.error || 'Delete failed'}${data.usage?.length ? `: Used by ${data.usage.join(', ')}` : ''}`); await this.loadCodexCommandProfiles(); this.renderCodexCommandProfileManager(); } catch (err) { this.showToast(err.message, 'error'); } },
+
   /**
    * Explicit Discover action (Decision A — never auto-runs on host select).
    * Saves the host config (idempotent), then queries the host for `codeman-*`
@@ -4576,7 +5634,7 @@ Object.assign(CodemanApp.prototype, {
             <span class="remote-discover-name">${escapeHtml(s.name)} ${attachedBadge}</span>
             <span class="form-hint">age ${age} · ${s.windows || 1} window(s)</span>
           </div>
-          <button type="button" class="btn-toolbar" onclick="app.attachDiscoveredSession('${escapeHtml(hostId)}', '${escapeHtml(s.name)}')">Attach</button>
+          <button type="button" class="btn-toolbar" onclick="app.attachDiscoveredSession(${escapeHtml(JSON.stringify(hostId))}, ${escapeHtml(JSON.stringify(s.name))})">Attach</button>
         </div>`;
     }).join('');
     results.innerHTML = rows;
@@ -4595,6 +5653,7 @@ Object.assign(CodemanApp.prototype, {
           mode: 'shell',
           name: remoteSessionName,
           attachRemoteSession: { hostId, remoteSessionName },
+          ...(this.terminal ? { cols: this.terminal.cols, rows: this.terminal.rows } : {}),
         })
       });
       const createData = await createRes.json();
@@ -4611,7 +5670,7 @@ Object.assign(CodemanApp.prototype, {
       }
       this.closeCreateCaseModal();
       this.showToast(`Attached to ${remoteSessionName} (detach on close)`, 'success');
-      this.activeSessionId = id;
+      // See runShell: pre-setting activeSessionId would dead-end selectSession.
       await this.selectSession(id);
       if (this.terminal && typeof this.terminal.focus === 'function') this.terminal.focus();
     } catch (err) {
@@ -4619,6 +5678,252 @@ Object.assign(CodemanApp.prototype, {
       this.showToast('Failed to attach: ' + err.message, 'error');
     }
   },
+
+  async editCase(name) {
+    const caseInfo = (this.cases || []).find(c => c.name === name);
+    if (!caseInfo) {
+      this.showToast(`Case "${name}" not found`, 'error');
+      return;
+    }
+
+    this.resetCaseModalFields();
+    this.caseEditOriginalName = name;
+    this.caseEditOriginalLocation = caseInfo.location || (caseInfo.linked ? 'linked-local' : 'local');
+    this.caseEditOriginalHostId = caseInfo.remote?.hostId || null;
+
+    const title = document.getElementById('caseModalTitle');
+    if (title) title.textContent = 'Edit Case';
+
+    const modal = document.getElementById('createCaseModal');
+    modal.querySelectorAll('.set-rail-item').forEach(btn => {
+      btn.onclick = () => this.switchCaseModalTab(btn.dataset.tab);
+    });
+
+    if (this.caseEditOriginalLocation === 'remote') {
+      const remote = caseInfo.remote || {};
+      document.getElementById('remoteCaseName').value = caseInfo.name || '';
+      document.getElementById('remoteCasePath').value = remote.path || '';
+      const selection = caseInfo.codexCommandSelection || remote.codexCommandSelection;
+      document.getElementById('remoteCaseCodexCommandCustomInput').value = selection?.kind === 'custom' ? remote.commands?.codex || '' : '';
+      this._storeSelectionForScope('local', 'default');
+      this._storeSelectionForScope('clone', 'default');
+      this._storeSelectionForScope('link', 'default');
+      await this.loadCodexCommandProfiles(selection?.kind === 'profile' ? `profile:${selection.profileId}` : selection?.kind === 'custom' ? 'custom' : 'default');
+      document.getElementById('remoteHostId').value = remote.hostId || '';
+      document.getElementById('remoteHostId').disabled = true;
+      document.getElementById('remoteHostAddress').value = remote.host || '';
+      document.getElementById('remoteHostUsername').value = remote.username || '';
+
+      try {
+        await this.loadRemoteHostsForCaseModal(remote.hostId || '');
+        const host = (this.caseRemoteHosts || []).find(item => item.id === remote.hostId);
+        if (host) this._fillRemoteHostForm(host);
+        document.getElementById('remoteHostId').value = remote.hostId || '';
+        document.getElementById('remoteHostId').disabled = true;
+      } catch (err) {
+        console.warn('Failed to load remote host details for editing:', err);
+      }
+
+      const remoteDiscoverSection = document.getElementById('remoteDiscoverSection');
+      if (remoteDiscoverSection) remoteDiscoverSection.classList.add('hidden');
+      this.switchCaseModalTab('case-remote');
+    } else if (this.caseEditOriginalLocation === 'docker') {
+      const docker = caseInfo.docker || {};
+      document.getElementById('dockerCaseName').value = caseInfo.name || '';
+      document.getElementById('dockerWorkspacePath').value = docker.path || '';
+      document.getElementById('dockerHostId').value = docker.hostId || '';
+      document.getElementById('dockerImage').value = docker.image || '';
+      document.getElementById('dockerNetwork').value = docker.network || 'bridge';
+      for (const id of ['dockerWorkspacePath', 'dockerHostId', 'dockerImage', 'dockerNetwork']) {
+        document.getElementById(id).disabled = true;
+      }
+      this.switchCaseModalTab('case-docker');
+    } else if (this.caseEditOriginalLocation === 'linked-local' || caseInfo.linked) {
+      document.getElementById('linkCaseName').value = caseInfo.name || '';
+      document.getElementById('linkCasePath').value = caseInfo.path || '';
+      document.getElementById('linkCaseCodexCommandCustomInput').value =
+        this._caseCodexCustomCommandForEdit(caseInfo.codexCommandSelection);
+      this._storeSelectionForScope(
+        'link',
+        this._selectionTokenForApi(caseInfo.codexCommandSelection)
+      );
+      void this.loadCodexCommandProfiles(this._selectionValueForScope('remote'));
+      this.switchCaseModalTab('case-link');
+    } else {
+      document.getElementById('newCaseName').value = caseInfo.name || '';
+      document.getElementById('newCaseDescription').value = '';
+      document.getElementById('localCaseCodexCommandCustomInput').value =
+        this._caseCodexCustomCommandForEdit(caseInfo.codexCommandSelection);
+      this._storeSelectionForScope('local', this._selectionTokenForApi(caseInfo.codexCommandSelection));
+      void this.loadCodexCommandProfiles(this._selectionValueForScope('remote'));
+      this.switchCaseModalTab('case-create');
+    }
+
+    modal.classList.add('active');
+    void this.loadCaseEditDefaultGroup(name);
+  },
+
+  _resetCaseEditDefaultGroup() {
+    const row = document.getElementById('caseEditDefaultGroupRow');
+    const select = document.getElementById('caseEditDefaultGroup');
+    if (row) row.classList.add('hidden');
+    if (!select) return;
+    const ungrouped = document.createElement('option');
+    ungrouped.value = '';
+    ungrouped.textContent = 'Ungrouped';
+    select.replaceChildren(ungrouped);
+    select.value = '';
+    select.disabled = true;
+  },
+
+  _caseEditDefaultGroupId() {
+    const select = document.getElementById('caseEditDefaultGroup');
+    if (!select || select.disabled) return undefined;
+    return select.value || null;
+  },
+
+  async loadCaseEditDefaultGroup(caseName) {
+    const token = (this._caseEditDefaultGroupLoadToken || 0) + 1;
+    this._caseEditDefaultGroupLoadToken = token;
+    this._resetCaseEditDefaultGroup();
+    const row = document.getElementById('caseEditDefaultGroupRow');
+    if (row) row.classList.remove('hidden');
+    try {
+      const res = await fetch(`/api/cases/${encodeURIComponent(caseName)}/default-group`);
+      const json = await res.json();
+      if (!res.ok || json.success === false) throw new Error(json.error || 'Failed to load default group');
+      if (token !== this._caseEditDefaultGroupLoadToken || this.caseEditOriginalName !== caseName) return;
+      const select = document.getElementById('caseEditDefaultGroup');
+      if (!select) return;
+      const groups = Array.isArray(json.data?.groups) ? json.data.groups : [];
+      const selected = typeof json.data?.groupId === 'string' && groups.some((group) => group.id === json.data.groupId)
+        ? json.data.groupId
+        : '';
+      const ungrouped = document.createElement('option');
+      ungrouped.value = '';
+      ungrouped.textContent = 'Ungrouped';
+      const options = groups.map((group) => {
+        const option = document.createElement('option');
+        option.value = group.id;
+        option.textContent = group.name;
+        return option;
+      });
+      select.replaceChildren(ungrouped, ...options);
+      select.value = selected;
+      select.disabled = false;
+    } catch (err) {
+      if (token !== this._caseEditDefaultGroupLoadToken || this.caseEditOriginalName !== caseName) return;
+      this.showToast?.('Failed to load default session group: ' + err.message, 'error');
+    }
+  },
+
+  async updateCase() {
+    const originalName = this.caseEditOriginalName;
+    const originalLocation = this.caseEditOriginalLocation;
+    if (!originalName) return;
+
+    try {
+      let nextName;
+      let updatePayload;
+
+      if (originalLocation === 'remote') {
+        nextName = document.getElementById('remoteCaseName').value.trim();
+        const remotePath = document.getElementById('remoteCasePath').value.trim();
+        const hostId = this.caseEditOriginalHostId || document.getElementById('remoteHostId').value.trim();
+        const host = document.getElementById('remoteHostAddress').value.trim();
+        const username = document.getElementById('remoteHostUsername').value.trim();
+        const codexSelection = this._readCaseCodexCommandFromForm('remote');
+        const portRaw = document.getElementById('remoteHostPort').value.trim();
+
+        if (!nextName || !remotePath || !hostId || !host || !username) {
+          this.showToast('Please complete all required remote fields', 'error');
+          return;
+        }
+        if (!/^[a-zA-Z0-9_-]+$/.test(nextName)) {
+          this.showToast('Invalid name. Use only letters, numbers, hyphens, underscores.', 'error');
+          return;
+        }
+        if (!remotePath.startsWith('/')) {
+          this.showToast('Remote path must be absolute', 'error');
+          return;
+        }
+
+        let port;
+        if (portRaw) {
+          port = Number(portRaw);
+          if (!Number.isInteger(port) || port < 1 || port > 65535) {
+            this.showToast('SSH port must be a number between 1 and 65535', 'error');
+            return;
+          }
+        }
+
+        updatePayload = { name: nextName, hostId, remotePath, ...codexSelection };
+      } else if (originalLocation === 'docker') {
+        nextName = document.getElementById('dockerCaseName').value.trim();
+        if (!nextName) {
+          this.showToast('Please enter a case name', 'error');
+          return;
+        }
+        if (!/^[a-zA-Z0-9_-]+$/.test(nextName)) {
+          this.showToast('Invalid name. Use only letters, numbers, hyphens, underscores.', 'error');
+          return;
+        }
+        updatePayload = { name: nextName };
+      } else if (originalLocation === 'linked-local') {
+        nextName = document.getElementById('linkCaseName').value.trim();
+        const path = document.getElementById('linkCasePath').value.trim();
+        if (!nextName || !path) {
+          this.showToast('Please enter a case name and folder path', 'error');
+          return;
+        }
+        if (!/^[a-zA-Z0-9_-]+$/.test(nextName)) {
+          this.showToast('Invalid name. Use only letters, numbers, hyphens, underscores.', 'error');
+          return;
+        }
+        updatePayload = { name: nextName, path, ...this._readCaseCodexCommandFromForm('link') };
+      } else {
+        nextName = document.getElementById('newCaseName').value.trim();
+        if (!nextName) {
+          this.showToast('Please enter a case name', 'error');
+          return;
+        }
+        if (!/^[a-zA-Z0-9_-]+$/.test(nextName)) {
+          this.showToast('Invalid name. Use only letters, numbers, hyphens, underscores.', 'error');
+          return;
+        }
+        updatePayload = { name: nextName, ...this._readCaseCodexCommandFromForm('local') };
+      }
+
+      const defaultGroupId = this._caseEditDefaultGroupId();
+      if (defaultGroupId === undefined) {
+        this.showToast('Wait for the default session group to load before saving.', 'error');
+        return;
+      }
+      updatePayload = { ...updatePayload, defaultGroupId };
+
+      const res = await fetch(`/api/cases/${encodeURIComponent(originalName)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatePayload)
+      });
+      const data = await res.json();
+      if (!data.success) {
+        this.showToast(data.error || 'Failed to update case', 'error');
+        return;
+      }
+
+      this.closeCreateCaseModal();
+      this.showToast(`Case "${nextName}" updated`, 'success');
+      await this.loadQuickStartCases(nextName);
+      if (document.getElementById('quickStartCase')?.value === nextName || originalName === nextName) {
+        await this.saveLastUsedCase(nextName);
+      }
+    } catch (err) {
+      console.error('Failed to update case:', err);
+      this.showToast('Failed to update case: ' + err.message, 'error');
+    }
+  },
+
 
   // ═══════════════════════════════════════════════════════════════
   // Case Management (reorder + delete)
@@ -4671,6 +5976,7 @@ Object.assign(CodemanApp.prototype, {
       // Was `/Users/<user>` only, the mirror image of the Run menu's bug: every
       // case path on a Linux host rendered in full, unabbreviated.
       const pathDisplay = c.path ? this._shortenHomePath(c.path) : '';
+      const locationBadge = c.location === 'remote' ? '<span class="case-location-badge">remote</span>' : '';
       const agentTitle = c.agentCreated
         ? `Created by an agent worker${c.agentCreated.parentSessionName ? ` from ${c.agentCreated.parentSessionName}` : ''}` +
           ` (${c.agentCreated.createdBy})${c.agentCreated.createdAt ? ` on ${new Date(c.agentCreated.createdAt).toLocaleString()}` : ''}`
@@ -4678,12 +5984,14 @@ Object.assign(CodemanApp.prototype, {
       html += `
         <div class="case-manage-item" data-case="${escapeHtml(c.name)}">
           <div class="case-manage-info">
-            <span class="case-manage-name">${escapeHtml(c.name)}${
+            <span class="case-manage-name">${escapeHtml(c.name)} ${locationBadge}${
               c.agentCreated ? `<span class="case-manage-tag-agent" title="${escapeHtml(agentTitle)}" data-i18n-skip>agent</span>` : ''
             }</span>
             <span class="case-manage-path">${escapeHtml(pathDisplay)}</span>
           </div>
           <div class="case-manage-actions">
+            <button class="case-manage-btn case-manage-btn-edit" onclick="app.editCase(${escapeHtml(JSON.stringify(c.name))})"
+                    title="Edit case">&#x270E;</button>
             ${
               c.location === 'docker'
                 ? `<button class="case-manage-btn" onclick="app.exportDockerCaseBundle(${escapeHtml(JSON.stringify(c.name))}, 'full')"
@@ -4988,7 +6296,12 @@ Object.assign(CodemanApp.prototype, {
         this.cases = (this.cases || []).filter(c => c.name !== name);
         // Refresh mobile picker and dropdown
         this.closeMobileCasePicker();
-        await this.loadQuickStartCases();
+        const select = document.getElementById('quickStartCase');
+        const currentCase = select?.value;
+        await this.loadQuickStartCases(currentCase === name ? null : currentCase);
+        if (currentCase === name) {
+          await this.saveLastUsedCase(document.getElementById('quickStartCase')?.value || 'testcase');
+        }
       } else {
         this.showToast(data.error || 'Failed to delete case', 'error');
       }

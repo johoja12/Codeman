@@ -74,6 +74,13 @@ function makeApp(activeSessionId: string | null) {
   app._renderHistoryTruncationBanner = vi.fn();
   app._updateSseSubscription = vi.fn();
   app.hideWelcome = vi.fn();
+  // COD-187 scrollback ownership runs BEFORE the acknowledgement line and
+  // writes through this.terminal.options, so without these the whole path
+  // throws early and the gate under test is never reached.
+  app.terminal = { options: {} };
+  app._isMirrorSession = () => false;
+  app._userScrollback = () => 1000;
+  app._connectWs = vi.fn();
   app.sessions = new Map([[SID, { id: SID, name: 'w1' }]]);
   return app as Record<string, unknown> & {
     selectSession: (id: string, opts?: Record<string, unknown>) => Promise<void>;
@@ -180,9 +187,25 @@ describe('selectSession acknowledgement gate', () => {
 
     it('keyboard tab switching stays user-initiated', () => {
       // Alt+1..9 and Alt+[/] are a human asking for that tab, so they keep
-      // acknowledging; only app-chosen selections are tagged.
-      expect(APP_SOURCE).toContain('this.selectSession(live[idx]);');
-      expect(APP_SOURCE).toContain('this.selectSession(this.sessionOrder[nextIndex]);');
+      // acknowledging; only app-chosen selections are tagged. Both dispatch
+      // through the tab-layout projection (COD-306) rather than indexing
+      // sessionOrder, so this asserts the UNTAGGED call at each site — pinning
+      // the old inline literals is what let this guard go stale.
+      const altNumber = APP_SOURCE.slice(APP_SOURCE.indexOf('const target = this._tabAltRefs()[idx];'));
+      expect(altNumber.slice(0, 400)).toContain('this.selectSession(target.id);');
+
+      for (const [method, call] of [
+        ['nextSession() {', 'this.selectSession(this.sessionOrder[nextIndex]);'],
+        ['prevSession() {', 'this.selectSession(this.sessionOrder[prevIndex]);'],
+      ]) {
+        const body = APP_SOURCE.slice(APP_SOURCE.indexOf(method));
+        expect(body.slice(0, 500)).toContain(call);
+      }
+
+      // The negative half: no keyboard path may acquire the auto tag. Every
+      // tagged call site in the file is one of the four enumerated above.
+      const tagged = APP_SOURCE.match(/this\.selectSession\([^)]*,\s*\{\s*auto:\s*true\s*\}\)/g) ?? [];
+      expect(tagged).toHaveLength(4);
     });
   });
 });

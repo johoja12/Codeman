@@ -17,6 +17,10 @@ export interface ConfigPort {
   getModelConfig(): Promise<{ defaultModel?: string; agentTypeOverrides?: Record<string, string> } | null>;
   getClaudeModeConfig(): Promise<{ claudeMode?: ClaudeMode; allowedTools?: string }>;
   getTerminalHistoryConfig(): Promise<TerminalHistoryConfig>;
+  /** COD-75: whether new Claude/non-codex sessions opt into COLORTERM=truecolor (settings.json, default off). */
+  getTruecolorEnabled(): Promise<boolean>;
+  /** COD-257: whether newly created sessions enable Agent Checkpoint (settings.json, default on). */
+  getCheckpointDefaultEnabled(): Promise<boolean>;
   /** Synced `agentSkillEnabled` app setting (default OFF); gates per-case agent-skill injection. */
   getAgentSkillEnabled(): Promise<boolean>;
   /** Synced `workspaceHooksEnabled` app setting (default ON); gates INSTALLING hooks into a session's workspace. */
@@ -34,6 +38,6 @@ export interface ConfigPort {
    * collector tail-reads this file for prediction context.
    */
   getTranscriptPath(sessionId: string): string | null;
-  /** Read My Mind predictor model: the `readMyMindModel` setting, defaulting to AI_CHECK_MODEL. */
+  /** Claude Read My Mind model: the `readMyMindModel` setting, defaulting to AI_CHECK_MODEL. */
   getReadMyMindModel(): Promise<string>;
 }

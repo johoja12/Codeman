@@ -137,11 +137,12 @@ describe('smart-copy wiring invariants', () => {
     // The generic capture loop preventDefaults on every match it dispatches. If
     // the copy action were reachable from there, Ctrl+C would be swallowed with
     // no selection and the user would lose the interrupt key.
-    const actionsBlock = APP_SOURCE.slice(
-      APP_SOURCE.indexOf('const SHORTCUT_ACTIONS = {'),
-      APP_SOURCE.indexOf('// Use capture to handle before terminal')
-    );
-    expect(actionsBlock.length).toBeGreaterThan(0);
-    expect(actionsBlock).not.toContain('copyTerminalSelection');
+    // Downstream shape: there is no SHORTCUT_ACTIONS allowlist — runShortcutAction()
+    // resolves `this[shortcut.action]`, so merely having a registry entry would make
+    // the copy action dispatchable. The equivalent guard is an explicit skip set that
+    // the document capture loop consults before matching.
+    // The set also lists the tile-grid chords (tile-grid.js dispatches those itself).
+    expect(APP_SOURCE).toMatch(/const NON_DOCUMENT_SHORTCUT_ACTIONS = new Set\(\[\s*'copyTerminalSelection',/);
+    expect(APP_SOURCE).toContain('if (NON_DOCUMENT_SHORTCUT_ACTIONS.has(shortcut.action)) continue;');
   });
 });

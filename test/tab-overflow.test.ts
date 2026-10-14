@@ -20,6 +20,7 @@ function loadTabOverflowHelper() {
     context.window as {
       CodemanTabOverflow: {
         shouldAutoWrapTabs: (input: unknown) => boolean;
+        shouldWrapHeaderRight: (input: unknown) => boolean;
         computeTabScrollLeft: (input: ScrollInput) => number;
         TAB_SCROLL_REVEAL_PX: number;
       };
@@ -93,6 +94,39 @@ describe('tab overflow layout policy', () => {
     expect(helper.shouldAutoWrapTabs({ ...fits, deviceType: 'desktop', manualTwoRows: true, innerWrap: true })).toBe(
       false
     );
+  });
+});
+
+describe('shouldWrapHeaderRight (COD-147)', () => {
+  it('wraps when desktop and manual two-rows is pinned', () => {
+    const helper = loadTabOverflowHelper();
+    expect(helper.shouldWrapHeaderRight({ deviceType: 'desktop', manualTwoRows: true })).toBe(true);
+  });
+
+  it('wraps when desktop and tabs auto-wrapped', () => {
+    const helper = loadTabOverflowHelper();
+    expect(helper.shouldWrapHeaderRight({ deviceType: 'desktop', autoWrap: true })).toBe(true);
+  });
+
+  it('does not wrap on desktop when neither manual nor auto wrap is active', () => {
+    const helper = loadTabOverflowHelper();
+    expect(helper.shouldWrapHeaderRight({ deviceType: 'desktop' })).toBe(false);
+  });
+
+  it('never wraps on mobile even when tabs auto-wrap', () => {
+    const helper = loadTabOverflowHelper();
+    expect(helper.shouldWrapHeaderRight({ deviceType: 'mobile', autoWrap: true })).toBe(false);
+  });
+
+  it('never wraps on tablet even when manual two-rows is pinned', () => {
+    const helper = loadTabOverflowHelper();
+    expect(helper.shouldWrapHeaderRight({ deviceType: 'tablet', manualTwoRows: true })).toBe(false);
+  });
+
+  it('does not wrap for missing or empty input', () => {
+    const helper = loadTabOverflowHelper();
+    expect(helper.shouldWrapHeaderRight(undefined)).toBe(false);
+    expect(helper.shouldWrapHeaderRight({})).toBe(false);
   });
 });
 

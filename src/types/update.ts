@@ -150,6 +150,15 @@ export interface UpdateCheckResult {
   error?: string;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Repository status (App Settings → Updates → "Repository status")
+//
+// Distinct from the release-tag updater above: an INFORMATIONAL view of how the
+// local checkout sits relative to one or more remotes — the upstream project and
+// the maintainer's own fork — by commit ahead/behind count plus a short summary
+// of the incoming commits. Backend: `src/web/repo-status.ts`.
+// ─────────────────────────────────────────────────────────────────────────────
+
 /**
  * Role of a remote in the repository-status view.
  * - `tracking`: the current branch's `@{upstream}` remote (where `git pull` goes).

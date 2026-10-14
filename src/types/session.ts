@@ -7,7 +7,7 @@
  * - SessionState — full session state (status, tokens, respawn, ralph, CLI metadata)
  * - SessionConfig — creation-time config (id, workingDir, createdAt)
  * - SessionOutput — captured stdout/stderr/exitCode
- * - SessionStatus — 'idle' | 'busy' | 'stopped' | 'error'
+ * - SessionStatus — 'idle' | 'busy' | 'stopped' | 'error' | 'parked'
  * - SessionMode — 'claude' | 'shell' | 'opencode' | 'codex' | 'gemini' | 'antigravity' | 'pi' | 'grok' | 'deepseek' | 'omp' (which CLI backend)
  * - ClaudeMode — CLI permission mode ('dangerously-skip-permissions' | 'auto' | 'normal' | 'allowedTools')
  * - SessionColor — visual differentiation color
@@ -31,10 +31,28 @@
  */
 
 import type { RespawnConfig } from './respawn.js';
+import type { SessionSource } from './sources.js';
 import type { AttachmentDetectedType } from './tools.js';
 
-/** Status of a Claude session */
-export type SessionStatus = 'idle' | 'busy' | 'stopped' | 'error';
+/**
+ * Status of a Claude session.
+ * - `'parked'` (COD-124): detached + CLI stopped, but the session record, workingDir,
+ *   and resumeSessionId are preserved for later resume — distinct from `'stopped'`,
+ *   which existing flows treat as terminal (deleted from SessionManager.sessions).
+ */
+export type SessionStatus = 'idle' | 'busy' | 'stopped' | 'error' | 'parked';
+
+/** Effective runtime activity exposed by the server without replacing raw SessionStatus. */
+export type SessionActivityStatus = SessionStatus | 'waiting_agents' | 'checking_agents';
+
+/** Server-side confidence about exactly correlated background-agent activity. */
+export type AgentObservation = 'none' | 'live' | 'unknown' | 'not_observable';
+
+/** Runtime-only agent activity derived by the server coordinator. */
+export interface SessionActivityProjection {
+  activityStatus: SessionActivityStatus;
+  activityStatusSince: number | null;
+}
 
 /**
  * Claude CLI startup permission mode.
@@ -57,6 +75,29 @@ export type SessionMode =
   | 'grok'
   | 'deepseek'
   | 'omp';
+export type SessionCheckpointMode = 'compact' | 'clear' | 'new';
+
+export interface SessionCheckpointState {
+  active: boolean;
+  runId?: string;
+  status?: 'requested' | 'running' | 'completed' | 'cancelled' | 'failed';
+  mode: SessionCheckpointMode;
+  phase:
+    | 'requested'
+    | 'waiting-ready'
+    | 'command-submitted'
+    | 'operation-started'
+    | 'operation-complete'
+    | 'continue-submitted'
+    | 'done'
+    | 'failed'
+    | 'aborted';
+  step?: SessionCheckpointMode | 'continue';
+  attempt?: number;
+  stage?: 'text' | 'enter';
+  reason?: string;
+  updatedAt: number;
+}
 
 /**
  * Who owns a session's name. `placeholder`: Codeman's own `w<n>-<case>` (or no
@@ -74,6 +115,8 @@ export interface SessionWriteOptions {
    * name a tab; Ralph, respawn, cron and approval writes leave this unset.
    */
   fromUser?: boolean;
+  /** Internal assistant coordinator permit; never accepted from HTTP or WebSocket payloads. */
+  assistantPermit?: string;
 }
 
 export type RemoteCommandMode = Extract<
@@ -114,6 +157,7 @@ export interface RemoteHost extends RemoteSshOptions {
   host: string;
   username: string;
   port?: number;
+  /** Legacy/default command overrides. New case-specific overrides live on RemoteCase. */
   commands?: Partial<Record<RemoteCommandMode, string>>;
   /**
    * Optional Wake-on-LAN MAC address(es), comma-separated (e.g.
@@ -143,6 +187,12 @@ export interface RemoteCase {
   owner?: string;
   hostId: string;
   remotePath: string;
+  /** Selected owner-private saved Codex command profile. */
+  codexCommandProfileId?: string;
+  /** Runtime-resolved profile template; never accepted from remote-cases.json input. */
+  codexResumeCommandTemplate?: string;
+  /** Custom or legacy command overrides. */
+  commands?: Partial<Record<RemoteCommandMode, string>>;
 }
 
 export interface SessionRemote extends RemoteSshOptions {
@@ -153,6 +203,10 @@ export interface SessionRemote extends RemoteSshOptions {
   port?: number;
   remotePath: string;
   commands?: Partial<Record<RemoteCommandMode, string>>;
+  /** Saved profile provenance needed to resume a custom Codex command safely. */
+  codexCommandProfileId?: string;
+  /** Validated template paired with codexCommandProfileId at launch selection. */
+  codexResumeCommandTemplate?: string;
   /**
    * COD-105 — whether THIS Codeman created the remote tmux session.
    *
@@ -421,10 +475,9 @@ export interface OpenCodeConfig {
   configContent?: string;
 }
 
-/** Codex (OpenAI CLI) browser rendering strategy. Hybrid TUI is the only supported mode. */
+/** Codex (OpenAI CLI) session configuration */
 export type CodexRenderMode = 'hybrid';
 
-/** Codex (OpenAI CLI) session configuration */
 export interface CodexConfig {
   /** Model identifier (e.g., "gpt-5", "o4-mini"). Passed via --model. */
   model?: string;
@@ -434,10 +487,17 @@ export interface CodexConfig {
   resumeSessionId?: string;
   /** Bypass approval prompts (passes --dangerously-bypass-approvals-and-sandbox) */
   dangerouslyBypassApprovals?: boolean;
+  /** Bypass Codex hook trust prompts for externally-sandboxed automation. */
+  dangerouslyBypassHookTrust?: boolean;
   /** Enable Codex's decorative TUI animations. Disable to reduce remote terminal redraws. */
   animations?: boolean;
   /** Browser rendering strategy for Codex sessions. Hybrid TUI is the only supported mode. */
   renderMode?: CodexRenderMode;
+  /**
+   * Server-resolved complete Codex launch command (COD-392). Never accepted
+   * from HTTP input; Zod strips unknown keys, so the browser cannot inject it.
+   */
+  baseCommand?: string;
 }
 
 /** Gemini CLI session configuration */
@@ -590,6 +650,14 @@ export interface SessionConfig {
   workingDir: string;
   /** Timestamp when session was created */
   createdAt: number;
+  /** Restored last-known checkpoint status; active work is safely aborted. */
+  checkpointState?: SessionCheckpointState;
+  /** Bounded run-keyed history restored safely after restart. */
+  checkpointRuns?: Record<string, SessionCheckpointState>;
+  /** Last authoritative Claude conversation identity observed from SessionStart. */
+  claudeSessionId?: string;
+  /** Whether claudeSessionId was established by an authoritative source. */
+  claudeSessionIdentityAdopted?: boolean;
 }
 
 /**
@@ -629,6 +697,10 @@ export interface SessionAttachmentHistoryItem {
   relativePath?: string;
   /** Server-private absolute path for explicitly published external files */
   externalPath?: string;
+  /** Server-private canonical root for generated-artifact read-time confinement. */
+  generatedArtifactBoundary?: string;
+  /** Persisted proof that Codeman created this history file through the upload endpoint. */
+  uploadProvenance?: 'codeman-upload';
 }
 
 /**
@@ -778,6 +850,23 @@ export interface SessionState {
   status: SessionStatus;
   /** Working directory path */
   workingDir: string;
+  /**
+   * The pane's LIVE working directory (`#{pane_current_path}`), when known.
+   *
+   * `workingDir` is fixed at create time and never follows a `cd`, so in a shell
+   * session it stops describing where the agent actually is. This is what a
+   * relative path printed in the terminal is relative TO (COD-386).
+   *
+   * ⚠ Runtime-derived and refreshed by a server sweep, like `respawnBlocked`:
+   * it is serialized but never restored by the constructor, so a restart starts
+   * blank rather than trusting a stamp from before the process died. Absent for
+   * remote/docker sessions, whose local pane runs the ssh/docker-exec client.
+   *
+   * ⚠ NOT a confinement root. The file routes stay confined to `workingDir`;
+   * this only decides which base a relative path resolves against, and anything
+   * landing outside the workspace goes through the attachment route's own guard.
+   */
+  cwd?: string;
   /** Remote execution metadata, present when this session runs over SSH through local tmux */
   remote?: SessionRemote;
   /** Docker execution metadata, present when this session runs inside a container via local tmux + docker exec */
@@ -816,6 +905,32 @@ export interface SessionState {
   autoCompactThreshold?: number;
   /** Auto-compact prompt */
   autoCompactPrompt?: string;
+  /**
+   * PTY-exit circuit breaker tripped — respawn blocked until an explicit restart
+   * (COD-118). Runtime-only: never restored on boot (fresh server = fresh breaker).
+   */
+  respawnBlocked?: boolean;
+  /** Agent-initiated checkpoint (compact-or-clear, then continue) enabled */
+  checkpointEnabled?: boolean;
+  /**
+   * Deprecated (kept for backward compat): the single mode a bare checkpoint
+   * runs. Superseded by `checkpointModes`; emitted as the compact-preferred
+   * default of the allowed set.
+   */
+  checkpointMode?: SessionCheckpointMode;
+  /**
+   * Modes the agent is allowed to invoke at checkpoint signal time. Default is
+   * all three; the operator may forbid any. A bare checkpoint (no -m) runs
+   * compact when allowed, then clear, then new.
+   */
+  checkpointModes?: SessionCheckpointMode[];
+  /** Durable most-recent checkpoint lifecycle record, including terminal outcomes. */
+  checkpoint?: SessionCheckpointState;
+  checkpointRuns?: Record<string, SessionCheckpointState>;
+  /** Last authoritative Claude conversation identity observed from SessionStart. */
+  claudeSessionId?: string;
+  /** Whether claudeSessionId was established by an authoritative source. */
+  claudeSessionIdentityAdopted?: boolean;
   /** Auto-resume on usage limit enabled */
   autoResumeEnabled?: boolean;
   /** Pending usage-limit auto-resume fire time (epoch ms), if armed */
@@ -899,6 +1014,15 @@ export interface SessionState {
   ompConfig?: OmpConfig;
   /** Claude conversation session ID to resume after reboot (set by restore script) */
   resumeSessionId?: string;
+  /**
+   * Native CLI session/rollout id captured at PARK time for external-CLI modes
+   * (COD-124 unit 2, Gap B). Codex: the rollout UUID discovered from the newest
+   * matching JSONL rollout file under `~/.codex/sessions/` — threaded back into
+   * `codexConfig.resumeSessionId` on resume so `codex resume <id>` restores the
+   * conversation. OpenCode uses its captured session ID with `--session`.
+   * Discovery fails closed when its shared-directory records are ambiguous.
+   */
+  nativeResumeId?: string | null;
   /** Claude CLI effort level (soft default via --settings, switchable in-session via /effort) */
   effort?: EffortLevel;
   /** Claude advisor model (`advisorModel` in the launch `--settings`, switchable in-session via /advisor) */
@@ -933,6 +1057,8 @@ export interface SessionState {
   displayModel?: DisplayModel;
   /** Sanitized per-session attachment history. */
   attachmentHistory?: SessionAttachmentHistoryItem[];
+  /** Per-session reference sources (COD-65). */
+  sources?: SessionSource[];
   /**
    * Wall-clock ms of this pane's last Enter (Session.lastSubmitAt). Persisted
    * because it is the response-viewer's only anchor for re-deriving the pane's
@@ -951,11 +1077,6 @@ export interface SessionState {
    * entry is what re-pins `claudeSessionId` past `start()`'s three resets.
    */
   claudeSessionChain?: string[];
-  /**
-   * PTY-exit circuit breaker tripped — respawn blocked until an explicit restart
-   * (COD-118). Runtime-only: never restored on boot (fresh server = fresh breaker).
-   */
-  respawnBlocked?: boolean;
   /**
    * The agent in this session's LOCAL tmux pane has exited (Ark0N/Codeman#446).
    * See {@link PaneExit} for the tri-state rule and for which session shapes

@@ -6,7 +6,7 @@
        served at /session/:id (detached single-session window) without 404ing
        on relative <script>/<link> URLs. Must precede the first resource tag. -->
   <base href="/">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <meta name="description" content="Claude Code session manager with web interface">
   <meta name="theme-color" content="#11151c">
   <meta name="google" content="notranslate">
@@ -43,7 +43,8 @@
   <script defer src="vendor/xterm-zerolag-input.js"></script>
   <script defer src="vendor/xterm-predictive-echo.js"></script>
   <script defer src="vendor/marked.min.js"></script>
-  <!-- DOMPurify (allowlist HTML sanitizer for rendered markdown).
+  <!-- COD-56: DOMPurify (Cure53) — allowlist HTML sanitizer for markdown-rendered agent output.
+       Pinned 3.4.8; integrity (sha384): jrsBdrv4eDpEYIq32u13DPbvB6tRmqIDnA6UlgFBoexpetaiWi7g/VbfMEL1WVen.
        Must load before sanitize-html.js (which wires it) and app.js (which calls it). -->
   <script defer src="vendor/dompurify.min.js"></script>
   <!-- Synchronous mobile detection — runs before first paint to prevent panel flash -->
@@ -91,6 +92,7 @@
     }
     .app-loaded .loading-skeleton{display:none}
   </style>
+  <link rel="stylesheet" href="assistants.css">
 </head>
 <body>
   <!-- Loading skeleton — visible instantly before CSS/JS loads, hidden by app-loaded class -->
@@ -130,6 +132,11 @@
         </button>
       </div>
 
+      <!-- Mobile Tab Pill — always in DOM for instant paint, JS toggles visibility -->
+      <button id="mobileTabPill" class="mobile-tab-pill" aria-label="Open tab list" aria-expanded="false" aria-controls="mobileTabSheet" style="display:none">
+        <span class="pill-mini"></span><span class="pill-count">0</span><span class="pill-chev">▼</span>
+      </button>
+
       <!-- Session Tabs. In sidebar layout THIS VERY #sessionTabs element is
            re-parented into #sessionSidebarList by applySessionListLayout() and
            this host is hidden — it is never cloned or rebuilt, because
@@ -138,6 +145,10 @@
         <div class="session-tabs" id="sessionTabs" role="tablist" aria-label="Session tabs" aria-orientation="horizontal">
         </div>
       </div>
+
+      <button class="mobile-header-utility-toggle" type="button" onclick="app.toggleMobileHeaderUtilities()" aria-label="Toggle header controls" aria-controls="headerRight" aria-expanded="false">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg>
+      </button>
 
       <!-- Detached single-session window title (shown only in solo mode) -->
       <div class="solo-session-title" id="soloSessionTitle" style="display: none;" aria-live="polite"></div>
@@ -181,14 +192,17 @@
         </div>
         <button class="btn-icon-header btn-redraw-terminal btn-redraw-terminal--hidden" onclick="app.restoreTerminalSize()" title="Redraw terminal to fit current screen (Ctrl+Shift+R)" aria-label="Redraw terminal"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="1 4 1 10 7 10"/><polyline points="23 20 23 14 17 14"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/></svg></button>
         <button class="btn-icon-header btn-response-viewer-header btn-response-viewer-header--hidden" onclick="app.toggleResponseViewer()" title="View last response" aria-label="View last response"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
-        <button class="btn-icon-header btn-away-digest btn-away-digest--hidden" onclick="app.openAwayDigest()" title="Away Digest" aria-label="Open away digest"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></svg></button>
-        <button class="btn-icon-header btn-session-manager btn-session-manager--hidden" onclick="app.openSessionManager()" title="Session Manager" aria-label="Open session manager"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg></button>
+        <button id="sourcesBtn" class="btn-icon-header btn-sources" onclick="app.openSources()" title="Session Sources" aria-label="Open session sources"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></button>
+        <button id="fileBrowserBtn" class="btn-icon-header btn-files" onclick="app.toggleFileBrowserPanel()" title="Files" aria-label="Open files panel" aria-expanded="false" disabled><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg></button>
+        <button id="libraryBtn" class="btn-icon-header btn-library" onclick="app.openLibrary()" title="Library" aria-label="Open library"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></button>
+        <button id="awayDigestBtn" class="btn-icon-header btn-away-digest btn-away-digest--hidden" onclick="app.openAwayDigest()" title="Away Digest" aria-label="Open away digest"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></svg></button> <button class="btn-icon-header btn-session-manager" onclick="app.openSessionManager()" title="Session Manager" aria-label="Open session manager"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg></button>
         <button class="btn-icon-header btn-approvals btn-approvals--hidden" id="approvalsBtn" onclick="app.toggleApprovalsInbox()" title="Approvals waiting on you" aria-label="Open approvals inbox" aria-expanded="false">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
           <span class="approvals-badge" id="approvalsBadge">0</span>
         </button>
         <button class="btn-icon-header btn-readmymind btn-readmymind--hidden" id="readMyMindBtn" onclick="app.openReadMyMind()" title="Read My Mind: predict your next prompt" aria-label="Predict my next prompt"><span class="readmymind-icon" aria-hidden="true">🧠</span></button>
         <button class="btn-icon-header btn-attachments-history btn-attachments-history--hidden" id="attachmentsHistoryBtn" onclick="app.toggleAttachmentHistory()" title="Attachments" aria-label="Open attachment history" aria-expanded="false">
+
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
           <span class="attachment-history-badge" id="attachmentHistoryBadge" style="display:none;">0</span>
         </button>
@@ -203,6 +217,7 @@
           <span class="notification-badge" id="notifBadge" style="display:none;">0</span>
         </button>
         <button class="btn-icon-header btn-lifecycle-log" style="display: none" onclick="app.openLifecycleLog()" title="Session Lifecycle Log" aria-label="Open session lifecycle log"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></button>
+        <button class="btn-icon-header btn-assistants assistant-desktop-entry" onclick="app.openAssistants()" title="Assistants" aria-label="Open assistants">AI</button>
         <button class="btn-icon-header btn-settings" onclick="app.openAppSettings()" title="App Settings" aria-label="Open app settings"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
         <div class="header-tokens" id="headerTokens" style="display: none" title="Total tokens across all sessions">0 tokens</div>
       </div>
@@ -228,6 +243,17 @@
       <span class="offline-banner-text" id="hostWakeBannerText">Remote host is unreachable</span>
       <span class="offline-banner-detail" id="hostWakeBannerDetail"></span>
       <button class="offline-banner-retry" id="hostWakeBannerAction" onclick="app.hostWakeAction()">Wake</button>
+    </div>
+
+    <!-- COD-463: the remote host answers TCP but new ssh sessions hang, so pane
+         captures are in backoff and the terminal shows the LOCAL wrapper's copy.
+         That copy may not be live and holds about one screen of history, so the
+         user must be told. Populated by host-wake-ui.js. -->
+    <div class="offline-banner remote-capture-banner" id="remoteCaptureBanner" role="status" hidden>
+      <span class="offline-banner-dot" aria-hidden="true"></span>
+      <span class="offline-banner-text" id="remoteCaptureBannerText">Remote host is not responding: this view may not be live</span>
+      <span class="offline-banner-detail" id="remoteCaptureBannerDetail"></span>
+      <button class="offline-banner-retry" id="remoteCaptureBannerAction" onclick="app.remoteCaptureRetry()">Retry</button>
     </div>
 
     <!-- Reboot-restore offer: shown when the server found sessions a host reboot
@@ -393,7 +419,10 @@
 
     <!-- Main Terminal Area -->
     <main class="main">
-      <aside class="tab-rail" id="tabRail" aria-label="Session navigation">
+      <!-- COD-286: vertical tab rail. Empty in horizontal mode; applyTabOrientation()
+           MOVES the one #sessionTabs strip in here (never clones it) when the
+           orientation setting is vertical, so every tab behaviour keeps working. -->
+      <div class="tab-rail" id="tabRail" aria-label="Session navigation">
         <!-- Session-name search (app.js setTabRailSearch): a view filter over the
              rows below, in memory only. Shown with the rail, never elsewhere. -->
         <div class="session-sidebar-filter tab-rail-search">
@@ -408,18 +437,19 @@
         </div>
         <div id="tabRailSearchEmpty" class="tab-rail-search-empty" role="status" hidden>No sessions match</div>
         <div
-          id="tabRailResizeHandle"
           class="tab-rail-resize-handle"
+          id="tabRailResizeHandle"
           role="separator"
-          aria-orientation="vertical"
+          tabindex="0"
           aria-label="Resize session rail"
+          aria-orientation="vertical"
           aria-valuemin="208"
           aria-valuemax="360"
           aria-valuenow="256"
-          tabindex="0"
+          title="Drag to resize; arrow keys adjust; Enter resets"
         ></div>
-      </aside>
-
+      </div>
+      <div class="tab-rail-resize-shield" id="tabRailResizeShield" aria-hidden="true" hidden></div>
       <!-- Collapsible session sidebar (opt-in layout). Deliberately EMPTY in
            markup: applySessionListLayout() moves #sessionTabs in here, so the
            vertical list is the exact same DOM node as the header strip and every
@@ -447,6 +477,10 @@
              on. Populated by app.js _renderHistoryTruncationBanner(). -->
         <div class="history-trunc-bar" id="historyTruncationBar" role="status" aria-live="polite" hidden></div>
         <div class="terminal-container" id="terminalContainer"></div>
+        <!-- Typing blocked banner (w1-nzbdav): shows why input is suppressed and offers Fix -->
+        <div id="typingBlockedBanner" class="typing-blocked-banner" hidden role="alert" aria-live="assertive"></div>
+        <!-- COD-187: frozen history view indicator for live-mirror tabs -->
+        <div id="historyPill" class="history-pill" hidden onclick="app._exitHistoryView?.()"></div>
         <textarea id="cjkInput" rows="1" placeholder="CJK input (Enter = send, Esc = clear)"
           maxlength="65536" aria-label="CJK IME input field"
           autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
@@ -552,7 +586,7 @@
             </div>
             <div class="history-list" id="historyList"></div>
           </div>
-          <p class="welcome-hint">Or click Run to start</p>
+          <p class="welcome-hint">Choose a tool to start</p>
           <button class="welcome-ralph-link" onclick="app.showRalphWizard()">Start Ralph Loop &rarr;</button>
         </div>
       </div>
@@ -580,6 +614,8 @@
       <div class="file-browser-header">
         <span class="file-browser-title">Files</span>
         <div class="file-browser-actions">
+          <button class="btn-icon-sm" onclick="app.triggerFileBrowserUpload()" title="Upload files" aria-label="Upload files" id="fileBrowserUploadBtn">&#x2B06;</button>
+          <button class="btn-icon-sm" onclick="app.createFileBrowserFolder()" title="New folder" aria-label="New folder" id="fileBrowserNewFolderBtn">＋</button>
           <button class="btn-icon-sm btn-file-browser-hidden" onclick="app.toggleFileBrowserHidden()" title="Show hidden files and folders" aria-label="Show hidden files and folders" aria-pressed="false" id="fileBrowserHiddenBtn">.*</button>
           <button class="btn-icon-sm" onclick="app.refreshFileBrowser()" title="Refresh">&#x21BB;</button>
           <button class="btn-icon-sm" onclick="app.toggleFileBrowserExpand()" title="Expand/Collapse All" id="fileBrowserExpandBtn">&#x229E;</button>
@@ -613,17 +649,23 @@
       <div class="file-preview-window">
         <div class="file-preview-header">
           <span class="file-preview-title" id="filePreviewTitle">file.ts</span>
+          <div class="file-preview-navigation" id="filePreviewNavigation" hidden>
+            <button type="button" class="btn-icon-sm" id="filePreviewPrevious" onclick="app.navigateFilePreviewAttachment(-1)" title="Previous attachment" aria-label="Previous attachment" disabled>&larr;</button>
+            <span class="file-preview-position" id="filePreviewPosition" aria-live="polite"></span>
+            <button type="button" class="btn-icon-sm" id="filePreviewNext" onclick="app.navigateFilePreviewAttachment(1)" title="Next attachment" aria-label="Next attachment" disabled>&rarr;</button>
+          </div>
           <div class="file-preview-actions">
             <button class="btn-icon-sm" id="filePreviewPrevBtn" onclick="app.stepFolderPreview(-1)" title="Previous file in folder (←)" aria-label="Previous file in folder" hidden>&lsaquo;</button>
             <button class="btn-icon-sm" id="filePreviewNextBtn" onclick="app.stepFolderPreview(1)" title="Next file in folder (→)" aria-label="Next file in folder" hidden>&rsaquo;</button>
             <button class="btn-icon-sm" id="filePreviewFolderBtn" onclick="app.openFolderOfPreview()" title="Show folder" aria-label="Show folder" hidden><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
+            <button type="button" class="btn-icon-sm file-preview-download-original" id="filePreviewDownloadOriginal" onclick="app.downloadFilePreviewOriginal()" title="Download original file" aria-label="Download original file" disabled><span class="file-preview-download-label">Download</span><span class="file-preview-download-icon" aria-hidden="true">&#x2B07;</span></button>
+            <button type="button" class="btn-icon-sm" id="filePreviewOpenNewTab" onclick="app.openFilePreviewInNewTab()" title="Open in new tab" aria-label="Open in new tab" disabled>&#x2197;</button>
             <button class="btn-icon-sm file-preview-pill" id="filePreviewMdBtn" onclick="app.toggleFilePreviewMd()" title="Rendered markdown" aria-label="Rendered markdown" aria-pressed="true" hidden>MD</button>
             <button class="btn-icon-sm file-preview-pill" id="filePreviewPageBtn" onclick="app.toggleFilePreviewPage()" title="Rendered page" aria-label="Rendered page" aria-pressed="true" hidden>Page</button>
             <button class="btn-icon-sm" id="filePreviewLinesBtn" onclick="app.toggleFilePreviewLines()" title="Line numbers" aria-label="Line numbers" aria-pressed="false" hidden><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="10" y1="6" x2="21" y2="6"/><line x1="10" y1="12" x2="21" y2="12"/><line x1="10" y1="18" x2="21" y2="18"/><path d="M4 6h1v4"/><path d="M4 10h2"/><path d="M6 18H4c0-1 2-2 2-3s-1-1.5-2-1"/></svg></button>
             <button class="btn-icon-sm" id="filePreviewWrapBtn" onclick="app.toggleFilePreviewWrap()" title="Wrap lines" aria-label="Wrap lines" aria-pressed="true" hidden><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="3" y1="6" x2="21" y2="6"/><path d="M3 12h15a3 3 0 1 1 0 6h-4"/><polyline points="16 16 14 18 16 20"/><line x1="3" y1="18" x2="10" y2="18"/></svg></button>
-            <button class="btn-icon-sm file-preview-edit-btn" id="filePreviewEditBtn" onclick="app.enterFilePreviewEdit()" title="Edit file" aria-label="Edit file" hidden><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg></button>
+            <button type="button" class="btn-icon-sm file-preview-edit-btn" id="filePreviewEditBtn" onclick="app.enterFilePreviewEdit()" title="Edit file" aria-label="Edit file" hidden><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg></button>
             <button class="btn-icon-sm" onclick="app.copyFilePreviewContent()" title="Copy content">&#x2398;</button>
-            <button class="btn-icon-sm" id="filePreviewDetachBtn" onclick="app.detachFilePreview()" title="Open in new tab" aria-label="Open in new tab" hidden><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg></button>
             <button class="btn-icon-sm" onclick="app.closeFilePreview()" title="Close">&times;</button>
           </div>
         </div>
@@ -660,12 +702,20 @@
         <span id="responseViewerTitle">Last Response</span>
         <div class="response-viewer-actions">
           <button class="response-viewer-more" id="responseViewerMore" onclick="app.loadFullContext()">More</button>
-          <button class="response-viewer-close" onclick="app.toggleResponseViewer()">&times;</button>
+          <button class="response-viewer-copy" id="responseViewerCopy" type="button" onclick="app.copyResponseViewerRichText()" title="Copy response as rich text" aria-label="Copy response as rich text"></button>
+          <button class="response-viewer-more response-viewer-copy-markdown" id="responseViewerCopyMarkdown" type="button" onclick="app.copyResponseViewerMarkdown()" title="Copy response as Markdown" aria-label="Copy response as Markdown">Copy Markdown</button>
+          <button class="response-viewer-close" onclick="app.closeResponseViewer()">&times;</button>
         </div>
+      </div>
+      <div class="response-viewer-filters" id="responseViewerFilters" role="group" aria-label="Filter transcript by content type" hidden>
+        <span class="response-viewer-filters-label">Show</span>
+        <button type="button" class="rv-filter-btn" data-rv-filter="user" aria-pressed="true" onclick="app.toggleTranscriptFilter('user', this)">User</button>
+        <button type="button" class="rv-filter-btn" data-rv-filter="tool" aria-pressed="true" onclick="app.toggleTranscriptFilter('tool', this)">Tools</button>
+        <button type="button" class="rv-filter-btn" data-rv-filter="response" aria-pressed="true" onclick="app.toggleTranscriptFilter('response', this)">Responses</button>
       </div>
       <div class="response-viewer-body" id="responseViewerBody"></div>
     </div>
-    <div class="response-viewer-backdrop" id="responseViewerBackdrop" onclick="app.toggleResponseViewer()"></div>
+    <div class="response-viewer-backdrop" id="responseViewerBackdrop" onclick="app.closeResponseViewer()"></div>
 
     <!-- Bottom Toolbar -->
     <footer class="toolbar">
@@ -673,7 +723,7 @@
         <!-- Run AI -->
         <div class="toolbar-group">
           <div class="run-btn-group">
-            <button class="btn-toolbar btn-run" id="runBtn" onclick="app.run()" title="Run">
+            <button class="btn-toolbar btn-run" id="runBtn" onclick="app.run()" title="Run selected AI backend">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
               <span id="runBtnLabel">Run</span>
             </button>
@@ -831,6 +881,14 @@
       </div>
 
       <div class="toolbar-center">
+        <button class="btn-toolbar btn-sm btn-upload" onclick="app.openUploadPopup()"
+                title="Upload image" aria-label="Upload image to session">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+            <circle cx="8.5" cy="8.5" r="1.5"/>
+            <polyline points="21 15 16 10 5 21"/>
+          </svg>
+        </button>
         <button class="btn-toolbar btn-sm btn-voice" id="voiceInputBtn" onclick="VoiceInput.toggle()"
                 title="Voice input (Ctrl+Shift+V)" aria-label="Start voice input" aria-pressed="false">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -845,7 +903,8 @@
       <div class="toolbar-right">
         <!-- Orchestrator button hidden until feature is ready -->
         <!-- <button class="btn-toolbar btn-sm" onclick="app.toggleOrchestratorPanel()" title="Orchestrator Loop">&#x2699; Orchestrator</button> -->
-        <button class="btn-toolbar btn-sm btn-cron btn-cron--hidden" onclick="app.openCron()" title="Cron Jobs">&#x23F0; Cron</button>
+        <button class="btn-toolbar btn-sm" onclick="app.openCron()" title="Cron Jobs">&#x23F0; Cron</button>
+        <button id="skillsChipBtn" class="btn-skills-chip hidden" title="Skills" onclick="app.openSkillsDrawer()"></button>
         <!-- Git status of the active session's repository (git-status-ui.js). Optional and per-device
              (App Settings → Header & Panels → Bottom bar, default OFF), so it is hidden until that
              setting is on AND the session is a local git repository. -->
@@ -909,11 +968,10 @@
               <div><kbd>Ctrl</kbd>+<kbd>L</kbd></div><div>Clear Terminal</div>
               <div><kbd>Ctrl</kbd>+<kbd>+</kbd></div><div>Increase Font</div>
               <div><kbd>Ctrl</kbd>+<kbd>-</kbd></div><div>Decrease Font</div>
-              <div><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd></div><div>Restore Terminal Size</div>
+              <div><kbd>Shift</kbd>+<kbd>Wheel</kbd></div><div>Scroll local history (when mouse passthrough is active)</div>
               <div><kbd>Shift</kbd>+<kbd>Enter</kbd></div><div>Insert Newline</div>
               <div><kbd>Ctrl</kbd>+<kbd>Enter</kbd></div><div>Insert Newline</div>
               <div><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>V</kbd></div><div>Voice Input</div>
-              <div><kbd>Shift</kbd>+<kbd>Wheel</kbd></div><div>Scroll local history (when mouse passthrough is active)</div>
             </div>
           </section>
           <section class="shortcut-section">
@@ -1565,6 +1623,36 @@
                   </div>
                 </div>
               </div>
+              <div class="set-group">
+                <div class="set-group-head"><h4>Checkpoint & tmux</h4></div>
+                <div class="set-group-body">
+            <div class="set-row" data-search="agent checkpoint compact clear new boundary conversation">
+              <div class="set-row-text">
+                <span class="set-row-label">Agent Checkpoint</span>
+                <span class="set-row-desc">When enabled, the agent checkpoints at a clean boundary. <strong>Tick the modes it may run</strong> — compact keeps the current conversation; clear starts a fresh conversation and clears the display; new starts a fresh conversation while preserving the display. Choose with <code id="checkpointCliHint">aicodeman checkpoint -m compact|clear|new</code>. A bare <code>checkpoint</code> uses compact when allowed. Default OFF.<span id="checkpointCliPathWarning" class="cli-path-warning" hidden> ⚠ Codeman CLI not found on PATH — add <code>~/.local/bin</code> to your PATH to use this.</span></span>
+              </div>
+              <label class="switch switch-sm"><input type="checkbox" id="modalCheckpointEnabled" onchange="app.autoSaveCheckpoint()"><span class="slider"></span></label>
+            </div>
+            <div class="set-row" data-search="checkpoint modes compact clear new allowed">
+              <div class="set-row-text">
+                <span class="set-row-label">Allowed modes</span>
+                <span class="set-row-desc">Tick the modes the checkpoint may run.</span>
+              </div>
+              <span class="checkpoint-modes" role="group" aria-label="Allowed checkpoint modes">
+                <label class="checkbox-inline"><input type="checkbox" id="modalCheckpointModeCompact" onchange="app.autoSaveCheckpoint()"><span>compact</span></label>
+                <label class="checkbox-inline"><input type="checkbox" id="modalCheckpointModeClear" onchange="app.autoSaveCheckpoint()"><span>clear</span></label>
+                <label class="checkbox-inline"><input type="checkbox" id="modalCheckpointModeNew" onchange="app.autoSaveCheckpoint()"><span>new</span></label>
+              </span>
+            </div>
+            <div class="set-row" data-search="tmux session name attach codeman id">
+              <div class="set-row-text">
+                <span class="set-row-label">Tmux session</span>
+                <span class="set-row-desc">tmux session for this tab — attach with <code id="modalMuxAttachCmd" style="user-select: all;">tmux attach -t &lt;name&gt;</code> (Codeman id: <span id="modalMuxSessionId" style="user-select: all;">—</span>)</span>
+              </div>
+              <span id="modalMuxName" style="font-family: var(--font-mono, monospace); user-select: all;">—</span>
+            </div>
+                </div>
+              </div>
             </section>
 
             <!-- ══ Ralph / Todo ═════════════════════════════════════════════ -->
@@ -1763,6 +1851,14 @@
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 13h.01M18 13h.01M9 13h6"/></svg>
                 <span>Shortcuts</span>
               </button>
+              <button type="button" class="set-rail-item" data-section="settings-authoring">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                <span>Authoring</span>
+              </button>
+              <button type="button" class="set-rail-item" data-section="settings-skills">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                <span>Skills</span>
+              </button>
               <button type="button" class="set-rail-item" data-section="settings-system">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.26.6.86 1 1.51 1H21a2 2 0 0 1 0 4h-.09c-.65 0-1.25.4-1.51 1z"/></svg>
                 <span>System</span>
@@ -1945,6 +2041,53 @@
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="appSettingsGestureControl"><span class="slider"></span></label>
                   </div>
+                  <div class="set-row" data-search="live mirror scrollback tmux history garbled repaint">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Live Mirror</span>
+                      <span class="set-row-desc">Agent terminals mirror the live screen; scrolling up pulls exact tmux history on demand.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsLiveMirror"><span class="slider"></span></label>
+                  </div>
+                </div>
+              </div>
+              <div class="set-group">
+                <div class="set-group-head"><h4>Buffers & history</h4></div>
+                <div class="set-group-body">
+                  <div class="set-row" data-search="browser scrollback lines xterm memory reload">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Browser Scrollback Lines</span>
+                      <span class="set-row-desc">Rendered lines this browser keeps for the current tab. Higher scrolls farther back, costs browser memory.</span>
+                    </div>
+                    <input type="number" id="appSettingsTerminalScrollbackLines" min="1000" max="1000000" step="1000" value="100000">
+                  </div>
+                  <div class="set-row" data-search="tmux history lines reconnect restore panes">
+                    <div class="set-row-text">
+                      <span class="set-row-label">tmux History Lines</span>
+                      <span class="set-row-desc">Lines tmux keeps behind each session, used for reconnects and new panes.</span>
+                    </div>
+                    <input type="number" id="appSettingsTmuxHistoryLimit" min="1000" max="1000000" step="1000" value="100000">
+                  </div>
+                  <div class="set-row" data-search="server buffer max mib raw terminal output memory">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Server Buffer Max MiB</span>
+                      <span class="set-row-desc">Raw terminal output kept per session on the server. Higher improves reload snapshots and search context.</span>
+                    </div>
+                    <input type="number" id="appSettingsTerminalBufferMaxMiB" min="1" max="128" step="1" value="32">
+                  </div>
+                  <div class="set-row" data-search="server buffer trim mib memory">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Server Buffer Trim MiB</span>
+                      <span class="set-row-desc">Size retained once the server buffer exceeds the max. Lower frees memory sooner.</span>
+                    </div>
+                    <input type="number" id="appSettingsTerminalBufferTrimMiB" min="1" max="128" step="1" value="24">
+                  </div>
+                  <div class="set-row" data-search="truecolor 24-bit color colorterm">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Truecolor (24-bit color)</span>
+                      <span class="set-row-desc">Set COLORTERM=truecolor for new Claude sessions. Off by default; may cause colour glitches.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsTruecolor"><span class="slider"></span></label>
+                  </div>
                 </div>
               </div>
 
@@ -2023,6 +2166,13 @@
                     <label class="set-chip" data-search="tiles tile grid side by side several sessions" data-preview="header" data-preview-order="11.6"><input type="checkbox" id="appSettingsShowTileGridButton"><svg class="set-chip-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="1"/><rect x="13" y="3" width="8" height="8" rx="1"/><rect x="3" y="13" width="8" height="8" rx="1"/><rect x="13" y="13" width="8" height="8" rx="1"/></svg><span>Tiles</span></label>
                     <label class="set-chip" data-preview="header" data-preview-order="13" data-preview-text="42%"><input type="checkbox" id="appSettingsShowPlanUsageLimits"><svg class="set-chip-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 18a8 8 0 1 1 16 0"/><path d="M12 18l4.5-5"/></svg><span>Plan Usage</span></label>
                     <label class="set-chip" data-preview="header" data-preview-order="14"><input type="checkbox" id="appSettingsShowLifecycleLog"><svg class="set-chip-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg><span>Lifecycle Log</span></label>
+                  </div>
+                  <div class="set-row" data-search="away digest header button summary while away">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Away Digest</span>
+                      <span class="set-row-desc">Show the Away Digest button in the header. Off by default.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsShowAwayDigest"><span class="slider"></span></label>
                   </div>
                   <div class="set-row has-field" data-search="header stats style system cpu mem ws plan usage tiles compact rings">
                     <div class="set-row-text">
@@ -2329,6 +2479,29 @@
                       <span class="set-row-desc">The C logo opens the session overview instead of the welcome screen.</span>
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="appSettingsMobileOverview" checked><span class="slider"></span></label>
+                  </div>
+                  <div class="set-row" data-search="tab orientation vertical rail sidebar horizontal strip">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Tab Orientation</span>
+                      <span class="set-row-desc">Session tabs across the top, or as a rail beside the terminal. Phones stay horizontal.</span>
+                    </div>
+                    <select id="appSettingsTabOrientation" class="form-select">
+                      <option value="horizontal">Horizontal (top)</option>
+                      <option value="vertical">Vertical (side rail)</option>
+                    </select>
+                  </div>
+                  <div class="set-row" data-search="vertical rail sidebar width resize compact wide maximum">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Vertical Rail Width <span class="set-tag">desktop</span></span>
+                      <span class="set-row-desc">Choose a preset or drag the rail edge. Custom widths stay on this device.</span>
+                    </div>
+                    <select id="appSettingsTabRailWidth" class="form-select">
+                      <option value="custom" hidden>Custom</option>
+                      <option value="208">Compact (208px)</option>
+                      <option value="256">Default (256px)</option>
+                      <option value="320">Wide (320px)</option>
+                      <option value="360">Maximum (360px)</option>
+                    </select>
                   </div>
                 </div>
               </div>
@@ -2736,6 +2909,13 @@
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="appSettingsRemoteAutoReconnect"><span class="slider"></span></label>
                   </div>
+                  <div class="set-row" data-search="reboot automatic recovery resume reconnect sessions">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Recover sessions after reboot</span>
+                      <span class="set-row-desc">Automatically reconnect live remote sessions and resume sessions with a verified native conversation ID. Ambiguous sessions stay in the Recovery Queue.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsAutoRecoverSessionsAfterReboot"><span class="slider"></span></label>
+                  </div>
                   <div class="set-row" data-search="nice priority cpu">
                     <div class="set-row-text">
                       <span class="set-row-label">Nice priority</span>
@@ -2790,10 +2970,70 @@
                   <div class="set-row" data-search="codex animations status effects">
                     <div class="set-row-text">
                       <span class="set-row-label">Animated status effects</span>
-                      <span class="set-row-desc">Decorative Codex TUI motion. Leave off to reduce remote and mobile redraws.</span>
+                      <span class="set-row-desc">Auto uses your Codex configuration. On and Off pass a session override; Codex may start without its shared background server.</span>
                     </div>
-                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsCodexAnimations"><span class="slider"></span></label>
+                    <select id="appSettingsCodexAnimations" class="set-select">
+                      <option value="auto">Auto</option>
+                      <option value="on">On</option>
+                      <option value="off">Off</option>
+                    </select>
                   </div>
+                </div>
+              </div>
+              <div class="set-group">
+                <div class="set-group-head"><h4>Checkpoint</h4></div>
+                <div class="set-group-body">
+                  <div class="set-row" data-search="agent checkpoint compact clear new sessions">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Agent Checkpoint for new sessions</span>
+                      <span class="set-row-desc">Enable compact and clear checkpoints when a new agent session starts. Existing sessions keep their own setting.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsCheckpointDefault" checked><span class="slider"></span></label>
+                  </div>
+                </div>
+              </div>
+              <div class="set-group">
+                <div class="set-group-head"><h4>Headroom proxy</h4></div>
+                <div class="set-group-body">
+            <!-- Headroom Section -->
+            <div id="appSettingsHeadroomSection">
+              <div class="form-row">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+                  <span id="appSettingsHeadroomDot" style="display:inline-block;width:9px;height:9px;border-radius:50%;background:#64748b;flex-shrink:0;"></span>
+                  <span id="appSettingsHeadroomHealth" style="font-size:0.8rem;color:var(--text-secondary);flex:1;">&#x2014;</span>
+                  <button class="btn-toolbar btn-sm" id="appSettingsHeadroomTest" onclick="app._refreshHeadroomStatus()">Test</button>
+                </div>
+              </div>
+              <div class="set-row" data-search="headroom proxy url endpoint host port">
+                <div class="set-row-text">
+                  <span class="set-row-label">Proxy URL</span>
+                  <span class="set-row-desc">Where the Headroom context-compression proxy is listening.</span>
+                </div>
+                <input type="text" id="appSettingsHeadroomUrl" placeholder="http://192.168.55.175:8787">
+              </div>
+              <div class="form-row">
+                <div class="form-hint" style="margin-top:8px;">Proxy-wide · all proxy clients</div>
+                <div id="appSettingsHeadroomSavings" style="margin-top:4px;margin-bottom:4px;">&#x2014;</div>
+              </div>
+              <div class="set-row" data-search="headroom route claude proxy new sessions">
+                <div class="set-row-text">
+                  <span class="set-row-label">Route Claude</span>
+                  <span class="set-row-desc">New Claude sessions launch through the Headroom proxy.</span>
+                </div>
+                <label class="switch switch-sm"><input type="checkbox" id="appSettingsHeadroomClaude"><span class="slider"></span></label>
+              </div>
+              <div class="set-row" data-search="headroom route codex proxy new sessions">
+                <div class="set-row-text">
+                  <span class="set-row-label">Route Codex</span>
+                  <span class="set-row-desc">New Codex sessions launch through the Headroom proxy.</span>
+                </div>
+                <label class="switch switch-sm"><input type="checkbox" id="appSettingsHeadroomCodex"><span class="slider"></span></label>
+              </div>
+              <div class="form-hint" style="margin-top:8px;">Managed-session launch / respawn snapshots</div>
+              <div id="appSettingsHeadroomSessions" style="margin-top:6px;font-size:0.75rem;display:flex;flex-direction:column;gap:3px;"></div>
+              <span class="form-hint">Proxy activity is not attributable to these managed-session snapshots; it includes other proxy clients and historical traffic.</span>
+              <span class="form-hint">The shared Codex config is reconciled immediately, but a running session's routing snapshot changes on its next respawn.</span>
+            </div>
                 </div>
               </div>
 
@@ -3135,6 +3375,44 @@
 
 
             <!-- ══ System ═══════════════════════════════════════════════════ -->
+            <section class="set-section" id="settings-authoring" data-label="Authoring">
+              <div class="set-section-head">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                <h2>Authoring</h2>
+              </div>
+              <div class="set-group">
+                <div class="set-group-head"><h4>Authoring actions</h4></div>
+                <div class="set-group-body">
+            <div class="form-section-header">Authoring Actions</div>
+            <p class="form-hint" style="margin: 0 0 12px 0;">One-click actions shown in the document preview. Clicking one sends its instruction to the open document's agent session. Use <code>{path}</code> in the instruction for the document path (e.g. "Tighten the prose in {path}"); if omitted, the path is appended.</p>
+            <div id="authoringActionsList" class="authoring-actions-editor"></div>
+            <button type="button" class="btn-secondary btn-sm" onclick="app.addAuthoringActionRow()">+ Add action</button>
+                </div>
+              </div>
+            </section>
+            <section class="set-section" id="settings-skills" data-label="Skills">
+              <div class="set-section-head">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                <h2>Skills</h2>
+              </div>
+              <div class="set-group">
+                <div class="set-group-head"><h4>Agent skills</h4></div>
+                <div class="set-group-body">
+            <div class="settings-grid">
+              <div class="settings-section-header" style="grid-column: 1 / -1;">User Scope</div>
+              <div class="settings-item-full" style="grid-column: 1 / -1;">
+                <span class="settings-item-label" style="font-size:0.78rem;opacity:0.7;">Always available in every case (~/.claude/skills, agents, commands)</span>
+              </div>
+              <div id="userSkillsList" style="grid-column: 1 / -1;"></div>
+              <div class="settings-item-full" style="grid-column: 1 / -1; display:flex; gap:6px; margin-top:4px;">
+                <input type="text" id="userSkillAddInput" placeholder="source/name or source:pack" style="flex:1; padding:0.4rem 0.6rem; background:var(--bg-input); border:1px solid var(--border); border-radius:4px; color:var(--text); font-size:0.8rem; font-family:inherit;">
+                <button class="btn-toolbar btn-sm" onclick="app.addUserSkill()" id="userSkillAddBtn">Add</button>
+              </div>
+              <div id="userSkillsWarning" class="form-hint" style="grid-column:1/-1;color:var(--warning,#e6a817);display:none;">Consider moving project-specific skills to the per-case manifest.</div>
+            </div>
+                </div>
+              </div>
+            </section>
             <section class="set-section" id="settings-system" data-label="System">
               <div class="set-section-head">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.26.6.86 1 1.51 1H21a2 2 0 0 1 0 4h-.09c-.65 0-1.25.4-1.51 1z"/></svg>
@@ -3243,7 +3521,7 @@
       <div class="modal-backdrop" onclick="app.closeCreateCaseModal()"></div>
       <div class="modal-content modal-lg set-shell">
         <div class="modal-header set-shell-head">
-          <h3>Add Case</h3>
+          <h3 id="caseModalTitle">Add Case</h3>
           <!-- mobile.css hides this modal's .set-foot, so on a phone the footer's
                Create/Link button is unreachable and the modal cannot be submitted
                at all. Mirrors the Settings modal's header Save: close first in the
@@ -3302,6 +3580,13 @@
             <div class="form-row">
               <label>Description (optional)</label>
               <input type="text" id="newCaseDescription" placeholder="A brief description..." autocomplete="off">
+            </div>
+            <div class="form-row case-codex-command-row" data-codex-command-scope="local">
+              <label for="localCaseCodexProfile">Codex command</label>
+              <div class="case-codex-command-controls"><select id="localCaseCodexProfile" onchange="app.onCaseCodexProfileChanged(false, 'local')" disabled><option value="default">Default</option></select><button type="button" class="btn-toolbar btn-sm" id="manageLocalCodexCommandProfiles" onclick="app.openCodexCommandProfileManager()">Manage</button></div>
+              <input type="text" id="localCaseCodexProfilePreview" readonly aria-label="Selected Codex command preview">
+              <div id="localCaseCodexCommandCustom" class="hidden"><label for="localCaseCodexCommandCustomInput">Custom command</label><input type="text" id="localCaseCodexCommandCustomInput" oninput="app.onCaseCodexProfileChanged(true, 'local')" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+              <span class="form-hint">Runs the saved command exactly as shown, with no extra Codeman flags. Applies to local cases only.</span>
             </div>
             <div class="form-row" id="newCaseCustomPathToggleRow">
               <label class="checkbox-row"><input type="checkbox" id="newCaseCustomPathToggle" onchange="app.toggleNewCaseCustomPath()"> 📁 Create in a custom folder</label>
@@ -3404,6 +3689,13 @@
               </select>
               <span class="form-hint">Which CLI to point the Run button at once the clone finishes. Changeable any time from the Run dropdown.</span>
             </div>
+            <div class="form-row case-codex-command-row" data-codex-command-scope="local">
+              <label for="cloneCaseCodexProfile">Codex command</label>
+              <div class="case-codex-command-controls"><select id="cloneCaseCodexProfile" onchange="app.onCaseCodexProfileChanged(false, 'clone')" disabled><option value="default">Default</option></select><button type="button" class="btn-toolbar btn-sm" id="manageCloneCodexCommandProfiles" onclick="app.openCodexCommandProfileManager()">Manage</button></div>
+              <input type="text" id="cloneCaseCodexProfilePreview" readonly aria-label="Selected Codex command preview">
+              <div id="cloneCaseCodexCommandCustom" class="hidden"><label for="cloneCaseCodexCommandCustomInput">Custom command</label><input type="text" id="cloneCaseCodexCommandCustomInput" oninput="app.onCaseCodexProfileChanged(true, 'clone')" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+              <span class="form-hint">Runs the saved command exactly as shown, with no extra Codeman flags. Applies to local cases only.</span>
+            </div>
             <details class="advanced-options">
               <summary><svg class="set-adv-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg><span>Clone options</span></summary>
               <div class="advanced-options-content">
@@ -3438,6 +3730,13 @@
               </div>
               <span class="form-hint">Choose an existing folder from this computer or enter its absolute path</span>
             </div>
+            <div class="form-row case-codex-command-row" data-codex-command-scope="local">
+              <label for="linkCaseCodexProfile">Codex command</label>
+              <div class="case-codex-command-controls"><select id="linkCaseCodexProfile" onchange="app.onCaseCodexProfileChanged(false, 'link')" disabled><option value="default">Default</option></select><button type="button" class="btn-toolbar btn-sm" id="manageLinkCodexCommandProfiles" onclick="app.openCodexCommandProfileManager()">Manage</button></div>
+              <input type="text" id="linkCaseCodexProfilePreview" readonly aria-label="Selected Codex command preview">
+              <div id="linkCaseCodexCommandCustom" class="hidden"><label for="linkCaseCodexCommandCustomInput">Custom command</label><input type="text" id="linkCaseCodexCommandCustomInput" oninput="app.onCaseCodexProfileChanged(true, 'link')" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+              <span class="form-hint">Runs the saved command exactly as shown, with no extra Codeman flags. Applies to local cases only.</span>
+            </div>
           </div>
           <!-- Remote Tab -->
           <div class="set-section hidden" id="case-remote">
@@ -3452,13 +3751,30 @@
               <span class="form-hint">Name to identify this remote case in Codeman</span>
             </div>
             <div class="form-row">
-              <label>Remote Path</label>
-              <input type="text" id="remoteCasePath" placeholder="/home/user/projects/work" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
-              <span class="form-hint">Absolute path on the remote host. Codeman will not create or delete it.</span>
+              <label>Saved SSH</label>
+              <div class="saved-ssh-row">
+                <select id="remoteHostSavedSelect" onchange="app.onRemoteHostSelected()">
+                  <option value="">New host...</option>
+                </select>
+                <button type="button" class="btn-toolbar btn-sm saved-ssh-action-btn" id="remoteHostSavedEdit" onclick="app.editSelectedRemoteHostConfig()" title="Edit saved SSH profile">Edit</button>
+                <button type="button" class="btn-toolbar btn-sm saved-ssh-add-btn" id="remoteHostSavedAdd" onclick="app.startNewRemoteHostConfig()" title="Add saved SSH profile">+</button>
+              </div>
+              <span class="form-hint">Reuse an existing SSH profile or click + to add a new saved profile.</span>
             </div>
             <div class="form-row">
-              <label>Host ID</label>
-              <input type="text" id="remoteHostId" placeholder="gpu-box" pattern="[a-zA-Z0-9_-]+" autocomplete="off" autocapitalize="off" spellcheck="false">
+              <label>Remote Path</label>
+              <div class="case-path-input-row">
+                <input type="text" id="remoteCasePath" placeholder="/home/user/projects/work" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+                <button type="button" class="btn-toolbar btn-sm" onclick="app.openCaseDirectoryBrowser('remote')">Browse</button>
+              </div>
+              <span class="form-hint">Absolute path on the remote host. Codeman will not create or delete it.</span>
+            </div>
+            <div class="form-row remote-codex-profile-row case-codex-command-row" data-codex-command-scope="remote">
+              <label for="remoteCaseCodexProfile">Codex command</label>
+              <div class="remote-codex-profile-controls case-codex-command-controls"><select id="remoteCaseCodexProfile" onchange="app.onCaseCodexProfileChanged(false, 'remote')" disabled><option value="default">Default</option></select><button type="button" class="btn-toolbar btn-sm" id="manageCodexCommandProfiles" onclick="app.openCodexCommandProfileManager()">Manage</button></div>
+              <input type="text" id="remoteCaseCodexProfilePreview" readonly aria-label="Selected Codex command preview">
+              <div id="remoteCaseCodexCommandCustom" class="hidden"><label for="remoteCaseCodexCommandCustomInput">Custom command</label><input type="text" id="remoteCaseCodexCommandCustomInput" oninput="app.onCaseCodexProfileChanged(true, 'remote')" autocomplete="off" autocapitalize="off" spellcheck="false"></div>
+              <span class="form-hint">Runs the saved command exactly as shown, with no extra Codeman flags. Applies to this remote case only.</span>
             </div>
             <div class="form-row">
               <label>SSH Host/IP</label>
@@ -3511,6 +3827,7 @@
                   <textarea id="remoteHostExtraSshOptions" rows="3" placeholder="StrictHostKeyChecking=accept-new&#10;ConnectTimeout=10" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
                   <span class="form-hint">Optional. One KEY=VALUE per line; each becomes an ssh -o option.</span>
                 </div>
+                <div id="remoteDiscoverResults" class="remote-discover-results"></div>
               </div>
             </details>
             <!-- COD-105 — discover + attach existing remote tmux sessions this Codeman didn't create. -->
@@ -3611,6 +3928,16 @@
             </details>
             <span class="form-hint" id="dockerLinkStatus" style="margin-top: 8px; display: block;"></span>
           </div>
+          <div class="case-directory-browser hidden" id="caseDirectoryBrowserPanel">
+            <div class="case-directory-browser-header">
+              <button type="button" class="case-directory-browser-up" onclick="app.openParentCaseDirectory()" title="Parent directory">&#x25B2;</button>
+              <span class="case-directory-browser-path" id="caseDirectoryBrowserPath"></span>
+              <button type="button" class="btn-toolbar btn-sm" id="caseDirectoryBrowserSelect" onclick="app.selectCaseDirectory()">Select</button>
+              <button type="button" class="btn-toolbar btn-sm" onclick="app.closeCaseDirectoryBrowser()">Cancel</button>
+            </div>
+            <div class="case-directory-browser-error" id="caseDirectoryBrowserError"></div>
+            <div class="case-directory-browser-list" id="caseDirectoryBrowserList"></div>
+          </div>
           <!-- Manage Tab -->
           <div class="set-section hidden" id="case-manage">
             <div class="set-section-head">
@@ -3631,11 +3958,80 @@
               <div class="case-manage-list" id="dockerExportsList"><span class="form-hint">No exports yet. Export a docker case from its tab.</span></div>
             </div>
           </div>
+          <div class="form-row hidden" id="caseEditDefaultGroupRow">
+            <label class="case-setting-field" for="caseEditDefaultGroup">
+              <span>Default session group</span>
+              <select id="caseEditDefaultGroup" disabled>
+                <option value="">Ungrouped</option>
+              </select>
+            </label>
+            <span class="form-hint">Place future sessions for this case in this group.</span>
+          </div>
           </div>
         </div>
         <div class="form-actions set-foot">
           <button class="btn-toolbar" onclick="app.closeCreateCaseModal()">Cancel</button>
           <button class="btn-toolbar btn-primary" id="caseModalSubmit" onclick="app.submitCaseModal()">Create</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal" id="remoteHostConfigModal">
+      <div class="modal-backdrop" onclick="app.closeRemoteHostConfigModal()"></div>
+      <div class="modal-content modal-sm">
+        <div class="modal-header">
+          <h2>Saved SSH</h2>
+          <button class="modal-close" onclick="app.closeRemoteHostConfigModal()" aria-label="Close saved SSH">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-row">
+            <label>Host ID</label>
+            <input type="text" id="remoteHostId" placeholder="gpu-box" pattern="[a-zA-Z0-9_-]+" autocomplete="off" autocapitalize="off" spellcheck="false">
+          </div>
+          <div class="form-row">
+            <label>SSH Host/IP</label>
+            <input type="text" id="remoteHostAddress" placeholder="10.0.0.42" autocomplete="off" autocapitalize="off" spellcheck="false">
+          </div>
+          <div class="form-row">
+            <label>SSH Username</label>
+            <input type="text" id="remoteHostUsername" placeholder="ubuntu" autocomplete="off" autocapitalize="off" spellcheck="false">
+          </div>
+          <div class="form-row">
+            <label>SSH Port</label>
+            <input type="number" id="remoteHostPort" placeholder="22" min="1" max="65535" autocomplete="off">
+            <span class="form-hint">Optional. Leave blank for the default port 22.</span>
+          </div>
+          <details class="advanced-options">
+            <summary>Advanced SSH</summary>
+            <div class="advanced-options-content">
+              <div class="form-row">
+                <label>Identity File</label>
+                <input type="text" id="remoteHostIdentityFile" placeholder="~/.ssh/remote_ed25519" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+                <span class="form-hint">Optional. Path to a private key on this machine (passed to ssh -i). Never the key contents.</span>
+              </div>
+              <div class="form-row">
+                <label>SOCKS Proxy</label>
+                <input type="text" id="remoteHostSocksProxy" placeholder="127.0.0.1:1080" autocomplete="off" autocapitalize="off" spellcheck="false">
+                <span class="form-hint">Optional. host:port of a SOCKS5 proxy (e.g. cloudflared). Routes ssh through it via a ProxyCommand.</span>
+              </div>
+              <div class="form-row">
+                <label>Jump Host</label>
+                <input type="text" id="remoteHostJumpHost" placeholder="bastion@10.0.0.1:22" autocomplete="off" autocapitalize="off" spellcheck="false">
+                <span class="form-hint">Optional. [user@]host[:port] for ssh -J (jump/bastion host).</span>
+              </div>
+              <div class="form-row">
+                <label>Extra -o Options</label>
+                <textarea id="remoteHostExtraSshOptions" rows="3" placeholder="StrictHostKeyChecking=accept-new&#10;ConnectTimeout=10" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+                <span class="form-hint">Optional. One KEY=VALUE per line; each becomes an ssh -o option.</span>
+              </div>
+            </div>
+          </details>
+          <div class="remote-host-verify-status" id="remoteHostVerifyStatus"></div>
+        </div>
+        <div class="form-actions">
+          <button class="btn-toolbar" onclick="app.closeRemoteHostConfigModal()">Cancel</button>
+          <button class="btn-toolbar" id="remoteHostVerifyBtn" onclick="app.testRemoteHostConfig()">Test</button>
+          <button class="btn-toolbar btn-primary" id="remoteHostSaveBtn" onclick="app.saveRemoteHostConfig()" disabled>Save</button>
         </div>
       </div>
     </div>
@@ -3891,6 +4287,60 @@
       <div class="notif-drawer-empty" id="notifEmpty">No notifications</div>
     </div>
 
+    <!-- Sources Modal -->
+    <div class="modal" id="sourcesModal">
+      <div class="modal-backdrop" onclick="app.closeSources()"></div>
+      <div class="modal-content sources-modal">
+        <div class="modal-header">
+          <h3>Session Sources</h3>
+          <button class="modal-close" onclick="app.closeSources()" aria-label="Close sources">&times;</button>
+        </div>
+        <div class="modal-body sources-modal-body">
+          <form class="sources-add-form" id="sourcesAddForm" onsubmit="app.handleAddSource(event)">
+            <select class="sources-type-select" id="sourcesTypeSelect" aria-label="Source type" onchange="app.updateSourceFormFields()">
+              <option value="url">URL</option>
+              <option value="file">File</option>
+              <option value="highlight">Highlight</option>
+            </select>
+            <input type="text" id="sourcesTitle" class="sources-title-input" placeholder="Title" maxlength="500" required autocomplete="off">
+            <div id="sourcesUrlRow" class="sources-field-row">
+              <input type="url" id="sourcesUrl" class="sources-url-input" placeholder="https://..." maxlength="2000" autocomplete="off">
+            </div>
+            <div id="sourcesUploadRow" class="sources-field-row sources-field-row--hidden">
+              <input type="file" id="sourcesFilePicker" class="sources-file-picker" accept=".pdf,.docx,.pptx,.xlsx,.md,.markdown,.txt,.py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.toml,.ini,.cfg,.conf,.sh,.bash,.zsh,.go,.rs,.java,.c,.cpp,.h,.hpp,.cs,.rb,.php,.swift,.kt,.scala,.sql,.html,.css,.csv,.png,.jpg,.jpeg,.gif,.webp,.bmp">
+              <button type="button" class="btn-toolbar btn-sm sources-upload-btn" id="sourcesUploadBtn" onclick="app.handleSourceUpload()">Upload</button>
+            </div>
+            <div id="sourcesContentRow" class="sources-field-row sources-field-row--hidden">
+              <textarea id="sourcesContent" class="sources-content-input" placeholder="Highlighted text..." maxlength="10000" rows="4"></textarea>
+            </div>
+            <button type="submit" class="btn-toolbar btn-sm sources-add-btn">Add</button>
+          </form>
+          <div class="sources-list" id="sourcesList">
+            <p class="empty-message sources-empty">No sources yet. Add a URL, upload a file, or add a highlight above.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Library Modal -->
+    <div class="modal" id="libraryModal">
+      <div class="modal-backdrop" onclick="app.closeLibrary()"></div>
+      <div class="modal-content library-modal">
+        <div class="modal-header">
+          <h3>Library</h3>
+          <button class="modal-close" onclick="app.closeLibrary()" aria-label="Close library">&times;</button>
+        </div>
+        <div class="modal-body library-modal-body">
+          <div class="library-search-row">
+            <input type="search" id="librarySearchInput" class="library-search-input" placeholder="Search documents..." autocomplete="off" maxlength="200">
+          </div>
+          <div class="library-documents" id="libraryDocuments">
+            <p class="empty-message library-empty">No documents yet.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Away Digest Modal -->
     <div class="modal" id="awayDigestModal">
       <div class="modal-backdrop" onclick="app.closeAwayDigest()"></div>
@@ -3943,6 +4393,9 @@
       </div>
     </div>
 
+    <!-- Codex Command Profile Manager -->
+    <div class="modal" id="codexCommandProfileManager"><div class="modal-backdrop" onclick="app.closeCodexCommandProfileManager()"></div><div class="modal-content codex-command-profile-manager" role="dialog" aria-modal="true" aria-labelledby="codexCommandProfileManagerTitle"><div class="modal-header"><h3 id="codexCommandProfileManagerTitle">Codex command profiles</h3><button class="modal-close" onclick="app.closeCodexCommandProfileManager()" aria-label="Close">&times;</button></div><div class="modal-body"><div id="codexCommandProfileList"></div><button type="button" class="btn-toolbar" id="codexCommandProfileNew" onclick="app.newCodexCommandProfile()">New profile</button><div id="codexCommandProfileEditor" class="hidden"><label for="codexCommandProfileName">Name</label><input id="codexCommandProfileName" type="text"><label for="codexCommandProfileCommand">Command</label><input id="codexCommandProfileCommand" type="text"><button type="button" class="btn-toolbar btn-primary" id="codexCommandProfileSave" onclick="app.saveCodexCommandProfile()">Save</button><button type="button" class="btn-toolbar" id="codexCommandProfileDelete" onclick="app.deleteCodexCommandProfile()">Delete</button></div></div></div></div>
+
     <!-- Session Manager Modal -->
     <div class="modal" id="sessionManagerModal">
       <div class="modal-backdrop" onclick="app.closeSessionManager()"></div>
@@ -3953,11 +4406,19 @@
         </div>
         <div class="modal-body">
           <input type="search" id="sessionManagerSearch" class="search-input" placeholder="Search sessions by name, prompt, or path&hellip;" autocomplete="off" maxlength="200">
+          <div id="sessionManagerFilters" class="session-manager-filters" aria-label="Filter loaded sessions"></div>
+          <section class="session-recovery-queue" aria-labelledby="sessionRecoveryTitle">
+            <div class="session-recovery-heading">
+              <h4 id="sessionRecoveryTitle">Recovery Queue</h4>
+              <span>Sessions interrupted by a host reboot</span>
+            </div>
+            <div id="sessionRecoveryList" class="session-recovery-list" aria-live="polite"></div>
+          </section>
+          <h4 id="sessionHistoryTitle" class="session-manager-history-heading">Saved sessions</h4>
           <div id="sessionManagerList" class="session-manager-list"></div>
         </div>
       </div>
     </div>
-
 
     <!-- Token Stats Modal -->
     <div class="modal" id="tokenStatsModal">
@@ -4178,14 +4639,14 @@
   <script defer src="notification-manager.js"></script>
   <script defer src="keyboard-accessory.js"></script>
   <script defer src="input-cjk.js"></script>
-  <!-- Shows iOS Safari IME composition text inside the terminal. Must precede terminal-ui.js. -->
   <script defer src="mobile-ime-preview.js"></script>
   <!-- Forwards committed input events that xterm drops on Android/GBoard soft keyboards. Must precede terminal-ui.js. -->
   <script defer src="terminal-keycode229-recovery.js"></script>
-  <!-- Hardened markdown HTML sanitizer (wires DOMPurify). Must precede app.js. -->
+  <!-- COD-56: hardened markdown HTML sanitizer; wires DOMPurify into window.sanitizeMarkdownHtml; must precede app.js. -->
   <script defer src="sanitize-html.js"></script>
   <!-- Owner tab layout projection (grouped vertical rail); pure, read by app.js. -->
   <script defer src="tab-layout-browser.js"></script>
+  <script defer src="terminal-viewer-activity.js"></script>
   <script defer src="app.js"></script>
   <script defer src="tab-rail-resize.js"></script>
   <script defer src="terminal-ui.js"></script>
@@ -4197,6 +4658,7 @@
   <script defer src="orchestrator-panel.js"></script>
   <script defer src="cron-ui.js"></script>
   <script defer src="settings-ui.js"></script>
+  <script defer src="spreadsheet-preview.js"></script>
   <script defer src="panels-ui.js"></script>
   <script defer src="readmymind-ui.js"></script>
   <script defer src="ultracode-panel.js"></script>
@@ -4206,16 +4668,28 @@
   <script defer src="session-ui.js"></script>
   <script defer src="host-wake-ui.js"></script>
   <script defer src="webview-tabs.js"></script>
+  <script defer src="mobile-tabs.js"></script>
   <script defer src="mobile-overview.js"></script>
   <script defer src="home-sessions.js"></script>
   <script defer src="git-status-ui.js"></script>
   <script defer src="entrance-animations.js"></script>
   <script defer src="ralph-wizard.js"></script>
+  <button type="button" class="btn-toolbar assistant-mobile-entry" onclick="app.openAssistants()" aria-label="Open assistants">Assistants</button>
+  <dialog id="assistantsDialog" class="assistants-dialog" aria-labelledby="assistantsTitle">
+    <header class="assistants-header"><div><span class="assistants-eyebrow">Codeman</span><h2 id="assistantsTitle">Assistants</h2></div><div class="assistant-header-actions"><button class="assistant-button assistant-primary" onclick="app.toggleAssistantCreate()" aria-expanded="false" aria-controls="assistantCreatePanel" id="assistantAddButton">+ Add assistant</button><button class="assistant-button assistant-close" onclick="app.closeAssistants()" aria-label="Close">×</button></div></header>
+    <section id="assistantCreatePanel" class="assistant-create-panel" hidden aria-label="Create an assistant"><h3>New assistant</h3><form class="assistant-create" onsubmit="app.createAssistant(event)"><label>Name<input id="assistantName" aria-label="Assistant name" placeholder="Brain" required maxlength="60"></label><label>Messaging name<input id="assistantSlug" aria-label="Assistant slug" placeholder="brain" required pattern="[a-z][a-z0-9\-]{0,59}"></label><button class="assistant-button assistant-primary" type="submit">Create assistant</button></form></section>
+    <p id="assistantsError" role="alert" aria-live="polite"></p>
+    <section id="assistantsTokenPanel" class="assistant-token-panel" hidden><h3>New connector token</h3><p>Copy this token to the gateway's credential environment. It is shown only now.</p><textarea id="assistantsToken" readonly aria-label="New connector token"></textarea><button class="assistant-button" onclick="app.$('assistantsToken').value='';app.$('assistantsTokenPanel').hidden=true">Hide token</button></section>
+    <div id="assistantsList"></div>
+    <nav class="assistant-bottom-nav" aria-label="Assistant navigation"><button type="button" onclick="app.closeAssistants()">▣<span>Sessions</span></button><button type="button" aria-current="page">✦<span>Assistants</span></button><button type="button" onclick="app.closeAssistants();app.openAppSettings()">⚙<span>Settings</span></button></nav>
+  </dialog>
+  <div id="assistantInputBanner" hidden role="status"><span></span> <button class="btn-toolbar" onclick="app.openAssistants()">Assistants / Take control</button></div>
   <script defer src="api-client.js"></script>
+  <script defer src="assistants-ui.js"></script>
   <script defer src="subagent-windows.js"></script>
   <script defer src="ultracode-windows.js"></script>
   <script defer src="session-lineage.js"></script>
   <script defer src="image-input.js"></script>
-  <script defer src="spreadsheet-preview.js"></script>
+  <script defer src="document-input.js"></script>
 </body>
 </html>

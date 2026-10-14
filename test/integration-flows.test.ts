@@ -183,24 +183,21 @@ describe('Integration Flows', () => {
     });
 
     it('should handle terminal resize', async () => {
-      const caseName = `resize-flow-${Date.now()}`;
-      createdCases.push(caseName);
-
-      // Quick start
-      const quickStartRes = await fetch(`${baseUrl}/api/quick-start`, {
+      const sessionRes = await fetch(`${baseUrl}/api/sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ caseName }),
+        body: JSON.stringify({ name: 'resize-flow', workingDir: '/tmp' }),
       });
-      const quickStartData = await quickStartRes.json();
-      expect(quickStartData.success).toBe(true);
-      createdSessions.push(quickStartData.data.sessionId);
+      const sessionData = await sessionRes.json();
+      expect(sessionData.success).toBe(true);
+      const sessionId = sessionData.data.session.id;
+      createdSessions.push(sessionId);
 
-      // Resize terminal (retry briefly — a just-quick-started session can be
+      // Resize terminal (retry briefly — a just-created session can be
       // momentarily busy, which would return SESSION_BUSY; this is a transient race).
       let resizeData;
       for (let attempt = 0; attempt < 5; attempt++) {
-        const resizeRes = await fetch(`${baseUrl}/api/sessions/${quickStartData.data.sessionId}/resize`, {
+        const resizeRes = await fetch(`${baseUrl}/api/sessions/${sessionId}/resize`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ cols: 200, rows: 50 }),

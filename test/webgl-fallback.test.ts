@@ -216,6 +216,69 @@ describe('WebGL longtask auto-fallback', () => {
     });
   });
 
+  describe('terminal write pacing', () => {
+    it('uses a smaller first browser frame for active Codex terminal output', async () => {
+      const result = await page.evaluate(() => {
+        const app = (
+          window as unknown as {
+            app: {
+              activeSessionId: string;
+              sessions: Map<string, { mode: string }>;
+              pendingWrites: string[];
+              writeFrameScheduled: boolean;
+              _wasAtBottomBeforeWrite: boolean;
+              _workerYield: (cb: () => void) => void;
+              terminal: { write: (data: string) => void; scrollToBottom: () => void };
+              flushPendingWrites: () => void;
+            };
+          }
+        ).app;
+        const original = {
+          activeSessionId: app.activeSessionId,
+          sessions: app.sessions,
+          pendingWrites: app.pendingWrites,
+          writeFrameScheduled: app.writeFrameScheduled,
+          wasAtBottomBeforeWrite: app._wasAtBottomBeforeWrite,
+          workerYield: app._workerYield,
+          terminal: app.terminal,
+        };
+        const writes: string[] = [];
+        try {
+          app.activeSessionId = 'codex-browser-test';
+          app.sessions = new Map([['codex-browser-test', { mode: 'codex' }]]);
+          app.pendingWrites = ['x'.repeat(96 * 1024)];
+          app.writeFrameScheduled = false;
+          app._wasAtBottomBeforeWrite = false;
+          app._workerYield = () => {};
+          app.terminal = {
+            write: (data: string) => writes.push(data),
+            scrollToBottom: () => {},
+          };
+
+          app.flushPendingWrites();
+
+          return {
+            firstWriteBytes: writes[0]?.length ?? 0,
+            remainingBytes: app.pendingWrites.join('').length,
+          };
+        } finally {
+          app.activeSessionId = original.activeSessionId;
+          app.sessions = original.sessions;
+          app.pendingWrites = original.pendingWrites;
+          app.writeFrameScheduled = original.writeFrameScheduled;
+          app._wasAtBottomBeforeWrite = original.wasAtBottomBeforeWrite;
+          app._workerYield = original.workerYield;
+          app.terminal = original.terminal;
+        }
+      });
+
+      expect(result).toEqual({
+        firstWriteBytes: 32 * 1024,
+        remainingBytes: 64 * 1024,
+      });
+    });
+  });
+
   describe('shouldSkipWebGL — renderer toggle + fallback precedence', () => {
     type Input = {
       deviceType?: string;

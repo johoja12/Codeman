@@ -22,27 +22,34 @@ import type {
   RalphTrackerState,
   RalphTodoItem,
   ActiveBashTool,
+  SessionIdleInfo,
 } from '../session.js';
+import type { TerminalMultiplexer } from '../mux-interface.js';
 import type { RalphStatusBlock, CircuitBreakerStatus } from '../types.js';
 import { SseEvent } from './sse-events.js';
 import { getLifecycleLog } from '../session-lifecycle-log.js';
 import { fileStreamManager } from '../file-stream-manager.js';
-import { sessionWaits } from './session-wait-registry.js';
+import type { CheckpointProgress } from '../session-auto-ops.js';
+import { approvalsAvailableForMode, sessionWaits } from './session-wait-registry.js';
 import { approvalInbox } from './approval-inbox.js';
+import { buildPaneCapture } from './pane-capture.js';
+import type { AgentActivityControllerPort } from './ports/agent-activity-port.js';
 import { composeAutoSessionName, deriveAutoSessionName } from '../session-auto-name.js';
 import { MAX_SESSION_NAME_LENGTH } from '../config/terminal-limits.js';
 
 /** Stored listener references for session cleanup (prevents memory leaks) */
 export interface SessionListenerRefs {
+  terminalActivity: () => void;
   terminal: (data: string) => void;
   clearTerminal: () => void;
   needsRefresh: () => void;
+  resized: (data: { cols: number; rows: number }) => void;
   message: (msg: ClaudeMessage) => void;
   error: (error: string) => void;
   completion: (result: string, cost: number) => void;
   exit: (code: number | null) => void;
   working: () => void;
-  idle: () => void;
+  idle: (info?: SessionIdleInfo) => void;
   watchingChanged: () => void;
   displayModelChanged: () => void;
   taskCreated: (task: BackgroundTask) => void;
@@ -51,6 +58,8 @@ export interface SessionListenerRefs {
   taskFailed: (task: BackgroundTask, error: string) => void;
   autoClear: (data: { tokens: number; threshold: number }) => void;
   autoCompact: (data: { tokens: number; threshold: number; prompt?: string }) => void;
+  checkpointStart: (data: { mode: 'compact' | 'clear' | 'new'; runId?: string }) => void;
+  checkpointProgress: (data: CheckpointProgress) => void;
   limitPauseScheduled: (data: { resetAt: number; resumeAt: number; matched: string }) => void;
   limitResume: (data: { attempt: number }) => void;
   limitResumeCancelled: (data: { reason: string }) => void;
@@ -66,12 +75,14 @@ export interface SessionListenerRefs {
   bashToolStart: (tool: ActiveBashTool) => void;
   bashToolEnd: (tool: ActiveBashTool) => void;
   bashToolsUpdate: (tools: ActiveBashTool[]) => void;
-  attachmentRequested: (event: { path: string; source: 'external' | 'codex-generated' }) => void;
+  attachmentRequested: (event: { path: string; source?: 'external' | 'codex-generated' }) => void;
   promptSubmitted: (prompt: string) => void;
 }
 
 /** Dependencies injected by WebServer — keeps listener creation decoupled from server internals. */
 interface SessionListenerDeps {
+  agentActivity: AgentActivityControllerPort;
+  mux: TerminalMultiplexer;
   broadcast(event: string, data: unknown): void;
   batchTerminalData(sessionId: string, data: string): void;
   batchTaskUpdate(sessionId: string, task: BackgroundTask): void;
@@ -87,7 +98,7 @@ interface SessionListenerDeps {
   removeSessionListenerRefs(sessionId: string): void;
   cleanupRespawnOnExit(sessionId: string): void;
   getStore(): import('../state-store.js').StateStore;
-  registerAttachment(sessionId: string, filePath: string, source: 'external' | 'codex-generated'): Promise<void>;
+  registerAttachment(sessionId: string, filePath: string, source?: 'external' | 'codex-generated'): Promise<void>;
   updateSessionName(sessionId: string, name: string): boolean;
   /** The synced `autoNameSessions` setting, read fresh so a flip applies to the next prompt. */
   isAutoNameEnabled(): Promise<boolean>;
@@ -98,7 +109,50 @@ interface SessionListenerDeps {
  * Call `attachSessionListeners()` after to wire them to the session.
  */
 export function createSessionListeners(session: Session, deps: SessionListenerDeps): SessionListenerRefs {
+  const commitRawIdle = (info?: SessionIdleInfo, sourceSequence?: number): void => {
+    sessionWaits.notifySignal(session.id, 'idle');
+    if (
+      approvalsAvailableForMode(session.mode) &&
+      session.mode !== 'claude' &&
+      info?.reason === 'turn-end' &&
+      approvalInbox.getForSession(session.id)?.kind !== 'idle'
+    ) {
+      const item = approvalInbox.notePrompt({
+        sessionId: session.id,
+        sessionName: session.name,
+        kind: 'idle',
+        mode: session.mode,
+        sourceSequence,
+        capture: buildPaneCapture(session, deps.mux),
+      });
+      deps.sendPushNotifications(SseEvent.HookIdlePrompt, {
+        sessionId: session.id,
+        sessionName: session.name,
+        approvalId: item.id,
+        approvalsInboxOnly: true,
+      });
+    }
+    deps.broadcast(SseEvent.SessionIdle, { id: session.id });
+    deps.broadcastSessionStateDebounced(session.id);
+    const tracker = deps.getRunSummaryTracker(session.id);
+    if (tracker) {
+      tracker.recordIdle();
+      tracker.recordTokens(session.inputTokens, session.outputTokens);
+    }
+  };
+
+  const applyRawIdleDecision = (
+    info: SessionIdleInfo | undefined,
+    decision: Awaited<ReturnType<AgentActivityControllerPort['decideEvent']>>
+  ): void => {
+    if (!decision.presentToHuman || decision.settleEndedEarly) return;
+    commitRawIdle(info, decision.event?.sequence);
+  };
+
   return {
+    terminalActivity: () => {
+      deps.agentActivity.terminalActivity(session);
+    },
     // ─── Terminal Output ─────────────────────────────────────
 
     /** Batches PTY output → broadcasts `session:terminal` at 16-50ms intervals */
@@ -117,6 +171,11 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
     /** Broadcasts `session:needsRefresh` — tells clients to reload buffer */
     needsRefresh: () => {
       deps.broadcast(SseEvent.SessionNeedsRefresh, { id: session.id });
+    },
+
+    /** Broadcasts `session:resized` — PTY geometry changed; other-dims viewers reconcile (COD-179) */
+    resized: (data: { cols: number; rows: number }) => {
+      deps.broadcast(SseEvent.SessionResized, { id: session.id, cols: data.cols, rows: data.rows });
     },
 
     // ─── Session Messages & Errors ──────────────────────────
@@ -151,6 +210,7 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
 
     /** Broadcasts `session:exit` + `session:updated` — PTY process exited; cleans up respawn, timers, listeners */
     exit: (code) => {
+      deps.agentActivity.sessionExited(session);
       // Before anything that can throw: a caller blocked on this session must learn
       // the process died rather than sit until its timeout.
       //
@@ -224,6 +284,7 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
 
     /** Broadcasts `session:working` — Claude started processing */
     working: () => {
+      deps.agentActivity.terminalActivity(session);
       sessionWaits.notifySignal(session.id, 'working');
       // An idle-prompt inbox item means "composer is waiting"; any working
       // transition means input arrived, so the item is moot. ONLY the idle
@@ -253,15 +314,22 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
       }
     },
 
-    /** Broadcasts `session:idle` — Claude finished processing, waiting for input */
-    idle: () => {
-      sessionWaits.notifySignal(session.id, 'idle');
-      deps.broadcast(SseEvent.SessionIdle, { id: session.id });
-      deps.broadcastSessionStateDebounced(session.id);
-      const tracker = deps.getRunSummaryTracker(session.id);
-      if (tracker) {
-        tracker.recordIdle();
-        tracker.recordTokens(session.inputTokens, session.outputTokens);
+    /** Broadcasts `session:idle` — the agent finished processing and is waiting for input */
+    idle: (info) => {
+      try {
+        const event = deps.agentActivity.allocateEvent(session, 'raw_idle');
+        const decision = deps.agentActivity.decideEvent(session, event);
+        if (decision instanceof Promise) {
+          void decision
+            .then((resolved) => applyRawIdleDecision(info, resolved))
+            .catch((error) => {
+              console.error(`[Server] Agent activity decision failed safe for raw idle ${session.id}:`, error);
+            });
+        } else {
+          applyRawIdleDecision(info, decision);
+        }
+      } catch (error) {
+        console.error(`[Server] Agent activity decision failed safe for raw idle ${session.id}:`, error);
       }
     },
 
@@ -327,6 +395,18 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
       deps.broadcastSessionStateDebounced(session.id);
       const tracker = deps.getRunSummaryTracker(session.id);
       if (tracker) tracker.recordAutoCompact(data.tokens, data.threshold);
+    },
+
+    /** Broadcasts `session:checkpoint` — confirmed checkpoint lifecycle progress. */
+    checkpointProgress: (data: CheckpointProgress) => {
+      deps.broadcast(SseEvent.SessionCheckpoint, { sessionId: session.id, ...data });
+      deps.broadcastSessionStateDebounced(session.id);
+      deps.persistSessionState(session);
+    },
+
+    /** Legacy additive compatibility event; progress owns status persistence. */
+    checkpointStart: (data: { mode: 'compact' | 'clear' | 'new'; runId?: string }) => {
+      deps.broadcast(SseEvent.SessionCheckpoint, { sessionId: session.id, phase: 'start', ...data });
     },
 
     /** Broadcasts `session:limitPauseScheduled` — usage-limit pause detected, auto-resume armed.
@@ -475,7 +555,7 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
     },
 
     /** Registers an explicit attachment card requested by terminal magic text. */
-    attachmentRequested: (event: { path: string; source: 'external' | 'codex-generated' }) => {
+    attachmentRequested: (event: { path: string; source?: 'external' | 'codex-generated' }) => {
       deps.registerAttachment(session.id, event.path, event.source).catch((err) => {
         console.error(`[Attachment] Failed to register ${event.path} for ${session.id}:`, err);
       });
@@ -509,9 +589,11 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
 
 /** Attach all listeners to a session. */
 export function attachSessionListeners(session: Session, refs: SessionListenerRefs): void {
+  session.on('terminalActivity', refs.terminalActivity);
   session.on('terminal', refs.terminal);
   session.on('clearTerminal', refs.clearTerminal);
   session.on('needsRefresh', refs.needsRefresh);
+  session.on('resized', refs.resized);
   session.on('message', refs.message);
   session.on('error', refs.error);
   session.on('completion', refs.completion);
@@ -526,6 +608,8 @@ export function attachSessionListeners(session: Session, refs: SessionListenerRe
   session.on('taskFailed', refs.taskFailed);
   session.on('autoClear', refs.autoClear);
   session.on('autoCompact', refs.autoCompact);
+  session.on('checkpointStart', refs.checkpointStart);
+  session.on('checkpointProgress', refs.checkpointProgress);
   session.on('limitPauseScheduled', refs.limitPauseScheduled);
   session.on('limitResume', refs.limitResume);
   session.on('limitResumeCancelled', refs.limitResumeCancelled);
@@ -547,9 +631,11 @@ export function attachSessionListeners(session: Session, refs: SessionListenerRe
 
 /** Detach all listeners from a session (prevents memory leaks from closure references). */
 export function detachSessionListeners(session: Session, refs: SessionListenerRefs): void {
+  session.off('terminalActivity', refs.terminalActivity);
   session.off('terminal', refs.terminal);
   session.off('clearTerminal', refs.clearTerminal);
   session.off('needsRefresh', refs.needsRefresh);
+  session.off('resized', refs.resized);
   session.off('message', refs.message);
   session.off('error', refs.error);
   session.off('completion', refs.completion);
@@ -564,6 +650,8 @@ export function detachSessionListeners(session: Session, refs: SessionListenerRe
   session.off('taskFailed', refs.taskFailed);
   session.off('autoClear', refs.autoClear);
   session.off('autoCompact', refs.autoCompact);
+  session.off('checkpointStart', refs.checkpointStart);
+  session.off('checkpointProgress', refs.checkpointProgress);
   session.off('limitPauseScheduled', refs.limitPauseScheduled);
   session.off('limitResume', refs.limitResume);
   session.off('limitResumeCancelled', refs.limitResumeCancelled);

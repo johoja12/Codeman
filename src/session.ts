@@ -1,7 +1,7 @@
 /**
  * @fileoverview Core PTY session wrapper for Claude CLI interactions.
  *
- * Manages a PTY (pseudo-terminal) process running Claude CLI or OpenCode CLI.
+ * Manages a PTY (pseudo-terminal) process running Claude CLI, OpenCode CLI, or Codex CLI.
  * Three operation modes:
  * 1. **One-shot** (`runPrompt`): Single prompt → JSON response
  * 2. **Interactive** (`startInteractive`): Persistent interactive session
@@ -29,8 +29,11 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { workerResumeOptions } from './remote-worker-recovery.js';
 import { basename } from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { v4 as uuidv4 } from 'uuid';
 import * as pty from 'node-pty';
 import {
@@ -47,19 +50,23 @@ import {
   isEffortLevel,
   type ClaudeMode,
   type SessionMode,
+  type SessionCheckpointMode,
   type OpenCodeConfig,
   type CodexConfig,
   type EffortLevel,
   type CustomModelBookkeeping,
   type CustomModelSelection,
   type GeminiConfig,
+  type SessionAttachmentHistoryItem,
   type AntigravityConfig,
   type PiConfig,
   type GrokConfig,
   type DeepSeekConfig,
   type OmpConfig,
   type SessionRemote,
+  type SessionSource,
   type SessionDocker,
+  type SessionActivityProjection,
   type SessionNameSource,
   type SessionWriteOptions,
   type PaneExit,
@@ -69,8 +76,8 @@ import { resolveAndClaimOmpSessionId } from './utils/omp-session-resolver.js';
 import { claudeTranscriptExists } from './utils/claude-transcript.js';
 import { matchesPattern } from './config/cli-registry/patterns.js';
 import { probeDockerCliVersion } from './docker-hosts.js';
-import { probeRemoteCliVersion } from './remote-hosts.js';
-import type { TerminalMultiplexer, MuxSession } from './mux-interface.js';
+import { probeRemoteCliVersion, probeRemoteWorker } from './remote-hosts.js';
+import type { TerminalMultiplexer, MuxSession, CommandDeliveryResult } from './mux-interface.js';
 import { TaskTracker, type BackgroundTask } from './task-tracker.js';
 import { RalphTracker } from './ralph-tracker.js';
 import { BashToolParser } from './bash-tool-parser.js';
@@ -117,10 +124,11 @@ import {
   MAX_MESSAGES,
   MAX_LINE_BUFFER_SIZE,
 } from './config/buffer-limits.js';
-import { DEFAULT_TMUX_HISTORY_LIMIT } from './config/terminal-history.js';
 import { EXEC_TIMEOUT_MS } from './config/exec-timeout.js';
+import { DEFAULT_TMUX_HISTORY_LIMIT } from './config/terminal-history.js';
 import { getCli } from './config/cli-registry/registry.js';
-import { SubmitVerifier } from './session-submit-verifier.js';
+import { legacyResumeSlot } from './session-cli-registry-bridge.js';
+import { SubmitVerifier, exactPromptStillInComposer } from './session-submit-verifier.js';
 import { compileVersionRegex } from './config/cli-registry/patterns.js';
 import { resolveSessionCliVersion } from './utils/cli-resolver.js';
 import {
@@ -130,7 +138,20 @@ import {
   buildMuxAttachEnv,
   buildShellEnv,
 } from './session-cli-builder.js';
-import { SessionAutoOps } from './session-auto-ops.js';
+import {
+  SessionAutoOps,
+  type CheckpointObservation,
+  type CheckpointProgress,
+  type CheckpointState,
+  type CheckpointMode,
+} from './session-auto-ops.js';
+import {
+  findActiveCodexConversation,
+  findAuthoritativeCodexConversation,
+  findRecentOwnedCodexConversationIds,
+  invalidateCodexConversationInventory,
+  canonicalizeCodexHome,
+} from './checkpoint-conversation-identity.js';
 import { detectUsageLimitPause } from './usage-limit-patterns.js';
 import { SessionTaskCache } from './session-task-cache.js';
 import { InteractivePtyExitBreaker } from './session-pty-exit-breaker.js';
@@ -140,7 +161,22 @@ import {
   sanitizeAttachmentHistory,
   upsertAttachmentHistory as upsertAttachmentHistoryList,
 } from './session-attachment-history.js';
-import type { SessionAttachmentHistoryItem, DisplayModel } from './types/session.js';
+import type { CodexProviderEnvironment } from './readmymind-predictor.js';
+import type { CodexProviderIdentity } from './codex-provider-identity.js';
+import { workingFramePollCoordinator } from './working-frame-poll-coordinator.js';
+import {
+  TerminalSizingOwnership,
+  type TerminalViewerDimensions,
+  type TerminalViewportType,
+} from './terminal-sizing-ownership.js';
+import {
+  hashMobileInputTraceValue,
+  mobileInputTraceCollector,
+  mobileInputTraceTimestamp,
+  type MobileInputTraceCollector,
+  type MobileInputTraceStage,
+} from './perf/mobile-input-trace.js';
+import type { DisplayModel } from './types/session.js';
 import { resolveConfigModel } from './model-config-resolvers.js';
 import { legacyConfigForMode } from './session-cli-registry-bridge.js';
 import {
@@ -156,7 +192,47 @@ import {
 export type { BackgroundTask } from './task-tracker.js';
 export type { RalphTrackerState, RalphTodoItem, ActiveBashTool } from './types.js';
 
-export type ResizeViewportType = 'mobile' | 'tablet' | 'desktop';
+export type ResizeViewportType = TerminalViewportType;
+
+interface SessionMobileInputTraceRegistration {
+  token?: symbol;
+  trace: MobileInputTraceCollector;
+  active: boolean;
+}
+
+const sessionMobileInputTraceRegistrations: SessionMobileInputTraceRegistration[] = [];
+const globalSessionMobileInputTraceRegistration: SessionMobileInputTraceRegistration | undefined =
+  mobileInputTraceCollector.enabled ? { trace: mobileInputTraceCollector, active: true } : undefined;
+
+function currentSessionMobileInputTraceRegistration(): SessionMobileInputTraceRegistration | undefined {
+  return sessionMobileInputTraceRegistrations.at(-1) ?? globalSessionMobileInputTraceRegistration;
+}
+
+type SessionMobileInputTraceRecorder = (stage: MobileInputTraceStage, data: string) => void;
+
+/** Install an enabled trace collector only inside Vitest and return an exact restoration callback. */
+export function setMobileInputTraceCollectorForTests(trace: MobileInputTraceCollector): () => void {
+  if (!process.env.VITEST || !trace.enabled) {
+    throw new Error('Session tracing tests require an enabled test trace collector');
+  }
+  const token = Symbol('session-mobile-input-trace');
+  const registration: SessionMobileInputTraceRegistration = { token, trace, active: true };
+  sessionMobileInputTraceRegistrations.push(registration);
+  let restored = false;
+  return () => {
+    if (restored) return;
+    restored = true;
+    registration.active = false;
+    const index = sessionMobileInputTraceRegistrations.findIndex((registration) => registration.token === token);
+    if (index !== -1) sessionMobileInputTraceRegistrations.splice(index, 1);
+  };
+}
+
+export type SessionIdleReason = 'turn-end' | 'initial-ready' | 'shell-ready';
+
+export interface SessionIdleInfo {
+  reason: SessionIdleReason;
+}
 
 /** Line buffer flush interval (100ms) - forces processing of partial lines */
 const LINE_BUFFER_FLUSH_INTERVAL = 100;
@@ -171,6 +247,33 @@ const MUX_STARTUP_DELAY_MS = 300;
 /** Delay before declaring session idle after last output (2 seconds) */
 const IDLE_DETECTION_DELAY_MS = 2000;
 
+/** Quiet window after the last external-CLI working frame before declaring
+ *  idle. Codex ticks its "Working (Ns • esc to interrupt)" counter about once
+ *  per second while a turn runs, so a few missed frames are tolerated but a
+ *  finished turn flips to idle promptly (COD-175). */
+const EXTERNAL_CLI_IDLE_DELAY_MS = 5000;
+
+/** COD-189 — shell burst healing: during fast output bursts tmux's attach
+ *  client jump-scrolls (repaints rows in place instead of scrolling), so the
+ *  browser's live scrollback ends up sparse or missing entirely — the
+ *  contiguous truth lives only in the pane history. When a shell session
+ *  streams more than SHELL_BURST_BYTES within SHELL_BURST_WINDOW_MS, emit
+ *  'needsRefresh' once output settles: the client full-reloads from the
+ *  (capture-canonical since COD-189) /terminal response. */
+const SHELL_BURST_BYTES = 24 * 1024;
+const SHELL_BURST_REPAINTS = 4;
+const SHELL_BURST_WINDOW_MS = 5000;
+const SHELL_BURST_SETTLE_MS = 1500;
+
+/** COD-181/182 — external-CLI sessions poll the RENDERED local frame for the
+ *  working pattern. Every Codeman session runs inside tmux, so the stream is
+ *  tmux-client repaint traffic (doubly nested for remote sessions): the
+ *  Working line arrives as partial cell updates split across chunks, and the
+ *  per-chunk literal match in _detectInteractiveActivity never fires — sessions
+ *  stayed "idle" through 30-minute turns. The local tmux window's visible
+ *  frame always has the line fully assembled. Must be shorter than
+ *  EXTERNAL_CLI_IDLE_DELAY_MS so positive polls keep re-arming the
+ *  quiet-window timer. */
 // How long after construction a RECOVERED session's wire activity stamp keeps
 // its restored previous-run value. Recovery attaches every pane at boot and the
 // attach repaint arrives as ordinary PTY output; without this window that
@@ -186,6 +289,11 @@ const WIRE_ACTIVITY_SETTLE_MS = 15_000;
  * session. A deadline, not a sleep: stop() moves on as soon as it has exited.
  */
 const GRACEFUL_SHUTDOWN_DELAY_MS = 100;
+
+/** SIGKILL can race a process or its process group exiting after SIGTERM. */
+function isNoSuchProcessError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'ESRCH';
+}
 
 // Conversations kept in a pane's chain. A pane that /clears repeatedly would
 // otherwise grow state.json without bound; 32 covers any real session's history
@@ -212,6 +320,9 @@ const LEADING_ANSI_WHITESPACE_PATTERN = /^(\x1b\[\??[\d;]*[A-Za-z]|[\s\r\n])+/;
 const CTRL_L_PATTERN = /\x0c/g;
 /** Pattern to split by newlines (CR or LF) */
 const NEWLINE_SPLIT_PATTERN = /\r?\n/;
+/** Row starts emitted by TmuxManager.formatPaneSnapshot (which intentionally omits newlines). */
+// eslint-disable-next-line no-control-regex
+const TMUX_ABSOLUTE_ROW_START_PATTERN = /\x1b\[\d+;1H/g;
 
 /**
  * True for external-CLI run modes (non-Claude) that use their own TUI and output format:
@@ -228,6 +339,163 @@ const NEWLINE_SPLIT_PATTERN = /\r?\n/;
  */
 export function isExternalCliMode(mode: SessionMode): boolean {
   return getCli(mode)?.capabilities.external ?? true;
+}
+
+export function detectExternalCliWorkingFrame(data: string, mode: SessionMode): boolean {
+  if (mode === 'codex') {
+    // Codex renders "Working (2s • esc to interrupt)", "Working (4m 03s • …)"
+    // and sometimes unit-less "Working (31 • …)" (COD-175 prod screenshot), so
+    // only anchor on "Working (<digits>" plus the interrupt hint in-parens.
+    return /\bWorking \(\d+[^)\n]*esc to interrupt\)/.test(data);
+  }
+  if (mode === 'opencode') {
+    // Opencode Bubble Tea TUI — see OPENCODE_WORKING_LINE_PATTERN for
+    // rationale. Any single hit proves working; absence proves nothing.
+    // COD-375: w6-tcc idle frame shows `esc interrupt` and `⬝` while idle — only Working/`…` timer or braille spinner prove working.
+    if (/\bWorking\b/i.test(data)) return true;
+    if (/…\s*\((?:\d+h\s+)?(?:\d+m\s+)?\d+s\b/.test(data)) return true;
+    if (SPINNER_PATTERN.test(data)) return true;
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Broader rendered-frame evidence used only by checkpoint readiness. Codex's
+ * stable TUI can retain the submitted `›` row while exposing work through a
+ * short `• Working (2s)` row or a `· Working ·` status footer, neither of which
+ * always carries the interrupt hint used by global quiet-window detection.
+ */
+export function detectCodexCheckpointWorkingFrame(data: string): boolean {
+  return (
+    detectExternalCliWorkingFrame(data, 'codex') ||
+    /^\s*[•·]\s+Working(?:\s*\([^\n)]*\))?(?:\s*[•·]|\s*$)/m.test(data) ||
+    /(?:^|\s)·\s*Working\s*·(?:\s|$)/m.test(data)
+  );
+}
+
+export type CodexRenderedState = 'working' | 'input-ready' | 'unknown';
+
+const CODEX_COMPOSER_LINE_PATTERN = /^[ \t]*›(?![ \t]*\d+[.)](?:[ \t]|$))(?:[ \t]|$)/m;
+const CODEX_NUMBERED_CHOICE_LINE_PATTERN = /^\s*([›❯])?\s*(\d+)[.)](?:[ \t]+(\S(?:.*\S)?))?[ \t]*$/;
+
+function hasCodexNumberedChoiceBlock(frame: string): boolean {
+  const lines = frame.split(NEWLINE_SPLIT_PATTERN);
+  for (let start = 0; start < lines.length; start++) {
+    const firstOption = lines[start].match(CODEX_NUMBERED_CHOICE_LINE_PATTERN);
+    if (firstOption?.[2] !== '1') continue;
+
+    let expectedOption = 1;
+    let optionCount = 0;
+    let selectionVisible = false;
+    let previousOptionLine = start - 1;
+    let coherent = true;
+    for (let lineIndex = start; lineIndex < lines.length; lineIndex++) {
+      if (lineIndex - previousOptionLine > 4) break;
+      const option = lines[lineIndex].match(CODEX_NUMBERED_CHOICE_LINE_PATTERN);
+      if (!option) continue;
+      if (Number(option[2]) !== expectedOption || !option[3]) {
+        coherent = false;
+        break;
+      }
+
+      optionCount++;
+      selectionVisible ||= Boolean(option[1]);
+      previousOptionLine = lineIndex;
+      expectedOption++;
+    }
+    if (coherent && optionCount >= 2 && optionCount <= 6 && selectionVisible) return true;
+  }
+  return false;
+}
+
+const CODEX_BACKGROUND_TERMINAL_WAIT_PATTERN = /\bwaiting for background terminal\b/i;
+
+/**
+ * Rendered-frame evidence that Codex is explicitly waiting on a background
+ * terminal.
+ *
+ * A ready composer establishes parent-session availability. A remaining
+ * background terminal can be a durable helper, such as a preview server, so a
+ * numeric background-terminal count is informational rather than evidence that
+ * Codex is currently working.
+ */
+export function detectCodexBackgroundTerminalWaitFrame(data: string): boolean {
+  return CODEX_BACKGROUND_TERMINAL_WAIT_PATTERN.test(data);
+}
+
+export function classifyCodexRenderedState(frame: string | null | undefined): CodexRenderedState {
+  if (!frame) return 'unknown';
+
+  const plain = frame.replace(TMUX_ABSOLUTE_ROW_START_PATTERN, '\n').replace(ANSI_ESCAPE_PATTERN_FULL, '');
+  if (detectCodexCheckpointWorkingFrame(plain)) return 'working';
+  // A genuine question outranks a running background terminal: the human still
+  // has to answer it, so it must stay input-ready and keep raising an alert.
+  if (hasCodexNumberedChoiceBlock(plain)) return 'input-ready';
+  if (detectCodexBackgroundTerminalWaitFrame(plain)) return 'working';
+  if (CODEX_COMPOSER_LINE_PATTERN.test(plain)) return 'input-ready';
+  return 'unknown';
+}
+
+/**
+ * Rendered-frame working evidence used only by checkpoint sequencing, the
+ * Claude counterpart of detectCodexCheckpointWorkingFrame.
+ *
+ * Claude keeps its `❯` input row visible for the WHOLE of a `/compact`, so
+ * prompt visibility cannot distinguish idle from busy and the operation is
+ * only observable through its progress row. That row is marked with a
+ * `✻`/`✽`-class glyph, not the braille SPINNER_PATTERN, which is why the
+ * spinner check alone never fired and every compact reported
+ * `operation-not-accepted` while plainly succeeding.
+ *
+ * The discriminator is an animation glyph followed by a label ending in an
+ * ellipsis, e.g. `✢ Compacting conversation… `. The elapsed timer and percent
+ * (`✽ Compacting conversation… (55s) ▰▰▱ 46%`) must NOT be required: they only
+ * appear once there is progress to report, roughly 15s in, which is well past
+ * the 8s acceptance window — that delay is exactly what made an earlier
+ * timer-based pattern still report `operation-not-accepted`.
+ *
+ * Completed rows read `✻ Cogitated for 5s` — same glyph family, no ellipsis —
+ * and persist on screen while Claude sits idle, so they must not match:
+ * reading one as working would hold `ready` false forever and stall every
+ * checkpoint in `waiting-ready`. The glyph anchor also keeps the `❯` input row
+ * out of it, whose ghost-suggestion text can legitimately contain an ellipsis.
+ */
+export function detectClaudeCheckpointWorkingFrame(data: string): boolean {
+  return SPINNER_PATTERN.test(data) || /\besc to interrupt\b/.test(data) || /^\s*[·✢✳∗✻✽]\s+\S[^\n]*…/m.test(data);
+}
+
+/**
+ * The `^`-anchored composer-prompt matcher for a declared glyph.
+ *
+ * ⚠️ Built per call rather than shared: a `/g`-less regex has no `lastIndex` to reset, but these
+ * are cheap and the alternative — a module-level cache keyed by glyph — buys nothing measurable
+ * on a path that already just captured and ANSI-stripped a pane frame.
+ *
+ * The glyph is registry data, so it is escaped rather than interpolated raw: a custom entry
+ * declaring `.` must match a literal dot, not any character.
+ */
+function checkpointPromptPattern(glyph: string): RegExp {
+  return new RegExp(`^\\s*${glyph.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\s|$)`, 'm');
+}
+
+/**
+ * Dispatch to the frame classifier a CLI's `capabilities.checkpoint.workingFrameProfile` names.
+ *
+ * ⚠️ An UNKNOWN profile returns false — "no working evidence" — which is the same answer a CLI
+ * with no classifier at all gets, and it is the safe direction here: a false positive would
+ * make a checkpoint wait forever for a pane that is already idle. `schema.ts` rejects an
+ * unknown name at LOAD time, so reaching this arm means a build/registry mismatch, not a typo.
+ */
+function detectCheckpointWorkingFrame(grammar: { workingFrameProfile: string }, plain: string): boolean {
+  switch (grammar.workingFrameProfile) {
+    case 'codex-checkpoint':
+      return detectCodexCheckpointWorkingFrame(plain);
+    case 'claude-checkpoint':
+      return detectClaudeCheckpointWorkingFrame(plain);
+    default:
+      return false;
+  }
 }
 
 /**
@@ -260,18 +528,6 @@ function getModeLabel(mode: SessionMode): string {
  */
 function cliNeedsVersionProbe(mode: SessionMode): boolean {
   return Object.keys(getCli(mode)?.capabilities.gates ?? {}).length > 0;
-}
-
-/**
- * Does this CLI ask for `COLORTERM=truecolor`?
- *
- * Read off the SAME `env.exports` list that `buildEnvExports()` emits into the tmux
- * session, so the attach client and the pane cannot disagree about colour depth. These
- * used to be two hand-maintained lists of mode names in two files that had to be edited
- * together, with a comment in each asking the next person to remember.
- */
-function cliExportsTruecolor(mode: SessionMode): boolean {
-  return (getCli(mode)?.env.exports ?? []).some((entry) => entry.name === 'COLORTERM' && entry.value === 'truecolor');
 }
 
 /**
@@ -484,6 +740,7 @@ export interface ClaudeMessage {
  * @fires Session#autoCompact - Token threshold reached, compacting context
  */
 export class Session extends EventEmitter {
+  private static readonly codexSubmitTimes = new Map<string, number>();
   readonly id: string;
   readonly workingDir: string;
   readonly createdAt: number;
@@ -505,6 +762,12 @@ export class Session extends EventEmitter {
   private ptyProcess: pty.IPty | null = null;
   private _pid: number | null = null;
   private _status: SessionStatus = 'idle';
+  private _activityProjection: SessionActivityProjection = {
+    activityStatus: 'idle',
+    activityStatusSince: null,
+  };
+  private _terminalActivityEpoch = 0;
+  private _mobileInputTraceOrdinal = 0;
   private _currentTaskId: string | null = null;
 
   // COD-118: bound repeated non-zero interactive-PTY exits. Recorded in the
@@ -513,8 +776,16 @@ export class Session extends EventEmitter {
   // calls resetRespawnBreaker(). Defense-in-depth over the COD-115 crash-loop.
   private readonly _ptyExitBreaker = new InteractivePtyExitBreaker();
   private _respawnBlocked = false;
+  // COD-386: the pane's live `#{pane_current_path}`, refreshed by the server's
+  // sweep. Runtime-only in the same sense as _respawnBlocked — serialized by
+  // toState() but never restored by the constructor.
+  private _cwd?: string;
+  private readonly _terminalBufferMaxSize: number;
+  private readonly _terminalBufferTrimSize: number;
+  /** Creating browser's terminal dims — new tmux windows spawn at this size instead of 120x40 (COD-179) */
+  private readonly _initialDims?: { cols: number; rows: number };
   // Use BufferAccumulator for hot-path buffers to reduce GC pressure
-  private _terminalBuffer = new BufferAccumulator(MAX_TERMINAL_BUFFER_SIZE, TERMINAL_BUFFER_TRIM_SIZE);
+  private _terminalBuffer: BufferAccumulator;
   private _textOutput = new BufferAccumulator(MAX_TEXT_OUTPUT_SIZE, TEXT_OUTPUT_TRIM_SIZE);
   private _errorBuffer: string = '';
   private _lastActivityAt: number;
@@ -524,7 +795,11 @@ export class Session extends EventEmitter {
   // screens' quiet ordering. Idle detection never reads it.
   private _wireActivityAt: number;
   private _wireActivitySettleUntil: number;
+  private readonly _restoredIdleAnchorAt?: number;
   private _claudeSessionId: string | null = null;
+  private _claudeAuthoritativeSessionId: string | null = null;
+  private _claudeSessionIdentityAdopted = false;
+  private _claudeSessionStartHookReady: boolean;
   // Set only when the id came from the CLI's own UserPromptSubmit/Stop hook
   // payload, keyed on this pane's $CODEMAN_SESSION_ID. That binding is a fact,
   // not a correlation: it never consults cwd, so a sibling pane on the same
@@ -558,7 +833,40 @@ export class Session extends EventEmitter {
   private _promptResolved: boolean = false; // Guard against race conditions in runPrompt
   private _isWorking: boolean = false;
   private _lastPromptTime: number = 0;
+  /** Semantic checkpoint prompt generation (not a raw repaint counter). */
+  private _checkpointPromptRevision = 0;
+  private _checkpointWasReady = false;
+  private _checkpointLastObservation: CheckpointObservation = { ready: false, working: false, revision: 0 };
+  private _checkpointReadyFingerprint: string | null = null;
+  private _checkpointCodexConversationId: string | undefined;
+  private _checkpointCodexFreshBaselineId: string | undefined;
+  private _checkpointCodexFreshBaselineIds: string[] = [];
+  private _checkpointCodexFreshTransitionArmed = false;
+  private _findRecentOwnedCodexConversationIds = findRecentOwnedCodexConversationIds;
+  /** Armed only while a delivered `/clear` may reset+return between polls. */
+  private _checkpointAwaitingInstantClear = false;
+  private _checkpointInstantClearBaseline: string | null = null;
+  private _checkpointDirectPtySawClear = false;
   private activityTimeout: NodeJS.Timeout | null = null;
+  private _externalCliIdleTimer: NodeJS.Timeout | null = null;
+  /** Shared rendered-frame poll registration for external-CLI sessions (local AND remote). */
+  private _workingFramePollUnregister: (() => void) | null = null;
+  private _workingFramePollGeneration = 0;
+  private _workingFrameFirstPollCompleted = false;
+  private _workingFrameCapture: {
+    generation: number;
+    mux: TerminalMultiplexer;
+    muxName: string;
+    controller: AbortController;
+    promise: Promise<string | null>;
+  } | null = null;
+  private _externalCliIdleGeneration = 0;
+  /** COD-189 — shell burst tracking (heal live scrollback from capture after big bursts) */
+  private _shellBurstBytes = 0;
+  private _shellBurstRepaints = 0;
+  private _shellBurstWindowStart = 0;
+  private _shellBurstActive = false;
+  private _shellBurstSettleTimer: NodeJS.Timeout | null = null;
   private _awaitingIdleConfirmation: boolean = false; // Prevents timeout reset during idle detection
   private _activityStreak: ActivityStreak | null = null; // Unbroken run of PTY repaints (working detection)
   private _lastPaneProbeAt = 0; // Throttle for the tmux screen probe
@@ -623,6 +931,7 @@ export class Session extends EventEmitter {
   private _trustDialogTimer: NodeJS.Timeout | null = null; // Re-read after a keystroke (see below)
   /** Re-sends Enter while a programmatic prompt still sits in the composer (session-submit-verifier.ts). */
   private _submitVerifier: SubmitVerifier | null = null;
+  private _assistantSubmitVerifier: SubmitVerifier | null = null;
   private _interactiveStartedAt = 0; // When the interactive pane launched (bounds that scan)
   private _taskTracker: TaskTracker;
 
@@ -640,6 +949,11 @@ export class Session extends EventEmitter {
   // manager list, ordered by pinnedAt descending (most-recently-pinned first).
   private _pinned: boolean = false;
   private _pinnedAt: number | null = null;
+
+  // Explicit attachment magic links already emitted from terminal output.
+  private _attachmentMagicSeen = new Set<string>();
+  private _attachmentHistory: SessionAttachmentHistoryItem[] = [];
+  private _sources: SessionSource[] = [];
 
   // Flicker filter setting (per-session toggle, applied on frontend)
   private _flickerFilterEnabled: boolean = false;
@@ -699,10 +1013,6 @@ export class Session extends EventEmitter {
   private _parentAgentId: string | null = null;
   private _childAgentIds: string[] = [];
 
-  // Bounded dedup set for terminal attachment magic-links already requested.
-  private _attachmentMagicSeen = new Set<string>();
-  private _attachmentHistory: SessionAttachmentHistoryItem[] = [];
-
   // Nice prioritying configuration
   private _niceConfig: NiceConfig = { ...DEFAULT_NICE_CONFIG };
 
@@ -719,6 +1029,9 @@ export class Session extends EventEmitter {
   private _codexConfig: CodexConfig | undefined;
   // Gemini configuration (only for mode === 'gemini')
   private _geminiConfig: GeminiConfig | undefined;
+  // Debug capture (CODEMAN_CODEX_RAW_LOG=1): set to true after the first
+  // write failure so we don't spam the server log.
+  private _codexRawLogErrored = false;
   // Antigravity configuration (only for mode === 'antigravity')
   private _antigravityConfig: AntigravityConfig | undefined;
   // Pi configuration (only for mode === 'pi')
@@ -732,15 +1045,32 @@ export class Session extends EventEmitter {
   private _ompConfig: OmpConfig | undefined;
   private _resumeSessionId: string | undefined;
 
+  // Native external-CLI session/rollout id captured at PARK time (COD-124 unit 2,
+  // Gap B; widened to opencode/gemini/agy by COD-251). The CLI-native session/
+  // conversation id discovered from that CLI's own on-disk store at park time
+  // (codex: rollout UUID under ~/.codex/sessions/; opencode: session row in its
+  // sqlite db; gemini: session id from its projects/chats JSONL trees; agy:
+  // conversation id from its history.jsonl), threaded back into the matching
+  // mode-specific config field on resume (see _applyNativeResumeIdForResume())
+  // so relaunching resumes the same conversation. null for claude/shell — no
+  // on-disk resume-by-id mechanism is wired for those.
+  private _nativeResumeId: string | null = null;
+
   // Ephemeral env overrides (e.g., CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS). Exported by tmux
   // at spawn, preserved across respawns via persisted state. Not written to .claude/settings.local.json.
   private _envOverrides: Record<string, string> | undefined;
+  /** Recovery fence: session-scoped provider credentials existed but were never written to disk. */
+  private _codexProviderCredentialsLost = false;
 
   // Claude CLI effort level — injected as a `--settings` soft default at spawn so the
   // user can still switch in-session via /effort (incl. ultracode). Never carried as
   // the CLAUDE_CODE_EFFORT_LEVEL env var, which would hard-lock the session.
   private _effort: EffortLevel | undefined;
 
+  // COLORTERM=truecolor opt-in (COD-75). App-level setting resolved from settings.json
+  // at session creation; threaded into the tmux env exports and the direct-PTY env.
+  // Default off → COLORTERM is unset (avoids tmux→PTY→xterm.js color glitches).
+  private _truecolorEnabled: boolean = false;
   // Claude advisor model (code.claude.com/docs/en/advisor), merged into the same launch
   // `--settings` JSON as ultracode, never the `--advisor` flag (which exits on a refused
   // pairing). A soft default: /advisor still switches or disables it in-session.
@@ -858,16 +1188,34 @@ export class Session extends EventEmitter {
       ompConfig?: OmpConfig;
       /** Resume a previous Claude conversation (used after server reboot) */
       resumeSessionId?: string;
+      /** Native external-CLI session/rollout id captured at park time (COD-124 unit 2, Gap B) */
+      nativeResumeId?: string | null;
       /** Extra env vars exported to the CLI at spawn time (no disk persistence) */
       envOverrides?: Record<string, string>;
+      /** Private, secret-free Codex provider provenance restored from state.json. */
+      codexProviderIdentity?: CodexProviderIdentity | null;
       /** Claude CLI effort level (soft default via --settings, switchable in-session via /effort) */
       effort?: EffortLevel;
+      /** Opt Claude/non-codex sessions into COLORTERM=truecolor (COD-75 app setting; default off). */
+      truecolorEnabled?: boolean;
+      /** Enable Agent Checkpoint for this newly created session (COD-257 app default). */
+      checkpointEnabled?: boolean;
+      /** Restored Claude session can receive authoritative SessionStart identity changes. */
+      claudeSessionStartHookReady?: boolean;
+      /** Last authoritative Claude conversation identity persisted across recovery. */
+      claudeSessionId?: string;
+      /** Whether the persisted Claude identity was authoritatively adopted. */
+      claudeSessionIdentityAdopted?: boolean;
       /** Claude advisor model (soft default via --settings, switchable in-session via /advisor) */
       advisorModel?: string;
-      /** tmux history-limit (scrollback lines) allocated when this session's pane is created. */
-      tmuxHistoryLimit?: number;
       /** Restored per-session attachment history. May include server-private external paths. */
       attachmentHistory?: SessionAttachmentHistoryItem[];
+      /** Restored per-session reference sources (COD-65). */
+      sources?: SessionSource[];
+      /** Per-session terminal buffer limits; applies to this server-side session buffer. */
+      terminalBufferConfig?: { maxBytes: number; trimBytes: number };
+      /** tmux history limit for newly created mux sessions. */
+      tmuxHistoryLimit?: number;
       /** Restored wall-clock ms of the pane's last Enter (see `lastSubmitAt`). */
       lastSubmitAt?: number;
       /** Restored conversation chain, oldest first (see `claudeSessionChain`). */
@@ -884,6 +1232,8 @@ export class Session extends EventEmitter {
       lastActivityAt?: number;
       /** Remote execution metadata for sessions launched through SSH inside local tmux. */
       remote?: SessionRemote;
+      /** Creating browser's terminal dims — new tmux windows spawn at this size instead of 120x40 (COD-179). */
+      initialDims?: { cols: number; rows: number };
       /** Docker execution metadata for sessions launched inside a container via local tmux. */
       docker?: SessionDocker;
       /** Owning username (multi-user mode); undefined in single-user. */
@@ -910,12 +1260,19 @@ export class Session extends EventEmitter {
       config.nameSource ?? (!this._name || isGeneratedSessionName(this._name) ? 'placeholder' : 'manual');
     this._acceptsPrompts = getCli(this.mode)?.capabilities.startMode !== 'shell';
     this._resumeSessionId = config.resumeSessionId;
+    this._nativeResumeId = config.nativeResumeId ?? null;
     // NOW, not `createdAt`: recovery passes the ORIGINAL creation time of a
     // days-old tmux session, and seeding last-activity from it would report a
     // freshly re-attached pane as having been silent for days, which the idle
     // confirmation reads as "already quiet". For a genuinely new session the
     // two are the same instant.
     this._lastActivityAt = Date.now();
+    this._terminalBufferMaxSize = config.terminalBufferConfig?.maxBytes ?? MAX_TERMINAL_BUFFER_SIZE;
+    this._terminalBufferTrimSize = config.terminalBufferConfig?.trimBytes ?? TERMINAL_BUFFER_TRIM_SIZE;
+    this._tmuxHistoryLimit = config.tmuxHistoryLimit ?? DEFAULT_TMUX_HISTORY_LIMIT;
+    this._remote = config.remote;
+    this._initialDims = config.initialDims;
+    this._terminalBuffer = new BufferAccumulator(this._terminalBufferMaxSize, this._terminalBufferTrimSize);
     // The WIRE copy of the stamp is allowed to be older: recovery threads the
     // previous run's value so a restart does not flatten the home screens'
     // most-recently-quiet ordering (every stamp otherwise resets to boot time,
@@ -939,13 +1296,23 @@ export class Session extends EventEmitter {
     // fresh one learns its id only once codex writes the rollout, so it is folded
     // from the other side — see the originator stamping in `gatherUnifiedInputs()`.
     this._claudeSessionId =
-      config.resumeSessionId || config.ompConfig?.resumeSessionId || config.codexConfig?.resumeSessionId || this.id;
+      config.claudeSessionId ??
+      config.resumeSessionId ??
+      config.ompConfig?.resumeSessionId ??
+      config.codexConfig?.resumeSessionId ??
+      this.id;
+    this._claudeAuthoritativeSessionId = config.claudeSessionId ?? config.resumeSessionId ?? null;
+    this._claudeSessionIdentityAdopted = config.claudeSessionIdentityAdopted ?? Boolean(config.resumeSessionId);
+    this._claudeSessionStartHookReady = config.claudeSessionStartHookReady ?? this.mode !== 'claude';
     // Restored from state.json on boot recovery. start() resets _claudeSessionId
     // to the launch id even when re-attaching to a mux session whose CLI has
     // moved on (a `/clear` before the restart), so this anchor is what lets the
     // response viewer re-derive the live conversation without waiting for the
     // user to type again.
     this._lastSubmitAt = config.lastSubmitAt ?? 0;
+    this._restoredIdleAnchorAt = config.lastActivityAt
+      ? Math.max(config.lastActivityAt, config.lastSubmitAt ?? 0)
+      : undefined;
     // Restored chain: its tail is the conversation the CLI was actually on when
     // the server stopped, which outranks the launch id seeded just above. The
     // FIRST-HAND flag is deliberately NOT restored — a persisted claim is not a
@@ -980,11 +1347,17 @@ export class Session extends EventEmitter {
       this._openCodeConfig = config.openCodeConfig;
     }
 
-    // Apply Codex configuration
+    // Apply Codex configuration. COD-392 baseCommand is server-resolved and
+    // private: keep it on the in-memory config so respawn reuses the exact
+    // launch text, but never expose it through toState()/toDetailedState().
     if (config.codexConfig) {
       this._codexConfig = config.codexConfig;
     }
 
+    // Apply Agy configuration
+    if (config.antigravityConfig) {
+      this._antigravityConfig = config.antigravityConfig;
+    }
     // Apply Gemini configuration
     if (config.geminiConfig) {
       this._geminiConfig = config.geminiConfig;
@@ -1018,21 +1391,34 @@ export class Session extends EventEmitter {
     // Legacy migration: pre-0.7.2 carried effort as the CLAUDE_CODE_EFFORT_LEVEL env var,
     // which hard-locks /effort switching. Extract it into _effort (--settings soft default)
     // and never export it as an env var again. Explicit config.effort wins over legacy.
-    if (config.envOverrides && Object.keys(config.envOverrides).length > 0) {
-      const { CLAUDE_CODE_EFFORT_LEVEL: legacyEffort, ...restOverrides } = config.envOverrides;
+    const recoveredCodexHome = config.codexProviderIdentity?.codexHome
+      ? canonicalizeCodexHome(config.codexProviderIdentity.codexHome, config.workingDir)
+      : undefined;
+    const combinedEnvOverrides: Record<string, string> = {
+      ...(recoveredCodexHome ? { CODEX_HOME: recoveredCodexHome } : {}),
+      ...(config.envOverrides ?? {}),
+    };
+    if (Object.keys(combinedEnvOverrides).length > 0) {
+      const { CLAUDE_CODE_EFFORT_LEVEL: legacyEffort, ...restOverrides } = combinedEnvOverrides;
       this._envOverrides = Object.keys(restOverrides).length > 0 ? restOverrides : undefined;
       if (legacyEffort && isEffortLevel(legacyEffort)) {
         this._effort = legacyEffort;
       }
     }
+    this._codexProviderCredentialsLost =
+      this.mode === 'codex' &&
+      (config.codexProviderIdentity === null || config.codexProviderIdentity?.credentialSource === 'session-key') &&
+      !combinedEnvOverrides.OPENAI_API_KEY &&
+      !combinedEnvOverrides.CODEX_API_KEY;
     if (config.effort && isEffortLevel(config.effort)) {
       this._effort = config.effort;
+    }
+    if (config.truecolorEnabled !== undefined) {
+      this._truecolorEnabled = config.truecolorEnabled;
     }
     if (isAdvisorModel(config.advisorModel)) {
       this._advisorModel = config.advisorModel;
     }
-    this._tmuxHistoryLimit = config.tmuxHistoryLimit ?? DEFAULT_TMUX_HISTORY_LIMIT;
-    this._remote = config.remote;
     this._docker = config.docker;
     this._owner = config.owner;
     this._discoveredMuxSession = config.discoveredMuxSession === true;
@@ -1057,6 +1443,9 @@ export class Session extends EventEmitter {
     this._parentSessionId = config.parentSessionId === this.id ? undefined : config.parentSessionId;
     if (config.attachmentHistory && config.attachmentHistory.length > 0) {
       this.restoreAttachmentHistory(config.attachmentHistory);
+    }
+    if (config.sources && config.sources.length > 0) {
+      this.restoreSources(config.sources);
     }
 
     // Initialize task tracker and forward events (store handlers for cleanup)
@@ -1103,7 +1492,22 @@ export class Session extends EventEmitter {
     // Initialize auto-compact/auto-clear automation and forward events
     this._autoOps = new SessionAutoOps({
       writeCommand: (cmd) => this.writeViaMux(cmd),
+      writeCheckpointCommand: (cmd) => this.writeCheckpointViaMux(cmd),
+      getCheckpointObservation: () => this.getCheckpointAutomationObservation(),
+      getCheckpointBackendMode: () => this.mode,
+      getCheckpointCapabilityReason: (mode) => {
+        if (mode === 'compact') return undefined;
+        if (this.mode === 'codex' && this._remote) return 'remote-identity-unavailable';
+        if (this.mode === 'claude' && !this._claudeSessionStartHookReady) {
+          return 'session-start-hook-unavailable';
+        }
+        if (this.mode === 'claude' && !this._claudeSessionIdentityAdopted) {
+          return 'baseline-identity-unavailable';
+        }
+        return undefined;
+      },
       isWorking: () => this._isWorking,
+      isIdleAutomationBlocked: () => this.blocksIdleAutomation,
       isStopped: () => this._isStopped,
       getTotalTokens: () => this._totalInputTokens + this._totalOutputTokens,
       getSessionId: () => this.id,
@@ -1115,9 +1519,27 @@ export class Session extends EventEmitter {
       this._totalOutputTokens = 0;
       this.emit('autoClear', data);
     });
+    this._autoOps.on('checkpointStart', (data) => this.emit('checkpointStart', data));
+    this._autoOps.on('checkpointDone', (data) => this.emit('checkpointDone', data));
+    this._autoOps.on('checkpointProgress', (data: CheckpointProgress) => {
+      if (data.phase === 'failed' || data.phase === 'aborted' || data.phase === 'done') {
+        this._checkpointAwaitingInstantClear = false;
+        this._checkpointInstantClearBaseline = null;
+        this._checkpointDirectPtySawClear = false;
+        this._checkpointCodexFreshBaselineId = undefined;
+        this._checkpointCodexFreshBaselineIds = [];
+        this._checkpointCodexFreshTransitionArmed = false;
+      }
+      this.emit('checkpointProgress', data);
+    });
     this._autoOps.on('limitPauseScheduled', (data) => this.emit('limitPauseScheduled', data));
     this._autoOps.on('limitResume', (data) => this.emit('limitResume', data));
     this._autoOps.on('limitResumeCancelled', (data) => this.emit('limitResumeCancelled', data));
+    if (typeof config.checkpointEnabled === 'boolean') {
+      this._autoOps.setCheckpoint(config.checkpointEnabled);
+    }
+    this._autoOps.restoreCheckpointStates(config.checkpointRuns as Record<string, CheckpointState> | undefined);
+    this._autoOps.restoreCheckpointState(config.checkpointState);
   }
 
   get status(): SessionStatus {
@@ -1150,6 +1572,11 @@ export class Session extends EventEmitter {
 
   get lastActivityAt(): number {
     return this._wireActivityAt;
+  }
+
+  /** Recovery-only lower bound for when a persisted raw-idle episode could begin. */
+  get restoredIdleAnchorAt(): number | undefined {
+    return this._status === 'idle' ? this._restoredIdleAnchorAt : undefined;
   }
 
   /**
@@ -1237,8 +1664,10 @@ export class Session extends EventEmitter {
     this._owner = username;
   }
 
-  // Adopt a Claude conversation ID observed from an external source (e.g. hook
-  // payload). In interactive PTY mode Claude CLI emits no JSON to stdout, so
+  // Update Claude's best-effort viewer identity. This does not establish the
+  // authoritative checkpoint baseline; only SessionStart may do that.
+  //
+  // In interactive PTY mode Claude CLI emits no JSON to stdout, so
   // `_handleJsonMessage` never sees `session_id`; hooks are the only signal
   // that conveys a post-/clear conversation switch.
   //
@@ -1259,6 +1688,20 @@ export class Session extends EventEmitter {
     // rather than show the previous conversation's "warm until" against the new one; the
     // next statusline render repopulates. A same-id reattach returned above, untouched.
     this._promptCache = null;
+  }
+
+  /**
+   * Adopt the authoritative identity delivered by Claude's SessionStart hook.
+   *
+   * SessionStart is delivered to this pane on its own $CODEMAN_SESSION_ID, so it
+   * is first-hand by construction and extends the conversation chain.
+   */
+  adoptClaudeSessionStartId(newId: string): void {
+    if (!newId) return;
+    this._claudeSessionStartHookReady = true;
+    this._claudeSessionIdentityAdopted = true;
+    this._claudeAuthoritativeSessionId = newId;
+    this.adoptClaudeSessionId(newId, { firstHand: true });
   }
 
   /**
@@ -1417,6 +1860,46 @@ export class Session extends EventEmitter {
 
   get isWorking(): boolean {
     return this._isWorking;
+  }
+
+  /** Agent activity or uncertainty must not be mistaken for autonomous availability. */
+  get blocksIdleAutomation(): boolean {
+    return (
+      this._activityProjection.activityStatus === 'waiting_agents' ||
+      this._activityProjection.activityStatus === 'checking_agents'
+    );
+  }
+
+  /** Raw idle plus a fail-safe server activity projection. */
+  isAutonomouslyIdle(): boolean {
+    return this.isIdle() && !this.blocksIdleAutomation;
+  }
+
+  /** Current server-derived activity. This projection is never persisted by toState(). */
+  get activityProjection(): SessionActivityProjection {
+    return { ...this._activityProjection };
+  }
+
+  /** Monotonic invalidation token for decisions based on terminal quiescence. */
+  get terminalActivityEpoch(): number {
+    return this._terminalActivityEpoch;
+  }
+
+  setActivityProjection(projection: SessionActivityProjection, options: { reconstructEpisode?: boolean } = {}): void {
+    const isAgentActivity =
+      projection.activityStatus === 'waiting_agents' || projection.activityStatus === 'checking_agents';
+    const wasAgentActivity =
+      this._activityProjection.activityStatus === 'waiting_agents' ||
+      this._activityProjection.activityStatus === 'checking_agents';
+    this._activityProjection = {
+      ...projection,
+      activityStatusSince:
+        isAgentActivity && wasAgentActivity && !options.reconstructEpisode
+          ? this._activityProjection.activityStatusSince
+          : isAgentActivity
+            ? projection.activityStatusSince
+            : null,
+    };
   }
 
   /**
@@ -1601,6 +2084,97 @@ export class Session extends EventEmitter {
     return this._codexConfig;
   }
 
+  /** OpenCode CLI configuration for this session. */
+  get openCodeConfig(): OpenCodeConfig | undefined {
+    return this._openCodeConfig;
+  }
+
+  /** Gemini CLI configuration for this session. */
+  get geminiConfig(): GeminiConfig | undefined {
+    return this._geminiConfig;
+  }
+
+  /**
+   * Native external-CLI session/conversation id captured at park time
+   * (COD-124 unit 2, Gap B; widened to opencode/gemini/agy by COD-251) — see
+   * {@link setNativeResumeId} and {@link _applyNativeResumeIdForResume}.
+   */
+  get nativeResumeId(): string | null {
+    return this._nativeResumeId;
+  }
+
+  /**
+   * Record the native CLI session/conversation id discovered at park time.
+   * Called by the park route after locating the on-disk session record for
+   * codex/opencode/gemini/agy sessions; left null for CLIs with no analogous
+   * on-disk resume mechanism (claude/shell).
+   */
+  setNativeResumeId(id: string | null): void {
+    this._nativeResumeId = id;
+  }
+
+  /**
+   * If a native resume id was captured at a previous park and the CLI mode
+   * supports resuming by id (codex via `codex resume <id>`, opencode via
+   * `--session <id>`, gemini via `--resume <id>`, agy via `--conversation
+   * <id>` — see the matching builders in tmux-manager.ts), merge it into the
+   * mode-specific launch config so the upcoming relaunch resumes the original
+   * conversation instead of starting fresh. A no-op for modes without a wired
+   * resume mechanism (claude/shell).
+   *
+   * Only fills in the id when the config doesn't already carry an explicit
+   * resume target, so an explicit caller-supplied resume id always wins.
+   */
+  private _applyNativeResumeIdForResume(): void {
+    if (!this._nativeResumeId) return;
+    // WHERE the id goes is registry data (`legacyConfigField` + the `resumeId` alias), so the
+    // four-way chain this replaces was a second copy of pairs already declared per entry.
+    const slot = legacyResumeSlot(this.mode);
+    if (!slot) return; // claude/shell: no <Mode>Config object, so nothing to merge into.
+    const current = this._legacyConfigSlot(slot.field);
+    if (!current) return;
+    const existing = current.read();
+    // An explicit caller-supplied resume target always outranks an opportunistically
+    // captured one — the `??` the original chain repeated four times.
+    if (existing?.[slot.key] !== undefined && existing[slot.key] !== null) return;
+    current.write({ ...existing, [slot.key]: this._nativeResumeId });
+  }
+
+  /**
+   * Read/write access to this session's `<Mode>Config` slots, addressed by the registry's own
+   * `legacyConfigField` name.
+   *
+   * These are eight separately-typed private fields, so something has to map a field NAME to
+   * one — but that is a property of this class's storage, not a per-CLI behaviour decision:
+   * the registry still chooses which slot and which key. Anything not listed (claude, shell)
+   * has no config object and returns undefined.
+   */
+  private _legacyConfigSlot(
+    field: string
+  ): { read: () => Record<string, unknown> | undefined; write: (v: Record<string, unknown>) => void } | undefined {
+    const slots: Record<string, { read: () => object | undefined; write: (v: never) => void }> = {
+      openCodeConfig: { read: () => this._openCodeConfig, write: (v) => (this._openCodeConfig = v) },
+      codexConfig: { read: () => this._codexConfig, write: (v) => (this._codexConfig = v) },
+      geminiConfig: { read: () => this._geminiConfig, write: (v) => (this._geminiConfig = v) },
+      antigravityConfig: { read: () => this._antigravityConfig, write: (v) => (this._antigravityConfig = v) },
+      piConfig: { read: () => this._piConfig, write: (v) => (this._piConfig = v) },
+      grokConfig: { read: () => this._grokConfig, write: (v) => (this._grokConfig = v) },
+      deepSeekConfig: { read: () => this._deepSeekConfig, write: (v) => (this._deepSeekConfig = v) },
+      ompConfig: { read: () => this._ompConfig, write: (v) => (this._ompConfig = v) },
+    };
+    const slot = slots[field];
+    if (!slot) return undefined;
+    return {
+      read: () => slot.read() as Record<string, unknown> | undefined,
+      write: (v) => slot.write(v as never),
+    };
+  }
+
+  /** Agy CLI configuration for this session. */
+  get antigravityConfig(): AntigravityConfig | undefined {
+    return this._antigravityConfig;
+  }
+
   // Note: _buildPermissionArgs removed — now using buildInteractiveArgs from session-cli-builder.ts
 
   /**
@@ -1745,6 +2319,16 @@ export class Session extends EventEmitter {
     return this._name;
   }
 
+  /** COD-102: whether this session was routed through Headroom at spawn. */
+  get headroomRouted(): boolean | undefined {
+    return this._muxSession?.headroomRouted;
+  }
+
+  /** COD-254: when the Headroom launch/respawn routing snapshot was recorded. */
+  get headroomRoutedAt(): number | undefined {
+    return this._muxSession?.headroomRoutedAt;
+  }
+
   /** An explicit rename: the name is the user's from here on and auto-naming never touches it. */
   set name(value: string) {
     this._name = value;
@@ -1803,6 +2387,230 @@ export class Session extends EventEmitter {
 
   setAutoCompact(enabled: boolean, threshold?: number, prompt?: string): void {
     this._autoOps.setAutoCompact(enabled, threshold, prompt);
+  }
+
+  get checkpointEnabled(): boolean {
+    return this._autoOps.checkpointEnabled;
+  }
+
+  /** The mode a bare checkpoint runs (compact-preferred); legacy compat field. */
+  get checkpointMode(): SessionCheckpointMode {
+    return this._autoOps.checkpointMode;
+  }
+
+  /** Modes the agent is allowed to invoke at checkpoint signal time. */
+  get checkpointModes(): SessionCheckpointMode[] {
+    return this._autoOps.checkpointModes;
+  }
+
+  /** Durable last-known checkpoint lifecycle record. */
+  get checkpointState(): CheckpointState | undefined {
+    return this._autoOps.checkpointState;
+  }
+
+  /** Whether an agent-initiated checkpoint handoff is currently active. */
+  get isCheckpointActive(): boolean {
+    return this._autoOps.isCheckpointActive;
+  }
+
+  get checkpointStates(): Record<string, CheckpointState> {
+    return this._autoOps.checkpointStates;
+  }
+
+  /** Enable/disable agent-initiated checkpoints; optionally set allowed modes. */
+  setCheckpoint(enabled: boolean, modes?: SessionCheckpointMode[]): void {
+    this._autoOps.setCheckpoint(enabled, modes);
+  }
+
+  /** Restore persisted checkpoint enable/allowed-modes after a Codeman restart. */
+  restoreCheckpoint(enabled: boolean, modes?: SessionCheckpointMode[]): void {
+    this._autoOps.restoreCheckpoint(enabled, modes);
+  }
+
+  /** Agent signal: run the checkpoint op, then continue once it completes. */
+  requestCheckpoint(opts?: { mode?: CheckpointMode; continuePrompt?: string }): {
+    triggered: boolean;
+    runId?: string;
+    reason?: string;
+  } {
+    return this._autoOps.requestCheckpoint(opts);
+  }
+
+  /** Cancel checkpoint automation before accepting user-originated terminal input. */
+  cancelCheckpoint(reason = 'manual-takeover'): void {
+    this._autoOps.cancelCheckpoint(reason);
+  }
+
+  private async getCheckpointAutomationObservation(): Promise<CheckpointObservation> {
+    const terminal = this.getCheckpointObservation();
+    if (this.mode === 'claude') {
+      return {
+        ...terminal,
+        conversationId: this._claudeSessionIdentityAdopted
+          ? (this._claudeAuthoritativeSessionId ?? undefined)
+          : undefined,
+      };
+    }
+    if (this.mode === 'codex') {
+      const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME || '/tmp', '.codex');
+      const conversationId = this._checkpointCodexFreshTransitionArmed
+        ? (
+            await findAuthoritativeCodexConversation({
+              codexHome,
+              sessionId: this.id,
+              baselineId: this._checkpointCodexFreshBaselineId,
+              baselineIds: this._checkpointCodexFreshBaselineIds,
+            })
+          )?.id
+        : (
+            await findActiveCodexConversation({
+              codexHome,
+              sessionId: this.id,
+              workingDir: this.workingDir,
+              resumeSessionId: this._codexConfig?.resumeSessionId,
+              lastSubmitAt: this._lastSubmitAt,
+              competingSubmitAts: [...Session.codexSubmitTimes.entries()]
+                .filter(([sessionId]) => sessionId !== this.id)
+                .map(([, submittedAt]) => submittedAt),
+            })
+          )?.id;
+      if (conversationId) {
+        this._checkpointCodexConversationId = conversationId;
+        if (this._checkpointCodexFreshTransitionArmed) invalidateCodexConversationInventory(codexHome);
+      }
+      return { ...terminal, conversationId };
+    }
+    return terminal;
+  }
+
+  /**
+   * Return positive, mode-aware terminal evidence for checkpoint sequencing.
+   * A semantic revision advances only after an observed ready prompt is left
+   * and a ready prompt later returns; repainting the same prompt is stable.
+   */
+  getCheckpointObservation(): CheckpointObservation {
+    // COD-416: which glyph means "ready" and which frame means "working" is registry DATA
+    // (`capabilities.checkpoint`), read once here. ABSENT is meaningful — see the type.
+    const checkpointGrammar = getCli(this.mode)?.capabilities.checkpoint;
+    const muxName = this._muxSession?.muxName;
+    const rendered = muxName ? this._mux?.captureActivePaneBuffer?.(muxName) : null;
+    if (muxName && !rendered) {
+      // A failed/empty capture is absence of evidence, not evidence that the
+      // prompt disappeared. Preserve the last semantic state so a capture
+      // blip cannot fabricate an accepted/completed operation cycle.
+      if (!this._isWorking) return { ...this._checkpointLastObservation };
+      this._checkpointWasReady = false;
+      this._checkpointLastObservation = {
+        ready: false,
+        working: true,
+        revision: this._checkpointPromptRevision,
+      };
+      return { ...this._checkpointLastObservation };
+    }
+    let working = this._isWorking;
+    let ready = false;
+
+    if (rendered) {
+      // formatPaneSnapshot paints rows with absolute cursor moves and no EOLs.
+      // Restore row boundaries before the generic ANSI strip so `›`/`❯` and
+      // working evidence retain their line semantics. This is not Codex-only:
+      // the prompt checks below are `^`-anchored, so an unrestored frame is a
+      // single line and the prompt is never visible — which stalls every
+      // checkpoint mode in `waiting-ready` until `readiness-timeout`.
+      const checkpointFrame = rendered.replace(TMUX_ABSOLUTE_ROW_START_PATTERN, '\n');
+      const plain = checkpointFrame.replace(ANSI_ESCAPE_PATTERN_FULL, '');
+      const renderedWorking = checkpointGrammar ? detectCheckpointWorkingFrame(checkpointGrammar, plain) : false;
+      working = working || renderedWorking;
+      const promptVisible = checkpointGrammar
+        ? checkpointPromptPattern(checkpointGrammar.promptGlyph).test(plain)
+        : false;
+      ready = promptVisible && !working;
+      if (ready) {
+        const fingerprint = this._checkpointSemanticFrameFingerprint(plain);
+        if (this._checkpointAwaitingInstantClear && this._checkpointWasReady) {
+          if (this._isCheckpointClearRejection(plain)) {
+            this._checkpointAwaitingInstantClear = false;
+            this._checkpointInstantClearBaseline = null;
+          } else if (this._isConfirmedInstantClearReplacement(fingerprint)) {
+            this._checkpointPromptRevision++;
+            this._checkpointAwaitingInstantClear = false;
+            this._checkpointInstantClearBaseline = null;
+          }
+        }
+        this._checkpointReadyFingerprint = fingerprint;
+      }
+    } else if (checkpointGrammar?.directPtyPromptTransition) {
+      // Direct-PTY fallback uses the existing positively recorded prompt
+      // transition; initial `idle` alone is not sufficient evidence.
+      ready = this._lastPromptTime > 0 && this._status === 'idle' && !working;
+    } else if (!checkpointGrammar) {
+      // Preserve legacy behavior for modes without verified prompt syntax. ⚠️ A CLI that
+      // DECLARES a grammar but has no frame lands in neither arm and stays not-ready, which
+      // is the point: it has a prompt we know how to see, and we did not see it.
+      ready = !working;
+    }
+
+    if (ready && !this._checkpointWasReady) {
+      this._checkpointPromptRevision++;
+      this._checkpointAwaitingInstantClear = false;
+      this._checkpointInstantClearBaseline = null;
+    }
+    this._checkpointWasReady = ready;
+    this._checkpointLastObservation = { ready, working, revision: this._checkpointPromptRevision };
+    return { ...this._checkpointLastObservation };
+  }
+
+  /**
+   * Normalize a ready frame to its semantic body. Prompt/status-only redraws
+   * remain stable, while `/clear` replacing the visible conversation/banner
+   * produces a new generation even if leave+return happened between polls.
+   */
+  private _checkpointSemanticFrameFingerprint(plain: string): string {
+    return plain
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .filter((line) => !/^[›❯](?:\s|$)/.test(line))
+      .filter((line) => !/^(?:gpt-|codex\b|o\d\b).*\s·\s/i.test(line))
+      .filter((line) => !/\b(?:context left|bypass permissions)\b/i.test(line))
+      .join('\n');
+  }
+
+  private _isCheckpointClearRejection(text: string): boolean {
+    return /(?:\b(?:error|unknown command|unrecognized command|invalid command|not found|unsupported)\b[^\n]*\/clear|\/clear[^\n]*\b(?:error|unknown|unrecognized|invalid|not found|unsupported)\b)/i.test(
+      text
+    );
+  }
+
+  private _isConfirmedInstantClearReplacement(current: string): boolean {
+    const baseline = this._checkpointInstantClearBaseline;
+    if (!baseline || !current || current === baseline) return false;
+    const previousLines = baseline.split('\n').filter(Boolean);
+    const currentLines = new Set(current.split('\n').filter(Boolean));
+    // Appended errors, notices, or unrelated rows retain the entire prior
+    // semantic frame. A successful clear must remove/replace prior content.
+    return previousLines.some((line) => !currentLines.has(line));
+  }
+
+  private _noteDirectPtyCheckpointGeneration(data: string): void {
+    if (!this._checkpointAwaitingInstantClear || this.mode !== 'claude' || this._muxSession) return;
+    if (this._isCheckpointClearRejection(data)) {
+      this._checkpointAwaitingInstantClear = false;
+      this._checkpointInstantClearBaseline = null;
+      this._checkpointDirectPtySawClear = false;
+      return;
+    }
+    const sawClearScreen =
+      data.includes('\u001b[J') || data.includes('\u001b[2J') || data.includes('\u001b[3J') || data.includes('\u000c');
+    if (sawClearScreen) {
+      this._checkpointDirectPtySawClear = true;
+    }
+    if (this._checkpointDirectPtySawClear && data.includes('❯')) {
+      this._checkpointPromptRevision++;
+      this._checkpointAwaitingInstantClear = false;
+      this._checkpointInstantClearBaseline = null;
+      this._checkpointDirectPtySawClear = false;
+    }
   }
 
   get autoResumeEnabled(): boolean {
@@ -1907,6 +2715,19 @@ export class Session extends EventEmitter {
     this._attachmentHistory = upsertAttachmentHistoryList(this._attachmentHistory, item);
   }
 
+  /**
+   * Drop attachment-history entries matching `predicate` (COD-241 unit 3).
+   * Used by DELETE …/attachments/uploaded so a removed Codeman-uploaded copy
+   * stops appearing in the paperclip drawer. Returns the number of entries
+   * removed. Operates on the raw (externalPath-bearing) list so callers can
+   * match by absolute path.
+   */
+  removeAttachmentHistory(predicate: (item: SessionAttachmentHistoryItem) => boolean): number {
+    const before = this._attachmentHistory.length;
+    this._attachmentHistory = this._attachmentHistory.filter((item) => !predicate(item));
+    return before - this._attachmentHistory.length;
+  }
+
   restoreAttachmentHistory(history: SessionAttachmentHistoryItem[] | undefined): void {
     this._attachmentHistory = [];
     for (const item of [...(history ?? [])].reverse()) {
@@ -1923,12 +2744,42 @@ export class Session extends EventEmitter {
     return this._attachmentHistory.length > 0 ? this._attachmentHistory.map((item) => ({ ...item })) : undefined;
   }
 
+  // ── Sources (COD-65) ──────────────────────────────────────────────────────
+
+  get sources(): SessionSource[] {
+    return [...this._sources];
+  }
+
+  addSource(item: SessionSource): void {
+    const idx = this._sources.findIndex((s) => s.id === item.id);
+    if (idx >= 0) {
+      this._sources[idx] = { ...item };
+    } else {
+      this._sources.push({ ...item });
+    }
+  }
+
+  removeSource(id: string): void {
+    this._sources = this._sources.filter((s) => s.id !== id);
+  }
+
+  restoreSources(data: SessionSource[] | undefined): void {
+    this._sources = data ? data.map((s) => ({ ...s })) : [];
+  }
+
+  getSourcesForPersist(): SessionSource[] | undefined {
+    return this._sources.length > 0 ? this._sources.map((s) => ({ ...s })) : undefined;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+
   toState(): SessionState {
     return {
       id: this.id,
       pid: this.pid,
       status: this._status,
       workingDir: this.workingDir,
+      cwd: this._cwd,
       remote: this._remote,
       docker: this._docker,
       owner: this._owner,
@@ -1946,6 +2797,15 @@ export class Session extends EventEmitter {
       autoCompactEnabled: this._autoOps.autoCompactEnabled,
       autoCompactThreshold: this._autoOps.autoCompactThreshold,
       autoCompactPrompt: this._autoOps.autoCompactPrompt,
+      checkpointEnabled: this._autoOps.checkpointEnabled,
+      checkpointMode: this._autoOps.checkpointMode,
+      checkpointModes: this._autoOps.checkpointModes,
+      checkpoint: this._autoOps.checkpointState,
+      checkpointRuns: this._autoOps.checkpointStates,
+      claudeSessionId: this._claudeSessionIdentityAdopted
+        ? (this._claudeAuthoritativeSessionId ?? undefined)
+        : undefined,
+      claudeSessionIdentityAdopted: this._claudeSessionIdentityAdopted,
       autoResumeEnabled: this._autoOps.autoResumeEnabled,
       autoResumeAt: this._autoOps.autoResumeAt ?? undefined,
       promptCache: this._promptCache ?? undefined,
@@ -1971,7 +2831,9 @@ export class Session extends EventEmitter {
       cliAccountType: this._cliAccountType || undefined,
       cliLatestVersion: this._cliLatestVersion || undefined,
       openCodeConfig: this._openCodeConfig,
-      codexConfig: this._codexConfig,
+      codexConfig: this._codexConfig
+        ? (({ baseCommand: _baseCommand, ...publicCodexConfig }) => publicCodexConfig)(this._codexConfig)
+        : undefined,
       geminiConfig: this._geminiConfig,
       antigravityConfig: this._antigravityConfig,
       piConfig: this._piConfig,
@@ -1979,6 +2841,7 @@ export class Session extends EventEmitter {
       deepSeekConfig: this._deepSeekConfig,
       ompConfig: this._ompConfig,
       resumeSessionId: this._resumeSessionId,
+      nativeResumeId: this._nativeResumeId,
       effort: this._effort,
       // Claude only: for any other CLI `_model` is inert (its model lives in its own config
       // object) and may be the app-wide Claude default cron handed it.
@@ -1996,6 +2859,7 @@ export class Session extends EventEmitter {
       // through the same persist. `status` and `pid` above stay untouched by it.
       paneExit: this._paneExit ?? undefined,
       attachmentHistory: this.attachmentHistory.length > 0 ? this.attachmentHistory : undefined,
+      sources: this.getSourcesForPersist(),
       lastSubmitAt: this._lastSubmitAt || undefined,
       // Only a chain the CLI's own hooks vouched for is persisted, and only when
       // the pane actually moved conversation. Its LAST entry is the live one, so
@@ -2028,6 +2892,57 @@ export class Session extends EventEmitter {
     return Object.keys(safe).length > 0 ? safe : undefined;
   }
 
+  /**
+   * Closed, runtime-only provider identity for an isolated Codex subprocess.
+   * Exact keys only: arbitrary session overrides must never cross this seam.
+   */
+  getCodexProviderEnvironment(): CodexProviderEnvironment {
+    const environment: CodexProviderEnvironment = {};
+    if (!this._envOverrides) return environment;
+    for (const key of ['CODEX_HOME', 'OPENAI_API_KEY', 'CODEX_API_KEY'] as const) {
+      const value = this._envOverrides[key];
+      if (value) environment[key] = value;
+    }
+    return environment;
+  }
+
+  /** CODEX_HOME only; safe for comparing another session's rollout namespace. */
+  getCodexHomeOverride(): string | undefined {
+    return this._envOverrides?.CODEX_HOME || undefined;
+  }
+
+  /** Whether recovery lost a session-scoped API credential that cannot safely fall back. */
+  hasLostCodexProviderCredentials(): boolean {
+    return this._codexProviderCredentialsLost;
+  }
+
+  /** Secret-free, disk-only identity record. Never include this in SessionState serializers. */
+  getCodexProviderIdentityForPersist(): CodexProviderIdentity | undefined {
+    if (this.mode !== 'codex') return undefined;
+    const rawCodexHome = this.getCodexHomeOverride();
+    const codexHome = rawCodexHome ? canonicalizeCodexHome(rawCodexHome, this.workingDir) : undefined;
+    const hasSessionKey =
+      this._codexProviderCredentialsLost ||
+      Boolean(this._envOverrides?.OPENAI_API_KEY) ||
+      Boolean(this._envOverrides?.CODEX_API_KEY);
+    return {
+      version: 1,
+      credentialSource: hasSessionKey ? 'session-key' : 'restorable',
+      ...(codexHome ? { codexHome } : {}),
+    };
+  }
+
+  /**
+   * Server-only resolved Codex launch command for disk persistence. Never
+   * include this in SessionState serializers or API responses; it can carry
+   * an arbitrary owner-authored command line.
+   */
+  getResolvedCodexCommandForPersist(): string | undefined {
+    if (this.mode !== 'codex') return undefined;
+    const command = this._codexConfig?.baseCommand?.trim();
+    return command ? command : undefined;
+  }
+
   toDetailedState() {
     return {
       ...this.toLightDetailedState(),
@@ -2057,7 +2972,7 @@ export class Session extends EventEmitter {
         terminalBufferSize: this._terminalBuffer.length,
         textOutputSize: this._textOutput.length,
         messageCount: this._messages.length,
-        maxTerminalBuffer: MAX_TERMINAL_BUFFER_SIZE,
+        maxTerminalBuffer: this._terminalBufferMaxSize,
         maxTextOutput: MAX_TEXT_OUTPUT_SIZE,
         maxMessages: MAX_MESSAGES,
       },
@@ -2135,7 +3050,7 @@ export class Session extends EventEmitter {
     let needsNewSession = false;
     let respawnedDeadPane = false;
     let respawnedResumeId: string | undefined;
-    if (this._muxSession && mux.isPaneDead(this._muxSession.muxName)) {
+    if (this._muxSession && (await mux.isPaneDead(this._muxSession.muxName))) {
       console.log('[Session] Dead pane detected, respawning:', this._muxSession.muxName);
       // Confirmed dead — safe to resolve/pin now (see `_pinOmpRespawnId()`).
       // `options.respawnPaneOptions` was built eagerly before this dead-pane
@@ -2218,11 +3133,10 @@ export class Session extends EventEmitter {
           cols: ptyCols,
           rows: ptyRows,
           cwd: resolveMuxAttachCwd(this.workingDir, this._remote, this._docker),
-          // COD-75: a CLI that declares `export COLORTERM=truecolor` gets it on the ATTACH
-          // client too. Both sides read the same registry entry, which is what stops the
-          // attach client and the tmux session from disagreeing — they used to be two
-          // hand-maintained lists of mode names that had to be edited in lockstep.
-          env: buildMuxAttachEnv(cliExportsTruecolor(this.mode)),
+          // Truecolor is settings-driven here (COD-75 upstream hardcodes it per-mode
+          // for codex/gemini/antigravity/pi); buildEnvExports() in tmux-manager.ts
+          // reads the same flag so the attach client and the tmux session agree.
+          env: buildMuxAttachEnv(this._truecolorEnabled),
         })
       );
       this._notePtySpawnGeometry(ptyCols, ptyRows);
@@ -2257,15 +3171,23 @@ export class Session extends EventEmitter {
 
     // If tmux lost the whole session (not just a dead pane), there is nothing to
     // respawn into — a genuine death, leave it for normal recovery/reconcile.
-    if (!mux.muxSessionExists(this._muxSession.muxName)) {
+    if (!(await mux.muxSessionExists(this._muxSession.muxName))) {
       console.log('[Session] reattachRemote: mux session gone, skipping:', this._muxSession.muxName);
       return false;
     }
 
+    this._stopWorkingFramePoller();
     // Confirmed the mux session (and thus the pane) exists but this reattach
     // is about to respawn it — safe to resolve/pin now.
     this._pinOmpRespawnId();
-    const newPid = await mux.respawnPane(this._buildRespawnPaneOptions());
+    const options = this._buildRespawnPaneOptions();
+    // A liveness probe can race a worker reboot. Transport recovery must only
+    // attach; it must never create a replacement session on a stale answer.
+    options.remote = {
+      ...this._remote,
+      remoteSessionName: this._remote.remoteSessionName ?? `codeman-ssh-${this.id.slice(0, 8)}`,
+    };
+    const newPid = await mux.respawnPane(options);
     if (!newPid) {
       console.error('[Session] reattachRemote: respawnPane failed for', this._muxSession.muxName);
       return false;
@@ -2274,7 +3196,31 @@ export class Session extends EventEmitter {
     // mux layer's cache is keyed by muxName and this pane now runs a new client.
     this.clearPaneExitForNewPane();
     console.log('[Session] reattachRemote: reattached remote session', this._muxSession.muxName, 'pid', newPid);
+    if (isExternalCliMode(this.mode)) this._startWorkingFramePoller();
     return true;
+  }
+
+  /** COD-486: restart only a pinned conversation after a proven worker reboot. */
+  async resumeRemoteAfterWorkerReboot(): Promise<boolean> {
+    if (this._closing || this._isStopped || this.paneLifecycleInFlight) return false;
+    return this._withPaneLifecycle(async () => {
+      if (!this._remote || !this._useMux || !this._mux || !this._muxSession) return false;
+      const respawn = this._buildRespawnPaneOptions();
+      respawn.resumeSessionId = this._claudeSessionChain.at(-1) ?? this._claudeSessionId ?? respawn.resumeSessionId;
+      const options = workerResumeOptions(respawn, this._nativeResumeId);
+      if (!options || !(await this._mux.muxSessionExists(this._muxSession.muxName))) return false;
+      if (this._closing || this._isStopped) return false;
+      this._stopWorkingFramePoller();
+      const pid = await this._mux.respawnPane(options);
+      if (!pid || this._closing || this._isStopped) return false;
+      const observed = await probeRemoteWorker(this._remote, `codeman-ssh-${this.id.slice(0, 8)}`);
+      // A living SSH wrapper can be attached to a retained FAILED remote pane.
+      // Require the remote agent itself to be running before reporting recovery.
+      if (!observed?.agentRunning || this._closing || this._isStopped) return false;
+      this.clearPaneExitForNewPane();
+      if (isExternalCliMode(this.mode)) this._startWorkingFramePoller();
+      return true;
+    });
   }
 
   /**
@@ -2363,6 +3309,7 @@ export class Session extends EventEmitter {
       envOverrides: this._envOverrides,
       unsetEnvKeys: this._pendingEnvUnsets.size > 0 ? [...this._pendingEnvUnsets] : undefined,
       effort: this._effort,
+      truecolorEnabled: this._truecolorEnabled,
       advisorModel: this._advisorModel,
       historyLimit: this._tmuxHistoryLimit,
       remote: this._remote,
@@ -2471,6 +3418,10 @@ export class Session extends EventEmitter {
   }
 
   /** The session's Claude config dir when it has been relocated (#255), else undefined. */
+  getClaudeConfigDirOverride(): string | undefined {
+    return this._claudeConfigDir();
+  }
+
   private _claudeConfigDir(): string | undefined {
     // Trimmed like `claudeProjectsDir()` trims the process-wide override: the
     // envOverrides schema validates keys only, and a whitespace-only value would
@@ -2595,7 +3546,16 @@ export class Session extends EventEmitter {
     this.emit('mouseTrackingChanged', active);
   }
 
-  private _handleTerminalOutput(data: string): void {
+  private _handleTerminalOutput(data: string, recordTrace?: SessionMobileInputTraceRecorder): void {
+    recordTrace?.('server.output.handler-enter', data);
+    // Invalidate idle decisions for every raw PTY chunk, including bytes held
+    // back by the sanitizer while it waits for the rest of an incomplete CSI.
+    this._terminalActivityEpoch++;
+    this.emit('terminalActivity');
+    // COD-189: shell burst tracking runs on the SHARED output path — shell
+    // sessions have their own onData handlers and never pass through the
+    // interactive-session hooks.
+    if (this.mode === 'shell') this._trackShellBurst(data);
     // Codex AND Claude Code emit sequences that wipe xterm.js scrollback, plus
     // mouse-tracking enables that hijack the scroll wheel so the user can't reach
     // scrollback. Claude Code does this intermittently (e.g. full-screen pickers /
@@ -2632,6 +3592,30 @@ export class Session extends EventEmitter {
     const mouseStrip = isMuxMouseStripMode(this.mode, this._useMux);
     const altOnlyStrip = !fullStrip && !mouseStrip && isMuxAltScreenOnlyStripMode(this.mode, this._useMux);
     if (fullStrip || mouseStrip || altOnlyStrip) {
+      // Debug capture (codex only): when CODEMAN_CODEX_RAW_LOG=1, write the raw
+      // codex PTY output (pre-strip) to a per-session log file. Used to diagnose
+      // the stacked-status-bar / ghost-row rendering issues by inspecting the
+      // actual CUP / erase sequences codex emits. Disabled by default — set
+      // CODEMAN_CODEX_RAW_LOG=1 in the codeman server env to turn it on.
+      if (this.mode === 'codex' && process.env.CODEMAN_CODEX_RAW_LOG === '1') {
+        try {
+          const logDir = process.env.CODEMAN_CODEX_RAW_LOG_DIR || '/tmp';
+          const logPath = path.join(logDir, `codex-raw-${this.id}.log`);
+          // Prefix each chunk with a timestamp + byte count so we can correlate
+          // chunks with state changes the user observes. Use a control-character
+          // sentinel that codex itself won't emit so the file is still
+          // round-trip-replayable into a terminal if needed.
+          const ts = new Date().toISOString();
+          fs.appendFileSync(logPath, `\x00[${ts} ${data.length}B]\x00${data}`);
+        } catch (logErr) {
+          // Never let logging break the session — log once and continue.
+          if (!this._codexRawLogErrored) {
+            console.error('[Session] CODEMAN_CODEX_RAW_LOG write failed:', logErr);
+            this._codexRawLogErrored = true;
+          }
+        }
+      }
+
       // Reassemble sequences split across PTY chunk boundaries first: a chunk
       // ending mid-sequence ('\x1b[?104' now, '9h' next) would slip past the
       // strip below and leave xterm stuck in the scrollback-less alt buffer
@@ -2694,17 +3678,43 @@ export class Session extends EventEmitter {
     // BufferAccumulator handles auto-trimming when max size exceeded
     this._terminalBuffer.append(data);
     this._markActivity();
+    recordTrace?.('server.output.terminal-emitted', data);
     this.emit('terminal', data);
     this.emit('output', data);
   }
 
+  private _recordMobileInputOutputTrace(
+    trace: MobileInputTraceCollector,
+    stage: MobileInputTraceStage,
+    data: string
+  ): void {
+    try {
+      trace.record({
+        stage,
+        ...mobileInputTraceTimestamp(),
+        sessionHash: hashMobileInputTraceValue(this.id),
+        ordinal: ++this._mobileInputTraceOrdinal,
+        bytes: Buffer.byteLength(data),
+        valueHash: hashMobileInputTraceValue(data),
+      });
+    } catch {
+      // Trace observation is test-only and must never affect terminal output.
+    }
+  }
+
   async startInteractive(): Promise<void> {
+    const traceRegistration = currentSessionMobileInputTraceRegistration();
     if (this.ptyProcess) {
       throw new Error('Session already has a running process');
     }
     if (this._closing) {
       throw new Error('Session is being closed');
     }
+
+    // Viewer ownership is valid only for a fully initialized interactive PTY.
+    // Keep it suspended across every attach/spawn/fallback failure path and
+    // resume only after the new PTY has all synchronous listeners installed.
+    this._suspendTerminalViewerSizing();
 
     // Bounds the workspace-trust scan (see _maybeAcceptTrustDialog). Stamped here
     // rather than at PTY spawn so a slow mux attach still counts as startup.
@@ -2725,6 +3735,12 @@ export class Session extends EventEmitter {
         'Respawn blocked: interactive PTY exited non-zero too many times in a short window (circuit breaker tripped). Restart the session to clear it.'
       );
     }
+
+    // COD-124 unit 2, Gap B: if a native resume id was captured at a previous
+    // park, fold it into the mode-specific launch config (currently codex
+    // only) before building spawn options below, so the relaunch resumes the
+    // original conversation instead of starting fresh.
+    this._applyNativeResumeIdForResume();
 
     this._resetBuffers();
 
@@ -2827,6 +3843,8 @@ export class Session extends EventEmitter {
             claudeMode: this._claudeMode,
             allowedTools: this._allowedTools,
             openCodeConfig: this._openCodeConfig,
+            // The mux create path needs the same resolved command as respawn.
+            // API/state serializers strip this private field separately.
             codexConfig: this._codexConfig,
             geminiConfig: this._geminiConfig,
             antigravityConfig: this._antigravityConfig,
@@ -2837,9 +3855,12 @@ export class Session extends EventEmitter {
             resumeSessionId: this._resumeSessionId,
             envOverrides: this._envOverrides,
             effort: this._effort,
+            truecolorEnabled: this._truecolorEnabled,
             advisorModel: this._advisorModel,
             historyLimit: this._tmuxHistoryLimit,
             remote: this._remote,
+            initialCols: this._initialDims?.cols,
+            initialRows: this._initialDims?.rows,
             docker: this._docker,
             owner: this._owner,
           },
@@ -2969,7 +3990,7 @@ export class Session extends EventEmitter {
             rows: 40,
             cwd: this.workingDir,
             // Merge envOverrides after buildClaudeEnv so user settings shadow defaults.
-            env: { ...buildClaudeEnv(this.id), ...(this._envOverrides ?? {}) },
+            env: { ...buildClaudeEnv(this.id, this._truecolorEnabled), ...(this._envOverrides ?? {}) },
           })
         );
         this._notePtySpawnGeometry(120, 40);
@@ -3001,12 +4022,17 @@ export class Session extends EventEmitter {
     this._pid = this.ptyProcess.pid;
     console.log('[Session] Interactive PTY spawned with PID:', this._pid);
 
+    const boundRecordTrace: SessionMobileInputTraceRecorder | undefined = traceRegistration
+      ? (stage, data) => this._recordMobileInputOutputTrace(traceRegistration.trace, stage, data)
+      : undefined;
     this.ptyProcess.onData((rawData: string) => {
+      const recordTrace = traceRegistration?.active ? boundRecordTrace : undefined;
+      recordTrace?.('server.output.pty-received', rawData);
       // Filter out focus escape sequences and Ctrl+L (form feed)
       const data = rawData.replace(FOCUS_ESCAPE_FILTER, '').replace(CTRL_L_PATTERN, ''); // Remove Ctrl+L
       if (!data) return; // Skip if only filtered sequences
 
-      this._handleTerminalOutput(data);
+      this._handleTerminalOutput(data, recordTrace);
 
       // === Auto-accept workspace trust dialog ===
       this._maybeAcceptTrustDialog();
@@ -3052,8 +4078,22 @@ export class Session extends EventEmitter {
       }
     });
 
+    // External CLIs never print the Claude '❯' prompt, so the initial-ready →
+    // idle transition must come from the quiet-window timer instead. Arm it
+    // once at spawn/attach; working frames re-arm it as they tick (COD-175).
+    if (isExternalCliMode(this.mode)) {
+      this._armExternalCliIdleTimer();
+      // COD-181/182: external-CLI sessions can't rely on stream-chunk matching
+      // — LOCAL sessions run inside tmux too, so the attach client delivers
+      // the Working line as partial cell updates just like the remote nested
+      // case (a local codex sleep-20 turn never flipped busy in COD-182 e2e).
+      // Poll the rendered frame for the working pattern instead.
+      this._startWorkingFramePoller();
+    }
+
     this.ptyProcess.onExit(({ exitCode }) => {
       console.log('[Session] Interactive PTY exited with code:', exitCode);
+      this._suspendTerminalViewerSizing();
       // COD-118: record the exit in the circuit breaker BEFORE status bookkeeping.
       // A clean (0) exit resets the counter; rapid non-zero repeats trip it.
       const breakerResult = this._ptyExitBreaker.recordExit(exitCode, Date.now());
@@ -3067,6 +4107,12 @@ export class Session extends EventEmitter {
         clearTimeout(this.activityTimeout);
         this.activityTimeout = null;
       }
+      if (this._externalCliIdleTimer) {
+        clearTimeout(this._externalCliIdleTimer);
+        this._externalCliIdleTimer = null;
+      }
+      this._externalCliIdleGeneration += 1;
+      this._stopWorkingFramePoller();
       if (this._promptCheckInterval) {
         clearInterval(this._promptCheckInterval);
         this._promptCheckInterval = null;
@@ -3098,6 +4144,10 @@ export class Session extends EventEmitter {
       }
       this.emit('exit', exitCode);
     });
+
+    if (this.ptyProcess) {
+      this._resumeTerminalViewerSizing();
+    }
   }
 
   /**
@@ -3115,6 +4165,27 @@ export class Session extends EventEmitter {
   /** Whether the interactive-PTY exit circuit breaker is currently tripped (COD-118). */
   get respawnBlocked(): boolean {
     return this._respawnBlocked;
+  }
+
+  /** The pane's live working directory, when the sweep has observed one (COD-386). */
+  get cwd(): string | undefined {
+    return this._cwd;
+  }
+
+  /**
+   * Record the pane's live cwd. Returns whether it CHANGED, so the caller can
+   * broadcast only on a real transition instead of once per sweep tick.
+   *
+   * A remote/docker session is refused outright rather than filtered upstream:
+   * its local pane runs the ssh/docker-exec client, so a cwd read from it names
+   * a host directory the agent was never in, and resolving relative paths there
+   * would be a new wrong answer in place of the old one.
+   */
+  setCwd(cwd: string | undefined): boolean {
+    const next = this._remote || this._docker ? undefined : cwd?.startsWith('/') ? cwd : undefined;
+    if (next === this._cwd) return false;
+    this._cwd = next;
+    return true;
   }
 
   /**
@@ -3201,6 +4272,7 @@ export class Session extends EventEmitter {
    * @param data raw PTY chunk, ANSI included
    */
   private _detectInteractiveActivity(data: string): void {
+    this._noteDirectPtyCheckpointGeneration(data);
     const workDetect = getCli(this.mode)?.capabilities.workDetect;
     // The composer row carries this glyph when the CLI is waiting for input. It only
     // ARMS the check and is NOT evidence the turn ended: a CLI redraws its composer
@@ -3220,7 +4292,21 @@ export class Session extends EventEmitter {
 
     // Detect when Claude starts working (thinking, writing, etc).
     // Fast path: spinner characters on raw data (Unicode, never inside ANSI sequences).
-    if (SPINNER_PATTERN.test(data)) this._markWorking();
+    //
+    // COD-181 (downstream): an external CLI renders its own TUI with no braille
+    // spinner, so a positive working FRAME is its fast path. It also re-arms the
+    // quiet-window timer, which is what ends the turn when frames stop — hence
+    // the branch rather than two independent ifs.
+    if (detectExternalCliWorkingFrame(data, this.mode)) this._noteExternalWorkingFrame();
+    else if (SPINNER_PATTERN.test(data)) {
+      // For external CLIs the spinner must also re-arm the quiet-window
+      // timer — otherwise the session latches busy forever because only
+      // _noteExternalWorkingFrame arms the idle timer (observed on
+      // idle opencode panes that emit a stray braille char in their
+      // Bubble Tea chrome).
+      if (isExternalCliMode(this.mode)) this._noteExternalWorkingFrame();
+      else this._markWorking();
+    }
 
     // Activity fallback: current Claude Code animates `✻ Actualizing…` instead of a
     // braille spinner, so the fast path above misses entire turns, and matching the
@@ -3495,6 +4581,7 @@ export class Session extends EventEmitter {
     if (this._isWorking) return;
     this._isWorking = true;
     this._status = 'busy';
+    this._terminalActivityEpoch++;
     this.emit('working');
     this._autoOps.notifyWorking();
   }
@@ -3548,7 +4635,7 @@ export class Session extends EventEmitter {
     // Only a finished turn proves omp has written its session file; a pane that is
     // merely ready has nothing to resolve yet and could claim a neighbour's file.
     if (turnEnded) this._maybeCaptureOmpSessionId();
-    this.emit('idle');
+    this.emit('idle', { reason: turnEnded ? 'turn-end' : 'initial-ready' } satisfies SessionIdleInfo);
   }
 
   /**
@@ -3748,6 +4835,7 @@ export class Session extends EventEmitter {
             mode: 'shell',
             niceConfig: this._niceConfig,
             envOverrides: this._envOverrides,
+            truecolorEnabled: this._truecolorEnabled,
             historyLimit: this._tmuxHistoryLimit,
             remote: this._remote,
             docker: this._docker,
@@ -3760,8 +4848,11 @@ export class Session extends EventEmitter {
             name: this._name,
             niceConfig: this._niceConfig,
             envOverrides: this._envOverrides,
+            truecolorEnabled: this._truecolorEnabled,
             historyLimit: this._tmuxHistoryLimit,
             remote: this._remote,
+            initialCols: this._initialDims?.cols,
+            initialRows: this._initialDims?.rows,
             docker: this._docker,
             owner: this._owner,
           },
@@ -3843,7 +4934,7 @@ export class Session extends EventEmitter {
       this._shellIdleTimer = null;
       this._status = 'idle';
       this._isWorking = false;
-      this.emit('idle');
+      this.emit('idle', { reason: 'shell-ready' } satisfies SessionIdleInfo);
     }, 500);
   }
 
@@ -3873,6 +4964,7 @@ export class Session extends EventEmitter {
     prompt: string,
     options?: { model?: string; onProgress?: (info: { tokens?: number; status?: string }) => void }
   ): Promise<{ result: string; cost: number }> {
+    if (!this.assistantInputAllowed()) throw new Error('Assistant owns session input');
     return new Promise((resolve, reject) => {
       if (this.ptyProcess) {
         reject(new Error('Session already has a running process'));
@@ -3904,7 +4996,7 @@ export class Session extends EventEmitter {
               rows: 40,
               cwd: this.workingDir,
               // Merge envOverrides after buildClaudeEnv so user settings shadow defaults.
-              env: { ...buildClaudeEnv(this.id), ...(this._envOverrides ?? {}) },
+              env: { ...buildClaudeEnv(this.id, this._truecolorEnabled), ...(this._envOverrides ?? {}) },
             })
           );
           this._notePtySpawnGeometry(120, 40);
@@ -3992,7 +5084,12 @@ export class Session extends EventEmitter {
   }
 
   private _resetBuffers(): void {
+    this._stopWorkingFramePoller();
     this._status = 'busy';
+    // A Session object can be restarted after its PTY exits. Do not carry a
+    // latched working frame from the previous process into the new startup
+    // quiet window, where it would be misclassified as a completed turn.
+    this._isWorking = false;
     this._terminalBuffer.clear();
     this._textOutput.clear();
     this._errorBuffer = '';
@@ -4007,9 +5104,207 @@ export class Session extends EventEmitter {
     this._markActivity(true);
   }
 
+  /**
+   * Positive external-CLI working signal — from a stream chunk match OR from
+   * the COD-181 rendered-frame poller. Marks the session busy and re-arms the
+   * quiet-window timer. For Codex, expiry must also find positive rendered
+   * input-ready evidence before it can end the turn.
+   */
+  private _noteExternalWorkingFrame(): void {
+    if (!this._isWorking) {
+      this._isWorking = true;
+      this._status = 'busy';
+      this._terminalActivityEpoch++;
+      this.emit('working');
+      this._autoOps.notifyWorking();
+    }
+    this._awaitingIdleConfirmation = false;
+    if (this.activityTimeout) clearTimeout(this.activityTimeout);
+    this._armExternalCliIdleTimer();
+  }
+
+  /**
+   * COD-189 — detect a large shell output burst and, once it settles, tell
+   * clients to reload from the canonical capture. During bursts tmux repaints
+   * in place (jump-scroll), so live-streamed scrollback is sparse or absent;
+   * only the pane history is contiguous.
+   */
+  private _trackShellBurst(data: string): void {
+    const now = Date.now();
+    if (now - this._shellBurstWindowStart > SHELL_BURST_WINDOW_MS) {
+      this._shellBurstWindowStart = now;
+      this._shellBurstBytes = 0;
+      this._shellBurstRepaints = 0;
+      if (!this._shellBurstSettleTimer) this._shellBurstActive = false;
+    }
+    this._shellBurstBytes += data.length;
+    // Jump-scroll's fingerprint is repeated home/clear repaints, and tmux
+    // compresses the byte volume hard (a 10k-line seq burst reached the
+    // server as ~37KB) — so require BOTH a modest byte volume AND several
+    // full-screen repaints before treating output as a burst.
+    let idx = -1;
+    while ((idx = data.indexOf('\x1b[H', idx + 1)) !== -1) this._shellBurstRepaints++;
+    let jdx = -1;
+    while ((jdx = data.indexOf('\x1b[2J', jdx + 1)) !== -1) this._shellBurstRepaints++;
+    if (this._shellBurstBytes >= SHELL_BURST_BYTES && this._shellBurstRepaints >= SHELL_BURST_REPAINTS) {
+      this._shellBurstActive = true;
+    }
+    if (this._shellBurstActive) {
+      if (this._shellBurstSettleTimer) clearTimeout(this._shellBurstSettleTimer);
+      this._shellBurstSettleTimer = setTimeout(() => {
+        this._shellBurstSettleTimer = null;
+        this._shellBurstActive = false;
+        this._shellBurstBytes = 0;
+        this._shellBurstRepaints = 0;
+        if (!this._isStopped) this.emit('needsRefresh');
+      }, SHELL_BURST_SETTLE_MS);
+    }
+  }
+
+  private _startWorkingFramePoller(): void {
+    this._stopWorkingFramePoller();
+    const generation = this._workingFramePollGeneration;
+    this._workingFrameFirstPollCompleted = false;
+    this._workingFramePollUnregister = workingFramePollCoordinator.register({
+      key: this.id,
+      capture: () => this._captureWorkingFrameAsync(generation),
+      onFrame: (frame) => {
+        if (generation !== this._workingFramePollGeneration || this._isStopped) return;
+        this._workingFrameFirstPollCompleted = true;
+        if (!frame) return;
+        // The async capture may carry SGR escapes that can sit inside the
+        // pattern (e.g. bold around "Working") — strip before matching.
+        const plain = frame.replace(ANSI_ESCAPE_PATTERN_FULL, '');
+        if (detectExternalCliWorkingFrame(plain, this.mode)) {
+          this._noteExternalWorkingFrame();
+        }
+      },
+    });
+  }
+
+  private _stopWorkingFramePoller(): void {
+    this._workingFramePollGeneration += 1;
+    this._workingFramePollUnregister?.();
+    this._workingFramePollUnregister = null;
+    this._workingFrameFirstPollCompleted = false;
+    this._workingFrameCapture?.controller.abort();
+    this._workingFrameCapture = null;
+  }
+
+  private _captureWorkingFrameAsync(generation = this._workingFramePollGeneration): Promise<string | null> {
+    if (generation !== this._workingFramePollGeneration || this._isStopped) return Promise.resolve(null);
+    const mux = this._mux;
+    const muxName = this._muxSession?.muxName;
+    if (!muxName || !mux || typeof mux.capturePaneTextAsync !== 'function') return Promise.resolve(null);
+
+    const current = this._workingFrameCapture;
+    if (current && current.generation === generation && current.mux === mux && current.muxName === muxName) {
+      return current.promise;
+    }
+
+    const controller = new AbortController();
+    const capture = {
+      generation,
+      mux,
+      muxName,
+      controller,
+      promise: Promise.resolve<string | null>(null),
+    };
+    capture.promise = mux
+      .capturePaneTextAsync(muxName, { signal: controller.signal })
+      .then((frame) => {
+        if (
+          generation !== this._workingFramePollGeneration ||
+          this._isStopped ||
+          this._mux !== mux ||
+          this._muxSession?.muxName !== muxName
+        ) {
+          return null;
+        }
+        return frame;
+      })
+      .finally(() => {
+        if (this._workingFrameCapture === capture) this._workingFrameCapture = null;
+        if (
+          generation === this._workingFramePollGeneration &&
+          !this._isStopped &&
+          this._mux === mux &&
+          this._muxSession?.muxName === muxName
+        ) {
+          this._workingFrameFirstPollCompleted = true;
+        }
+      });
+    this._workingFrameCapture = capture;
+    return capture.promise;
+  }
+
+  /**
+   * (Re-)arm the external-CLI quiet-window timer. For a working Codex turn,
+   * expiry consults the rendered pane and only an input-ready state ends the
+   * turn; working or unknown state re-arms the timer. Startup readiness and
+   * other external CLIs retain the original quiet-window behavior.
+   */
+  private _armExternalCliIdleTimer(): void {
+    if (this._externalCliIdleTimer) clearTimeout(this._externalCliIdleTimer);
+    const idleGeneration = ++this._externalCliIdleGeneration;
+    this._externalCliIdleTimer = setTimeout(async () => {
+      this._externalCliIdleTimer = null;
+      if (this._isStopped || idleGeneration !== this._externalCliIdleGeneration) return;
+      const wasWorking = this._isWorking;
+      const isInitialReady = this._status === 'busy' && !this._isWorking;
+      if (isInitialReady && workingFramePollCoordinator.has(this.id) && !this._workingFrameFirstPollCompleted) {
+        const pollGeneration = this._workingFramePollGeneration;
+        // The shared poller can be queue-bound when many sessions register at
+        // once. Wait for this session's first/current capture before declaring
+        // startup idle so a queued Working frame cannot arrive after a false
+        // initial-ready transition.
+        const frame = await workingFramePollCoordinator.captureNow(this.id);
+        if (this._isStopped || idleGeneration !== this._externalCliIdleGeneration) return;
+        if (pollGeneration !== this._workingFramePollGeneration) {
+          if (this._status === 'busy' && !this._isWorking) this._armExternalCliIdleTimer();
+          return;
+        }
+        if (this._isWorking) return;
+        if (frame) {
+          const plain = frame.replace(ANSI_ESCAPE_PATTERN_FULL, '');
+          if (detectExternalCliWorkingFrame(plain, this.mode)) {
+            this._noteExternalWorkingFrame();
+            return;
+          }
+        }
+      }
+      if (wasWorking && this.mode === 'codex') {
+        const frame = await workingFramePollCoordinator.captureNow(this.id);
+        if (this._isStopped || idleGeneration !== this._externalCliIdleGeneration || !this._isWorking) return;
+        if (classifyCodexRenderedState(frame) !== 'input-ready') {
+          this._armExternalCliIdleTimer();
+          return;
+        }
+      } else if (wasWorking && getCli(this.mode)?.capabilities.workDetect?.workingLine) {
+        // A quiet stream is not the end of a turn: a CLI that declares a working line
+        // (opencode's footer spinner, gemini's spinner line) can sit silent between
+        // repaints while its turn still runs. Read the SCREEN before calling it idle,
+        // as _confirmIdle() does for the composer path.
+        // _probePaneWorking() reads the pane (throttled) for the declared working line or
+        // a hand-off to workers; null means it could not read, so the quiet timer stands.
+        if (this._probePaneWorking() === true) {
+          this._armExternalCliIdleTimer();
+          return;
+        }
+      }
+      if (wasWorking || isInitialReady) {
+        this._isWorking = false;
+        this._status = 'idle';
+        this._lastPromptTime = Date.now();
+        this.emit('idle', { reason: wasWorking ? 'turn-end' : 'initial-ready' } satisfies SessionIdleInfo);
+      }
+    }, EXTERNAL_CLI_IDLE_DELAY_MS);
+  }
+
   private _clearAllTimers(): void {
     // Stop re-sending Enter for a prompt this session will never take now
     this._submitVerifier?.cancel();
+    this._assistantSubmitVerifier?.cancel();
     this._submitVerifier = null;
     // Clear the workspace-trust follow-up read
     if (this._trustDialogTimer) {
@@ -4021,6 +5316,21 @@ export class Session extends EventEmitter {
     if (this.activityTimeout) {
       clearTimeout(this.activityTimeout);
       this.activityTimeout = null;
+    }
+
+    // Clear external CLI idle quiet-window timer
+    if (this._externalCliIdleTimer) {
+      clearTimeout(this._externalCliIdleTimer);
+      this._externalCliIdleTimer = null;
+    }
+    this._externalCliIdleGeneration += 1;
+
+    this._stopWorkingFramePoller();
+
+    // Clear the COD-189 shell burst settle timer
+    if (this._shellBurstSettleTimer) {
+      clearTimeout(this._shellBurstSettleTimer);
+      this._shellBurstSettleTimer = null;
     }
 
     // Clear line buffer flush timer
@@ -4392,10 +5702,68 @@ export class Session extends EventEmitter {
    * discards the data, but it used to do so with no signal at all — which is how
    * input could disappear while the caller believed it had been delivered.
    */
+  private _assistantInputGuard: ((permit?: string) => boolean) | undefined;
+  private _assistantPendingWrites = 0;
+  private _assistantLastInputAt = 0;
+  setAssistantInputGuard(guard: (permit?: string) => boolean): void {
+    this._assistantInputGuard = guard;
+  }
+  get assistantPendingWrites(): number {
+    return this._assistantPendingWrites;
+  }
+  get assistantLastInputAt(): number {
+    return this._assistantLastInputAt;
+  }
+  get assistantInputLocked(): boolean {
+    return !this.assistantInputAllowed();
+  }
+  assistantInputAllowed(permit?: string): boolean {
+    return this._assistantInputGuard?.(permit) ?? true;
+  }
+  async performAuxiliaryInput(operation: () => Promise<void>): Promise<void> {
+    if (!this.assistantInputAllowed()) throw new Error('Assistant owns session input');
+    this._assistantLastInputAt = Date.now();
+    this._assistantPendingWrites++;
+    try {
+      await operation();
+    } finally {
+      this._assistantPendingWrites--;
+    }
+  }
+  cancelAssistantSubmitVerification(): void {
+    this._submitVerifier?.cancel();
+    this._assistantSubmitVerifier?.cancel();
+  }
+  /** Enter-only recovery for a new, owned Codex request; never retypes its text. */
+  verifyAssistantSubmission(text: string, permit: string, beforeEnter: () => Promise<boolean>): void {
+    this._assistantSubmitVerifier?.cancel();
+    if (
+      getCli(this.mode)?.capabilities.nativeAssistantProfile !== 'codex' ||
+      !this._mux?.capturePaneText ||
+      !this._muxSession
+    )
+      return;
+    this._assistantSubmitVerifier = new SubmitVerifier({
+      capture: () =>
+        this._isStopped || !this._muxSession ? null : this._mux?.capturePaneText?.(this._muxSession.muxName),
+      glyph: () => '›',
+      matches: exactPromptStillInComposer,
+      beforeEnter,
+      sendEnter: async () => {
+        if (this._isStopped || !this.assistantInputAllowed(permit)) return;
+        await this.writeViaMux('\r', { assistantPermit: permit });
+      },
+      log: (message) => console.log(`[Session ${this.id.slice(0, 8)}] assistant ${message}`),
+    });
+    this._assistantSubmitVerifier.arm(text);
+  }
+
   write(data: string, options: SessionWriteOptions = {}): boolean {
-    const submittedPrompt = this._trackSubmit(data, options);
+    if (!this.assistantInputAllowed(options.assistantPermit)) return false;
     if (!this.ptyProcess) return false;
     this.ptyProcess.write(data);
+    this._assistantLastInputAt = Date.now();
+    const submittedPrompt = this._trackSubmit(data, options);
     this._emitSubmittedPrompt(submittedPrompt);
     return true;
   }
@@ -4423,6 +5791,12 @@ export class Session extends EventEmitter {
     const submitted = options.fromUser && this._acceptsPrompts ? this._submittedPromptTracker.feed(data) : [];
     if (data.includes('\r') || data.includes('\n')) {
       this._lastSubmitAt = Date.now();
+      this._terminalActivityEpoch++;
+      this.emit('terminalActivity');
+      // Codex last-response resolution compares submit times ACROSS sessions (a
+      // sibling codex pane's submit would otherwise be mistaken for this one's),
+      // so codex panes additionally publish theirs to the shared map.
+      if (this.mode === 'codex') Session.codexSubmitTimes.set(this.id, this._lastSubmitAt);
     }
     return submitted;
   }
@@ -4535,26 +5909,111 @@ export class Session extends EventEmitter {
    * @example
    * ```typescript
    * session.writeViaMux('/clear\r');  // Send /clear command
-   * session.writeViaMux('/init\r');   // Send /init command
+   * session.writeViaMux('/new\r');    // Send /new command
    * ```
    */
   async writeViaMux(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
-    const submittedPrompt = this._trackSubmit(data, options);
-    if (this._mux && this._muxSession) {
-      const sent = await this._mux.sendInput(this.id, data);
-      if (sent) {
-        this._emitSubmittedPrompt(submittedPrompt);
-        this._verifySubmitted(data);
+    if (!this.assistantInputAllowed(options.assistantPermit)) return false;
+    this._assistantPendingWrites++;
+    try {
+      if (this._mux && this._muxSession) {
+        const sent = await this._mux.sendInput(this.id, data);
+        if (sent) {
+          this._assistantLastInputAt = Date.now();
+          const submittedPrompt = this._trackSubmit(data, options);
+          this._emitSubmittedPrompt(submittedPrompt);
+          // Delegated delivery is observed through native acceptance, without autonomous Enter retries.
+          if (!options.assistantPermit) this._verifySubmitted(data);
+        }
+        return sent;
       }
-      return sent;
+      if (this.ptyProcess) {
+        this.ptyProcess.write(data);
+        this._assistantLastInputAt = Date.now();
+        const submittedPrompt = this._trackSubmit(data, options);
+        this._emitSubmittedPrompt(submittedPrompt);
+        return true;
+      }
+      return false;
+    } finally {
+      this._assistantPendingWrites--;
     }
-    // Fallback to PTY write
-    if (this.ptyProcess) {
-      this.ptyProcess.write(data);
-      this._emitSubmittedPrompt(submittedPrompt);
-      return true;
+  }
+
+  /**
+   * Checkpoint-only delivery path. The generic boolean input contract remains
+   * unchanged; checkpoint orchestration receives the exact failed stage.
+   */
+  async writeCheckpointViaMux(data: string): Promise<CommandDeliveryResult> {
+    if (!this.assistantInputAllowed())
+      return { ok: false, stage: 'text', error: 'Assistant owns session input', attempt: 1 };
+    const checkpointRunId = this._autoOps.activeCheckpointRunId;
+    const checkpointCommand = data.replace(/[\r\n]/g, '').trim();
+    const isClear = checkpointCommand === '/clear';
+    const isCodexFreshThread = this.mode === 'codex' && (isClear || checkpointCommand === '/new');
+    if (isClear) {
+      this._checkpointAwaitingInstantClear = true;
+      this._checkpointInstantClearBaseline = this._checkpointReadyFingerprint;
+      this._checkpointDirectPtySawClear = false;
     }
-    return false;
+    if (isCodexFreshThread) {
+      const baselineId = this._checkpointCodexConversationId;
+      const codexHome = process.env.CODEX_HOME || path.join(process.env.HOME || '/tmp', '.codex');
+      const baselineIds = await this._findRecentOwnedCodexConversationIds({
+        codexHome,
+        sessionId: this.id,
+      });
+      if (
+        this._isStopped ||
+        (checkpointRunId !== undefined && checkpointRunId !== this._autoOps.activeCheckpointRunId)
+      ) {
+        return { ok: false, stage: 'text', error: 'checkpoint run cancelled before delivery', attempt: 1 };
+      }
+      this._checkpointCodexFreshBaselineId = baselineId;
+      this._checkpointCodexFreshBaselineIds =
+        baselineId && !baselineIds.includes(baselineId) ? [...baselineIds, baselineId] : baselineIds;
+      this._checkpointCodexFreshTransitionArmed = true;
+    }
+    if (this._isStopped || (checkpointRunId !== undefined && checkpointRunId !== this._autoOps.activeCheckpointRunId)) {
+      return { ok: false, stage: 'text', error: 'checkpoint run cancelled before delivery', attempt: 1 };
+    }
+    if (this._mux && this._muxSession) {
+      const result = await this._mux.sendCheckpointCommand(this.id, data);
+      if (result.ok) {
+        // Codex fresh-thread commands intentionally do not update lastSubmitAt:
+        // they are not viewer-history prompts, but successful delivery still
+        // invalidates pending idle decisions.
+        if (isCodexFreshThread) {
+          this._terminalActivityEpoch++;
+          this.emit('terminalActivity');
+        } else this._trackSubmit(data, {});
+      }
+      if (isClear && !result.ok) {
+        this._checkpointAwaitingInstantClear = false;
+        this._checkpointInstantClearBaseline = null;
+      }
+      return result;
+    }
+    // Claude retains its direct-PTY fallback. Codex and the other external
+    // CLIs require tmux and cannot claim delivery without it.
+    if (this.mode === 'claude' && this.ptyProcess) {
+      try {
+        this.ptyProcess.write(data);
+        this._trackSubmit(data, {});
+        return { ok: true, attempt: 1 };
+      } catch (err) {
+        if (isClear) {
+          this._checkpointAwaitingInstantClear = false;
+          this._checkpointInstantClearBaseline = null;
+        }
+        return { ok: false, stage: 'text', error: getErrorMessage(err), attempt: 1 };
+      }
+    }
+    if (isClear) {
+      this._checkpointAwaitingInstantClear = false;
+      this._checkpointInstantClearBaseline = null;
+    }
+    return { ok: false, stage: 'text', error: 'no terminal transport', attempt: 1 };
   }
 
   /**
@@ -4582,7 +6041,7 @@ export class Session extends EventEmitter {
         this._isStopped || !this._mux || !this._muxSession
           ? null
           : this._mux.capturePaneText?.(this._muxSession.muxName),
-      sendEnter: () => this._mux?.sendInput(this.id, '\r'),
+      sendEnter: () => (this.assistantInputAllowed() ? this._mux?.sendInput(this.id, '\r') : undefined),
       // ⚠ NO fallback glyph here, unlike the screen-reading probe elsewhere in this file.
       // Only claude, codex, pi, opencode, omp and gemini declare a promptGlyph; the other modes would fall back
       // to claude's `❯`, which is ALSO starship's default shell prompt (and pure's, and
@@ -4638,64 +6097,89 @@ export class Session extends EventEmitter {
     return this.ptyProcess ? { cols: this._ptyCols, rows: this._ptyRows } : null;
   }
 
-  /**
-   * Live WebSocket connections that have announced a desktop viewport for this
-   * session. While at least one is registered, small-viewport (mobile/tablet)
-   * resizes are ignored so a phone glancing at the session can't reflow the
-   * PTY under an active desktop view. Claims are connection-scoped: ws-routes
-   * registers them on a desktop-typed resize and releases them on socket
-   * close, so a mobile-only session (no desktop connected) keeps full control
-   * of its own size — including narrowing below the spawn default.
-   *
-   * Deliberate tradeoff: claims are WS-only because only a socket has a
-   * liveness signal. A desktop degraded to the stateless HTTP resize fallback
-   * still applies its typed resizes but holds no claim, so a concurrent phone
-   * can reflow it. This is cooperative UX arbitration, not a security
-   * boundary — untyped (legacy/API) resizes bypass claims by design.
-   */
-  private _desktopSizeClaims = new Set<symbol>();
+  private _terminalResizeRequestSequence = 0;
+  private _terminalResizeConfirmedSequence = 0;
+  private _terminalGeometryDirty = false;
+  private _pendingTerminalResize: {
+    sequence: number;
+    cols: number;
+    rows: number;
+    authority?: { token: symbol; generation: number };
+  } | null = null;
 
-  /**
-   * A desktop sizing claim only blocks small-viewport resizes while the
-   * desktop is RECENTLY ACTIVE (claim registration or typed input within this
-   * window). An abandoned-but-connected desktop tab (left open at home, screen
-   * locked) must not hold a phone's view hostage: without this, the phone
-   * renders a desktop-width stream in a narrow xterm — mid-word wraps, tmux
-   * dot-fill, and Ink overdraw soup (the 0.9.8–0.9.12 mobile regression).
-   */
-  private static readonly DESKTOP_CLAIM_IDLE_MS = 90_000;
+  private readonly _terminalSizing = new TerminalSizingOwnership();
+  private _acceptsTerminalViewerSizing = true;
 
-  /** Last evidence of a live desktop user (claim registered / typed input). */
-  private _lastDesktopActivityAt = 0;
-
-  /** Last desktop-typed dimensions, for re-asserting after a mobile override. */
-  private _lastDesktopDims: { cols: number; rows: number } | null = null;
-
-  /** True while a small viewport reflowed the pane past an idle desktop claim. */
-  private _mobileSizeOverride = false;
-
-  /** Register a live desktop sizing claim (see _desktopSizeClaims). */
-  claimDesktopSizing(token: symbol): void {
-    this._desktopSizeClaims.add(token);
-    this._lastDesktopActivityAt = Date.now();
+  private _suspendTerminalViewerSizing(): void {
+    this._acceptsTerminalViewerSizing = false;
+    this._terminalSizing.clear();
+    this._terminalResizeRequestSequence += 1;
+    this._pendingTerminalResize = null;
   }
 
-  /** Release a desktop sizing claim when its connection goes away. */
-  releaseDesktopSizing(token: symbol): void {
-    this._desktopSizeClaims.delete(token);
-  }
-
-  /**
-   * Record desktop user activity (typed input over a claim-holding socket).
-   * If a phone reflowed the pane while the desktop was idle, the desktop
-   * layout is restored — "whoever is actively using the session wins".
-   */
-  noteDesktopActivity(): void {
-    this._lastDesktopActivityAt = Date.now();
-    if (this._mobileSizeOverride && this._lastDesktopDims) {
-      this._mobileSizeOverride = false;
-      this.resize(this._lastDesktopDims.cols, this._lastDesktopDims.rows, { viewportType: 'desktop' });
+  private _resumeTerminalViewerSizing(): void {
+    if (!this._isStopped) {
+      this._acceptsTerminalViewerSizing = true;
     }
+  }
+
+  rememberTerminalViewerSize(token: symbol, cols: number, rows: number, viewportType: TerminalViewportType): void {
+    if (!this._acceptsTerminalViewerSizing) {
+      return;
+    }
+    this._terminalSizing.remember(token, { cols, rows, viewportType });
+  }
+
+  activateTerminalViewer(token: symbol, dimensions?: TerminalViewerDimensions): number {
+    if (!this._acceptsTerminalViewerSizing) {
+      return this._terminalSizing.currentGeneration;
+    }
+    const activation = this._terminalSizing.activate(token, dimensions);
+    if (activation.dimensions) {
+      const { cols, rows, viewportType } = activation.dimensions;
+      this._resizeTerminal(cols, rows, { viewportType }, { token, generation: activation.generation });
+    }
+    return activation.generation;
+  }
+
+  resizeFromTerminalViewer(
+    token: symbol,
+    cols: number,
+    rows: number,
+    viewportType: TerminalViewportType,
+    force = false
+  ): boolean {
+    if (!this._acceptsTerminalViewerSizing) {
+      return false;
+    }
+    this.rememberTerminalViewerSize(token, cols, rows, viewportType);
+    if (!this._terminalSizing.isOwner(token)) {
+      return false;
+    }
+    this._resizeTerminal(
+      cols,
+      rows,
+      { viewportType, force },
+      { token, generation: this._terminalSizing.currentGeneration }
+    );
+    return true;
+  }
+
+  bootstrapTerminalViewer(token: symbol, force = false): boolean {
+    if (!this._acceptsTerminalViewerSizing) {
+      return false;
+    }
+    const activation = this._terminalSizing.bootstrap(token);
+    if (!activation?.dimensions) {
+      return false;
+    }
+    const { cols, rows, viewportType } = activation.dimensions;
+    this._resizeTerminal(cols, rows, { viewportType, force }, { token, generation: activation.generation });
+    return true;
+  }
+
+  releaseTerminalViewer(token: symbol): void {
+    this._terminalSizing.release(token);
   }
 
   /**
@@ -4703,42 +6187,109 @@ export class Session extends EventEmitter {
    * Skips the resize if dimensions haven't changed to avoid triggering
    * unnecessary Ink full-screen redraws (visible flicker on tab switch).
    *
-   * Arbitration: while a desktop connection holds a sizing claim AND has been
-   * active within DESKTOP_CLAIM_IDLE_MS, resizes from small viewports
-   * (mobile/tablet) are ignored — shrink AND grow would both reflow the
-   * desktop view. Once the desktop goes idle, a phone may take the pane (the
-   * desktop re-asserts its size on its next typed input via
-   * noteDesktopActivity). Without a desktop connected, small viewports
-   * control the PTY size freely.
-   *
    * @param cols - Number of columns (width in characters)
    * @param rows - Number of rows (height in lines)
    */
   resize(cols: number, rows: number, options: { viewportType?: ResizeViewportType; force?: boolean } = {}): void {
-    const isSmallViewport = options.viewportType === 'mobile' || options.viewportType === 'tablet';
-    if (options.viewportType === 'desktop') {
-      this._lastDesktopDims = { cols, rows };
-      this._lastDesktopActivityAt = Date.now();
-      this._mobileSizeOverride = false;
+    this._resizeTerminal(cols, rows, options);
+  }
+
+  resizeIfNoActiveTerminalViewer(cols: number, rows: number): boolean {
+    if (this._terminalSizing.ownerToken !== null) return false;
+    this.resize(cols, rows);
+    return true;
+  }
+
+  private _resizeTerminal(
+    cols: number,
+    rows: number,
+    options: { viewportType?: ResizeViewportType; force?: boolean },
+    authority?: { token: symbol; generation: number }
+  ): void {
+    const pty = this.ptyProcess;
+    if (!pty) return;
+
+    const authoritativeResize = this._mux && this._muxSession ? this._mux.resizeWindow : undefined;
+    const dimsChanged = cols !== this._ptyCols || rows !== this._ptyRows;
+    const pending = this._pendingTerminalResize;
+    const correctsStaleAuthority = !!pending && !!authority && pending.authority?.generation !== authority.generation;
+    const needsAuthoritativeReconcile = !!authoritativeResize && this._terminalGeometryDirty;
+    const duplicatesPending =
+      !!pending && pending.cols === cols && pending.rows === rows && !correctsStaleAuthority && !options.force;
+    if (
+      (!dimsChanged && !options.force && !correctsStaleAuthority && !needsAuthoritativeReconcile) ||
+      duplicatesPending
+    ) {
+      return;
     }
-    if (isSmallViewport && this._desktopSizeClaims.size > 0) {
-      if (Date.now() - this._lastDesktopActivityAt < Session.DESKTOP_CLAIM_IDLE_MS) {
-        // Declined. The caller is told nothing here on purpose — the decision
-        // belongs to the session, not the socket — but the caller MUST report
-        // `ptyGeometry` back afterwards so the asking client can adopt
-        // the shape it did not get. Both transports do; see issue #464.
+
+    const sequence = ++this._terminalResizeRequestSequence;
+    const request = { sequence, cols, rows, authority };
+    this._pendingTerminalResize = request;
+
+    const confirm = (success: boolean, authoritativeGeometryMayHaveChanged = false): void => {
+      const isLatestRequest = this._pendingTerminalResize?.sequence === sequence;
+      if (isLatestRequest) this._pendingTerminalResize = null;
+      const hasCurrentAuthority =
+        !authority ||
+        (this._acceptsTerminalViewerSizing &&
+          this._terminalSizing.currentGeneration === authority.generation &&
+          this._terminalSizing.isOwner(authority.token));
+      if (!isLatestRequest || !success || !hasCurrentAuthority) {
+        if (authoritativeGeometryMayHaveChanged && sequence > this._terminalResizeConfirmedSequence) {
+          this._terminalGeometryDirty = true;
+        }
         return;
       }
-      this._mobileSizeOverride = true;
-    }
-    const dimsChanged = cols !== this._ptyCols || rows !== this._ptyRows;
-    if (this.ptyProcess && (dimsChanged || options.force)) {
+      const confirmedChange = cols !== this._ptyCols || rows !== this._ptyRows;
       this._ptyCols = cols;
       this._ptyRows = rows;
-      if (!IS_TEST_MODE && this._mux && this._muxSession) {
-        this._mux.resizeWindow?.(this._muxSession.muxName, cols, rows);
+      this._terminalResizeConfirmedSequence = sequence;
+      if (authoritativeResize) this._terminalGeometryDirty = false;
+      // COD-179: tell every connected client the shared geometry changed. A
+      // viewer whose xterm has different dims renders the subsequent TUI
+      // repaint frames misaligned (orphan "Working" rows in scrollback) and
+      // needs to reconcile by rewriting from the tmux capture. Only a real
+      // geometry change matters — a forced same-size SIGWINCH can't misalign.
+      if (confirmedChange) {
+        this.emit('resized', { cols, rows });
       }
-      this.ptyProcess.resize(cols, rows);
+    };
+
+    if (authoritativeResize && this._muxSession) {
+      let admissionKnown = false;
+      let synchronousCompletion: boolean | undefined;
+      let accepted = false;
+      try {
+        accepted = authoritativeResize.call(this._mux, this._muxSession.muxName, cols, rows, (success) => {
+          if (!admissionKnown) synchronousCompletion = success;
+          else confirm(success, true);
+        });
+      } catch {
+        admissionKnown = true;
+        confirm(false);
+        return;
+      }
+      admissionKnown = true;
+      if (!accepted) {
+        confirm(false);
+        return;
+      }
+      try {
+        pty.resize(cols, rows);
+      } catch {
+        if (this.ptyProcess === pty) this.ptyProcess = null;
+      }
+      if (synchronousCompletion !== undefined) confirm(synchronousCompletion, true);
+      return;
+    }
+
+    try {
+      pty.resize(cols, rows);
+      confirm(true);
+    } catch {
+      if (this.ptyProcess === pty) this.ptyProcess = null;
+      confirm(false);
     }
   }
 
@@ -4749,6 +6300,7 @@ export class Session extends EventEmitter {
 
   // Legacy method for sending input - wraps runPrompt
   async sendInput(input: string): Promise<void> {
+    if (!this.assistantInputAllowed()) throw new Error('Assistant owns session input');
     this._status = 'busy';
     this._markActivity(true);
     this.runPrompt(input).catch((err) => {
@@ -4826,17 +6378,13 @@ export class Session extends EventEmitter {
   async stop(killMux: boolean = true): Promise<void> {
     // Set stopped flag first to prevent new timers from being created
     this._isStopped = true;
+    Session.codexSubmitTimes.delete(this.id);
+    this._suspendTerminalViewerSizing();
     // A pane that is gone is watching nothing. Nothing probes a stopped session, so
     // without this the last chip it drew would ride along on its row forever.
     this._watching = null;
 
     this._clearAllTimers();
-
-    // Drop desktop sizing claims defensively. Sockets normally release their
-    // own claim on close, but a hung client's close event can lag the session
-    // teardown by up to a ping cycle — don't let a stale claim suppress
-    // mobile resizes if this Session object sees any further use.
-    this._desktopSizeClaims.clear();
 
     // Immediately cleanup Promise callbacks to prevent orphaned references
     // during the rest of stop() processing (e.g., if mux kill times out)
@@ -4873,7 +6421,9 @@ export class Session extends EventEmitter {
             process.kill(pid, 'SIGKILL');
           }
         } catch (err) {
-          console.warn('[Session] Failed to send SIGKILL to process (already terminated):', err);
+          if (!isNoSuchProcessError(err)) {
+            console.warn('[Session] Failed to send SIGKILL to process (already terminated):', err);
+          }
         }
 
         // Also try to kill any child processes in the process group
@@ -4882,7 +6432,9 @@ export class Session extends EventEmitter {
             process.kill(-pid, 'SIGKILL');
           }
         } catch (err) {
-          console.warn('[Session] Failed to send SIGKILL to process group (may not exist):', err);
+          if (!isNoSuchProcessError(err)) {
+            console.warn('[Session] Failed to send SIGKILL to process group (may not exist):', err);
+          }
         }
       } else {
         // Server shutdown: just detach — the process lives on inside tmux
@@ -4915,6 +6467,94 @@ export class Session extends EventEmitter {
       console.log('[Session] Keeping mux session alive:', this._muxSession.muxName);
       this._muxSession = null; // Detach but don't kill
     }
+  }
+
+  /**
+   * COD-124 — park an idle session: detach the tmux session and gracefully
+   * stop the CLI (SIGTERM only, no forced SIGKILL escalation), while
+   * PRESERVING the state.json record, workingDir, and — for claude-mode
+   * sessions — the resumeSessionId needed to restore the conversation later
+   * via `--resume`. The session stays in `SessionManager.sessions` (unlike
+   * `stop()`, which is followed by deletion in every existing caller); it
+   * just shows up in the UI as `status: 'parked'`.
+   *
+   * Deliberately, unlike `stop()`, this does NOT set `_isStopped` and does
+   * NOT call `removeAllListeners()`: park/resume is designed for reusing
+   * this SAME `Session` object later via `startInteractive()` (a flow
+   * `stop()` never had to support — every existing `stop()` caller discards
+   * the object), and `_isStopped` is checked by several async CLI-version
+   * probes / buffer-flush guards that must still function after resume.
+   *
+   * Non-claude modes (codex/opencode/gemini/shell): resume-after-park is a
+   * best-effort relaunch in the same workingDir with NO conversation
+   * restore. `_resumeSessionId` is deliberately left untouched for these
+   * modes here, even though `appendResumeFlag()` in tmux-manager.ts can in
+   * principle carry a resume flag for gemini/codex too — COD-124 only
+   * commits to full resume semantics for claude-mode sessions.
+   *
+   * Remote-attached (owned:false) sessions: `TerminalMultiplexer.killSession()`
+   * already differentiates owned vs. non-owned sessions (COD-105) — a
+   * non-owned session is always DETACHED locally, never killed on the
+   * remote host. park() relies entirely on that existing guarantee; it does
+   * not special-case remote sessions itself.
+   *
+   * Idempotent: calling park() on an already-parked session is a no-op.
+   */
+  async park(): Promise<void> {
+    if (this._status === 'parked') {
+      return;
+    }
+
+    this._suspendTerminalViewerSizing();
+
+    // Preserve the conversation-resume id for claude-mode sessions only.
+    if (this.mode === 'claude') {
+      this._resumeSessionId = this._claudeSessionId || this._resumeSessionId || this.id;
+    }
+
+    this._clearAllTimers();
+    if (this.rejectPromise && !this._promptResolved) {
+      this._promptResolved = true;
+      this.rejectPromise(new Error('Session parked'));
+    }
+    this.resolvePromise = null;
+    this.rejectPromise = null;
+
+    this.cleanupTrackerListeners();
+
+    if (this.ptyProcess) {
+      // Graceful SIGTERM only — a parked session is expected to be resumed,
+      // not torn down, so we don't escalate to SIGKILL the way stop() does.
+      try {
+        this.ptyProcess.kill();
+      } catch (err) {
+        console.warn('[Session] park: failed to send SIGTERM to PTY process (may already be dead):', err);
+      }
+      this.ptyProcess = null;
+    }
+
+    this._pid = null;
+    this._currentTaskId = null;
+    this._taskCache.clear();
+    this._childAgentIds = [];
+
+    // Detach the mux/tmux session. killSession() already implements the
+    // COD-105-safe owned/non-owned differentiation (kill vs. local-only
+    // detach for remote-attached sessions) — park() just delegates to it,
+    // same as stop() does for its own killMux=true path.
+    if (this._mux) {
+      try {
+        const detached = await this._mux.killSession(this.id);
+        if (detached) {
+          console.log('[Session] park: detached mux session for:', this.id);
+        }
+      } catch (err) {
+        console.error('[Session] park: failed to detach mux session:', err);
+      }
+    }
+    this._muxSession = null;
+
+    this._status = 'parked';
   }
 
   assignTask(taskId: string): void {

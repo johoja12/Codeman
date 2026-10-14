@@ -32,7 +32,7 @@ vi.mock('node:fs', async (importOriginal) => {
 });
 
 import { FileStreamManager } from '../src/file-stream-manager.js';
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, realpathSync, statSync } from 'node:fs';
 
 /**
  * Creates a mock ChildProcess-like EventEmitter with stdout/stderr streams.
@@ -55,6 +55,7 @@ describe('FileStreamManager', () => {
     mockSpawn.mockReset();
     vi.mocked(existsSync).mockReturnValue(true);
     vi.mocked(statSync).mockReturnValue({ size: 1024 } as ReturnType<typeof statSync>);
+    vi.mocked(realpathSync).mockImplementation((path) => String(path));
   });
 
   afterEach(() => {
