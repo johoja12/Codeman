@@ -156,6 +156,7 @@ import { AI_CHECK_MODEL } from '../config/ai-defaults.js';
 import { approvalInbox } from './approval-inbox.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
 import { planAutomaticRecovery, snapshotDeadSessionRecoveries } from '../session-recovery.js';
+import { ownerLayoutKey } from '../tab-layout-persistence.js';
 import { createWorkerRecoveryRecord } from '../remote-worker-recovery.js';
 import { createNativeResumeIdResolver, resolveNativeResumeIdForRecovery } from '../native-session-identity.js';
 import type { SessionRecoveryRecord } from '../types/session-recovery.js';
@@ -4744,6 +4745,10 @@ export class WebServer extends EventEmitter {
       const resolveNativeResumeId = createNativeResumeIdResolver();
       this.bootRecoveryRecords = await snapshotDeadSessionRecoveries(this.store, dead, muxSessionsBeforeReconcile, {
         resolveNativeResumeId,
+        resolveTabGroupId: (session) =>
+          this.store
+            .getTabLayout(ownerLayoutKey(session.owner))
+            ?.groups.find((group) => group.refs.some((ref) => ref.kind === 'session' && ref.id === session.id))?.id,
       });
 
       if (discovered.length > 0) {
