@@ -479,8 +479,6 @@
         <div class="terminal-container" id="terminalContainer"></div>
         <!-- Typing blocked banner (w1-nzbdav): shows why input is suppressed and offers Fix -->
         <div id="typingBlockedBanner" class="typing-blocked-banner" hidden role="alert" aria-live="assertive"></div>
-        <!-- COD-187: frozen history view indicator for live-mirror tabs -->
-        <div id="historyPill" class="history-pill" hidden onclick="app._exitHistoryView?.()"></div>
         <textarea id="cjkInput" rows="1" placeholder="CJK input (Enter = send, Esc = clear)"
           maxlength="65536" aria-label="CJK IME input field"
           autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
@@ -2040,13 +2038,6 @@
                       <span class="set-row-desc">Camera hand-tracking overlay. Applied on reload; the instance must run with CODEMAN_GESTURE=1.</span>
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="appSettingsGestureControl"><span class="slider"></span></label>
-                  </div>
-                  <div class="set-row" data-search="live mirror scrollback tmux history garbled repaint">
-                    <div class="set-row-text">
-                      <span class="set-row-label">Live Mirror</span>
-                      <span class="set-row-desc">Disabled on this comparison branch: scrolling uses upstream terminal history and CLI transcript controls.</span>
-                    </div>
-                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsLiveMirror"><span class="slider"></span></label>
                   </div>
                 </div>
               </div>

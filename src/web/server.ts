@@ -2857,34 +2857,6 @@ export class WebServer extends EventEmitter {
       '</head>',
       () => `<script>window.__codemanTranscriptPageKeys=${JSON.stringify(pageKeyClis)};</script>\n</head>`
     );
-    // COD-464: the `wheelForward` capability for every CLI that forwards the
-    // wheel (mode other than 'never', measured `rows` present). Outside the
-    // solo-window guard for the same reason as the gutter map: a detached session
-    // window scrolls too. `minVersion` is a config-supplied string (a user's
-    // clis.json can set it), so the payload goes through escapeScriptJson.
-    const wheelForwardClis: Record<
-      string,
-      {
-        mode: string;
-        minVersion?: string;
-        rows: number;
-        reversalDeadReports: number;
-        streak?: { resetMs: number; steps: number[] };
-      }
-    > = {};
-    for (const entry of enabledClis()) {
-      const wheel = entry.capabilities.wheelForward;
-      if (wheel.mode === 'never' || typeof wheel.rows !== 'number') continue;
-      wheelForwardClis[entry.id] = {
-        mode: wheel.mode,
-        ...(wheel.minVersion ? { minVersion: wheel.minVersion } : {}),
-        rows: wheel.rows,
-        reversalDeadReports: wheel.reversalDeadReports ?? 0,
-        ...(wheel.streak ? { streak: { resetMs: wheel.streak.resetMs, steps: [...wheel.streak.steps] } } : {}),
-      };
-    }
-    const wheelForwardJson = escapeScriptJson(JSON.stringify(wheelForwardClis));
-    html = html.replace('</head>', () => `<script>window.__codemanWheelForward=${wheelForwardJson};</script>\n</head>`);
     if (!soloSessionId && process.env.CODEMAN_GESTURE === '1') {
       html = html.replace('</head>', () => `<script>window.__codemanGestureAvailable=true;</script>\n</head>`);
       if (settings.gestureControlEnabled === true) {

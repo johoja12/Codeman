@@ -53,17 +53,15 @@ describe('COD-284 iPhone opencode keyboard corruption fix', () => {
     expect(handlers).toMatch(/MobileDetection\.updateAppHeight/);
   });
 
-  it('touch scrolling is dynamic per session (COD-284b)', () => {
-    expect(terminalUi).toMatch(/getIsOpencodeMobile/);
-    expect(terminalUi).toContain('_syncTerminalTouchAction');
-    expect(terminalUi).toMatch(/getThreshold/);
-    expect(mobileCss).toContain(".touch-device .terminal-container[style*='pan-y']");
-    expect(terminalUi).toMatch(/syncTouchAction\(\)/);
+  it('touch scrolling uses upstream routing without per-session CSS switches', () => {
+    expect(terminalUi).toContain("container.style.touchAction = 'none';");
+    expect(terminalUi).toContain('_maybePageCliTranscript({ shiftKey: false, touchId: touchContactId }, lines)');
+    expect(terminalUi).not.toContain('_syncTerminalTouchAction');
   });
 
-  it('tab-switch does fit+refresh+touch sync (COD-284b)', () => {
+  it('tab-switch keeps the fork fit and refresh fixes', () => {
     const appJs = fs.readFileSync(path.resolve('src/web/public/app.js'), 'utf8');
     expect(appJs).toMatch(/selectSession[\s\S]*?fitAddon\.fit[\s\S]*?refresh/);
-    expect(appJs).toContain('_syncTerminalTouchAction');
+    expect(appJs).not.toContain('_syncTerminalTouchAction');
   });
 });

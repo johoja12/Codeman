@@ -1383,20 +1383,12 @@ describe('Virtual Keyboard', () => {
           cjkVisible: document.body.classList.contains('cjk-input-visible'),
         };
 
-        // COD-187 routes a mirror tab's drag into _handleUserScrollIntent, which
-        // runs at scrollback 0 and therefore never reaches terminal.scrollLines.
-        // Spy on the funnel itself — that is what "the drag reached the terminal"
-        // means for these modes now. Both are recorded so either route counts.
+        // Observe the actual upstream local scrollback path.
         const originalScrollLines = app.terminal.scrollLines.bind(app.terminal);
         const scrollCalls: number[] = [];
         app.terminal.scrollLines = (lines: number) => {
           scrollCalls.push(lines);
           return originalScrollLines(lines);
-        };
-        const originalScrollIntent = app._handleUserScrollIntent.bind(app);
-        app._handleUserScrollIntent = (lines: number) => {
-          scrollCalls.push(lines);
-          return originalScrollIntent(lines);
         };
 
         const sentToCli: string[] = [];
@@ -1479,20 +1471,19 @@ describe('Virtual Keyboard', () => {
         app.hideWelcome();
         app._updateCjkInputState();
 
-        // COD-187 routes a mirror tab's drag into _handleUserScrollIntent, which
-        // runs at scrollback 0 and therefore never reaches terminal.scrollLines.
-        // Spy on the funnel itself — that is what "the drag reached the terminal"
-        // means for these modes now. Both are recorded so either route counts.
+        // Give this scenario real local scrollback so it tests browser-pan
+        // prevention independently of the hollow-buffer transcript pager.
+        await new Promise<void>((resolve) =>
+          app.terminal.write(Array.from({ length: 200 }, (_, i) => `keyboard history ${i}\r\n`).join(''), resolve)
+        );
+        app.terminal.scrollToBottom();
+
+        // Observe the actual upstream local scrollback path.
         const originalScrollLines = app.terminal.scrollLines.bind(app.terminal);
         const scrollCalls: number[] = [];
         app.terminal.scrollLines = (lines: number) => {
           scrollCalls.push(lines);
           return originalScrollLines(lines);
-        };
-        const originalScrollIntent = app._handleUserScrollIntent.bind(app);
-        app._handleUserScrollIntent = (lines: number) => {
-          scrollCalls.push(lines);
-          return originalScrollIntent(lines);
         };
 
         const target = document.getElementById('terminalContainer');

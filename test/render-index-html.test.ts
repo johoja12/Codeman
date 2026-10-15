@@ -188,23 +188,14 @@ describe('WebServer.renderIndexHtml', () => {
     }
   });
 
-  it('COD-464: injects the wheelForward map from the capability, solo windows included', async () => {
+  it('uses upstream transcript paging without a fork wheel calibration map', async () => {
     const { server } = makeServer();
     for (const solo of [undefined, 'sess-123']) {
       const html = await render(server, solo);
-      const match = html.match(/window\.__codemanWheelForward=(\{[^<]*\});/);
+      expect(html).not.toContain('__codemanWheelForward');
+      const match = html.match(/window\.__codemanTranscriptPageKeys=(\[[^<]*\]);/);
       expect(match, String(solo)).not.toBeNull();
-      const map = JSON.parse(match![1]) as Record<string, Record<string, unknown>>;
-      expect(map.claude).toEqual({
-        mode: 'version-gated',
-        minVersion: '2.1.187',
-        rows: 1,
-        reversalDeadReports: 1,
-        streak: { resetMs: 35, steps: [1, 1, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 6] },
-      });
-      expect(map.codex).toEqual({ mode: 'mouse-tracking', rows: 3, reversalDeadReports: 0 });
-      expect(map.shell).toBeUndefined();
-      expect(map.gemini).toBeUndefined();
+      expect(JSON.parse(match![1])).toEqual(expect.arrayContaining(['claude', 'codex', 'opencode']));
     }
   });
 

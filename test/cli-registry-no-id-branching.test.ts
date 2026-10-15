@@ -549,7 +549,7 @@ describe('declared-for-later fields', () => {
   const DECLARED_FOR_LATER = [
     'accent',
     'capabilities.echo',
-    // capabilities.wheelForward is read downstream (COD-464 paced wheel → CLI).
+    'capabilities.wheelForward', // upstream keeps the runtime wheel gate in terminal-ui.js
     'capabilities.keyboardAccessory',
     'capabilities.maxFrameBytes',
     // The Docker credential-seeding path still reads its own CRED_STORES table: this shape

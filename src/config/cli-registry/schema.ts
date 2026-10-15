@@ -312,26 +312,8 @@ const capabilitiesSchema = z
     altScreen: z.enum(['strip-full', 'strip-mux-only', 'strip-mux-and-mouse', 'preserve']),
     echo: echoSchema,
     checkpoint: checkpointSchema.optional(),
-    // COD-464: read by the desktop wheel (terminal-ui.js `_shouldPaceWheelToCli`)
-    // through `window.__codemanWheelForward`. `rows` and `reversalDeadReports` are
-    // MEASURED against the real CLI; a mode other than 'never' without `rows` is
-    // never forwarded.
     wheelForward: z
-      .object({
-        mode: z.enum(['never', 'version-gated', 'mouse-tracking']),
-        minVersion: z.string().max(20).optional(),
-        rows: z.number().int().min(1).max(10).optional(),
-        reversalDeadReports: z.number().int().min(0).max(3).optional(),
-        // The CLI's own wheel acceleration, MEASURED: rows moved by the k-th
-        // report of a streak (last entry repeats), and the pause that resets it.
-        streak: z
-          .object({
-            resetMs: z.number().int().min(10).max(500),
-            steps: z.array(z.number().int().min(1).max(20)).min(1).max(32),
-          })
-          .strict()
-          .optional(),
-      })
+      .object({ mode: z.enum(['never', 'version-gated']), minVersion: z.string().max(20).optional() })
       .strict(),
     // Whether a hollow pane's wheel/touch scroll may be turned into PageUp/PageDown for
     // the CLI to page its own transcript. Distinct from wheelForward (SGR reports).

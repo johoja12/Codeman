@@ -748,7 +748,7 @@ const KeyboardHandler = {
               /* terminal may have been disposed during the frame */
             }
             if (shouldRestoreScroll) {
-              if (this._settleFollowing === false || app._viewMode === 'history') this._restoreTerminalScrollIntent();
+              if (this._settleFollowing === false) this._restoreTerminalScrollIntent();
               else app.terminal.scrollToBottom();
             }
             app._syncMobileHelperTextareaToCursor?.();

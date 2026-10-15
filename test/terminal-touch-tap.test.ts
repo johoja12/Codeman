@@ -919,29 +919,6 @@ describe('terminal touch tap mouse guard', () => {
     expect(app._wheelScrollLines({ deltaY: 0, deltaX: -100, deltaMode: 0, shiftKey: true })).toBe(-4);
   });
 
-  it('wheel: accumulates fractional history deltas before calling xterm with whole rows', () => {
-    const { app } = loadTerminalUiHarness();
-    app.activeSessionId = 'sess-1';
-    app.sessions = new Map([['sess-1', { mode: 'codex' }]]);
-    app._viewMode = 'history';
-    app._isMirrorSession = () => true;
-    app._noteTerminalUserScroll = vi.fn();
-    app.isTerminalAtBottom = () => false;
-    app.terminal = {
-      scrollLines: vi.fn(),
-      buffer: { active: { viewportY: 5 } },
-    };
-
-    expect(app._handleUserScrollIntent(0.4)).toBe('swallowed');
-    expect(app._handleUserScrollIntent(0.4)).toBe('swallowed');
-    expect(app.terminal.scrollLines).not.toHaveBeenCalled();
-
-    expect(app._handleUserScrollIntent(0.4)).toBe('scrolled');
-    expect(app.terminal.scrollLines).toHaveBeenCalledOnce();
-    expect(app.terminal.scrollLines).toHaveBeenCalledWith(1);
-    expect(Number.isInteger(app.terminal.scrollLines.mock.calls[0][0])).toBe(true);
-  });
-
   it('wheel: gates claude forwarding on CLI version 2.1.187+ (unknown or older stays local)', () => {
     const { app } = loadTerminalUiHarness();
     app.activeSessionId = 'sess-1';
@@ -1198,74 +1175,6 @@ describe('terminal touch tap mouse guard', () => {
     expect(trustedDown.stopImmediatePropagation).toHaveBeenCalledOnce();
     expect(trustedUp.preventDefault).toHaveBeenCalledOnce();
     expect(trustedUp.stopImmediatePropagation).toHaveBeenCalledOnce();
-  });
-
-  it('COD-209: sends SGR wheel reports directly so OpenCode scroll does not depend on xterm mouse mode', () => {
-    const { app } = loadTerminalUiHarness();
-    const screen = {
-      getBoundingClientRect: () => ({ left: 100, top: 50, width: 800, height: 400 }),
-    };
-
-    app.activeSessionId = 'session-1';
-    app._sendInputAsync = vi.fn();
-    app.terminal = {
-      cols: 80,
-      rows: 24,
-      element: {
-        querySelector: vi.fn((selector: string) => (selector === '.xterm-screen' ? screen : null)),
-      },
-      _core: {
-        _renderService: {
-          dimensions: {
-            css: {
-              cell: { width: 10, height: 20 },
-            },
-          },
-        },
-      },
-    };
-
-    app._sendForegroundTuiWheel(60, 120, 84);
-
-    expect(app._sendInputAsync).toHaveBeenCalledWith('session-1', '\x1b[<65;3;2M');
-  });
-
-  it('COD-209: accumulates small wheel deltas so OpenCode scrolling is not too fast', () => {
-    const { app } = loadTerminalUiHarness();
-    const screen = {
-      getBoundingClientRect: () => ({ left: 100, top: 50, width: 800, height: 400 }),
-    };
-
-    app.activeSessionId = 'session-1';
-    app._sendInputAsync = vi.fn();
-    app.terminal = {
-      cols: 80,
-      rows: 24,
-      element: {
-        querySelector: vi.fn((selector: string) => (selector === '.xterm-screen' ? screen : null)),
-      },
-      _core: {
-        _renderService: {
-          dimensions: {
-            css: {
-              cell: { width: 10, height: 20 },
-            },
-          },
-        },
-      },
-    };
-
-    app._sendForegroundTuiWheel(10, 120, 84);
-    app._sendForegroundTuiWheel(10, 120, 84);
-    app._sendForegroundTuiWheel(10, 120, 84);
-    app._sendForegroundTuiWheel(10, 120, 84);
-
-    expect(app._sendInputAsync).not.toHaveBeenCalled();
-
-    app._sendForegroundTuiWheel(10, 120, 84);
-
-    expect(app._sendInputAsync).toHaveBeenCalledTimes(1);
-    expect(app._sendInputAsync).toHaveBeenCalledWith('session-1', '\x1b[<65;3;2M');
   });
 
   it('COD-211: sends SGR click reports directly so OpenCode clickable regions work after replay', () => {
@@ -1782,5 +1691,48 @@ describe('terminal wrapped-line handling', () => {
     app._selectTouchSelectionLine();
 
     expect(app.terminal.select).toHaveBeenCalledWith(0, 0, 'short output'.length);
+  });
+});
+
+// The actual touchmove routing block: preserve sub-line travel once per move,
+// then use the same forwarding/page/local choice as the upstream wheel handler.
+describe('upstream touch scrolling', () => {
+  it.each(['forward', 'page', 'local'])('preserves fractional travel exactly once on the %s route', (route) => {
+    const start = terminalUiSource.indexOf('const delta = touchLastY - touchY;');
+    const ending = 'pixelAccum -= lines * ch;';
+    const end = terminalUiSource.indexOf(ending, start) + ending.length;
+    expect(start).toBeGreaterThan(-1);
+    const move = new Function(
+      'state',
+      'touchY',
+      `
+      let { pixelAccum, touchLastY } = state;
+      let velocity = 0, touchLastX = 0;
+      const touchX = 100, touchContactId = 7, cellHeight = () => 20;
+      ${terminalUiSource.slice(start, end)}
+      }
+      return { pixelAccum, touchLastY };
+    `
+    );
+    const app = {
+      _shouldForwardWheelToApp: () => route === 'forward',
+      _forwardScrollToApp: vi.fn(),
+      _maybePageCliTranscript: vi.fn(() => route === 'page'),
+      _logScrollRouting: vi.fn(),
+      _noteTerminalUserScroll: vi.fn(),
+      _maybeLoadMoreHistoryOnScroll: vi.fn(),
+      terminal: { scrollLines: vi.fn() },
+    };
+    let state = { pixelAccum: 0, touchLastY: 200 };
+    for (const y of [195, 190, 185]) state = move.call(app, state, y);
+    expect(app._forwardScrollToApp).not.toHaveBeenCalled();
+    expect(app._maybePageCliTranscript).not.toHaveBeenCalled();
+    expect(app.terminal.scrollLines).not.toHaveBeenCalled();
+    state = move.call(app, state, 180);
+    expect(state.pixelAccum).toBe(0);
+    if (route === 'forward') expect(app._forwardScrollToApp).toHaveBeenCalledExactlyOnceWith(100, 180, 1);
+    else expect(app._maybePageCliTranscript).toHaveBeenCalledExactlyOnceWith({ shiftKey: false, touchId: 7 }, 1);
+    expect(app.terminal.scrollLines).toHaveBeenCalledTimes(route === 'local' ? 1 : 0);
+    if (route === 'local') expect(app.terminal.scrollLines).toHaveBeenCalledWith(1);
   });
 });

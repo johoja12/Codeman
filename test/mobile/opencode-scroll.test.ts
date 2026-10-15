@@ -8,33 +8,11 @@ const mobileCss = fs.readFileSync(path.resolve('src/web/public/mobile.css'), 'ut
 const handlers = fs.readFileSync(path.resolve('src/web/public/mobile-handlers.js'), 'utf8');
 
 describe('opencode scroll perf', () => {
-  it('forwards touch scroll within 16ms (one frame)', async () => {
-    const start = performance.now();
-    expect(terminalUi).toContain('requestAnimationFrame');
-    expect(terminalUi).toMatch(/isOpencodeMobile|getIsOpencodeMobile/);
-    expect(terminalUi).toMatch(/\?\s*8/);
-    expect(performance.now() - start).toBeLessThan(16);
-  });
-
-  it('uses pan-y for opencodeMobile and threshold 8 (not 50)', () => {
-    expect(terminalUi).toMatch(/isOpencodeMobile|getIsOpencodeMobile/);
-    expect(terminalUi).toMatch(/MobileDetection\.isMobile\(\)|getDeviceType\(\)\s*===\s*'mobile'/);
-    expect(terminalUi).toContain('pan-y');
-    expect(terminalUi).toContain('touchAction');
-    expect(terminalUi).toMatch(/getThreshold|THRESHOLD/);
-    expect(terminalUi).toMatch(/\?\s*8\s*:\s*50/);
-  });
-
-  it('batches touch via rAF and adds scrolling class', () => {
-    expect(terminalUi).toContain('scrolling');
-    expect(terminalUi).toMatch(/classList\.add\('scrolling'\)/);
-    expect(terminalUi).toMatch(/classList\.remove\('scrolling'\)/);
-    expect(terminalUi).toContain('_scrollEnd');
-  });
-
-  it('throttles wheel via rAF 16ms debounce', () => {
-    expect(terminalUi).toMatch(/wheelRaf|wheelDelta/);
-    expect(terminalUi).toMatch(/requestAnimationFrame.*wheelDelta|wheelDelta.*requestAnimationFrame/s);
+  it('uses the upstream forward/page/local route for touch and momentum', () => {
+    expect(terminalUi).toContain('this._shouldForwardWheelToApp({ shiftKey: false })');
+    expect(terminalUi).toContain('this._maybePageCliTranscript({ shiftKey: false, touchId: touchContactId }, lines)');
+    expect(terminalUi).toContain("container.style.touchAction = 'none';");
+    expect(terminalUi).not.toContain('_sendForegroundTuiWheel');
   });
 
   it('fixes will-change: contain layout and auto, scrolling stays auto (COD-284)', () => {

@@ -1162,22 +1162,6 @@ class CodemanApp {
     this._lastReconcileWrite = null; // {id, buf} of the last reconcile rewrite — unchanged capture = no-op tick
     // COD-180: heal busy remote TUI tabs on a cadence (all guards live in the tick)
     this._remoteReconcileInterval = setInterval(() => this._remoteReconcileTick(), REMOTE_RECONCILE_TICK_MS);
-    // ── COD-187 live mirror ──
-    // Codex/gemini tabs render only the current screen (scrollback 0); scroll-up
-    // opens a frozen history view fed from the canonical tmux capture.
-    this._viewMode = 'live'; // 'live' | 'history' — meaningful only for mirror sessions
-    this._historyLoadGen = 0; // aborts stale history fetches
-    this._historyInitialLoadGen = 0; // COD-291: generation whose first history buffer is still pending
-    this._historyMissedOutput = false; // live output arrived while frozen in history
-    this._lastMirrorFrame = null; // {id, buf} dedupe for _refreshMirrorFrame
-    this._historyExitAt = 0; // history re-entry cooldown timestamp
-    this._historyPartial = false; // COD-187 lazy load: history view holds only the last N lines
-    this._historyPrefetch = null; // COD-190 speculative prefetch {id, at, promise}
-    this._historyExpandInFlight = false;
-    this._historyEntryAccum = 0; // wheel-up accumulation toward history entry
-    this._historyEntryAccumAt = 0;
-    this._historyScrollFraction = 0; // fractional wheel rows accumulated while history owns xterm
-    this._liveMirrorEnabled = false; // upstream-scrolling comparison branch
 
     // DOM element cache for performance (avoid repeated getElementById calls)
     this._elemCache = {};
@@ -3123,19 +3107,7 @@ class CodemanApp {
     // The tiles carry their own output over their own sockets.
     if (this._tilesOwnTerminal?.()) return;
     if (data.id === this.activeSessionId) {
-      // COD-187: while frozen in the history view, live output is dropped —
-      // the exit-time frame refetch shows the final state. Flag it so the
-      // pill can advertise "new output below".
-      if (this._viewMode === 'history' && this._isMirrorSession(data.id)) {
-        if (!this._historyMissedOutput) {
-          this._historyMissedOutput = true;
-          this._updateHistoryPill?.();
-        }
-        return;
-      }
-      // A streamed redraw means the last captured frame no longer describes
-      // the rendered screen; the next reconcile must be allowed to repaint it.
-      if (this._isMirrorSession(data.id)) this._lastMirrorFrame = null;
+
       if (data.data.length > 32768) _crashDiag.log(`TERMINAL: ${(data.data.length/1024).toFixed(0)}KB`);
 
       // Hard cap all app-owned render queues plus the one xterm chunk currently
@@ -4422,13 +4394,7 @@ class CodemanApp {
     // Skip if buffer load already in progress — avoids competing clear+rewrite cycles
     if (this._isLoadingBuffer) return false;
     if (this._terminalRefreshOwner?.sessionId === sessionId) return false;
-    // COD-187: mirror tabs recover with a cheap frame repaint, never a history
-    // replay (in history view the exit refetch heals instead).
-    if (this._isMirrorSession(this.activeSessionId)) {
-      if (this._viewMode === 'history') return false;
-      this._lastMirrorFrame = null;
-      return (await this._refreshMirrorFrame(sessionId)) === true;
-    }
+
     const refreshOwner = { sessionId };
     this._terminalRefreshOwner = refreshOwner;
     try {
@@ -4529,7 +4495,7 @@ class CodemanApp {
   _onSessionResized(data) {
     if (data.id !== this.activeSessionId || !this.terminal) return;
     const session = this.sessions.get(data.id);
-    if (!this._isMirrorSession(data.id) && session?.mode !== 'codex' && session?.mode !== 'gemini' && session?.mode !== 'antigravity') return;
+    if (session?.mode !== 'codex' && session?.mode !== 'gemini' && session?.mode !== 'antigravity') return;
     // Our own resize (or one that happens to match us) can't misalign our view.
     if (this.terminal.cols === data.cols && this.terminal.rows === data.rows) return;
     this._foreignResizeDirty = data.id;
@@ -4553,16 +4519,7 @@ class CodemanApp {
       this._foreignResizeDirty = null;
       return;
     }
-    // COD-187: mirror tabs never replay history — a cheap frame refresh is the
-    // repair for every trigger that lands here (foreign resize, idle, WS
-    // reconnect). In history view the exit refetch heals instead.
-    if (this._isMirrorSession(sessionId)) {
-      this._foreignResizeDirty = null;
-      if (this._viewMode !== 'history') await this._refreshMirrorFrame(sessionId);
-      return;
-    }
-    // A buffer load is already repainting; keep the dirty flag so the idle
-    // fallback re-checks later rather than racing two clear+rewrite cycles.
+
     if (this._isLoadingBuffer) return;
     try {
       const res = await fetch(`/api/sessions/${sessionId}/terminal`);
@@ -4598,248 +4555,6 @@ class CodemanApp {
   }
 
   /**
-   * COD-187: live-mirror mode — agent-TUI tab with the per-device setting ON
-   * (default). Includes claude (user opt-in expansion): mirror is purely a
-   * client rendering mode, so claude's server-side stream parsing (tokens,
-   * Ralph, prompt detection) is untouched. Deliberately NOT built on
-   * _isTuiSession — that helper also gates LEGACY (setting-OFF) repair paths,
-   * which must keep excluding claude exactly as before. COD-209: OpenCode is
-   * deliberately excluded because its pure TUI owns the scrollable conversation
-   * pane; Codeman history mode would intercept gestures the foreground app needs.
-   */
-  _isMirrorSession(sessionId) {
-    // Comparison branch: upstream uses terminal/CLI history, never a frozen mirror.
-    return false;
-  }
-
-  /** Modes the live mirror applies to when the setting is ON. */
-  _isMirrorEligible(sessionId) {
-    const mode = this.sessions.get(sessionId)?.mode;
-    return mode === 'codex' || mode === 'gemini' || mode === 'claude';
-  }
-
-  /** COD-187: settings hook — flips the cached flag and re-selects the active TUI tab so the mode applies immediately. */
-  _applyLiveMirrorSetting(enabled) {
-    // Ignore previously saved fork settings on this upstream-scrolling branch.
-    this._liveMirrorEnabled = false;
-  }
-
-  /**
-   * COD-187: repaint a live-mirror tab's screen from the canonical frame
-   * capture (`?frame=1` — cursor-positioned snapshot of the pane, remote-aware
-   * server-side). This is the mirror-mode replacement for every full-history
-   * repair path: idle, WS reconnect, foreign resize, needsRefresh,
-   * clearTerminal. Single-flight, generation-guarded, deduped on content.
-   */
-  async _refreshMirrorFrame(sessionId) {
-    if (sessionId !== this.activeSessionId || !this.terminal) return false;
-    if (!this._isMirrorSession(sessionId)) return false;
-    if (this._viewMode === 'history' || this._isLoadingBuffer) return false;
-    if (this._mirrorFrameInFlight) return false;
-    this._mirrorFrameInFlight = true;
-    try {
-      const res = await fetch(`/api/sessions/${sessionId}/terminal?frame=1&mirror=1`);
-      const data = (await res.json())?.data ?? {};
-      this.noteRemoteCaptureState?.(sessionId, data);
-      if (sessionId !== this.activeSessionId || this._viewMode === 'history' || this._isLoadingBuffer) return false;
-      if (data.source !== 'mux-frame' || !data.terminalBuffer) return false;
-      if (this._lastMirrorFrame?.id === sessionId && this._lastMirrorFrame.buf === data.terminalBuffer) return true;
-      this._resetTerminalForReplay();
-      await this.chunkedTerminalWrite(data.terminalBuffer);
-      this._localEchoOverlay?.rerender();
-      this._lastMirrorFrame = { id: sessionId, buf: data.terminalBuffer };
-      return true;
-    } catch (err) {
-      console.error('mirror frame refresh failed:', err);
-      return false;
-    } finally {
-      this._mirrorFrameInFlight = false;
-    }
-  }
-
-  /**
-   * COD-187: open the frozen history view — raise scrollback, fetch the
-   * canonical tmux full-history capture (remote-sourced for remote sessions,
-   * COD-180) and freeze it under a pill. tmux copy-mode semantics.
-   */
-  /**
-   * COD-190: speculative history prefetch — fired on the FIRST upward scroll
-   * tick so the fetch (dominated by the ssh RTT on remote sessions) overlaps
-   * the entry threshold instead of following it. Short TTL: the capture's
-   * last screen must still match the live frame for the no-jump landing.
-   */
-  _prefetchHistory() {
-    const id = this.activeSessionId;
-    if (!id || !this._isMirrorSession(id) || this._viewMode !== 'live') return;
-    if (this._historyPrefetch?.id === id && Date.now() - this._historyPrefetch.at < HISTORY_PREFETCH_TTL_MS) return;
-    this._historyPrefetch = {
-      id,
-      at: Date.now(),
-      promise: fetch(`/api/sessions/${id}/terminal?lines=${HISTORY_INITIAL_LINES}`)
-        .then((r) => r.json())
-        .catch(() => null),
-    };
-  }
-
-  async _enterHistoryView(carryLines = 0) {
-    const sessionId = this.activeSessionId;
-    if (!sessionId || !this.terminal) return;
-    if (!this._isMirrorSession(sessionId) || this._viewMode !== 'live') return;
-    if (this._isLoadingBuffer) return;
-    this._viewMode = 'history';
-    this._historyMissedOutput = false;
-    this._historyScrollFraction = 0;
-    const gen = ++this._historyLoadGen;
-    this._historyInitialLoadGen = gen;
-    this._showHistoryPill('History — loading…');
-    // COD-190 no-jump anchor: remember which viewport row the last non-empty
-    // line sits on. The capture strips trailing blank rows, so "bottom of
-    // buffer" lands HIGHER than the live frame — anchoring on content keeps
-    // the entry pixel-stable instead.
-    const preBuf = this.terminal.buffer.active;
-    let anchorRow = -1;
-    for (let r = this.terminal.rows - 1; r >= 0; r--) {
-      if ((preBuf.getLine(preBuf.viewportY + r)?.translateToString(true) ?? '').trim()) {
-        anchorRow = r;
-        break;
-      }
-    }
-    this.terminal.options.scrollback = this._userScrollback();
-    try {
-      // Fast first page (COD-187 lazy load): last HISTORY_INITIAL_LINES lines.
-      // Prefer the speculative prefetch (COD-190) started on the first
-      // up-tick; single-use — consume and clear.
-      const prefetch =
-        this._historyPrefetch?.id === sessionId && Date.now() - this._historyPrefetch.at < HISTORY_PREFETCH_TTL_MS
-          ? this._historyPrefetch.promise
-          : null;
-      this._historyPrefetch = null;
-      const json = await (prefetch ?? fetch(`/api/sessions/${sessionId}/terminal?lines=${HISTORY_INITIAL_LINES}`).then((r) => r.json()));
-      const data = json?.data ?? {};
-      if (gen !== this._historyLoadGen || sessionId !== this.activeSessionId || this._viewMode !== 'history') return;
-      if (data.source !== 'mux-full-history' || !data.terminalBuffer) {
-        this.showToast?.('History unavailable for this session', 'warning');
-        this._exitHistoryView();
-        return;
-      }
-      this._historyPartial = data.historyPartial === true;
-      // COD-190 atomic swap: ONE write wrapped in DEC 2026 synchronized-update
-      // markers — xterm 6 holds rendering until the terminator, so the blank
-      // clear frame never paints. Embedded 2026 markers are stripped from the
-      // content so they can't terminate our window early. No terminal.reset()
-      // here (it would drop sync mode); \x1b[3J\x1b[H\x1b[2J clears
-      // scrollback + screen in place.
-      const owner = this._beginBufferLoad(`history-${gen}`);
-      const content = data.terminalBuffer.replace(DEC_SYNC_STRIP_RE, '');
-      await new Promise((resolve) => this.terminal.write(`\x1b[?2026h\x1b[3J\x1b[H\x1b[2J${content}\x1b[?2026l`, resolve));
-      this._finishBufferLoad(owner);
-      if (gen !== this._historyLoadGen || this._viewMode !== 'history') return;
-      this._historyInitialLoadGen = 0;
-      // COD-190 no-jump landing: place the history's last non-empty line on
-      // the SAME viewport row it occupied in the live frame (content-anchored
-      // — the capture trims trailing blanks, so plain scrollToBottom would
-      // shift everything up). Then apply the user's accumulated wheel delta
-      // so their own gesture carries them up into history smoothly.
-      const nb = this.terminal.buffer.active;
-      let lastContent = -1;
-      for (let i = nb.baseY + this.terminal.rows - 1; i >= 0; i--) {
-        if ((nb.getLine(i)?.translateToString(true) ?? '').trim()) {
-          lastContent = i;
-          break;
-        }
-      }
-      if (anchorRow >= 0 && lastContent >= 0) {
-        this.terminal.scrollToLine(Math.max(0, Math.min(nb.baseY, lastContent - anchorRow)));
-      } else {
-        this.terminal.scrollToBottom();
-      }
-      const carryRows = Math.max(0, Math.trunc(carryLines));
-      if (carryRows > 0) this.terminal.scrollLines(-carryRows);
-      this._updateHistoryPill();
-    } catch (err) {
-      console.error('history view load failed:', err);
-      if (gen === this._historyLoadGen && this._viewMode === 'history') this._exitHistoryView();
-    }
-  }
-
-  /**
-   * COD-187 lazy load: the user hit the top of the partial history — replace
-   * it with the unbounded capture, preserving the reading position (anchored
-   * by distance from the bottom, which both captures share).
-   */
-  async _expandHistoryFull() {
-    const sessionId = this.activeSessionId;
-    if (!sessionId || this._viewMode !== 'history' || !this._historyPartial) return;
-    if (this._historyExpandInFlight) return;
-    this._historyExpandInFlight = true;
-    const gen = this._historyLoadGen;
-    this._showHistoryPill('History — loading older…');
-    try {
-      const res = await fetch(`/api/sessions/${sessionId}/terminal?capture=1`);
-      const data = (await res.json())?.data ?? {};
-      if (gen !== this._historyLoadGen || this._viewMode !== 'history') return;
-      if (data.source !== 'mux-full-history' || !data.terminalBuffer) {
-        this._historyPartial = false;
-        this._updateHistoryPill();
-        return;
-      }
-      const bufBefore = this.terminal.buffer.active;
-      const distFromBottom = bufBefore.baseY - bufBefore.viewportY;
-      const owner = this._beginBufferLoad(`history-${gen}-full`);
-      this._resetTerminalForReplay();
-      await this.chunkedTerminalWrite(data.terminalBuffer, TERMINAL_CHUNK_SIZE, owner);
-      if (gen !== this._historyLoadGen || this._viewMode !== 'history') return;
-      this._historyPartial = false;
-      const buf = this.terminal.buffer.active;
-      this.terminal.scrollToLine(Math.max(0, buf.baseY - distFromBottom));
-      this._updateHistoryPill();
-    } catch (err) {
-      console.error('history expand failed:', err);
-    } finally {
-      this._historyExpandInFlight = false;
-    }
-  }
-
-  /** COD-187: leave history — trim scrollback back to 0 and repaint the live frame. */
-  _exitHistoryView() {
-    if (this._viewMode !== 'history') return;
-    this._viewMode = 'live';
-    this._historyLoadGen++;
-    this._historyInitialLoadGen = 0;
-    this._historyMissedOutput = false;
-    this._historyPartial = false;
-    this._historyScrollFraction = 0;
-    this._historyExitAt = Date.now();
-    this._hideHistoryPill();
-    // Stale sticky-scroll grace must not survive into live mode.
-    this._lastUserScrollUpAt = null;
-    if (this.terminal && this.activeSessionId && this._isMirrorSession(this.activeSessionId)) {
-      this.terminal.options.scrollback = 0; // trims the freeze-frame instantly
-      this._lastMirrorFrame = null; // force the repaint even if the frame text matches
-      this._refreshMirrorFrame(this.activeSessionId);
-    }
-  }
-
-  _showHistoryPill(text) {
-    const pill = document.getElementById('historyPill');
-    if (!pill) return;
-    pill.textContent = text;
-    pill.hidden = false;
-  }
-
-  _updateHistoryPill() {
-    if (this._viewMode !== 'history') return;
-    let base = 'History (frozen) — Esc or scroll to bottom to resume';
-    if (this._historyPartial) base += ' · scroll to top for older';
-    this._showHistoryPill(this._historyMissedOutput ? `${base} · new output below` : base);
-  }
-
-  _hideHistoryPill() {
-    const pill = document.getElementById('historyPill');
-    if (pill) pill.hidden = true;
-  }
-
-  /**
    * COD-180: periodic mid-turn reconcile for busy REMOTE TUI sessions. Their
    * live stream is nested-tmux repaint traffic that mangles what lands in
    * browser scrollback (lost table rows, partial frames); a capture rewrite
@@ -4850,14 +4565,7 @@ class CodemanApp {
   _remoteReconcileTick() {
     const id = this.activeSessionId;
     if (!id || !this.terminal || this._isLoadingBuffer) return;
-    if (this._isMirrorSession(id)) {
-      // Nested remote redraws can lose cells without closing the WebSocket.
-      // Heal from the canonical frame even when the agent is idle.
-      if (this.sessions.get(id)?.remote && this._viewMode !== 'history') {
-        this._refreshMirrorFrame(id);
-      }
-      return;
-    }
+
     if (!this._isRemoteTuiSession(id)) return;
     // Deliberately NOT gated on busy status: remote codex sessions often never
     // flip to busy (their "Working (…)" frames arrive as partial cell updates
@@ -4873,19 +4581,8 @@ class CodemanApp {
     // The tiles get the clear over their own sockets; the parked main terminal must not refetch.
     if (this._tilesOwnTerminal?.()) return;
     if (data.id === this.activeSessionId) {
-      // COD-187: mirror tabs repaint from the frame capture instead of a
-      // history replay (in history view, exit refetches).
-      if (this._isMirrorSession(data.id)) {
-        if (this._viewMode !== 'history' && !this._isLoadingBuffer) {
-          this._lastMirrorFrame = null; // pane was cleared — force the rewrite
-          await this._refreshMirrorFrame(data.id);
-        }
-        return;
-      }
-      // Skip if selectSession is already loading the buffer — clearTerminal arriving
-      // during buffer load would clear the terminal mid-write, causing visible flicker
-      // and a race between two concurrent chunkedTerminalWrite calls (especially on mobile
-      // where rAF is slower). selectSession will handle the final buffer state.
+      // Skip if selectSession is already loading the buffer; it owns the final
+      // replay and a concurrent clear would interrupt its chunked write.
       if (this._isLoadingBuffer) return;
 
       // Fetch buffer, clear terminal, write buffer, resize (no Ctrl+L needed)
@@ -5368,7 +5065,7 @@ class CodemanApp {
         const wasReconnect = this._wsReconnectAttempts > 0;
         this._wsReconnectAttempts = 0;
         this._updateConnectionIndicator();
-        if (wasReconnect && (this._isTuiSession(sessionId) || this._isMirrorSession(sessionId))) {
+        if (wasReconnect && this._isTuiSession(sessionId)) {
           clearTimeout(this._foreignResizeTimer);
           this._foreignResizeTimer = setTimeout(() => {
             this._reconcileForeignResize(sessionId);
@@ -10957,20 +10654,10 @@ class CodemanApp {
     // mode !== 'shell'), so skip the serialize() + cache slot + localStorage
     // quota for them. Unknown/undefined mode still snapshots, matching restore.
     const outgoingSession = this.activeSessionId ? this.sessions?.get?.(this.activeSessionId) : null;
-    // COD-187: leaving a history view (or any mirror tab) — reset live-mirror
-    // state; a scrollback-0 serialize is worthless, so skip the snapshot too.
-    const outgoingMirror = this.activeSessionId && this._isMirrorSession(this.activeSessionId);
-    if (outgoingMirror || this._viewMode === 'history') {
-      this._viewMode = 'live';
-      this._historyLoadGen++;
-      this._historyMissedOutput = false;
-      this._historyPrefetch = null;
-      this._hideHistoryPill?.();
-    }
+
     if (
       !skipSnapshot &&
       this.activeSessionId &&
-      !outgoingMirror &&
       outgoingSession?.mode !== 'shell' &&
       this._serializeAddon &&
       this._xtermSnapshots
@@ -11607,10 +11294,7 @@ class CodemanApp {
     this._hideWebviewLayer?.();
 
     this._cleanupPreviousSession(sessionId);
-    // COD-187: scrollback ownership — mirror tabs run at 0 (pure screen
-    // mirror; nothing accumulates), everything else gets the user's value
-    // back. The ONLY other writers are _enterHistoryView/_exitHistoryView.
-    this.terminal.options.scrollback = this._isMirrorSession(sessionId) ? 0 : this._userScrollback();
+    this.terminal.options.scrollback = this._userScrollback();
     this.activeSessionId = sessionId;
     // Font metrics must match the selected mode before the socket can flush an
     // activation and before the first fit/resize measures this viewer.
@@ -11797,7 +11481,6 @@ class CodemanApp {
         this._clearTerminalLoadState(sessionId, selectGen);
         return;
       }
-
       // xterm snapshot restore: if we have a serialized xterm state from a
       // previous visit to this session, restore the user's exact prior view
       // (viewport + scrollback + colors) for an instant first paint. For codex
@@ -11809,16 +11492,12 @@ class CodemanApp {
       //
       // Try in-memory first (fast); fall back to localStorage so snapshots
       // survive tab discards / browser reloads.
-      // COD-187: mirror tabs never restore snapshots or cache — the frame
-      // fetch below is the sole first paint (a scrollback-0 serialize is one
-      // screen of stale content at best).
-      const mirror = this._isMirrorSession(sessionId);
-      let snapshot = mirror ? null : this._xtermSnapshots?.get(sessionId);
+      let snapshot = this._xtermSnapshots?.get(sessionId);
       if (snapshot && !this._isUsableXtermSnapshot(snapshot)) {
         this._xtermSnapshots?.delete(sessionId);
         snapshot = null;
       }
-      if (!snapshot && !mirror) {
+      if (!snapshot) {
         try {
           const persisted = localStorage.getItem(`codeman-xs-${sessionId}`);
           if (persisted && this._isUsableXtermSnapshot(persisted)) {
@@ -11859,7 +11538,7 @@ class CodemanApp {
       // jarring double-render: stale content appears, then the terminal flashes
       // blank and rewrites with fresh data. Skip the cache and write the fresh
       // buffer once for a single clean transition.
-      const cachedBuffer = mirror ? undefined : this.terminalBufferCache.get(sessionId);
+      const cachedBuffer = this.terminalBufferCache.get(sessionId);
       // `clearedBeforeFresh` is declared above the try, because the catch reads
       // it — re-declaring it here would shadow that and silently break it.
       if (cachedBuffer && !sessionIsBusy && !restoredSnapshot && session?.mode !== 'shell') {
@@ -11893,7 +11572,7 @@ class CodemanApp {
       // dimensions (a real SIGWINCH → Ink redraw); a same-size tab switch sent
       // no resize, so waiting would just add latency. Shell sessions never need
       // it, so terminal content can appear immediately when switching shells.
-      if (session?.mode !== 'shell' && dimsChanged && !mirror) {
+      if (session?.mode !== 'shell' && dimsChanged) {
         await new Promise((resolve) => setTimeout(resolve, TUI_REDRAW_SETTLE_MS));
         if (this._isStaleSelect(selectGen)) {
           this._clearTerminalLoadState(sessionId, selectGen);
@@ -11929,18 +11608,16 @@ class CodemanApp {
       const shellSession = session?.mode === 'shell';
       const paneKeepsNoHistory =
         !session?.remote && !session?.docker && this._paneHistoryLines?.get(sessionId) === 0;
-      const useFullHistory = !mirror && !shellSession && (paneKeepsNoHistory || !this._fullHistoryLoaded.has(sessionId));
+      const useFullHistory = !shellSession && (paneKeepsNoHistory || !this._fullHistoryLoaded.has(sessionId));
       if (useFullHistory) this._fullHistoryLoaded.add(sessionId);
       this._sessionsLoadedSincePageOpen.add(sessionId);
       const fetchStartedAt = performance.now();
       const tailUrl = `/api/sessions/${sessionId}/terminal?tail=${TERMINAL_TAIL_SIZE}`;
       let capture;
       try {
-        const captureUrl = mirror
-          ? `/api/sessions/${sessionId}/terminal?frame=1&mirror=1`
-          : useFullHistory
-            ? `/api/sessions/${sessionId}/terminal?full=1`
-            : shellSession ? `/api/sessions/${sessionId}/terminal?${SHELL_LOAD_QUERY}` : tailUrl;
+        const captureUrl = useFullHistory
+          ? `/api/sessions/${sessionId}/terminal?full=1`
+          : shellSession ? `/api/sessions/${sessionId}/terminal?${SHELL_LOAD_QUERY}` : tailUrl;
         capture = await this._fetchTerminalCapture(captureUrl, { full: useFullHistory });
       } catch (err) {
         // The deadline made a slow link reachable for the first time, and the
@@ -12029,13 +11706,8 @@ class CodemanApp {
           this.terminal.scrollToBottom();
         }
 
-        if (mirror) {
-          // COD-187: frames are not cached (always refetched); remember the
-          // painted frame so _refreshMirrorFrame can dedupe.
-          this._lastMirrorFrame = { id: sessionId, buf: data.terminalBuffer };
-        // Shell selection always uses a fresh bounded tail, so retaining its
-        // payload only wastes memory and can evict useful TUI caches.
-        } else if (session?.mode === 'shell') {
+        // Shell selection uses a fresh bounded tail; cache only TUI captures.
+        if (session?.mode === 'shell') {
           this.terminalBufferCache.delete(sessionId);
         } else {
           // Update cache (cap at 20 entries)
@@ -12051,12 +11723,7 @@ class CodemanApp {
         // clear stale content now; either way queued live output must be flushed.
         if (!clearedBeforeFresh) this._resetTerminalForReplay();
         bufferWasEmpty = true;
-        // COD-187: a mirror tab whose frame fetch came back degraded/empty
-        // recovers from live repaints; nudge one frame retry for idle panes
-        // that won't repaint on their own.
-        if (mirror) {
-          setTimeout(() => this._refreshMirrorFrame(sessionId), 2000);
-        }
+
       }
 
       const terminalLoadTiming = {
@@ -12232,7 +11899,6 @@ class CodemanApp {
       requestAnimationFrame(() => {
         try { this.syncTerminalGeometry?.(); } catch {}
         try { this.terminal?.refresh(0, Math.max(0, (this.terminal.rows || 24) - 1)); } catch {}
-        this._syncTerminalTouchAction?.();
       });
       _crashDiag.log(`SELECT_DONE: ${selectDoneMs.toFixed(0)}ms`);
       console.log(`[CRASH-DIAG] selectSession DONE: ${sessionId.slice(0,8)} in ${selectDoneMs.toFixed(0)}ms`);

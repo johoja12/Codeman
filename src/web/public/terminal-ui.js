@@ -137,33 +137,6 @@
   // event goes the SAME way, so slow small wheel ticks (40 px every 250 ms, a
   // Firefox 1-line notch) pay it back instead of each pre-paying a page of its own.
   const PAGE_KEY_DEBT_MS = 1000;
-  // COD-464 paced wheel → CLI. Per animation frame, send at most this share of
-  // the rows still owed (always at least one report's worth). Small amounts, which
-  // is everything a trackpad or a finger produces, go out at once, so the content
-  // stops when the input stops; only a big jump (a mouse notch, ~5 rows) is spread
-  // over a few frames, halving each frame, instead of landing in one repaint.
-  const WHEEL_PACE_EASE = 0.5;
-  const WHEEL_PACE_MAX_REPORTS_PER_FRAME = 6;
-  // Streak timing margins. A CLI that accelerates within a streak (`wheelForward.
-  // streak`, measured on Claude: reset between 30 and 40 ms) is only ever sent a
-  // report while the streak is CLEARLY alive (gap < resetMs - continue margin) or
-  // CLEARLY reset (gap >= resetMs + reset margin), never in between. ASYMMETRIC on
-  // purpose: the browser → WS → server → tmux path compresses gaps (a flick whose
-  // sends were 47-52 ms apart moved 68 rows, which only fits Claude NOT resetting
-  // at those gaps), and wrongly assuming a reset over-delivers (the runaway feel)
-  // while wrongly assuming a continuation merely under-delivers.
-  const WHEEL_STREAK_CONTINUE_MARGIN_MS = 12;
-  const WHEEL_STREAK_RESET_MARGIN_MS = 35;
-  // Finger still for this long before lifting = a hold, not a flick (iOS does the same).
-  const TOUCH_HOLD_NO_FLING_MS = 80;
-  // A wheel event after this much quiet starts a NEW gesture, whose first event
-  // sends a report even when it is less than one report's worth of travel, so the
-  // screen answers the very first event (a trackpad's first deltas are a few px).
-  // The pre-paid travel is owed back by the rest of the gesture, never added.
-  const WHEEL_PACE_GESTURE_GAP_MS = 150;
-  // ...but not for sub-row jitter (0.1 row, ~2px).
-  const WHEEL_PACE_MIN_START_ROWS = 0.1;
-
   // Wheel delta → scroll lines (fractional), for a terminal `rows` tall. The
   // body of the primary pane's _wheelScrollLinesFloat (see its comment for the
   // Shift-axis trap and the deltaMode units), pure so a TerminalTile pages with
@@ -468,13 +441,6 @@
     KEY_PAGE_DOWN,
     PAGE_KEY_SCREEN_FRACTION,
     PAGE_KEY_MAX_PER_BATCH,
-    WHEEL_PACE_EASE,
-    WHEEL_PACE_MAX_REPORTS_PER_FRAME,
-    WHEEL_PACE_GESTURE_GAP_MS,
-    WHEEL_PACE_MIN_START_ROWS,
-    WHEEL_STREAK_CONTINUE_MARGIN_MS,
-    WHEEL_STREAK_RESET_MARGIN_MS,
-    TOUCH_HOLD_NO_FLING_MS,
     wheelDeltaLines,
     wheelDeltaWholeLines,
     SGR_WHEEL_MAX_TICKS,
@@ -555,91 +521,14 @@ function _debugEchoLogOuter() {
 }
 
 Object.assign(CodemanApp.prototype, {
-  // ═══════════════════════════════════════════════════════════════
-  // Terminal Setup — xterm.js config and input handling
-  // ═══════════════════════════════════════════════════════════════
 
-  /**
-   * COD-187 — single funnel for user scroll intent (wheel, touch, momentum).
-   * Mirror tabs run at scrollback 0, so an up-scroll can't move the viewport;
-   * instead, accumulated up-intent opens the frozen history view. Returns
-   * 'entered-history' so touch callers can zero their momentum, 'swallowed'
-   * when there is nothing to scroll, 'scrolled' otherwise.
-   */
-  _handleUserScrollIntent(lines) {
-    const id = this.activeSessionId;
-    if (id && this._isMirrorSession?.(id) && this._viewMode !== 'history') {
-      if (lines < 0) {
-        const now = Date.now();
-        // Post-exit cooldown: a trackpad's inertia tail must not immediately re-enter.
-        if (now - (this._historyExitAt || 0) < HISTORY_REENTRY_COOLDOWN_MS) return 'swallowed';
-        // COD-190: start fetching history on the FIRST up-tick — by the time
-        // the entry threshold is reached the response is usually in hand,
-        // hiding the fetch latency (dominant on remote sessions: ssh RTT).
-        this._prefetchHistory?.();
-        if (now - (this._historyEntryAccumAt || 0) > HISTORY_ENTRY_WINDOW_MS) this._historyEntryAccum = 0;
-        this._historyEntryAccumAt = now;
-        this._historyEntryAccum += -lines;
-        if (this._historyEntryAccum >= HISTORY_ENTRY_LINES) {
-          const carryLines = this._historyEntryAccum;
-          this._historyEntryAccum = 0;
-          this._enterHistoryView?.(carryLines);
-          return 'entered-history';
-        }
-      }
-      return 'swallowed';
-    }
-    let scrollLines = lines;
-    if (this._viewMode === 'history') {
-      this._historyScrollFraction = (this._historyScrollFraction || 0) + lines;
-      scrollLines = Math.trunc(this._historyScrollFraction);
-      this._historyScrollFraction -= scrollLines;
-      if (!scrollLines) return 'swallowed';
-    }
-    this._noteTerminalUserScroll(scrollLines);
-    this.terminal.scrollLines(scrollLines);
-    // Scrolling back down to the bottom of the history view resumes the live mirror.
-    // COD-291: before the first history buffer lands, the old zero-scrollback
-    // live frame still reports "at bottom"; a trackpad reversal tail must not
-    // cancel that in-flight load.
-    if (
-      this._viewMode === 'history' &&
-      scrollLines > 0 &&
-      this._historyInitialLoadGen !== this._historyLoadGen &&
-      this.isTerminalAtBottom()
-    ) {
-      this._exitHistoryView?.();
-    }
-    // COD-187 lazy load: reaching the top of a PARTIAL history pulls the full depth.
-    if (this._viewMode === 'history' && scrollLines < 0 && this.terminal.buffer.active.viewportY === 0) {
-      this._expandHistoryFull?.();
-    }
-    return 'scrolled';
-  },
-
-  /**
-   * COD-209: OpenCode is a pure foreground TUI with its own scrollable middle
-   * pane. In live mode, wheel/touch gestures must reach xterm so xterm can
-   * forward mouse-wheel reports to OpenCode instead of entering Codeman history
-   * mode or moving browser scrollback.
-   */
-  _shouldForwardScrollToForegroundTui() {
-    // Comparison branch: use upstream's native tracking / PageUp routing.
-    return false;
-  },
-
-  _handleForegroundTuiWheel(ev) {
-    if (!this._shouldForwardScrollToForegroundTui()) return false;
-    ev.preventDefault();
-    ev.stopPropagation();
-    this._sendForegroundTuiWheel(ev.deltaY, ev.clientX, ev.clientY);
-    return true;
+  _shouldForwardClickToForegroundTui() {
+    return this.activeSessionId && this.sessions.get(this.activeSessionId)?.mode === 'opencode';
   },
 
   _handleForegroundTuiClick(ev) {
     // Keep the fork's click support independent of the scrolling comparison.
-    const session = this.activeSessionId ? this.sessions.get(this.activeSessionId) : null;
-    if (session?.mode !== 'opencode' || this._viewMode !== 'live' || ev.button !== 0) return false;
+    if (!this._shouldForwardClickToForegroundTui() || ev.button !== 0) return false;
     ev.preventDefault();
     ev.stopPropagation();
     this._sendForegroundTuiClick(ev.clientX, ev.clientY);
@@ -729,62 +618,6 @@ Object.assign(CodemanApp.prototype, {
     state.identifier = null;
   },
 
-  _sendForegroundTuiWheel(deltaY, clientX, clientY) {
-    if (!this.activeSessionId || !Number.isFinite(deltaY)) return;
-    const cell = this._terminalCellFromClientPoint(clientX, clientY);
-    if (!cell) return;
-    const _session = this.activeSessionId ? this.sessions?.get?.(this.activeSessionId) : null;
-    const _isOpencode = _session?.mode === 'opencode';
-    const _isMobile =
-      typeof MobileDetection !== 'undefined' &&
-      (typeof MobileDetection.isMobile === 'function'
-        ? MobileDetection.isMobile()
-        : MobileDetection.getDeviceType?.() === 'mobile');
-    if (_isOpencode && _isMobile) {
-      const prev = this._tuiWheelAccum || 0;
-      if (Math.sign(prev) !== 0 && Math.sign(prev) !== Math.sign(deltaY)) {
-        this._tuiWheelAccum = deltaY;
-        this._tuiWheelCell = cell;
-      } else {
-        this._tuiWheelAccum = prev + deltaY;
-        this._tuiWheelCell = cell;
-      }
-      if (this._tuiWheelTimer) return;
-      this._tuiWheelTimer = setTimeout(() => {
-        const total = this._tuiWheelAccum || 0;
-        const flushCell = this._tuiWheelCell;
-        this._tuiWheelAccum = 0;
-        this._tuiWheelTimer = null;
-        this._tuiWheelCell = null;
-        if (!flushCell || !Number.isFinite(total) || total === 0) return;
-        const ch = this.terminal?._core?._renderService?.dimensions?.css?.cell?.height || 13;
-        const lines = Math.trunc(total / ch);
-        if (!lines) return;
-        const button = lines > 0 ? 65 : 64;
-        const seq = `\x1b[<${button};${flushCell.col};${flushCell.row}M`;
-        const count = Math.abs(lines);
-        for (let i = 0; i < count; i++) this._sendInputAsync(this.activeSessionId, seq);
-        const rem = total % ch;
-        if (rem !== 0) this._tuiWheelAccum = rem;
-      }, 16);
-      return;
-    }
-    const threshold = 50;
-    const previous = this._foregroundTuiWheelAccum || 0;
-    const next = previous + deltaY;
-    if (Math.sign(previous) !== 0 && Math.sign(previous) !== Math.sign(deltaY)) {
-      this._foregroundTuiWheelAccum = deltaY;
-      return;
-    }
-    if (Math.abs(next) < threshold) {
-      this._foregroundTuiWheelAccum = next;
-      return;
-    }
-    const button = deltaY > 0 ? 65 : 64;
-    this._sendInputAsync(this.activeSessionId, `\x1b[<${button};${cell.col};${cell.row}M`);
-    this._foregroundTuiWheelAccum = next % threshold;
-  },
-
   _sendForegroundTuiClick(clientX, clientY) {
     if (!this.activeSessionId) return;
     const cell = this._terminalCellFromClientPoint(clientX, clientY);
@@ -794,9 +627,8 @@ Object.assign(CodemanApp.prototype, {
 
   /**
    * The user's configured scrollback (localStorage 'codeman-scrollback'),
-   * floored at DEFAULT_SCROLLBACK. Shared by initTerminal and the COD-187
-   * live-mirror scrollback writers (selectSession, history enter/exit) so the
-   * two can never drift.
+   * floored at DEFAULT_SCROLLBACK and shared by terminal initialization
+   * and tab selection.
    */
   _userScrollback() {
     const stored = parseInt(localStorage.getItem('codeman-scrollback'));
@@ -1103,35 +935,6 @@ Object.assign(CodemanApp.prototype, {
       // Esc would reach the PTY before the document handler closes the preview.
       // Returning false only stops xterm; the event still bubbles to that handler.
       if (ev.type === 'keydown' && ev.key === 'Escape' && this._isFilePreviewOpen?.()) return false;
-
-      // ── COD-187 history view keys ──
-      // Esc EXITS the frozen history view and must NEVER reach the PTY (a
-      // leaked \x1b cancels a running codex turn). Gated strictly on history.
-      if (ev.type === 'keydown' && this._viewMode === 'history') {
-        if (ev.key === 'Escape') {
-          this._exitHistoryView?.();
-          return false;
-        }
-        if (ev.key === 'PageUp' || ev.key === 'PageDown') {
-          this.terminal.scrollLines((ev.key === 'PageUp' ? -1 : 1) * Math.max(1, this.terminal.rows - 2));
-          if (ev.key === 'PageDown' && this.isTerminalAtBottom()) this._exitHistoryView?.();
-          if (ev.key === 'PageUp' && this.terminal.buffer.active.viewportY === 0) this._expandHistoryFull?.();
-          return false;
-        }
-      }
-      // Shift+PageUp opens history on a live mirror tab (plain PageUp keeps
-      // flowing to the PTY — TUIs consume it).
-      if (
-        ev.type === 'keydown' &&
-        ev.key === 'PageUp' &&
-        ev.shiftKey &&
-        this.activeSessionId &&
-        this._isMirrorSession?.(this.activeSessionId) &&
-        this._viewMode !== 'history'
-      ) {
-        this._enterHistoryView?.();
-        return false;
-      }
 
       // Let the app's Alt/Option session-nav and Command Palette shortcuts reach the document keydown handler
       // (app.js switches tabs by PHYSICAL e.code) instead of xterm injecting ESC<char> into
@@ -1616,30 +1419,12 @@ Object.assign(CodemanApp.prototype, {
     //
     // COD-283/284: session changes must update native momentum routing too.
     {
-      const getIsOpencodeMobile = () => {
-        const session = this.activeSessionId ? this.sessions?.get?.(this.activeSessionId) : null;
-        return session?.mode === 'opencode' && typeof MobileDetection !== 'undefined' && MobileDetection.isMobile?.();
-      };
-      const syncTouchAction = () => {
-        container.style.touchAction = getIsOpencodeMobile() ? 'pan-y' : 'none';
-      };
-      // touchAction = 'pan-y' // satisfy opencode-e2e static check
-      syncTouchAction();
-      this._syncTerminalTouchAction = syncTouchAction;
+      container.style.touchAction = 'none';
       const cellHeight = () => this.terminal._core?._renderService?.dimensions?.css?.cell?.height || 13;
-      const getThreshold = () =>
-        typeof MobileDetection !== 'undefined' && MobileDetection.isTouchDevice?.() ? 8 : 50;
-      let touchMoveRaf = 0;
-      let pendingDelta = 0;
-      let pendingX = 0;
-      let pendingY = 0;
       let touchLastX = 0;
       let touchLastY = 0;
       let velocity = 0;
       let lastTime = 0;
-      // COD-464: when the finger last MOVED. Lifting after holding still must
-      // not fling (measured: drag, hold 300 ms, lift → 664 ms of momentum).
-      let lastMoveAt = 0;
       let scrollFrame = null;
       let isTouching = false;
       // One id per touch contact (touchstart), carried by its touchmoves AND its
@@ -1652,36 +1437,10 @@ Object.assign(CodemanApp.prototype, {
         lastTime = timestamp;
 
         if (!isTouching && Math.abs(velocity) > 0.3) {
-          if (this._shouldForwardScrollToForegroundTui()) {
-            const isOpencode = getIsOpencodeMobile();
-            if (isOpencode) {
-              const cell = this._terminalCellFromClientPoint(touchLastX, touchLastY);
-              if (cell) {
-                const ch = cellHeight();
-                const lines = Math.trunc(velocity / ch);
-                if (lines !== 0) {
-                  const button = lines > 0 ? 65 : 64;
-                  const seq = `\x1b[<${button};${cell.col};${cell.row}M`;
-                  for (let i = 0; i < Math.abs(lines); i++) this._sendInputAsync(this.activeSessionId, seq);
-                }
-              }
-            } else {
-              this._sendForegroundTuiWheel(velocity, touchLastX, touchLastY);
-            }
-            velocity *= 0.92;
-            scrollFrame = requestAnimationFrame(scrollLoop);
-            return;
-          }
           // Momentum phase — convert pixel velocity to lines
           const lines = Math.round(velocity / cellHeight());
           if (lines !== 0) {
-            // COD-187: mirror tabs and the frozen history view own scroll
-            // intent (an up-flick OPENS history), so they bypass the #205
-            // forward/page routing below.
-            if (this._isMirrorSession?.(this.activeSessionId) || this._viewMode === 'history') {
-              const intent = this._handleUserScrollIntent(lines);
-              if (intent === 'entered-history' || intent === 'swallowed') velocity = 0;
-            } else if (this._shouldForwardWheelToApp({ shiftKey: false })) {
+            if (this._shouldForwardWheelToApp({ shiftKey: false })) {
               // Flick momentum keeps feeding the CLI's transcript from the last
               // touch point; the 40ms coalescer batches the per-frame reports.
               this._forwardScrollToApp(touchLastX, touchLastY, lines);
@@ -1756,11 +1515,6 @@ Object.assign(CodemanApp.prototype, {
           velocity = 0;
           pixelAccum = 0;
           lastTime = 0;
-          pendingDelta = 0;
-          if (touchMoveRaf) {
-            cancelAnimationFrame(touchMoveRaf);
-            touchMoveRaf = 0;
-          }
           if (!touch) {
             isTouching = false;
             didScroll = true;
@@ -1872,68 +1626,14 @@ Object.assign(CodemanApp.prototype, {
             const delta = touchLastY - touchY; // positive = scroll down
             pixelAccum += delta;
             velocity = delta * 1.2;
-            lastMoveAt = performance.now();
+
             touchLastX = touchX;
             touchLastY = touchY;
-            if (this._shouldForwardScrollToForegroundTui()) {
-              // opencode touch: immediate per-frame SGR (no double 16ms batch) for smooth 60fps
-              if (getIsOpencodeMobile()) {
-                pendingDelta += delta;
-                pendingX = touchX; pendingY = touchY;
-                if (touchMoveRaf) return;
-                touchMoveRaf = requestAnimationFrame(() => {
-                  const d = pendingDelta; pendingDelta = 0; touchMoveRaf = 0;
-                  const cell = this._terminalCellFromClientPoint(pendingX, pendingY);
-                  if (!cell || !Number.isFinite(d) || d === 0) return;
-                  const ch = cellHeight();
-                  const lines = Math.trunc(d / ch);
-                  if (!lines) { pendingDelta = d; return; }
-                  const button = lines > 0 ? 65 : 64;
-                  const seq = `\x1b[<${button};${cell.col};${cell.row}M`;
-                  for (let i = 0; i < Math.abs(lines); i++) this._sendInputAsync(this.activeSessionId, seq);
-                  const rem = d % ch;
-                  if (rem !== 0) pendingDelta = rem;
-                });
-                return;
-              }
-            if (Math.abs(pixelAccum + delta) >= getThreshold()) {
-                pendingDelta += delta;
-                pendingX = touchX; pendingY = touchY;
-                if (touchMoveRaf) return;
-                touchMoveRaf = requestAnimationFrame(() => {
-                  const d = pendingDelta; pendingDelta = 0; touchMoveRaf = 0;
-                  this._sendForegroundTuiWheel(d, pendingX, pendingY);
-                });
-              }
-              return;
-            }
-            pixelAccum += delta;
-          if (Math.abs(pixelAccum) < getThreshold()) return;
-          if (getIsOpencodeMobile()) {
-              pendingDelta += pixelAccum;
-              if (touchMoveRaf) return;
-              touchMoveRaf = requestAnimationFrame(() => {
-                const ch = cellHeight();
-                const lines = Math.trunc(pendingDelta / ch);
-                pendingDelta = 0; touchMoveRaf = 0;
-                if (lines !== 0) {
-                  const intent = this._handleUserScrollIntent(lines);
-                  pixelAccum -= lines * ch;
-                  if (intent === 'entered-history') { velocity = 0; pixelAccum = 0; }
-                }
-              });
-              return;
-            }
+            // Convert accumulated pixels to whole lines
             const ch = cellHeight();
             const lines = Math.trunc(pixelAccum / ch);
             if (lines !== 0) {
-              // COD-187: mirror tabs and the frozen history view own scroll
-              // intent (an up-drag OPENS history); everything else takes the
-              // #205 forward/page/local routing.
-              let intent = null;
-              if (this._isMirrorSession?.(this.activeSessionId) || this._viewMode === 'history') {
-                intent = this._handleUserScrollIntent(lines);
-              } else if (this._shouldForwardWheelToApp({ shiftKey: false })) {
+              if (this._shouldForwardWheelToApp({ shiftKey: false })) {
                 this._logScrollRouting('forward-sgr');
                 this._forwardScrollToApp(touchLastX, touchLastY, lines);
               } else if (!this._maybePageCliTranscript({ shiftKey: false, touchId: touchContactId }, lines)) {
@@ -1943,10 +1643,6 @@ Object.assign(CodemanApp.prototype, {
                 this._maybeLoadMoreHistoryOnScroll(lines);
               }
               pixelAccum -= lines * ch;
-              if (intent === 'entered-history') {
-                velocity = 0;
-                pixelAccum = 0;
-              }
             }
           }
         },
@@ -1978,7 +1674,6 @@ Object.assign(CodemanApp.prototype, {
           const wasTouching = isTouching;
           const touch = this._endTerminalTouchGesture(touchGesture, ev.changedTouches, ev.touches);
           isTouching = false;
-          if (touchMoveRaf) { cancelAnimationFrame(touchMoveRaf); touchMoveRaf = 0; pendingDelta = 0; }
           if (!scrollFrame && Math.abs(velocity) > 0.3) {
             scrollFrame = requestAnimationFrame(scrollLoop);
           }
@@ -2039,11 +1734,6 @@ Object.assign(CodemanApp.prototype, {
           this._touchSelecting = false;
           velocity = 0;
           pixelAccum = 0;
-          pendingDelta = 0;
-          if (touchMoveRaf) {
-            cancelAnimationFrame(touchMoveRaf);
-            touchMoveRaf = 0;
-          }
           this._cancelTerminalTouchGesture(touchGesture);
           tapStartedWithTerminalFocus = false;
           tapStartIntentCache = null;
@@ -2256,16 +1946,7 @@ Object.assign(CodemanApp.prototype, {
       // tapping to move the cursor silently does nothing whenever Chinese input
       // is on, because cjkActive stays true the whole time the field is visible.
       const isMouseReport = /^\x1b\[<\d+;\d+;\d+[Mm]$/.test(data);
-      // COD-187: typing exits the frozen history view first, then the
-      // keystroke flows into the live session (tmux copy-mode semantics).
-      if (
-        this._viewMode === 'history' &&
-        !isMouseReport &&
-        !window.CodemanTerminalInput?.shouldSuppressTerminalQueryResponse(data)
-      ) {
-        this._exitHistoryView?.();
-      }
-      // CJK input has focus — block xterm from sending keystrokes to PTY
+
       if (!isMouseReport && (window.cjkActive || document.activeElement?.id === 'cjkInput')) {
         // Self-heal: if the CJK field is visible but focus drifted to xterm's
         // hidden textarea (e.g. something called terminal.focus()), everything
@@ -6119,7 +5800,7 @@ Object.assign(CodemanApp.prototype, {
       cjkVisible,
       cjkActive: !!window.cjkActive,
       activeElement: activeId,
-      viewMode: this._viewMode || 'live',
+
       localEchoEnabled: !!this._localEchoEnabled,
       localEchoPolicy: this._localEchoPolicy || 'off',
       pendingTextLen: (this._localEchoOverlay?.pendingText || '').length,
@@ -6177,10 +5858,7 @@ Object.assign(CodemanApp.prototype, {
         if (this._cjkInput?.clear) this._cjkInput.clear();
       }
     } catch {}
-    // 2. Exit history
-    if (this._viewMode === 'history') {
-      try { this._exitHistoryView?.(); } catch {}
-    }
+
     // 3. Clear local-echo wedge
     try {
       this._localEchoOverlay?.clear();
@@ -6558,7 +6236,7 @@ Object.assign(CodemanApp.prototype, {
    * - the session is a busy codex session (its live output stream will
    *   reconcile the viewport; codex's TUI frame can omit earlier output the
    *   snapshot preserved).
-   * Never preserve when the terminal was already cleared (busy/mirror paint),
+   * Never preserve when the terminal was already cleared (busy paint),
    * on the first full-history load after page open, or when the buffer
    * changed on an idle session — idle tabs unsubscribe from terminal output,
    * so the fetched buffer is the only way they learn about missed output
@@ -7769,7 +7447,7 @@ Object.assign(CodemanApp.prototype, {
     const mouseMode = this.terminal.modes?.mouseTrackingMode;
     const mouseTrackingOn = !!mouseMode && mouseMode !== 'none';
     this._suppressTrustedTapMouseEvents();
-    if (this._shouldForwardScrollToForegroundTui()) {
+    if (this._shouldForwardClickToForegroundTui()) {
       this._sendForegroundTuiClick(touch.clientX, touch.clientY);
     } else if (mouseTrackingOn) {
       this._dispatchSyntheticTerminalClick(touch.clientX, touch.clientY);
@@ -7952,24 +7630,6 @@ Object.assign(CodemanApp.prototype, {
     return window.CodemanTerminalInput.wheelDeltaWholeLines(ev, this.terminal?.rows);
   },
 
-  /** Unrounded variant for the smooth local-scroll path, which accumulates
-   *  sub-line fractions across events instead of forcing every tiny trackpad
-   *  delta to a whole ±1 line. Same unit handling and Shift-axis trap. */
-  /**
-   * COD-464: the wheel delta in CONTENT ROWS at 1:1 pixels, so the transcript
-   * moves as far as a web page would for the same input. `_wheelScrollLinesFloat`
-   * uses a fixed 25px per line, but a row is ~21px on desktop, so content moved
-   * ~0.84x the trackpad. Line/page units keep their meaning.
-   */
-  _wheelRowsFloat(ev) {
-    const delta = ev.shiftKey && Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
-    if (!delta) return 0;
-    if (ev.deltaMode === 1) return delta;
-    if (ev.deltaMode === 2) return delta * (this.terminal?.rows || 24);
-    const rowPx = this.terminal?._core?._renderService?.dimensions?.css?.cell?.height;
-    return delta / (Number.isFinite(rowPx) && rowPx > 0 ? rowPx : 25);
-  },
-
   _wheelScrollLinesFloat(ev) {
     return window.CodemanTerminalInput.wheelDeltaLines(ev, this.terminal?.rows);
   },
@@ -8028,216 +7688,11 @@ Object.assign(CodemanApp.prototype, {
     return true;
   },
 
-  // Encode wheel ticks as SGR reports (button 64 = up, 65 = down) at the pointer
-  // cell. Reports are coalesced into one fire-and-forget write per ~40ms: a
-  // trackpad emits dozens of wheel events per second and each send becomes a
-  // tmux send-keys on the server — unbatched, a single flick would spawn a
-  // process storm. Per-event tick count is capped (Claude applies its own
-  // scroll-speed multiplier and acceleration on top), and the queue is bounded
-  // so a wild scroll can't build a backlog that keeps scrolling after the finger
-  // stops. Flushed via _sendInputEphemeral — loss-tolerant, off the durable queue.
-  /**
-   * COD-464: this session's `wheelForward` capability, as the server injects it
-   * into `window.__codemanWheelForward` (never an id literal here), when it says
-   * the wheel goes to the CLI RIGHT NOW: `{ rows, reversalDeadReports }`, else
-   * null. Every forwarding mode needs the CLI to have turned mouse tracking on
-   * itself (`cliMouseTracking`, false for claude's inline renderer, older codex
-   * and panes Codeman cannot see into, which keep the local/PageUp routes);
-   * 'version-gated' additionally needs the probed CLI version.
-   */
-  _wheelReportsFor(sessionId) {
-    const session = this.sessions?.get(sessionId);
-    const map = typeof window !== 'undefined' ? window.__codemanWheelForward : null;
-    const spec = session?.mode && map ? map[session.mode] : null;
-    if (!spec || !Number.isInteger(spec.rows) || spec.rows <= 0) return null;
-    // #498: a pane that never turned mouse tracking on ignores wheel reports
-    // (claude's default inline renderer, older codex, remote wrappers), so EVERY
-    // forwarding mode needs it; forwarding there made every wheel tick dead.
-    if (session.cliMouseTracking !== true) return null;
-    if (spec.mode === 'version-gated') {
-      if (!spec.minVersion || !this._cliVersionAtLeast?.(session.cliVersion, spec.minVersion)) return null;
-    } else if (spec.mode !== 'mouse-tracking') {
-      return null;
-    }
-    const dead = Number.isInteger(spec.reversalDeadReports) ? Math.max(0, spec.reversalDeadReports) : 0;
-    const streak =
-      spec.streak && Number.isFinite(spec.streak.resetMs) && Array.isArray(spec.streak.steps) && spec.streak.steps.length
-        ? { resetMs: spec.streak.resetMs, steps: spec.streak.steps }
-        : null;
-    return { rows: spec.rows, reversalDeadReports: dead, streak };
-  },
-
-  /**
-   * COD-464: should this desktop wheel event drive the CLI's own transcript
-   * through paced SGR reports? Measured (2026-10-01): on live-mirror tabs the
-   * wheel used to fall through to the PageUp fallback (the mirror buffer has no
-   * scrollback, so it always read as hollow): nothing moved until ~500px of
-   * wheel travel, then the CLI jumped half a screen, and a slow trackpad
-   * gesture moved nothing at all. Both CLIs whose `wheelForward` declares `rows`
-   * scroll by whole rows per report in 5-12 ms.
-   *
-   * Whether the CLI takes the wheel at all is its `wheelForward` capability
-   * (see _wheelReportsFor). Shift+wheel and the "Wheel scrolls local history"
-   * opt-out keep their meaning.
-   */
-  _shouldPaceWheelToCli(ev) {
-    if (!ev || ev.shiftKey || !this.activeSessionId || !this.terminal) return false;
-    if (this._viewMode === 'history') return false;
-    if (this.loadAppSettingsFromStorage?.()?.terminalWheelLocalScrollback) return false;
-    const tracking = this.terminal.modes?.mouseTrackingMode;
-    if (tracking && tracking !== 'none') return false;
-    if (this.terminal.buffer?.active?.type === 'alternate') return false;
-    return this._wheelReportsFor(this.activeSessionId) !== null;
-  },
-
-  /**
-   * COD-464 paced wheel/touch → CLI, in CONTENT ROWS (fractional): what the
-   * input asks the transcript to move, at 1:1 with its pixels (see
-   * _wheelRowsFloat; touch passes finger pixels / row height).
-   *
-   * Measured "not natural" (isolated real Claude 2.1.286 + Codex 0.159.3): the
-   * content moved ~0.82x the input, a notch kept gliding ~120 ms after the wheel
-   * stopped, and Claude ACCELERATES inside a streak of reports (step per report
-   * 1,1,1,1,2,2,2,3,3,3,3,4,4,4,5,5,6…; reset by a 35-40 ms pause), so a phone
-   * flick moved 8.5x the finger and sustained scrolling sped up the longer it
-   * ran. So the rows still OWED are tracked, and each frame sends only the
-   * reports whose measured step (`_wheelPaceStep`, from the CLI's `streak`
-   * curve, else its fixed `rows`) the debt covers: Claude stays linear while
-   * fast input still gets bigger steps. Rules:
-   *  - the first event of a gesture moves at once (pre-paid, owed back);
-   *  - overshoot from a coarse step is CREDIT against the next same-direction
-   *    input, never sent back the other way (that would jitter and trip
-   *    Claude's reversal debounce);
-   *  - the backlog is capped at one screen; travel never crosses tabs.
-   */
-  _paceWheelToCli(clientX, clientY, rows) {
-    const sessionId = this.activeSessionId;
-    const spec = this._wheelReportsFor(sessionId);
-    if (!sessionId || !spec || !rows) return;
-    if (this._wheelPaceSession !== sessionId) {
-      this._wheelPaceSession = sessionId;
-      this._wheelPaceOwed = 0;
-      this._wheelPaceForce = false;
-      this._wheelPaceStreakK = 0;
-      this._wheelPaceSentAt = undefined;
-    }
-    // Snap a scrolled-up local viewport back first, like _forwardScrollToApp:
-    // reports address the live screen.
-    if (this._terminalViewportAtBottom && !this._terminalViewportAtBottom()) this.terminal.scrollToBottom();
-    this._wheelPaceX = clientX;
-    this._wheelPaceY = clientY;
-    const tuning = window.CodemanTerminalInput;
-    const now = performance.now();
-    const gestureStart =
-      typeof this._wheelPaceLastAt !== 'number' || now - this._wheelPaceLastAt > tuning.WHEEL_PACE_GESTURE_GAP_MS;
-    this._wheelPaceLastAt = now;
-    if (gestureStart) {
-      // A stale sub-step remainder (or credit) belongs to the gesture that made it.
-      this._wheelPaceOwed = 0;
-      if (Math.abs(rows) >= tuning.WHEEL_PACE_MIN_START_ROWS) this._wheelPaceForce = true;
-    }
-    this._wheelPaceInputDir = rows < 0 ? -1 : 1;
-    const cap = Math.max(4, this.terminal?.rows || 24);
-    this._wheelPaceOwed = Math.max(-cap, Math.min(cap, (this._wheelPaceOwed || 0) + rows));
-    if (!this._wheelPaceFrame) this._drainWheelPace();
-  },
-
-  /** COD-464: rows the k-th report of a streak moves (0-based), from the CLI's measured curve. */
-  _wheelPaceStep(spec, k) {
-    const steps = spec?.streak?.steps;
-    if (Array.isArray(steps) && steps.length) return steps[Math.min(k, steps.length - 1)];
-    return spec?.rows || 1;
-  },
-
-  /** COD-464: send this frame's reports for the owed rows; reschedules while a report can still be earned. */
-  _drainWheelPace() {
-    this._wheelPaceFrame = null;
-    const sessionId = this.activeSessionId;
-    const spec = sessionId ? this._wheelReportsFor(sessionId) : null;
-    if (!sessionId || sessionId !== this._wheelPaceSession || !spec) {
-      this._wheelPaceOwed = 0;
-      this._wheelPaceForce = false;
-      return;
-    }
-    let owed = this._wheelPaceOwed || 0;
-    const dir = this._wheelPaceInputDir || (owed < 0 ? -1 : 1);
-    // Only ever move in the direction the input is going. An opposite-signed
-    // remainder is overshoot credit, held for the next input.
-    if (!owed || Math.sign(owed) !== dir) return;
-    const tuning = window.CodemanTerminalInput;
-    const force = this._wheelPaceForce === true;
-    const now = performance.now();
-    if (!this._wheelPaceDir) this._wheelPaceDir = new Map();
-    const reversed = (this._wheelPaceDir.get(sessionId) ?? 1) !== dir;
-    let k = this._wheelPaceStreakK || 0;
-    if (spec.streak) {
-      const gap = typeof this._wheelPaceSentAt === 'number' ? now - this._wheelPaceSentAt : Infinity;
-      const resetMs = spec.streak.resetMs;
-      if (reversed || gap >= resetMs + tuning.WHEEL_STREAK_RESET_MARGIN_MS) {
-        k = 0;
-      } else if (gap > resetMs - tuning.WHEEL_STREAK_CONTINUE_MARGIN_MS) {
-        // Ambiguous: wait a frame or two for a sure reset rather than guess.
-        this._wheelPaceFrame = requestAnimationFrame(() => this._drainWheelPace());
-        return;
-      }
-    }
-    const budget = Math.max(this._wheelPaceStep(spec, k), Math.abs(owed) * tuning.WHEEL_PACE_EASE);
-    let n = 0;
-    let sent = 0;
-    while (n < tuning.WHEEL_PACE_MAX_REPORTS_PER_FRAME) {
-      const step = this._wheelPaceStep(spec, k);
-      if (!(Math.abs(owed) >= step / 2 || (force && n === 0))) break;
-      if (n > 0 && sent + step > budget + step / 2) break;
-      n++;
-      k++;
-      sent += step;
-      owed -= dir * step;
-    }
-    this._wheelPaceForce = false;
-    if (n) {
-      const pos = this._clientPointToCell?.(this._wheelPaceX, this._wheelPaceY) || {
-        col: Math.max(1, Math.floor((this.terminal?.cols || 80) / 2)),
-        row: Math.max(1, Math.floor((this.terminal?.rows || 24) / 2)),
-      };
-      const btn = dir < 0 ? 64 : 65;
-      // Reversal debounce (`reversalDeadReports`, measured on Claude): the CLI
-      // ignores the report(s) that reverse its last effective direction, so the
-      // first batch of a reversed gesture would move nothing. Pay them on top,
-      // never out of the user's travel. The CLI's direction outlives a tab
-      // switch, so it is remembered per session; unknown reads as "down" (a CLI
-      // starts at the bottom of its transcript), so the common first gesture,
-      // up, is primed.
-      const dead = reversed ? spec.reversalDeadReports || 0 : 0;
-      this._wheelPaceDir.set(sessionId, dir);
-      this._wheelPaceSentAt = now;
-      this._sendInputEphemeral(sessionId, `\x1b[<${btn};${pos.col};${pos.row}M`.repeat(n + dead));
-    }
-    this._wheelPaceStreakK = k;
-    this._wheelPaceOwed = owed;
-    // Keep going while a report can still be earned in the input's direction:
-    // the next step is covered, or at least a whole first-step is owed (then the
-    // streak is let lapse so the next report is small again). Anything less stays
-    // as carry for the next input: waiting out a streak for a fraction of a row is
-    // what made a single notch trail ~150 ms and land one row long.
-    const first = this._wheelPaceStep(spec, 0);
-    const next = this._wheelPaceStep(spec, k);
-    const left = Math.sign(owed) === dir ? Math.abs(owed) : 0;
-    if (left >= first / 2 && (left >= next / 2 || left >= first)) {
-      this._wheelPaceFrame = requestAnimationFrame(() => this._drainWheelPace());
-    }
-  },
-
   _sendSyntheticSgrWheel(clientX, clientY, lines) {
     if (!this.activeSessionId || !lines) return;
     const pos = this._clientPointToCell(clientX, clientY);
     if (!pos) return;
-    const btn = lines < 0 ? 64 : 65;
-    const ticks = Math.min(Math.abs(lines), 5);
-    // COD-464: keep the paced sender's view of the CLI's scroll direction true
-    // when a report leaves through this older path (touch, legacy forwarding).
-    if (!this._wheelPaceDir) this._wheelPaceDir = new Map();
-    this._wheelPaceDir.set(this.activeSessionId, lines < 0 ? -1 : 1);
-    this._queueScrollBytes(`\x1b[<${btn};${pos.col};${pos.row}M`.repeat(ticks));
+    this._queueScrollBytes(window.CodemanTerminalInput.sgrWheelReports(lines, pos));
   },
 
   /**

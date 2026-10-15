@@ -137,11 +137,6 @@ const STATS_POLLING_INTERVAL_MS = 2000;     // System stats polling
 const TUI_REDRAW_SETTLE_MS = 400;           // Grace for a TUI to redraw after a real resize, before fetching its buffer
 const FOREIGN_RESIZE_SETTLE_MS = 1200;      // Debounce for reconciling after ANOTHER client resized the shared PTY (COD-179)
 const REMOTE_RECONCILE_TICK_MS = 25000;     // Periodic mid-turn reconcile cadence for busy REMOTE TUI sessions (COD-180)
-const HISTORY_ENTRY_LINES = 3;              // COD-187: accumulated up-scroll lines before a mirror tab opens history
-const HISTORY_ENTRY_WINDOW_MS = 300;        // COD-187: accumulation window for history entry (rejects trackpad jitter)
-const HISTORY_REENTRY_COOLDOWN_MS = 300;    // COD-187: ignore up-scroll right after leaving history (inertia tail)
-const HISTORY_INITIAL_LINES = 2000;         // COD-187: fast first page of the history view; full depth loads on scroll-to-top
-const HISTORY_PREFETCH_TTL_MS = 2500;       // COD-190: speculative history prefetch validity (bottom frame must stay fresh)
 
 // Z-index base values for layered floating windows
 const ZINDEX_SUBAGENT_BASE = 1000;

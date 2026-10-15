@@ -485,8 +485,6 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('appSettingsTunnelEnabled').checked = settings.tunnelEnabled ?? false;
     this.loadTunnelStatus();
     document.getElementById('appSettingsLocalEcho').checked = settings.localEchoEnabled ?? MobileDetection.isTouchDevice();
-    document.getElementById('appSettingsLiveMirror').checked = false;
-    document.getElementById('appSettingsLiveMirror').disabled = true;
     // Auto Copy (copy-on-select): per-device, default OFF everywhere. It quietly
     // overwrites the system clipboard on a gesture the user may have meant only as
     // a way to read, so it is opt-in rather than a default anyone has to discover.
@@ -2782,7 +2780,6 @@ Object.assign(CodemanApp.prototype, {
       imageWatcherEnabled: document.getElementById('appSettingsImageWatcherEnabled').checked,
       tunnelEnabled: document.getElementById('appSettingsTunnelEnabled').checked,
       localEchoEnabled: document.getElementById('appSettingsLocalEcho').checked,
-      liveMirrorEnabled: false,
       autoCopySelection: document.getElementById('appSettingsAutoCopySelection').checked,
       copyStripMargin: document.getElementById('appSettingsCopyStripMargin').checked,
       terminalFontFamily: document.getElementById('appSettingsTerminalFont').value.trim(),
@@ -2878,7 +2875,6 @@ Object.assign(CodemanApp.prototype, {
     this.saveAppSettingsToStorage(settings);
     localStorage.setItem('codeman-scrollback', String(settings.terminalScrollbackLines));
     this._updateLocalEchoState();
-    this._applyLiveMirrorSetting?.(settings.liveMirrorEnabled); // COD-187
     this.applyTerminalFontFamily?.(settings.terminalFontFamily);
     this.applyTerminalFontWeights?.(settings);
 
@@ -3040,7 +3036,7 @@ Object.assign(CodemanApp.prototype, {
       showPlanUsageLimits: _pul,
       showAwayDigest: _sad,
       showAttachmentsButton: _ahb,
-      liveMirrorEnabled: _lmr,
+      liveMirrorEnabled: _lmr, // retired local-only key; never forward to the strict server schema
       showFileViewerButton: _fvb,
       // Desktop-only header button, per-device, and absent from
       // SettingsUpdateSchema (.strict()) — sending it 400s the whole PUT
@@ -3875,7 +3871,6 @@ Object.assign(CodemanApp.prototype, {
         // policy guard keeps passing.
         showPlanUsageLimits: false,
         showAttachmentsButton: false,
-        liveMirrorEnabled: false, // upstream-scrolling comparison branch
         showFileViewerButton: false,
         showRedrawButton: false,
         showSessionButton: false,
@@ -4820,7 +4815,6 @@ Object.assign(CodemanApp.prototype, {
           'showSessionButton', 'showAwayDigestButton', 'showCronButton', 'showGitStatus', 'gitStatusTree', 'gitStatusMaxRepos', 'gitStatusTimeoutSeconds',
           'showTabDetachButton',
           'mobileOverviewEnabled',
-          'liveMirrorEnabled',
           'sessionLineageLines',
           'showSplitButton',
           'showTileGridButton',
@@ -4852,7 +4846,6 @@ Object.assign(CodemanApp.prototype, {
           }
         }
         this.saveAppSettingsToStorage(merged);
-        this._applyLiveMirrorSetting?.(merged.liveMirrorEnabled); // COD-187
         if (merged.terminalScrollbackLines) {
           localStorage.setItem('codeman-scrollback', String(merged.terminalScrollbackLines));
         }

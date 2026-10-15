@@ -553,32 +553,8 @@ export interface CliCapabilities {
      */
     directPtyPromptTransition?: true;
   };
-  /**
-   * Forwarding the desktop wheel to the CLI's own transcript as paced SGR wheel
-   * reports (COD-464). 'never' keeps local scrollback / the PageUp fallback.
-   * EVERY forwarding mode also requires the CLI itself to have turned mouse tracking
-   * on (`cliMouseTracking`): that is the CLI saying it handles mouse reports, and it is
-   * false for claude's default inline renderer (#498), older codex and panes Codeman
-   * cannot see into (remote wrappers). 'version-gated' additionally needs `minVersion`;
-   * 'mouse-tracking' needs nothing more.
-   *
-   * Both of the following are MEASURED against the real CLI, never guessed:
-   * `rows`: transcript rows moved per report. Required for forwarding.
-   * `reversalDeadReports`: reports the CLI ignores when one reverses its last effective
-   * scroll direction (a reversal debounce); paid on top of the first reversed batch, or
-   * the first event of every reversed gesture moves nothing.
-   * `streak`: the CLI's own wheel ACCELERATION. `steps[k]` is how many rows the k-th
-   * report of a streak moves (the last entry repeats), and a pause of `resetMs`
-   * starts a new streak. The pacer reads it to keep scrolling linear (send a report
-   * only when the owed rows cover its step). Absent = every report moves `rows`.
-   */
-  wheelForward: {
-    mode: 'never' | 'version-gated' | 'mouse-tracking';
-    minVersion?: string;
-    rows?: number;
-    reversalDeadReports?: number;
-    streak?: { resetMs: number; steps: number[] };
-  };
+  /** Forwarding the wheel to the CLI's own transcript. 'never' keeps local scrollback. */
+  wheelForward: { mode: 'never' | 'version-gated'; minVersion?: string };
   /** CLI supports native PageUp/PageDown transcript paging. */
   transcriptPageKeys?: boolean;
   keyboardAccessory: 'agent' | 'shell';
