@@ -166,6 +166,7 @@ describe('server reboot recovery snapshot', () => {
       getSession: vi.fn((id: string) => savedStates.get(id) ?? null),
       getSessionRecoveries: vi.fn(() => recoveries),
       upsertSessionRecovery: vi.fn((recovery: SessionRecoveryRecord) => recoveries.push(recovery)),
+      getTabLayout: vi.fn(() => ({ groups: [{ id: 'original-group', refs: [{ kind: 'session', id: state.id }] }] })),
       cleanupSessionsByIds,
     };
     const mux = {
@@ -196,7 +197,12 @@ describe('server reboot recovery snapshot', () => {
 
     expect(await server.restoreMuxSessions()).toBe(true);
     expect(store.upsertSessionRecovery).toHaveBeenCalledWith(
-      expect.objectContaining({ sourceSessionId: state.id, transport: 'remote', status: 'reattachable' })
+      expect.objectContaining({
+        sourceSessionId: state.id,
+        transport: 'remote',
+        status: 'reattachable',
+        tabGroupId: 'original-group',
+      })
     );
     expect(cleanupSessionsByIds).not.toHaveBeenCalled();
     expect(store.getSession(state.id)).toEqual(state);
@@ -326,13 +332,14 @@ describe('server reboot recovery snapshot', () => {
       store,
       [state.id],
       new Map([[state.id, { ...muxSession(state.id), remote: undefined }]]),
-      { resolveNativeResumeId }
+      { resolveNativeResumeId, resolveTabGroupId: () => 'original-group' }
     );
 
     expect(resolveNativeResumeId).toHaveBeenCalledWith(expect.objectContaining({ id: state.id }));
     expect(created).toEqual([
       expect.objectContaining({
         sourceSessionId: state.id,
+        tabGroupId: 'original-group',
         nativeResumeId: '01a0c810-a5c4-7b32-be0b-1599d9d5995d',
         status: 'resumable',
       }),

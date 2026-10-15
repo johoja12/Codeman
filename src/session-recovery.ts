@@ -18,6 +18,7 @@ export interface CreateRecoveryRecordOptions {
 
 export interface SnapshotRecoveryOptions {
   resolveNativeResumeId?: (session: SessionState) => Promise<string | null>;
+  resolveTabGroupId?: (session: SessionState) => string | undefined;
 }
 
 /** The small StateStore surface needed while boot reconciliation still has saved state available. */
@@ -168,6 +169,8 @@ export async function snapshotDeadSessionRecoveries(
       if (nativeResumeId) source = { ...source, nativeResumeId };
     }
     const recovery = createRecoveryRecord(source);
+    const tabGroupId = options.resolveTabGroupId?.(source);
+    if (tabGroupId) recovery.tabGroupId = tabGroupId;
     clearRecoveryDismissal(recovery.id);
     store.upsertSessionRecovery(recovery);
     created.push(recovery);

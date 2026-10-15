@@ -283,7 +283,7 @@ describe('session recovery routes', () => {
     ).toMatchObject({ owned: true, remoteSessionName: 'codeman-ssh-dead-1' });
   });
 
-  it('reconnects a live owned source through its source target instead of treating it as unavailable', async () => {
+  it('reconnects a previously recovered remote to its original pane and group', async () => {
     const remote = {
       hostId: 'remote-1',
       label: 'Remote',
@@ -293,7 +293,11 @@ describe('session recovery routes', () => {
       owned: true,
     };
     harness.ctx.store.getSessionRecoveries.mockReturnValue([
-      { ...recovery, remote: { hostId: 'remote-1', owned: true } },
+      {
+        ...recovery,
+        tabGroupId: 'original-group',
+        remote: { hostId: 'remote-1', owned: true, remoteSessionName: 'codeman-ssh-original' },
+      },
     ]);
     Object.assign(harness.ctx, {
       resolveRecoveryTransport: vi.fn(async () => ({ remote })),
@@ -314,13 +318,14 @@ describe('session recovery routes', () => {
     const response = await harness.app.inject({ method: 'POST', url: '/api/session-recoveries/recovery-1/reconnect' });
 
     expect(response.statusCode).toBe(200);
+    expect(harness.ctx.addSession).toHaveBeenCalledWith(expect.anything(), { tabGroupId: 'original-group' });
     expect(harness.ctx.probeRecoveryTarget).toHaveBeenCalledWith(
       expect.objectContaining({ sourceSessionId: 'dead-1' }),
       remote
     );
     expect(harness.ctx.mux.createSession).toHaveBeenCalledWith(
       expect.objectContaining({
-        remote: expect.objectContaining({ owned: true, remoteSessionName: 'codeman-ssh-dead-1' }),
+        remote: expect.objectContaining({ owned: true, remoteSessionName: 'codeman-ssh-original' }),
       })
     );
   });

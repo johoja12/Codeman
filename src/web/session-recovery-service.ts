@@ -37,7 +37,10 @@ export function recoverySessionConfig(
   const nativeResumeId = record.nativeResumeId;
   let remote: SessionRemote | undefined = transport.remote;
   if (action === 'reconnect' && remote && remote.owned !== false) {
-    remote = { ...remote, remoteSessionName: remoteTmuxSessionName(record.sourceSessionId) };
+    remote = {
+      ...remote,
+      remoteSessionName: record.remote?.remoteSessionName ?? remoteTmuxSessionName(record.sourceSessionId),
+    };
   }
   return {
     remote,
@@ -67,7 +70,10 @@ export async function resolveRecoveryTransport(record: SessionRecoveryRecord): P
       (item) =>
         item.hostId === record.remote?.hostId && item.remotePath === record.workingDir && item.owner === record.owner
     );
-    return remoteCase ? { remote: toSessionRemote(host, remoteCase) } : {};
+    if (!remoteCase) return {};
+    const remote = toSessionRemote(host, remoteCase);
+    if (record.remote.remoteSessionName) remote.remoteSessionName = record.remote.remoteSessionName;
+    return { remote };
   }
   if (record.transport === 'docker' && record.docker) {
     const host = (await readDockerHosts(configDir)).find((item) => item.id === record.docker?.hostId);
@@ -86,7 +92,7 @@ export async function recoveryRemoteIsLive(record: SessionRecoveryRecord, remote
   return probeRemoteRecoveryTarget(remote, {
     owned: remote.owned !== false,
     sessionId: record.sourceSessionId,
-    remoteSessionName: remote.remoteSessionName,
+    remoteSessionName: record.remote?.remoteSessionName ?? remote.remoteSessionName,
   });
 }
 
@@ -148,7 +154,7 @@ export async function executeSessionRecovery(
   });
   try {
     if (cancelled(seams)) throw new SessionRecoveryConflictError('Recovery was cancelled before launch');
-    await ctx.addSession(session);
+    await ctx.addSession(session, record.tabGroupId ? { tabGroupId: record.tabGroupId } : undefined);
     await ctx.setupSessionListeners(session);
     ctx.persistSessionStateNow(session);
     if (cancelled(seams)) {

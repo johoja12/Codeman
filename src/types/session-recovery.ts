@@ -41,6 +41,8 @@ export interface SessionRecoveryRecord {
   sourceSessionId: string;
   /** Codeman tab name, preserved before the session record is pruned. */
   name?: string;
+  /** Original owner-scoped group, captured before stale session refs are pruned. */
+  tabGroupId?: string;
   /** Secret-free original provider selection; custom selections require manual recovery. */
   providerSelection?: { endpointId: string; modelId: string; label?: string };
   /** Metadata probe time; a successful probe is not a confirmed CLI restore. */
