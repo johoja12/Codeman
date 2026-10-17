@@ -48,14 +48,25 @@ describe('session listener wiring', () => {
   it('keeps a screen-read blocked dialog when a Codex idle transition follows', () => {
     const session = new Session({ id: 'wiring-screen-blocked-idle', workingDir: '/tmp', mode: 'codex' });
     const refs = createSessionListeners(session, listenerDeps());
-    Object.defineProperty(session, 'screenBlocked', { get: () => true });
+    let blocked = true;
+    Object.defineProperty(session, 'screenBlocked', { get: () => blocked });
     refs.blockedChanged(true, 'Press enter to confirm or esc to cancel');
     const item = approvalInbox.getForSession(session.id);
     expect(item?.answerInTerminal).toBe(true);
     refs.idle({ reason: 'turn-end' });
     expect(approvalInbox.getForSession(session.id)?.id).toBe(item?.id);
     expect(approvalInbox.getForSession(session.id)?.kind).toBe('permission');
+    blocked = false;
     refs.blockedChanged(false, null);
+    expect(approvalInbox.getForSession(session.id)).toBeUndefined();
+
+    // Clearing a screen dialog must preserve the fork's next-turn reply path.
+    refs.idle({ reason: 'turn-end' });
+    const idle = approvalInbox.getForSession(session.id);
+    expect(idle?.kind).toBe('idle');
+    expect(idle?.answerInTerminal).not.toBe(true);
+    expect(idle?.id).not.toBe(item?.id);
+    refs.working();
     expect(approvalInbox.getForSession(session.id)).toBeUndefined();
   });
 

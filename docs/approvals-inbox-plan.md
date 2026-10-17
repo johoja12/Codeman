@@ -11,7 +11,7 @@ One cross-session inbox for every prompt that is waiting on a human: permission 
 
 ## Scope
 
-- Claude prompts remain hook-driven. Codex additionally creates an `idle` item only for a detected `working` → `idle` turn-end transition; other external CLIs create no inbox items. Hook-only `stop`/`blocked` waits remain Claude-only.
+- Claude prompts remain hook-driven. DeepSeek Harness (through its status bridge) and Codex (through dialogs read off its screen) also open alert-only dialog items: answer those in the terminal, never through inbox or push buttons. This fork additionally creates a Codex `idle` item for a detected `working` → `idle` turn-end transition, allowing a reply to the next prompt; a screen-read blocked dialog takes precedence over that idle item. Other external CLIs create no inbox items. `stop` waits are available for Claude and DeepSeek with its status bridge enabled; `blocked` also covers Codex screen-read dialogs (see `src/web/approval-inbox.ts`, `src/web/session-listener-wiring.ts` and `src/web/session-wait-registry.ts`).
 - Permission prompts occur for sessions running `ClaudeMode` `normal` / `auto` / `allowedTools` (and the trust-folder dialog even under skip-permissions). Question and idle prompts occur in every mode including `dangerously-skip-permissions`.
 - In-memory store (plus the frontend seeding from it on load). Server restart drops items; hooks re-fire on the next prompt. No new state file in v1.
 
