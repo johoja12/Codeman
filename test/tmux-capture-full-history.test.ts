@@ -77,7 +77,7 @@ describe('tmux full-history pane capture (COD-47)', () => {
     // status line, for an agent CLI — and every cursor-relative update the CLI
     // sends afterwards is then measured from the wrong row. COD-433 anchors that
     // move to the captured tail, which is what formatFullHistoryCapture does.
-    const restore = methodBody.indexOf('formatFullHistoryCapture(trimmed, geometry)');
+    const restore = methodBody.indexOf("formatFullHistoryCapture(trimmed + '\\x1b[0m', geometry)");
     const snapshot = methodBody.indexOf('formatPaneSnapshot(');
     expect(restore).toBeGreaterThan(-1);
     expect(restore).toBeLessThan(snapshot);
@@ -203,7 +203,7 @@ describe('the geometry a capture reports back', () => {
     const write = methodBody.indexOf('opts.capturedGeometry = { cols: geometry.cols, rows: geometry.rows }');
     // Anchor on the REPLAY branch, not the earlier `if (fullHistory)` that only
     // sizes the exec buffer.
-    const replayBranch = methodBody.indexOf('return formatFullHistoryCapture(trimmed, geometry);');
+    const replayBranch = methodBody.indexOf("return formatFullHistoryCapture(trimmed + '\\x1b[0m', geometry);");
     const visibleReturn = methodBody.indexOf('if (geometry) return formatPaneSnapshot(');
     expect(write).toBeGreaterThan(-1);
     expect(replayBranch).toBeGreaterThan(-1);

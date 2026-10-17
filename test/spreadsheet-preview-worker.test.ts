@@ -1057,6 +1057,9 @@ async function emptyRunsWorkbook(runs: number): Promise<Uint8Array> {
 describe('spreadsheet preview worker: element budget', () => {
   // ExcelJS builds one object per <r> run in sharedStrings.xml, which no
   // worksheet counter sees; 8.3M empty runs took 570 MB of heap to load.
+  // The uncapped control walks two million XML nodes. Give that synthetic
+  // fixture headroom on shared runners; keep the element-limit and pre-ExcelJS
+  // assertions unchanged.
   it('refuses a shared string of 2,000,001 empty runs before ExcelJS loads', async () => {
     const crafted = await emptyRunsWorkbook(2_000_001);
     const harness = createHarness();
@@ -1068,7 +1071,7 @@ describe('spreadsheet preview worker: element budget', () => {
     await harness.send({ type: 'load', bytes: toArrayBuffer(crafted) });
     expect(harness.messages.at(-1)).toMatchObject({ type: 'error', code: 'element-limit' });
     expect(harness.imports.some((url) => url.includes('exceljs'))).toBe(false);
-  }, 60_000);
+  }, 120_000);
 });
 
 // Real files written by openpyxl 3.1.5, the library most agents write

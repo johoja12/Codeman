@@ -45,6 +45,20 @@ afterEach(() => {
 });
 
 describe('session listener wiring', () => {
+  it('keeps a screen-read blocked dialog when a Codex idle transition follows', () => {
+    const session = new Session({ id: 'wiring-screen-blocked-idle', workingDir: '/tmp', mode: 'codex' });
+    const refs = createSessionListeners(session, listenerDeps());
+    Object.defineProperty(session, 'screenBlocked', { get: () => true });
+    refs.blockedChanged(true, 'Press enter to confirm or esc to cancel');
+    const item = approvalInbox.getForSession(session.id);
+    expect(item?.answerInTerminal).toBe(true);
+    refs.idle({ reason: 'turn-end' });
+    expect(approvalInbox.getForSession(session.id)?.id).toBe(item?.id);
+    expect(approvalInbox.getForSession(session.id)?.kind).toBe('permission');
+    refs.blockedChanged(false, null);
+    expect(approvalInbox.getForSession(session.id)).toBeUndefined();
+  });
+
   it('suppresses raw idle effects while the coordinator reports live agents', async () => {
     const session = new Session({ id: 'wiring-agent-idle-suppressed', workingDir: '/tmp', mode: 'claude' });
     const deps = listenerDeps();

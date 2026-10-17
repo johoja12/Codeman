@@ -16,7 +16,7 @@
  *
  * Port: ephemeral (`new WebServer(0, …)`, read back through `boundPort`)
  */
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import { TunnelManager } from '../src/tunnel-manager.js';
 import { WebServer } from '../src/web/server.js';
 
@@ -170,17 +170,29 @@ describe('QR Token Manager (unit)', () => {
     const code = tm.getCurrentShortCode()!;
     const tokenMap = (tm as unknown as { qrTokensByCode: Map<string, { createdAt: number }> }).qrTokensByCode;
     const record = tokenMap.get(code)!;
-    record.createdAt = Date.now() - 90_000;
+    const now = Date.now();
+    record.createdAt = now - 90_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
     // Condition is `> QR_TOKEN_GRACE_MS` (strict >), so exactly 90000 should pass
-    expect(tm.consumeToken(code)).toBe(true);
+    try {
+      expect(tm.consumeToken(code)).toBe(true);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it('should reject token at grace period + 1ms (90001ms)', () => {
     const code = tm.getCurrentShortCode()!;
     const tokenMap = (tm as unknown as { qrTokensByCode: Map<string, { createdAt: number }> }).qrTokensByCode;
     const record = tokenMap.get(code)!;
-    record.createdAt = Date.now() - 90_001;
-    expect(tm.consumeToken(code)).toBe(false);
+    const now = Date.now();
+    record.createdAt = now - 90_001;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      expect(tm.consumeToken(code)).toBe(false);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it('should never produce non-base62 characters (100 samples)', () => {

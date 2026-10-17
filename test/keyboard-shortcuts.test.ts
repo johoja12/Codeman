@@ -25,10 +25,11 @@ describe('keyboard shortcuts', () => {
   });
 
   it('provides Option+bracket shortcuts for previous and next session', () => {
-    expect(appSource).toContain("e.code === 'BracketLeft'");
-    expect(appSource).toContain("e.code === 'BracketRight'");
-    expect(appSource).toContain('this.prevSession()');
-    expect(appSource).toContain('this.nextSession()');
+    // Registry entries (so they can be rebound), matched by physical key code.
+    expect(appSource).toMatch(/id: 'previous-session'[\s\S]*?code: 'BracketLeft'[\s\S]*?action: 'previousSession'/);
+    expect(appSource).toMatch(/id: 'next-session-alt'[\s\S]*?code: 'BracketRight'[\s\S]*?action: 'nextSession'/);
+    expect(appSource).toContain("shortcut.action === 'previousSession' ? 'prevSession' : shortcut.action");
+    expect(appSource).toContain('fn.call(this)');
   });
 
   it('suppresses xterm PTY injection for the same physical Alt nav codes (no ESC leak)', () => {
