@@ -218,7 +218,7 @@ describe('terminal Ctrl+C smart copy', () => {
     expect(res.data.join('')).not.toContain('\x16');
   });
 
-  it('recovers explicit keyCode 229 input once when the helper textarea never mutates', async () => {
+  it('never invents keyCode 229 input and forwards a committed value once', async () => {
     await setup('KEYCODE-229-RECOVERY', false);
     const result = await page.evaluate(async () => {
       const app = (window as any).app;
@@ -254,8 +254,8 @@ describe('terminal Ctrl+C smart copy', () => {
         await new Promise((resolveWait) => setTimeout(resolveWait, 30));
         const afterRecovery = [...sent];
 
-        // A browser that supplies its canonical input late must not duplicate
-        // the character already recovered for this key token.
+        // A keydown label alone is not committed input. Only the real textarea
+        // change below may deliver x, once (the recovery must never guess it).
         textarea.dispatchEvent(
           new InputEvent('beforeinput', { data: 'x', inputType: 'insertText', bubbles: true, composed: true })
         );
@@ -270,16 +270,14 @@ describe('terminal Ctrl+C smart copy', () => {
         await new Promise((resolveWait) => setTimeout(resolveWait, 30));
         const final = [...sent];
 
-        // Two 229 candidates can overlap while the main thread is busy. A
-        // canonical value for the first must resolve that candidate without
-        // cancelling the second candidate's fallback.
+        // Overlapping keydowns still carry no committed text. Only the
+        // explicit canonical a below may be sent; b must never be invented.
         const overlapStart = sent.length;
         dispatch229('a');
         dispatch229('b');
         const busyUntil = performance.now() + 25;
         while (performance.now() < busyUntil) {
-          // Deliberately hold the browser task so both xterm/fallback timers
-          // remain queued while canonical input for `a` is prepared.
+          // Hold the browser task while canonical input for a is prepared.
         }
         app.terminal._core.coreService.triggerDataEvent('a', true);
         await new Promise((resolveWait) => setTimeout(resolveWait, 30));
@@ -295,10 +293,10 @@ describe('terminal Ctrl+C smart copy', () => {
     });
 
     expect(result).toEqual({
-      afterRecovery: ['x'],
+      afterRecovery: [],
       afterLateInput: ['x'],
-      final: ['x', '\r'],
-      overlap: ['a', 'b'],
+      final: ['x'],
+      overlap: ['a'],
     });
   });
 

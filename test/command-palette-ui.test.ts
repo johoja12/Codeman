@@ -682,3 +682,12 @@ describe('panel close helpers', () => {
     expect(elements.subagentsPanel.classList.remove).toHaveBeenCalledWith('open');
   });
 });
+
+it('uses the palette backend picker for a new Copilot session while another mode is active', () => {
+  const { app } = loadPaletteHarness();
+  app.runMode = 'claude';
+  app._getPaletteMode = () => 'copilot';
+  const item = app._buildCommandPaletteNewSessionItem();
+  expect(JSON.stringify(item)).toContain('Copilot');
+  expect(JSON.stringify(item)).not.toContain('New Claude');
+});

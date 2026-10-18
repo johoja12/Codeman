@@ -40,6 +40,8 @@ interface Harness {
   pastedText: string[];
   /** Image batches handed to _uploadAndInsertImages(), one entry per call. */
   uploadedBatches: Array<Array<{ type: string }>>;
+  /** Messages handed to showToast(), one entry per call. */
+  toasts: string[];
   /** How many trap divs are still attached to the fake body. */
   attachedTraps: () => number;
   runTimers: () => void;
@@ -107,7 +109,8 @@ function loadPasteHarness(): Harness {
   app._uploadAndInsertImages = (files: Array<{ type: string }>) => {
     uploadedBatches.push(Array.from(files));
   };
-  app.showToast = () => {};
+  const toasts: string[] = [];
+  app.showToast = (message: string) => toasts.push(message);
 
   (app._handleImagePaste as () => void).call(app);
 
@@ -126,6 +129,7 @@ function loadPasteHarness(): Harness {
     },
     pastedText,
     uploadedBatches,
+    toasts,
     attachedTraps: () => attached.size,
     runTimers: () => {
       const pending = timers.splice(0, timers.length);
@@ -134,8 +138,8 @@ function loadPasteHarness(): Harness {
   };
 }
 
-function loadImageInputApp() {
-  const context = vm.createContext({ console, window: {}, document: {} });
+function loadImageInputApp(documentObj = {}) {
+  const context = vm.createContext({ console, window: {}, document: documentObj });
   vm.runInContext('class CodemanApp {}', context);
   vm.runInContext(imageInputSource, context, { filename: 'image-input.js' });
   const CodemanApp = vm.runInContext('CodemanApp', context) as new () => Record<string, unknown>;
@@ -178,6 +182,36 @@ describe('Ctrl+V paste trap', () => {
     expect(h.uploadedBatches).toHaveLength(1);
     expect(h.uploadedBatches[0]).toEqual([{ type: 'image/png' }]);
     expect(h.pastedText).toEqual([]);
+  });
+
+  it('a paste mixing an image with a refused file uploads the image and says what it skipped', () => {
+    const h = loadPasteHarness();
+
+    h.firePaste({ text: 'shot.png', images: ['image/png', 'application/x-sh'] });
+
+    expect(h.uploadedBatches).toEqual([[{ type: 'image/png' }]]);
+    expect(h.toasts).toEqual(['1 file skipped: unsupported type']);
+  });
+
+  it('a paste whose only file is refused pastes its text instead, without a toast', () => {
+    const h = loadPasteHarness();
+
+    // Copying from a document can carry both: the text is what the user gets.
+    h.firePaste({ text: 'echo hi', images: ['application/x-sh'] });
+
+    expect(h.pastedText).toEqual(['echo hi']);
+    expect(h.uploadedBatches).toEqual([]);
+    expect(h.toasts).toEqual([]);
+  });
+
+  it('a paste of a refused file and no text says so instead of doing nothing', () => {
+    const h = loadPasteHarness();
+
+    h.firePaste({ images: ['application/x-sh'] });
+
+    expect(h.pastedText).toEqual([]);
+    expect(h.uploadedBatches).toEqual([]);
+    expect(h.toasts).toEqual(['Unsupported file type']);
   });
 
   it('removes the trap and hands focus back after the paste it accepted', () => {
@@ -249,5 +283,31 @@ describe('image upload insertion policy', () => {
     await app._uploadAndInsertImages([{ path: '/tmp/shot.png' }]);
 
     expect(app.showToast).toHaveBeenCalledWith(`1 failed: ${reason}`, 'error');
+  });
+});
+
+describe('mixed terminal drops after upstream reconciliation', () => {
+  it('routes fork documents and prompt attachments once, counting only refused files', () => {
+    let drop: (event: any) => void = () => {};
+    const container = {
+      classList: { remove: vi.fn() },
+      addEventListener: (name: string, handler: typeof drop) => {
+        if (name === 'drop') drop = handler;
+      },
+    };
+    const app = loadImageInputApp({ getElementById: (id: string) => (id === 'terminalContainer' ? container : null) });
+    const media = { name: 'shot.png', type: 'image/png' };
+    const document = { name: 'script.py', type: 'text/plain' };
+    const refused = { name: 'unknown.exe', type: 'application/octet-stream' };
+    app._isAllowedDocumentFile = (file: { name: string }) => file.name.endsWith('.py');
+    app._uploadAndInsertImages = vi.fn();
+    app._uploadAndInsertDocuments = vi.fn();
+    app.initImageInput();
+
+    drop({ preventDefault: vi.fn(), dataTransfer: { files: [media, document, refused] } });
+
+    expect(app._uploadAndInsertImages).toHaveBeenCalledExactlyOnceWith([media]);
+    expect(app._uploadAndInsertDocuments).toHaveBeenCalledExactlyOnceWith([document]);
+    expect(app.showToast).toHaveBeenCalledExactlyOnceWith('1 file skipped: unsupported type', 'info');
   });
 });

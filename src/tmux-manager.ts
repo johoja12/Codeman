@@ -78,6 +78,7 @@ import {
   type AntigravityConfig,
   type PiConfig,
   type GrokConfig,
+  type CopilotConfig,
   type DeepSeekConfig,
   type OmpConfig,
   type SessionRemote,
@@ -1410,6 +1411,7 @@ export function buildSpawnCommand(options: {
   antigravityConfig?: AntigravityConfig;
   piConfig?: PiConfig;
   grokConfig?: GrokConfig;
+  copilotConfig?: CopilotConfig;
   deepSeekConfig?: DeepSeekConfig;
   ompConfig?: OmpConfig;
   resumeSessionId?: string;
@@ -1418,7 +1420,7 @@ export function buildSpawnCommand(options: {
   advisorModel?: string;
   /** Resolved by resolveStatusLineCliCommand (hooks-config.ts) — undefined skips the exporter. Claude only. */
   statusLineCommand?: string;
-  /** Name pinned on claude as `--name` (version-gated, sanitized; local spawns only). Only a user-chosen name: see `Session.cliPinnedName`. */
+  /** Name pinned on claude as `--name` (version-gated, sanitized; local spawns only). By default only a user-chosen name; `pinCliSessionName` pins every tab name: see `Session.cliPinnedName`. */
   sessionName?: string;
   /**
    * Claude CLI version for the `--name` gate. Omitted = probe the local CLI
@@ -3004,6 +3006,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       antigravityConfig,
       piConfig,
       grokConfig,
+      copilotConfig,
       deepSeekConfig,
       ompConfig,
       resumeSessionId,
@@ -3099,6 +3102,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
             antigravityConfig,
             piConfig,
             grokConfig,
+            copilotConfig,
             deepSeekConfig,
             ompConfig,
             resumeSessionId,
@@ -3370,6 +3374,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       antigravityConfig,
       piConfig,
       grokConfig,
+      copilotConfig,
       deepSeekConfig,
       ompConfig,
       resumeSessionId,
@@ -3433,6 +3438,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           antigravityConfig,
           piConfig,
           grokConfig,
+          copilotConfig,
           deepSeekConfig,
           ompConfig,
           resumeSessionId,

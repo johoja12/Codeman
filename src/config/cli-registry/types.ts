@@ -539,7 +539,7 @@ export interface CliCapabilities {
    *   own mouse support must work in the pane (htop/vim in a shell).
    *
    * Stock CLIs: `strip-full` = claude, codex, gemini (Ink TUIs); `strip-mux-and-mouse` =
-   * opencode (a full-screen TUI that enables tracking itself); `strip-mux-only` =
+   * opencode and copilot (full-screen TUIs that enable tracking themselves); `strip-mux-only` =
    * antigravity, grok, deepseek, omp; `preserve` = shell, pi.
    *
    * A fourth combination is the point to split this into flags; three is still cheaper
@@ -579,9 +579,27 @@ export interface CliCapabilities {
      */
     directPtyPromptTransition?: true;
   };
-  /** Forwarding the wheel to the CLI's own transcript. 'never' keeps local scrollback. */
-  wheelForward: { mode: 'never' | 'version-gated'; minVersion?: string };
-  /** CLI supports native PageUp/PageDown transcript paging. */
+  /**
+   * Forwarding the wheel to the CLI's own transcript. 'never' keeps local scrollback;
+   * 'version-gated' forwards from `minVersion` on; 'always' forwards at any version. Either
+   * forwarding mode applies only while the CLI has mouse tracking on (`cliMouseTracking`).
+   *
+   * Declared only: the browser gate `_shouldForwardWheelToApp` still carries the measured rules.
+   */
+  wheelForward: { mode: 'never' | 'version-gated' | 'always'; minVersion?: string };
+  /**
+   * The CLI pages its OWN transcript on PageUp/PageDown, so a wheel or touch scroll over
+   * a pane with no local history can be turned into those keys instead of doing nothing
+   * (`_maybePageCliTranscript` in terminal-ui.js). Read by the frontend through
+   * `window.__codemanTranscriptPageKeys`, which the server builds from this field.
+   *
+   * ⚠ NOT wheel forwarding. `wheelForward` above sends SGR mouse wheel REPORTS; this sends
+   * plain keys, and only when the local buffer is hollow (normal buffer, `baseY === 0`).
+   * A CLI can ignore one and honour the other: codex ignores SGR wheel reports (so its
+   * `wheelForward` stays 'never') yet pages on PageUp/PageDown.
+   *
+   * Absent means no paging, so a CLI nobody has measured keeps plain local scrolling.
+   */
   transcriptPageKeys?: boolean;
   keyboardAccessory: 'agent' | 'shell';
   /** Multi-user: this CLI is a raw shell, so its commands need the privileged gate. */

@@ -242,9 +242,14 @@ describe('WS state lifecycle — real _connectWs/onopen/onclose transitions', ()
 
     app._connectWs('s1');
     const ws = FakeWebSocket.instances[0];
+    // The new upstream backlog indicator can arm while connecting. An
+    // authoritative exit must cancel it even though s2 still has queued input.
+    expect(timers.some((timer) => !timer.cleared)).toBe(true);
     ws.onclose?.({ code, reason });
 
     const internal = app as unknown as Record<string, any>;
+    expect(internal._backlogHoldTimer).toBeNull();
+    expect(internal._backlogOverSince).toBeNull();
     expect(internal._pendingDeliveries.has('s1')).toBe(false);
     expect(internal._pendingDeliveries.get('s2')).toBe(other);
     expect(internal._pendingTerminalResize).toBeNull();

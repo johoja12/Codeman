@@ -101,19 +101,10 @@ Object.assign(CodemanApp.prototype, {
       if (!this.activeSessionId) return;
       if (!e.dataTransfer || !e.dataTransfer.files.length) return;
 
-      // Unified drop split (COD-241 unit 3): a single drop handler on the
-      // terminal container routes images → the image flow and allowlisted
-      // documents → the document flow, so the two never fight over the same
-      // drop event (a second competing listener would double-toast a doc-only
-      // drop as "Only image files are supported"). _isAllowedDocumentFile is
-      // defined in document-input.js (also mixed onto CodemanApp.prototype).
-      const all = Array.from(e.dataTransfer.files);
+      // Admit once across both upload paths so refused files are counted once.
+      const all = this._admitPromptAttachments(Array.from(e.dataTransfer.files), { includeDocuments: true });
       const imageFiles = all.filter((f) => this._promptAttachKind(f));
-      const docFiles = all.filter((f) => !this._promptAttachKind(f) && this._isAllowedDocumentFile(f));
-      if (imageFiles.length === 0 && docFiles.length === 0) {
-        this.showToast('Unsupported file type', 'error');
-        return;
-      }
+      const docFiles = all.filter((f) => !this._promptAttachKind(f));
       if (imageFiles.length > 0) this._uploadAndInsertImages(imageFiles);
       if (docFiles.length > 0) this._uploadAndInsertDocuments(docFiles);
     });
@@ -131,11 +122,8 @@ Object.assign(CodemanApp.prototype, {
    *  Without the overlay (local echo off) there is nothing to buffer into, so the
    *  text goes straight out. The trailing space keeps the next word off the path. */
   async _attachFromToolbar(files, sessionId) {
-    const media = files.filter((f) => this._promptAttachKind(f));
-    if (media.length === 0) {
-      this.showToast('Unsupported file type', 'error');
-      return;
-    }
+    const media = this._admitPromptAttachments(files);
+    if (media.length === 0) return;
     if (!sessionId) return; // no captured session: refuse rather than guess at one
     const paths = await this._uploadAndInsertImages(media, { insert: false, sessionId });
     if (paths.length === 0) return;
@@ -240,14 +228,16 @@ Object.assign(CodemanApp.prototype, {
       pasteConsumed = true;
 
       // Check for images, videos or documents in clipboard items
-      var imageFiles = [];
+      var pastedFiles = [];
       var items = e.clipboardData && e.clipboardData.items;
       if (items) {
         for (var i = 0; i < items.length; i++) {
           var blob = items[i].getAsFile();
-          if (blob && self._promptAttachKind(blob)) imageFiles.push(blob);
+          if (blob) pastedFiles.push(blob);
         }
       }
+      var text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
+      var imageFiles = self._admitPromptAttachments(pastedFiles, { textPasted: !!text });
 
       // Clean up the trap
       setTimeout(function() {
@@ -265,7 +255,6 @@ Object.assign(CodemanApp.prototype, {
         // via raw sendInput() strips those markers and makes pasted input
         // indistinguishable from typed input, weakening the CLI's
         // prompt-injection defenses.
-        var text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
         if (text && terminal) terminal.paste(text);
       }
     });
@@ -297,6 +286,22 @@ Object.assign(CodemanApp.prototype, {
       return 'document';
     }
     return null;
+  },
+
+  /** The files of a pick, drop or paste that _promptAttachKind admits, telling the
+   *  user about any it refuses: all of them is "Unsupported file type", some of
+   *  them a count of what was skipped while the rest still upload. A clipboard
+   *  paste that also carries text passes `textPasted`: when none of its files is
+   *  admitted the text is pasted instead, so that case stays quiet. */
+  _admitPromptAttachments(files, { textPasted = false, includeDocuments = false } = {}) {
+    const admitted = files.filter((f) => this._promptAttachKind(f) || (includeDocuments && this._isAllowedDocumentFile?.(f)));
+    const skipped = files.length - admitted.length;
+    if (skipped > 0 && admitted.length > 0) {
+      this.showToast(`${skipped} file${skipped > 1 ? 's' : ''} skipped: unsupported type`, 'info');
+    } else if (skipped > 0 && !textPasted) {
+      this.showToast('Unsupported file type', 'error');
+    }
+    return admitted;
   },
 
   // Max images accepted in one batch (paste / drop / mobile picker). Each is
