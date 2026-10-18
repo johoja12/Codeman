@@ -4332,17 +4332,20 @@ html[data-session-list="sidebar"] .session-sidebar .session-tab .tab-close {
    the sheet and scrim are appended directly to body. */
 .mobile-tab-scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:opacity .22s;z-index:1205}
 .mobile-tab-scrim.open{opacity:1;pointer-events:auto}
-.mobile-tab-sheet{position:fixed;left:0;right:0;bottom:0;z-index:1206;background:#1b222c;border-radius:16px 16px 0 0;border-top:1px solid #2b333f;max-height:72vh;display:flex;flex-direction:column;transform:translateY(100%);transition:transform .28s cubic-bezier(.32,.72,0,1);box-shadow:0 -16px 48px rgba(0,0,0,.5)}
+.mobile-tab-sheet{position:fixed;left:0;right:0;bottom:0;z-index:1206;background:#1b222c;border-radius:16px 16px 0 0;border-top:1px solid #2b333f;max-height:72vh;max-height:72dvh;display:flex;flex-direction:column;transform:translateY(100%);transition:transform .28s cubic-bezier(.32,.72,0,1);box-shadow:0 -16px 48px rgba(0,0,0,.5)}
 .mobile-tab-sheet.open{transform:translateY(0)}
+/* Only the session list may shrink. Otherwise a crowded sheet squeezes the
+   filter bar below its text height and overlaps the first session row (#11). */
+.mobile-tab-sheet > :not(.sheet-list){flex-shrink:0}
 .mobile-tab-sheet .sheet-handle{position:relative;width:36px;height:4px;background:#3a4350;border-radius:2px;margin:8px auto 6px}
 .mobile-tab-sheet .sheet-handle::before{content:'';position:absolute;inset:-8px -12px -6px}
 .mobile-tab-sheet .sheet-search{margin:0 12px 8px;display:flex;gap:8px;align-items:center}
-.mobile-tab-sheet .sheet-search input{flex:1;background:#0a0a0a;border:1px solid #2b333f;border-radius:8px;padding:9px 10px;color:#f3f6fa;font-size:.85rem}
+.mobile-tab-sheet .sheet-search input{flex:1;min-width:0;background:#0a0a0a;border:1px solid #2b333f;border-radius:8px;padding:9px 10px;color:#f3f6fa;font-size:16px}
 .mobile-tab-sheet .sheet-search input:focus{outline:2px solid #38b6f0;border-color:#38b6f0}
 .mobile-tab-sheet .sheet-search .sheet-count{font-size:.7rem;color:#98a2b1;flex-shrink:0}
 .mobile-tab-sheet .sheet-filters{display:flex;gap:6px;padding:0 12px 8px;overflow-x:auto;scrollbar-width:none}
 .mobile-tab-sheet .sheet-filters::-webkit-scrollbar{display:none}
-.sheet-chip{flex-shrink:0;padding:5px 10px;border-radius:20px;font-size:.7rem;background:#0a0a0a;border:1px solid #2b333f;color:#98a2b1;cursor:pointer}
+.sheet-chip{flex-shrink:0;display:inline-flex;align-items:center;justify-content:center;min-height:44px;line-height:1.2;white-space:nowrap;padding:5px 10px;border-radius:20px;font-size:.7rem;background:#0a0a0a;border:1px solid #2b333f;color:#98a2b1;cursor:pointer}
 .sheet-chip.active{background:#38b6f0;color:#04223a;border-color:#38b6f0;font-weight:600}
 .mobile-tab-sheet .sheet-list{flex:1;min-height:0;overflow-y:auto;padding:0 8px 8px;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
 .sheet-group{padding:2px 0 6px}
@@ -4370,7 +4373,7 @@ html[data-session-list="sidebar"] .session-sidebar .session-tab .tab-close {
 .sheet-row .row-working{font-size:.65rem;color:#44b993}
 .sheet-row .row-close{width:28px;height:28px;display:grid;place-items:center;border-radius:6px;color:#98a2b1;flex-shrink:0;border:none;background:transparent;cursor:pointer}
 .sheet-row .row-close:active{background:rgba(255,255,255,.08)}
-.mobile-tab-sheet .sheet-footer{padding:8px 12px;border-top:1px solid #2b333f;display:flex;justify-content:space-between;font-size:.7rem;color:#98a2b1}
+.mobile-tab-sheet .sheet-footer{padding:8px 12px calc(8px + env(safe-area-inset-bottom, 0px));border-top:1px solid #2b333f;display:flex;justify-content:space-between;font-size:.7rem;color:#98a2b1}
 
 /* Folding devices, tabletop pose: cap the response viewer to the bottom
    segment. Twin of the rule at the end of styles.css, needed here because the
