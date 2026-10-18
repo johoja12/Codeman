@@ -6287,9 +6287,10 @@ Object.assign(CodemanApp.prototype, {
     // that would raise the phone keyboard over a list most opens just tap.
     const search = document.getElementById('mobileCaseSearch');
     if (search) search.value = '';
-    listContainer.parentElement.style.minHeight = '';
+    modal.querySelector('.mobile-case-picker-sheet').style.height = '';
     this.filterMobileCases();
     modal.classList.add('active');
+    if (typeof KeyboardHandler !== 'undefined' && KeyboardHandler.keyboardVisible) KeyboardHandler.updateLayoutForKeyboard();
     // Bring the current case into view when the list is longer than the sheet.
     // Scroll the list's own box, never scrollIntoView(), which can also scroll
     // the document under the fixed header.
@@ -6307,10 +6308,15 @@ Object.assign(CodemanApp.prototype, {
   filterMobileCases() {
     const search = document.getElementById('mobileCaseSearch');
     const words = (search?.value || '').toLowerCase().split(/\s+/).filter(Boolean);
-    // Hold the list at its unfiltered height while searching, so the sheet (and
-    // the input under the thumb) does not jump as rows disappear.
+    // Stabilize the whole sheet while filtering, never the list's min-height:
+    // a list floor captured before the keyboard opens can exceed the remaining
+    // viewport and push matches/footer outside the sheet (#12). The sheet's
+    // max-height can still shrink it as the visual viewport changes.
+    const sheet = document.querySelector('.mobile-case-picker-sheet');
+    if (sheet && words.length && !sheet.style.height) sheet.style.height = `${sheet.offsetHeight}px`;
+    if (sheet && !words.length) sheet.style.height = '';
     const body = document.querySelector('.mobile-case-picker-body');
-    if (body && words.length && !body.style.minHeight) body.style.minHeight = `${body.offsetHeight}px`;
+    if (body) body.scrollTop = 0;
     let shown = 0;
     for (const item of document.querySelectorAll('#mobileCaseList .mobile-case-item')) {
       const hay = item.dataset.search || '';

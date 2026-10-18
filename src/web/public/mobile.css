@@ -2535,16 +2535,27 @@ html.mobile-init .file-browser-panel {
     font-size: 1.5rem;
   }
 
-  /* With the keyboard up the sheet is lifted above it (mobile-handlers.js), so
-     what is left to fit is much shorter than 80dvh of the layout viewport. Cap
-     the list rather than the sheet, so the search row and the Create button
-     stay on screen and only the rows scroll. */
+  /* KeyboardHandler measures the actual visual viewport and caps/lifts the
+     sheet. Keep results flexible rather than imposing a second vh-based cap. */
   .keyboard-visible .mobile-case-picker-sheet {
-    max-height: 45vh;
+    /* A slide-in transform would distort KeyboardHandler's bottom measurement. */
+    animation: none;
   }
 
   .keyboard-visible .mobile-case-picker-body {
-    max-height: 28vh;
+    max-height: none;
+  }
+
+  .keyboard-visible .mobile-case-picker-header {
+    padding: 8px 16px;
+  }
+
+  .keyboard-visible .mobile-case-picker-search {
+    margin: 8px 16px 4px;
+  }
+
+  .keyboard-visible .mobile-case-picker-footer {
+    padding: 8px 16px;
   }
 
   .mobile-case-picker-footer {

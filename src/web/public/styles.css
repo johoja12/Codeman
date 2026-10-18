@@ -8755,6 +8755,11 @@ html[data-skin="og"] .welcome-primary:hover {
   box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.4);
 }
 
+/* Preserve controls; only the results body may shrink when the keyboard opens. */
+.mobile-case-picker-sheet > :not(.mobile-case-picker-body) {
+  flex-shrink: 0;
+}
+
 .mobile-case-picker-header {
   display: flex;
   align-items: center;

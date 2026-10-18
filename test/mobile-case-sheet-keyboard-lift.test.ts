@@ -71,6 +71,7 @@ describe('mobile case sheet keyboard lift', () => {
     handler.updateLayoutForKeyboard();
     expect(sheet.style.transform).toBe('translateY(-344px)');
     expect(sheet.style.transform).toBe(toolbar.style.transform);
+    expect(sheet.style.maxHeight).toBe('484px');
   });
 
   // Downstream keeps its own keyboard layout path (no iPad `bottom` branch); adopting
@@ -92,8 +93,10 @@ describe('mobile case sheet keyboard lift', () => {
     const { handler, sheet } = loadHandler({ width: 390, layoutHeight: 844, visualHeight: 500, sheetOpen: false });
     sheet.style.transform = 'translateY(-344px)';
     sheet.style.bottom = '400px';
+    sheet.style.maxHeight = '244px';
     handler.resetLayout();
     expect(sheet.style.transform).toBe('');
     expect(sheet.style.bottom).toBe('');
+    expect(sheet.style.maxHeight).toBe('');
   });
 });

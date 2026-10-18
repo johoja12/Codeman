@@ -577,7 +577,16 @@ const KeyboardHandler = {
       // The mobile case picker is a third position:fixed bottom-anchored surface,
       // and its search field can open the keyboard over it: lift it with the bars.
       const caseSheet = document.querySelector('.mobile-case-picker.active .mobile-case-picker-sheet');
-      if (caseSheet) caseSheet.style.transform = keyboardOffset > 0 ? `translateY(${-keyboardOffset}px)` : '';
+      if (caseSheet) {
+        // Size against the visible area, not a fraction of the layout viewport.
+        // Measure this surface independently: the toolbar may be hidden or have
+        // a different bottom inset. Clear the old lift before measuring it.
+        caseSheet.style.maxHeight = `${Math.max(0, window.visualViewport.height - 16)}px`;
+        caseSheet.style.transform = '';
+        const sheetBottom = caseSheet.getBoundingClientRect?.().bottom || window.innerHeight;
+        const sheetOffset = Math.max(0, sheetBottom - visualBottom);
+        caseSheet.style.transform = sheetOffset > 0 ? `translateY(${-sheetOffset}px)` : '';
+      }
       if (main && keyboardHeight > 0) {
         const cjkInputHeight = cjkInput?.classList.contains('cjk-input-visible') ? 44 : 0;
         const toolbarHeight =
@@ -623,6 +632,7 @@ const KeyboardHandler = {
       cjkInput.style.bottom = '';
     }
     if (caseSheet) {
+      caseSheet.style.maxHeight = '';
       caseSheet.style.transform = '';
       caseSheet.style.bottom = '';
     }
