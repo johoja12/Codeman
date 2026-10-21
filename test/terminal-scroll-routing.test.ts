@@ -748,7 +748,7 @@ describe('GitHub Copilot wheel forwarding', () => {
   });
 
   it('does not change what other non-claude modes do', () => {
-    for (const mode of ['codex', 'opencode', 'grok', 'gemini']) {
+    for (const mode of ['opencode', 'grok', 'gemini']) {
       const { app } = hollowApp({ mode, cliMouseTracking: true });
       expect(app._shouldForwardWheelToApp({ shiftKey: false }), mode).toBe(false);
     }
@@ -877,5 +877,24 @@ describe('scroll routing diagnostic (issue #205 round 2)', () => {
     const { app, logs } = hollowApp(); // no cliVersion — the probe failed
     app._logScrollRouting('page-keys');
     expect(logs[0]).toContain('cliVersion=unknown');
+  });
+});
+
+// Remote fullscreen panes can retain repaint frames in xterm despite having no
+// canonical tmux history. Tracking, rather than local baseY, owns this gate (#13).
+describe('tracked Codex wheel routing', () => {
+  it('forwards without a Claude version and even when the local viewport contains old frames', () => {
+    const { app } = hollowApp({ mode: 'codex', cliMouseTracking: true });
+    app.terminal.buffer.active.baseY = 100;
+    app.terminal.buffer.active.viewportY = 40;
+    expect(app._shouldForwardWheelToApp({ shiftKey: false })).toBe(true);
+    expect(app._shouldForwardWheelToApp({ shiftKey: true })).toBe(false);
+  });
+
+  it('retains local/paging behavior unless tracking is observed', () => {
+    for (const cliMouseTracking of [false, undefined]) {
+      const { app } = hollowApp({ mode: 'codex', cliMouseTracking });
+      expect(app._shouldForwardWheelToApp({ shiftKey: false })).toBe(false);
+    }
   });
 });

@@ -490,15 +490,16 @@ describe('capability shapes', () => {
   });
 
   it('declares which CLIs get the wheel forwarded, and whether a version gates it', () => {
-    // claude forwards from 2.1.187 (fullscreen renderer only); copilot forwards at any version while
-    // it tracks the mouse. codex ignores SGR wheel reports, so every other entry stays 'never'.
+    // Claude has a minimum version; measured fullscreen Codex and Copilot require
+    // observed tracking without relying on the Claude-only version field.
     const mode = (id: string) => STOCK_CLIS.find((e) => (e.id as string) === id)?.capabilities.wheelForward;
     expect(mode('copilot')).toEqual({ mode: 'always' });
+    expect(mode('codex')).toEqual({ mode: 'always' });
     expect(mode('claude')).toEqual({ mode: 'version-gated', minVersion: '2.1.187' });
     const forwarding = STOCK_CLIS.filter((e) => e.capabilities.wheelForward.mode !== 'never').map(
       (e) => e.id as string
     );
-    expect(forwarding.sort()).toEqual(['claude', 'copilot']);
+    expect(forwarding.sort()).toEqual(['claude', 'codex', 'copilot']);
     expect(CliEntrySchema.safeParse(baseEntry('copilot')).success).toBe(true);
   });
 

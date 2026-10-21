@@ -7670,8 +7670,10 @@ Object.assign(CodemanApp.prototype, {
     // same reports by hand, but only while the CLI is actually tracking the mouse. Not gated on a
     // version; a stale-false flag falls through to the PageUp/PageDown fallback like claude's.
     if (sessionMode === 'copilot') return session?.cliMouseTracking === true;
-    if (sessionMode !== 'claude') return false;
-    if (!this._cliVersionAtLeast(session?.cliVersion, '2.1.187')) return false;
+    // Codex 0.163.0 fullscreen accepts SGR wheel reports (PR #645 measurement).
+    // Inline/untracked Codex keeps its local/paging fallback.
+    if (sessionMode !== 'claude' && sessionMode !== 'codex') return false;
+    if (sessionMode === 'claude' && !this._cliVersionAtLeast(session?.cliVersion, '2.1.187')) return false;
     // Only while Claude is actually listening for the mouse. In its default
     // inline renderer (2.1.280 measured: alternate_on=0, mouse_any_flag=0) the
     // transcript lives in real scrollback, like codex, and SGR wheel reports are

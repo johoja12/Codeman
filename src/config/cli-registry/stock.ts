@@ -805,8 +805,8 @@ const CODEX: CliEntry = {
     transcript: 'codex-rollout',
     altScreen: 'strip-full',
     echo: { policy: 'predict', anchor: { kind: 'cursor' }, predictProfile: 'codex' },
-    // Match upstream: local history / PageUp fallback, without Codex SGR forwarding.
-    wheelForward: { mode: 'never' },
+    // Fullscreen Codex 0.163.0 measured in PR #645; requires observed mouse tracking.
+    wheelForward: { mode: 'always' },
     transcriptPageKeys: true,
     maxFrameBytes: 32 * 1024,
     // codex's own bare-spawn default (no config sent) is already safe (no bypass flag), so
