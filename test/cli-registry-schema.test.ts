@@ -490,8 +490,8 @@ describe('capability shapes', () => {
   });
 
   it('declares which CLIs get the wheel forwarded, and whether a version gates it', () => {
-    // Claude has a minimum version; measured fullscreen Codex and Copilot require
-    // observed tracking without relying on the Claude-only version field.
+    // Claude forwards from 2.1.187 (fullscreen only); tracked Codex and Copilot
+    // forward without a version gate. Unmeasured entries stay 'never'.
     const mode = (id: string) => STOCK_CLIS.find((e) => (e.id as string) === id)?.capabilities.wheelForward;
     expect(mode('copilot')).toEqual({ mode: 'always' });
     expect(mode('codex')).toEqual({ mode: 'always' });
@@ -523,5 +523,14 @@ describe('COD-471 overlays.remote.tmuxMouseAtStartupSeconds', () => {
     for (const bad of [0, -1, 31, 2.5, '8']) {
       expect(CliEntrySchema.safeParse(withSeconds(bad)).success, String(bad)).toBe(false);
     }
+  });
+});
+
+describe('observed mouse-tracking wheel policy', () => {
+  it('advertises and validates tracked Codex forwarding without a fictitious minimum version', () => {
+    const codex = STOCK_CLIS.find((e) => e.id === 'codex')!;
+    expect(codex.capabilities.wheelForward).toEqual({ mode: 'always' });
+    expect(CliEntrySchema.safeParse(codex).success).toBe(true);
+    expect(codex.capabilities.transcriptPageKeys).toBe(true);
   });
 });

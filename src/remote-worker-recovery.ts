@@ -39,6 +39,7 @@ export function createWorkerRecoveryRecord(state: SessionState) {
   const pinned = workerResumeOptions(
     {
       ...state,
+      keepWarm: state.keepWarmEnabled,
       sessionId: state.id,
       mode: state.mode ?? 'shell',
       resumeSessionId: record.claudeResumeId ?? state.resumeSessionId,

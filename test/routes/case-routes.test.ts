@@ -19,6 +19,7 @@ import fastifyCookie from '@fastify/cookie';
 import { createMockRouteContext, type MockRouteContext } from '../mocks/index.js';
 import { installRouteErrorHandler } from '../../src/web/route-error-handler.js';
 import { ApiErrorCode, httpStatusForErrorCode } from '../../src/types.js';
+import { TabLayoutValidationError } from '../../src/tab-layout.js';
 import { registerCaseRoutes } from '../../src/web/routes/case-routes.js';
 import { probePath } from '../../src/utils/index.js';
 import { MAX_STALLED_PATH_PROBES } from '../../src/config/path-probe.js';
@@ -1142,6 +1143,40 @@ describe('case-routes', () => {
       expect(body.data.linked).toBe(true);
     });
 
+    it('preserves adopted container ownership and its in-container workspace in a single-case lookup', async () => {
+      mockedReadFile.mockImplementation(async (path) => {
+        if (String(path).endsWith('docker-cases.json'))
+          return JSON.stringify([
+            {
+              name: 'adopted-case',
+              type: 'docker',
+              hostId: 'docker-host',
+              hostWorkspacePath: '/host/workspace',
+              containerWorkdir: '/srv/app',
+              container: 'existing-app',
+              owned: false,
+            },
+          ]) as never;
+        if (String(path).endsWith('docker-hosts.json'))
+          return JSON.stringify([
+            {
+              id: 'docker-host',
+              name: 'Docker',
+              image: 'codeman/agent:base',
+            },
+          ]) as never;
+        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      });
+      mockedExistsSync.mockReturnValue(true);
+      const res = await harness.app.inject({ method: 'GET', url: '/api/cases/adopted-case' });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().data.docker).toMatchObject({
+        container: 'existing-app',
+        owned: false,
+        containerWorkdir: '/srv/app',
+      });
+    });
+
     it('returns CASES_DIR case when no linked case found', async () => {
       // linked-cases.json read fails
       mockedReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
@@ -1265,20 +1300,26 @@ describe('case-routes', () => {
 
     it('returns the stored default and authoritative owner groups', async () => {
       mockedExistsSync.mockReturnValue(true);
-      vi.mocked(harness.ctx.store.getCaseDefaultGroup).mockReturnValue('group-nzbdav');
-
-      const res = await harness.app.inject({ method: 'GET', url: '/api/cases/nzbdav/default-group' });
-
-      expect(res.statusCode).toBe(200);
-      expect(res.json().data).toEqual({
+      vi.mocked(harness.ctx.tabLayouts.caseDefaultGroup).mockResolvedValue({
         groupId: 'group-nzbdav',
         groups: [
           { id: 'group-nzbdav', name: 'nzbdav' },
           { id: 'group-tcc', name: 'tcc' },
         ],
       });
-      expect(harness.ctx.store.getCaseDefaultGroup).toHaveBeenCalledWith('@single', 'nzbdav');
-      expect(harness.ctx.tabLayouts.getSnapshot).toHaveBeenCalledWith('@single');
+
+      const res = await harness.app.inject({ method: 'GET', url: '/api/cases/nzbdav/default-group' });
+
+      expect(res.statusCode).toBe(200);
+      expect(res.json().data).toEqual({
+        caseName: 'nzbdav',
+        groupId: 'group-nzbdav',
+        groups: [
+          { id: 'group-nzbdav', name: 'nzbdav' },
+          { id: 'group-tcc', name: 'tcc' },
+        ],
+      });
+      expect(harness.ctx.tabLayouts.caseDefaultGroup).toHaveBeenCalledWith('@single', 'nzbdav');
     });
 
     it('persists an intentional Ungrouped default', async () => {
@@ -1292,11 +1333,14 @@ describe('case-routes', () => {
 
       expect(res.statusCode).toBe(200);
       expect(res.json().data.groupId).toBeNull();
-      expect(harness.ctx.store.setCaseDefaultGroup).toHaveBeenCalledWith('@single', 'nzbdav', null);
+      expect(harness.ctx.tabLayouts.setCaseDefaultGroup).toHaveBeenCalledWith('@single', 'nzbdav', null);
     });
 
     it('rejects an unknown group without writing the setting', async () => {
       mockedExistsSync.mockReturnValue(true);
+      vi.mocked(harness.ctx.tabLayouts.setCaseDefaultGroup).mockRejectedValueOnce(
+        new TabLayoutValidationError('Unknown tab group')
+      );
 
       const res = await harness.app.inject({
         method: 'PUT',
@@ -1362,11 +1406,10 @@ describe('case-routes', () => {
       const res = await harness.app.inject({ method: 'GET', url: '/api/cases/alice-case/default-group' });
 
       expect(res.statusCode).toBe(200);
-      expect(harness.ctx.tabLayouts.getSnapshot).toHaveBeenCalledWith('alice');
-      expect(harness.ctx.store.getCaseDefaultGroup).toHaveBeenCalledWith('alice', 'alice-case');
+      expect(harness.ctx.tabLayouts.caseDefaultGroup).toHaveBeenCalledWith('alice', 'alice-case');
     });
 
-    it('repairs a stale stored group ID to intentional Ungrouped', async () => {
+    it('reports a stale stored group as Ungrouped without changing it during GET', async () => {
       mockedExistsSync.mockReturnValue(true);
       vi.mocked(harness.ctx.store.getCaseDefaultGroup).mockReturnValue('deleted-group');
 
@@ -1374,7 +1417,8 @@ describe('case-routes', () => {
 
       expect(res.statusCode).toBe(200);
       expect(res.json().data.groupId).toBeNull();
-      expect(harness.ctx.store.setCaseDefaultGroup).toHaveBeenCalledWith('@single', 'nzbdav', null);
+      expect(harness.ctx.store.setCaseDefaultGroup).not.toHaveBeenCalled();
+      expect(harness.ctx.tabLayouts.caseDefaultGroup).toHaveBeenCalledWith('@single', 'nzbdav');
     });
   });
 

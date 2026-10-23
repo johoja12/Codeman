@@ -342,6 +342,8 @@ describe('Update-Codeman.sh (the scripted major-update path — docker/README.md
         mkdirSync(binDir);
         const stub = [
           '#!/usr/bin/env bash',
+          // awk/head intentionally stop reading early; a fixture SIGPIPE is not a Docker failure.
+          "trap 'exit 0' PIPE",
           'echo "docker $*" >> "$CMDLOG"',
           'if [[ "$1" == "compose" ]]; then',
           '  shift',
@@ -353,9 +355,8 @@ describe('Update-Codeman.sh (the scripted major-update path — docker/README.md
           '  done',
           '  if [[ " $* " == *" config "* && " $* " == *" --environment "* ]]; then',
           '    source "$envfile"',
-          '    echo "CODEMAN_APPDATA_PATH=$CODEMAN_APPDATA_PATH"',
-          '    echo "CODEMAN_CASES_PATH=$CODEMAN_CASES_PATH"',
-          '    echo "DOCKER_SOCKET=$DOCKER_SOCKET"',
+          // One printf avoids a stub-only SIGPIPE when awk exits after the first row.
+          '    printf "%s\\n" "CODEMAN_APPDATA_PATH=$CODEMAN_APPDATA_PATH" "CODEMAN_CASES_PATH=$CODEMAN_CASES_PATH" "DOCKER_SOCKET=$DOCKER_SOCKET"',
           '    exit 0',
           '  fi',
           '  if [[ " $* " == *" config "* && " $* " == *" --format json "* ]]; then',
@@ -425,7 +426,7 @@ describe('Update-Codeman.sh (the scripted major-update path — docker/README.md
 
       const buildIdx = log.findIndex((l) => l.includes('build --no-cache'));
       const downIdx = log.findIndex((l) => / down(\s|$)/.test(l));
-      expect(buildIdx).toBeGreaterThan(-1);
+      expect(buildIdx, stderr + '\n' + log.join('\n')).toBeGreaterThan(-1);
       expect(downIdx).toBeGreaterThan(buildIdx);
       expect(log[downIdx]).not.toContain('--volumes');
       expect(log.some((l) => l.includes('down --volumes'))).toBe(false);
@@ -452,9 +453,9 @@ describe('Update-Codeman.sh (the scripted major-update path — docker/README.md
     });
 
     it('--keep-volumes: a plain `down`, with no --volumes flag', () => {
-      const { log } = runSmokeTest(['--keep-volumes']);
+      const { log, stderr } = runSmokeTest(['--keep-volumes']);
       const downLine = log.find((l) => / down(\s|$)/.test(l));
-      expect(downLine).toBeDefined();
+      expect(downLine, stderr + '\n' + log.join('\n')).toBeDefined();
       expect(downLine).not.toContain('--volumes');
       expect(log.some((l) => l.startsWith('docker volume rm'))).toBe(false);
     });

@@ -259,6 +259,9 @@ describe('COD-238 Files-panel source download', () => {
         return null;
       }),
       _restorePreviewSize: vi.fn(),
+      _recordFilePreviewHistory: vi.fn(),
+      _bindFilePreviewChrome: vi.fn(),
+      _applyFilePreviewExpanded: vi.fn(),
       _updateFolderPreviewNav: vi.fn(),
       _previewFolderPath: () => null,
       _closeAnnotationTray: vi.fn(),

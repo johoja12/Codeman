@@ -66,6 +66,7 @@ function makeHost(overrides: Record<string, unknown> = {}) {
     _stopFilePreviewPolling: vi.fn(),
     _resetFilePreviewExternalAction: vi.fn(),
     _hideFilePreviewNavigation: vi.fn(),
+    _updateFilePreviewHistoryNav: vi.fn(),
     _teardownOutlineScrollSpy: vi.fn(),
     _closeAnnotationPopover: vi.fn(),
     _closeAnnotationTray: vi.fn(),

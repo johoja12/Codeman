@@ -46,6 +46,7 @@ export const BROWSER_TEST_GLOBS = [
   'test/codex-predictive-echo.test.ts', // also needs a real codex binary
   'test/split-pane-terminal.browser.test.ts',
   'test/terminal-tile-scroll.browser.test.ts',
+  'test/codex-wheel-routing.browser.test.ts',
   'test/terminal-touch-paging.browser.test.ts',
   'test/shift-enter-keypress.browser.test.ts',
   'test/key-tester.browser.test.ts',
@@ -59,6 +60,7 @@ export const BROWSER_TEST_GLOBS = [
   'test/run-mode-menu-scroll.browser.test.ts',
   'test/markdown-anchor-links.browser.test.ts',
   'test/fullscreen-tab-switch-capture.browser.test.ts',
+  'test/terminal-touch-swipe-axis.browser.test.ts',
 ];
 
 /**

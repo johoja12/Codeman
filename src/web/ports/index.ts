@@ -16,3 +16,4 @@ export type { OrchestratorPort } from './orchestrator-port.js';
 export type { CronPort } from './cron-port.js';
 export type { TabLayoutPort } from './tab-layout-port.js';
 export type { AgentActivityControllerPort, AgentActivityPort } from './agent-activity-port.js';
+export type { KeepWarmPort } from './keep-warm-port.js';

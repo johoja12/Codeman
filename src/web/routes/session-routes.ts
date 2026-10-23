@@ -61,6 +61,7 @@ import {
   AutoClearSchema,
   AutoCompactSchema,
   AutoResumeSchema,
+  KeepWarmSchema,
   PinSessionSchema,
   CheckpointSchema,
   ImageWatcherSchema,
@@ -175,6 +176,7 @@ import type {
   RespawnPort,
   AgentActivityPort,
   TabLayoutPort,
+  KeepWarmPort,
 } from '../ports/index.js';
 import { RunSummaryTracker } from '../../run-summary.js';
 import {
@@ -296,7 +298,8 @@ const canonicalExistingPath = (value: string): string | undefined => {
 
 /** Infer only exact local cases already visible through the authenticated case-list model. */
 const inferAccessibleLocalCaseName = async (req: FastifyRequest, workingDir: string): Promise<string | undefined> => {
-  const canonicalWorkingDir = canonicalExistingPath(workingDir);
+  const caseRoot = CLAUDE_WORKTREE_PATH.exec(resolve(workingDir))?.[1] ?? workingDir;
+  const canonicalWorkingDir = canonicalExistingPath(caseRoot);
   if (!canonicalWorkingDir) return undefined;
   const user = getAuthUser(req);
 
@@ -319,6 +322,9 @@ const inferAccessibleLocalCaseName = async (req: FastifyRequest, workingDir: str
     ([name, path]) => INFERABLE_LOCAL_CASE_NAME.test(name) && canonicalExistingPath(path) === canonicalWorkingDir
   )?.[0];
 };
+
+/** `<repo>/.claude/worktrees/<name>`: the layout Claude Code's own worktree feature creates. */
+const CLAUDE_WORKTREE_PATH = /^(.*)\/\.claude\/worktrees\/([^/]+)\/?$/;
 
 // Pre-compiled regex for terminal buffer cleaning (avoids per-request compilation)
 // eslint-disable-next-line no-control-regex
@@ -1239,7 +1245,15 @@ function wakeableHost(host: RemoteHost): WakeableRemote {
 
 export function registerSessionRoutes(
   app: FastifyInstance,
-  ctx: SessionPort & EventPort & ConfigPort & InfraPort & AuthPort & RespawnPort & AgentActivityPort & TabLayoutPort,
+  ctx: SessionPort &
+    EventPort &
+    ConfigPort &
+    InfraPort &
+    AuthPort &
+    RespawnPort &
+    AgentActivityPort &
+    TabLayoutPort &
+    KeepWarmPort,
   /** Test seam: inject a registry with fake IO instead of the real TCP/WoL probes. */
   options: { remoteWake?: RemoteWakeRegistry } = {}
 ): RemoteWakeRegistry {
@@ -1820,6 +1834,7 @@ export function registerSessionRoutes(
       return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Model endpoint not found');
     }
     const contextLength = endpoint.modelContextLengths?.[body.modelId];
+    const slotCount = endpoint.modelSlotCounts?.[body.modelId];
 
     // Some CLIs (today: only claude) carry enough of their own fixed system-prompt/tool-
     // schema overhead that a small enough real context guarantees a first-message failure
@@ -1830,12 +1845,13 @@ export function registerSessionRoutes(
     // `confirmed`, which still means both) — NOT by `confirmedSwap`: this warning is
     // about the caller's own session, and the swap warning below is about someone
     // else's, so an answer to one is not consent to the other.
-    if (!(body.confirmed || body.confirmedContext) && exceedsSafeContextFloor(entry, contextLength)) {
+    if (!(body.confirmed || body.confirmedContext) && exceedsSafeContextFloor(entry, contextLength, slotCount)) {
       return {
         requiresContextWarning: true,
         modelId: body.modelId,
         contextLength,
         minSafeContextTokens: CLAUDE_MIN_SAFE_CONTEXT_TOKENS,
+        ...(slotCount && slotCount > 1 ? { slotCount } : {}),
       };
     }
 
@@ -4013,6 +4029,39 @@ export function registerSessionRoutes(
     };
   });
 
+  // ========== Prompt-cache keep-warm ==========
+
+  // Per-session opt-in for the keep-alive nudge (prompt-cache-keepwarm.ts). `enabled: null`
+  // clears the choice so the app-wide default applies again. Refused for a CLI that reports
+  // no cache telemetry on its statusline: without `expires_at` there is nothing to schedule.
+  app.post('/api/sessions/:id/keep-warm', async (req) => {
+    const { id } = req.params as { id: string };
+    const body = parseBody(KeepWarmSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id, req);
+    if (!getCli(session.mode)?.capabilities.statusLineTelemetry) {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        'Prompt-cache keep-warm needs the cache telemetry this CLI does not report'
+      );
+    }
+
+    session.setKeepWarmEnabled(body.enabled ?? undefined);
+    // Re-evaluate BEFORE the state broadcast and the response: both carry `keepWarm`, and a
+    // page that received the previous status would overwrite the one the toggle just produced.
+    await ctx.keepWarm.schedule(id);
+    persistAndBroadcastSession(ctx, session);
+
+    return {
+      success: true,
+      data: {
+        keepWarm: {
+          enabled: session.keepWarmEnabled ?? null,
+          status: session.keepWarm,
+        },
+      },
+    };
+  });
+
   // ========== Auto-Resume (usage-limit pause) ==========
 
   app.post('/api/sessions/:id/auto-resume', async (req) => {
@@ -4793,6 +4842,7 @@ export function registerSessionRoutes(
       const cmEndpoint = cmHosts.find((h) => h.id === customModel.endpointId);
       if (!cmEndpoint) return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Model endpoint not found');
       const cmContextLength = cmEndpoint.modelContextLengths?.[customModel.modelId];
+      const cmSlotCount = cmEndpoint.modelSlotCounts?.[customModel.modelId];
 
       // See the dedicated route's own comment for the full reasoning: some CLIs' own fixed
       // overhead can exceed a small enough real context on the very first message,
@@ -4802,13 +4852,14 @@ export function registerSessionRoutes(
       // `confirmedSwap`.
       if (
         !(customModel.confirmed || customModel.confirmedContext) &&
-        exceedsSafeContextFloor(cmEntry, cmContextLength)
+        exceedsSafeContextFloor(cmEntry, cmContextLength, cmSlotCount)
       ) {
         return {
           requiresContextWarning: true,
           modelId: customModel.modelId,
           contextLength: cmContextLength,
           minSafeContextTokens: CLAUDE_MIN_SAFE_CONTEXT_TOKENS,
+          ...(cmSlotCount && cmSlotCount > 1 ? { slotCount: cmSlotCount } : {}),
         };
       }
 
@@ -5212,9 +5263,6 @@ export function registerSessionRoutes(
     /** Main repo root the worktree belongs to. */
     worktreeRepo?: string;
   };
-
-  /** `<repo>/.claude/worktrees/<name>` — the layout Claude Code's own worktree feature creates. */
-  const CLAUDE_WORKTREE_PATH = /^(.*)\/\.claude\/worktrees\/([^/]+)\/?$/;
 
   /**
    * Recover cwd / branch / worktree from a transcript chunk.

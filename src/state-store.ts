@@ -825,11 +825,12 @@ export class StateStore {
 
   /** Returns an owner's case default, distinguishing unset from intentional Ungrouped. */
   getCaseDefaultGroup(owner: string, caseName: string): string | null | undefined {
-    const defaults = this.state.caseDefaultGroups;
-    if (!defaults || !Object.hasOwn(defaults, owner)) return undefined;
-
-    const ownerDefaults = defaults[owner];
-    return Object.hasOwn(ownerDefaults, caseName) ? ownerDefaults[caseName] : undefined;
+    const all = this.state.caseDefaultGroups;
+    if (!all || typeof all !== 'object' || !Object.hasOwn(all, owner)) return undefined;
+    const forOwner = all[owner];
+    if (!forOwner || typeof forOwner !== 'object' || !Object.hasOwn(forOwner, caseName)) return undefined;
+    const value = forOwner[caseName];
+    return typeof value === 'string' || value === null ? value : undefined;
   }
 
   /** Persists an owner-and-case scoped default session group. */

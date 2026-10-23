@@ -71,6 +71,9 @@ function makeHarness(fetch: ReturnType<typeof vi.fn>) {
               : null
     ),
     _restorePreviewSize: vi.fn(),
+    _recordFilePreviewHistory: vi.fn(),
+    _bindFilePreviewChrome: vi.fn(),
+    _applyFilePreviewExpanded: vi.fn(),
     _resetFilePreviewExternalAction: vi.fn(),
     _resetFilePreviewOriginalDownloadAction: vi.fn(),
     _hideFilePreviewNavigation: vi.fn(),

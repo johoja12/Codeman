@@ -218,14 +218,16 @@ describe('App Settings modal structure', () => {
 });
 
 describe('Case Management default group structure', () => {
-  it('keeps one accessible default-group control in the Edit Case surface', () => {
+  it('keeps the accessible Edit Case default alongside the desktop and phone quick selectors', () => {
     expect(html).toContain('id="caseEditDefaultGroupRow"');
     expect(html).toContain('for="caseEditDefaultGroup"');
     expect(html).toContain('id="caseEditDefaultGroup"');
     expect(html).toContain('<option value="">Ungrouped</option>');
     expect(html).toContain('Place future sessions for this case in this group');
-    expect(html).not.toContain('id="caseDefaultGroup"');
-    expect(html).not.toContain('id="caseDefaultGroupMobile"');
+    for (const id of ['caseEditDefaultGroup', 'caseDefaultGroup', 'caseDefaultGroupMobile']) {
+      expect(html.split('id="' + id + '"')).toHaveLength(2);
+      expect(html).toContain('for="' + id + '"');
+    }
   });
 
   it('loads the Edit Case control from the server and saves it through the case update', () => {

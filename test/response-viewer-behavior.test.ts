@@ -67,6 +67,8 @@ describe('response viewer behavior', () => {
 
     const link = document.querySelector<HTMLAnchorElement>('#responseViewerBody a');
     expect(link).not.toBeNull();
+    // A tab change after opening the viewer must not retarget its document links.
+    app.activeSessionId = 'another-active-session';
     const click = new MouseEvent('click', { bubbles: true, cancelable: true });
     link?.dispatchEvent(click);
 

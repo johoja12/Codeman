@@ -595,8 +595,8 @@ export interface CliCapabilities {
    *
    * ⚠ NOT wheel forwarding. `wheelForward` above sends SGR mouse wheel REPORTS; this sends
    * plain keys, and only when the local buffer is hollow (normal buffer, `baseY === 0`).
-   * A CLI can ignore one and honour the other: untracked/inline Codex ignores SGR
-   * wheel reports yet can use PageUp/PageDown as its hollow-pane fallback.
+   * A CLI can ignore one and honour the other: Codex without observed mouse tracking
+   * uses this fallback, while fullscreen Codex 0.163.0 accepts SGR wheel reports.
    *
    * Absent means no paging, so a CLI nobody has measured keeps plain local scrolling.
    */

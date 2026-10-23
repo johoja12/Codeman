@@ -97,6 +97,9 @@ describe('COD-261 original viewer download', () => {
                   : null
       ),
       _restorePreviewSize: vi.fn(),
+      _recordFilePreviewHistory: vi.fn(),
+      _bindFilePreviewChrome: vi.fn(),
+      _applyFilePreviewExpanded: vi.fn(),
       _hideFilePreviewNavigation: vi.fn(),
       _loadFilePreviewNavigation: vi.fn(),
       _closeAnnotationTray: vi.fn(),
