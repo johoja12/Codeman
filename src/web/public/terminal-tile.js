@@ -244,6 +244,7 @@
         scrollback: this.scrollback ?? DEFAULT_SCROLLBACK,
         allowTransparency: true,
         allowProposedApi: true,
+        linkHandler: global.app?._terminalOsc8LinkHandler?.({ getSessionId: () => this.sessionId }),
       });
 
       this.fitAddon = new FitAddon.FitAddon();

@@ -66,6 +66,7 @@ function makeHarness(
     cwd?: string;
     cols?: number;
     remote?: object;
+    mode?: string;
     docker?: object;
   } = {}
 ) {
@@ -132,6 +133,7 @@ function makeHarness(
           workingDir: options.workingDir ?? '/workspace/project',
           cwd: options.cwd,
           remote: options.remote,
+          mode: options.mode,
           docker: options.docker,
         },
       ],
@@ -1214,4 +1216,48 @@ describe('COD-386 relative paths resolve against the pane cwd', () => {
     expect(previewSpy).toHaveBeenCalledWith('docs/guide.md', originalSessionId);
     expect(externalPreviewSpy).not.toHaveBeenCalled();
   });
+});
+
+it('opens the reported remote Codex PDF in a descriptive bullet through the guarded external resolver (#16)', () => {
+  const path = '/Users/saqebakhter/syncthing/contexts/hdai-hyperdrive/output/pdf/saif-hyperdrive-upgrade-plan.pdf';
+  const { provide, externalPreviewSpy, originalSessionId } = makeHarness(
+    `• Created the illustrated upgrade plan PDF (${path}).`,
+    { workingDir: '/Users/saqebakhter/syncthing/contexts/saif', mode: 'codex', remote: { hostId: 'mac-mini' } }
+  );
+  const links = provide();
+  expect(links.map((link) => link.text)).toContain(path);
+  links.find((link) => link.text === path)!.activate(null, path);
+  expect(externalPreviewSpy).toHaveBeenCalledWith(path, originalSessionId);
+});
+
+it('routes native Codex file hyperlinks through the guarded preview using the owning pane session (#16)', () => {
+  const { proto } = loadTerminalUiPrototype();
+  const preview = vi.fn();
+  const web = vi.fn();
+  const host = {
+    activeSessionId: 'another-tab',
+    sessions: new Map([['pdf-pane', { mode: 'codex', remote: {} }]]),
+    openFileUriPreview: preview,
+    _openTerminalUrl: web,
+  };
+  const handler = proto._terminalOsc8LinkHandler.call(host, { getSessionId: () => 'pdf-pane' });
+  const uri = 'file:///Users/example/other-project/output/a%20plan.pdf';
+  handler.activate(null, uri);
+  expect(preview).toHaveBeenCalledExactlyOnceWith(uri, 'pdf-pane');
+  for (const rejected of [
+    'javascript:alert(1)',
+    'data:text/html,test',
+    'file://server/share/a.pdf',
+    'file:////tmp/a.pdf',
+    'file:///tmp/a.zip',
+    'file:///tmp/a.pdf\n',
+  ]) {
+    handler.activate(null, rejected);
+  }
+  expect(preview).toHaveBeenCalledTimes(1);
+  handler.activate(null, 'https://example.com/plan.pdf');
+  expect(web).toHaveBeenCalledExactlyOnceWith('https://example.com/plan.pdf');
+  host.sessions.set('pdf-pane', { mode: 'claude', remote: {} });
+  handler.activate(null, uri);
+  expect(preview).toHaveBeenCalledTimes(1);
 });
