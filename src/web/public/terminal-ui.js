@@ -548,6 +548,8 @@ function _debugEchoLogOuter() {
   } catch {}
 }
 
+const TERMINAL_FILE_URI_PREVIEW_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'pdf', 'docx', 'pptx', 'xlsx', 'md', 'txt']);
+
 Object.assign(CodemanApp.prototype, {
 
   _shouldForwardClickToForegroundTui() {
@@ -2761,7 +2763,7 @@ Object.assign(CodemanApp.prototype, {
             continue;
           }
 
-          if (!session?.remote && !session?.docker && attachmentExtensions.has(extensionOf(candidate))) {
+          if ((!session?.remote || session.mode === 'codex') && !session?.docker && attachmentExtensions.has(extensionOf(candidate))) {
             references.push({ text: candidate, absolutePath: candidate, startIndex, endIndex });
             continue;
           }
@@ -2818,7 +2820,7 @@ Object.assign(CodemanApp.prototype, {
             const relativePath = normalizePreviewPath(candidate, workingDir);
             if (relativePath) {
               references.push({ text: candidate, relativePath, startIndex, endIndex });
-            } else if (!session?.remote && !session?.docker && attachmentExtensions.has(extensionOf(candidate))) {
+            } else if ((!session?.remote || session.mode === 'codex') && !session?.docker && attachmentExtensions.has(extensionOf(candidate))) {
               references.push({ text: candidate, absolutePath: candidate, startIndex, endIndex });
             } else {
               suppress(startIndex, lineText.length);
@@ -3110,19 +3112,7 @@ Object.assign(CodemanApp.prototype, {
         // turn a hover into unbounded work.
         const FILE_URI_PREFIX = 'file:///';
         const MAX_FILE_URI_LENGTH = 2000;
-        const fileUriExtensions = new Set([
-          'png',
-          'jpg',
-          'jpeg',
-          'gif',
-          'webp',
-          'pdf',
-          'docx',
-          'pptx',
-          'xlsx',
-          'md',
-          'txt',
-        ]);
+        const fileUriExtensions = TERMINAL_FILE_URI_PREVIEW_EXTENSIONS;
         const isFileUriDelimiter = (char) => !char || /[\s"'<>|;&\x00-\x1f]/.test(char);
         const scanFileUriTokens = () => {
           const candidates = [];
@@ -3496,14 +3486,22 @@ Object.assign(CodemanApp.prototype, {
     return provider;
   },
 
-  _terminalOsc8LinkHandler() {
-    // OSC 8 links take precedence over our text link provider in xterm. Route
-    // them through the same opener, while accepting only browser web URLs from
-    // terminal output. Other URI schemes remain handled by the text provider.
+  _terminalOsc8LinkHandler({ getSessionId = () => this.activeSessionId } = {}) {
+    // Native OSC 8 ranges take priority over text links in xterm. Resolve Codex
+    // file URIs in-app too, retaining the server's artifact/allow-once guards.
     return {
       activate: (_event, text) => {
-        if (!/^https?:\/\/[^\s\x00-\x1f]+$/i.test(text)) return;
-        this._openTerminalUrl(text);
+        if (/^https?:\/\/[^\s\x00-\x1f]+$/i.test(text)) {
+          this._openTerminalUrl(text);
+          return;
+        }
+        const sessionId = getSessionId();
+        if (this.sessions?.get(sessionId)?.mode !== 'codex' || typeof text !== 'string' || text.length > 2000 ||
+            !/^file:\/\/\/[^/\s\x00-\x1f][^\s\x00-\x1f]*$/i.test(text)) return;
+        const path = text.split(/[?#]/, 1)[0];
+        if (!TERMINAL_FILE_URI_PREVIEW_EXTENSIONS.has(path.slice(path.lastIndexOf('.') + 1).toLowerCase())) return;
+        const pending = this.openFileUriPreview(text, sessionId);
+        pending?.catch?.((err) => console.error('Failed to open terminal file URI:', err));
       },
     };
   },
