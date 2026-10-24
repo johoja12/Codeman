@@ -47,7 +47,6 @@ Object.assign(CodemanApp.prototype, {
   closeAssistants() {
     this.$('assistantsToken').value = '';
     this.$('assistantsTokenPanel').hidden = true;
-    this._assistantComposerConfirmed = undefined;
     this._assistantDetailsOpen = new Map();
     this.$('assistantsDialog').close();
   },
@@ -89,7 +88,10 @@ Object.assign(CodemanApp.prototype, {
       return { label: 'Recovery needed', tone: 'attention' };
     if (a.capabilities.requestExecution) return { label: 'Ready', tone: 'ready' };
     if (!a.binding) return { label: 'Setup needed', tone: 'muted' };
-    return { label: a.enabled ? 'Handoff needed' : 'Paused', tone: 'muted' };
+    if (!a.enabled) return { label: 'Paused', tone: 'muted' };
+    if (a.capabilities.handedOff || a.capabilities.inputLocked)
+      return { label: 'Connection unavailable', tone: 'attention' };
+    return { label: 'Not connected', tone: 'attention' };
   },
   async renderAssistants() {
     const list = this.$('assistantsList');
@@ -202,7 +204,6 @@ Object.assign(CodemanApp.prototype, {
         if (this._assistantActionPending) return;
         entry.blur();
         this._selectedAssistantId = item.id;
-        this._assistantComposerConfirmed = undefined;
         this.$('assistantsToken').value = '';
         this.$('assistantsTokenPanel').hidden = true;
         void this.renderAssistants().catch((error) => {
@@ -284,23 +285,39 @@ Object.assign(CodemanApp.prototype, {
       );
     sessionTile.append(sessionText);
     tiles.append(connection, sessionTile);
-    card.append(tiles);
     const ownership = element('section', undefined, 'assistant-ownership');
+    const connectionUnavailable =
+      a.enabled &&
+      !a.capabilities.needsAttention &&
+      !a.capabilities.requestExecution &&
+      (a.capabilities.handedOff || a.capabilities.inputLocked);
     const ownerTitle = a.capabilities.needsAttention
       ? 'Review needed before messaging resumes'
-      : a.capabilities.handedOff
-        ? 'Messaging is in control'
-        : 'Desktop is in control';
+      : connectionUnavailable
+        ? 'Messaging needs attention'
+        : a.capabilities.handedOff
+          ? 'Messaging is in control'
+          : !a.binding
+            ? 'Choose a session first'
+            : a.enabled
+              ? 'Connect this assistant to messaging'
+              : 'Messaging is paused';
     const ownerText = element('div');
     ownerText.append(
       element('h4', ownerTitle),
       element(
         'p',
-        a.capabilities.handedOff
-          ? 'Take control to type directly in the session.'
-          : a.capabilities.needsAttention
-            ? 'Take control, review the task, and reconcile it below.'
-            : 'Hand off an idle session to receive messaging requests.',
+        a.capabilities.needsAttention
+          ? 'Take control, review the task, and reconcile it below before reconnecting.'
+          : connectionUnavailable
+            ? 'Messaging already has control, but the session cannot receive requests. Open the session to check it, or take control to review and reconnect.'
+            : a.capabilities.handedOff
+              ? 'Messages can send tasks to this session. Take control to type here instead.'
+              : !a.binding
+                ? 'Choose a session in Advanced settings below, then connect it to messaging.'
+                : a.enabled
+                  ? 'Connect to let messages send tasks to this session. You can take control again at any time.'
+                  : 'Enable the assistant, then connect it to messaging.',
         'assistant-secondary'
       )
     );
@@ -308,7 +325,7 @@ Object.assign(CodemanApp.prototype, {
     if (a.capabilities.handedOff || a.capabilities.inputLocked || a.capabilities.needsAttention) {
       ownership.append(
         button(
-          'Take control',
+          connectionUnavailable ? 'Take control to reconnect' : 'Take control',
           () => this.assistantApi(`/api/assistants/${a.id}/take-control`, 'POST', {}),
           false,
           'assistant-accent'
@@ -325,37 +342,39 @@ Object.assign(CodemanApp.prototype, {
             'assistant-primary'
           )
         );
-      const label = element('label', undefined, 'assistant-confirmation');
-      const confirm = element('input');
-      confirm.type = 'checkbox';
-      confirm.id = 'assistantComposerEmpty';
-      confirm.checked = this._assistantComposerConfirmed === a.id;
-      confirm.onchange = () => {
-        this._assistantComposerConfirmed = confirm.checked ? a.id : undefined;
-      };
-      label.append(
-        confirm,
-        element('span', 'The terminal composer is empty, no task is running, and no direct tmux attachment is in use.')
-      );
-      ownership.append(label);
       ownership.append(
         button(
-          'Handoff to messaging',
+          'Connect to messaging',
           async () => {
-            if (!confirm.checked)
-              throw new Error('Confirm that the terminal composer is empty and no task is running.');
+            if (
+              !window.confirm(
+                `Connect ${a.name} to messaging?\n\nMessages will send tasks to ${bound?.name || 'this session'}. Desktop typing will be locked until you take control again.\n\nContinue only if the terminal input is empty, no task is running, and no direct tmux attachment is in use.`
+              )
+            )
+              return;
             await this.assistantApi(`/api/assistants/${a.id}/handoff`, 'POST', {
               expectedRevision: a.revision,
               composerEmpty: true,
             });
-            this._assistantComposerConfirmed = undefined;
           },
           !a.enabled,
-          'assistant-accent'
+          'assistant-primary'
         )
       );
     }
-    card.append(ownership);
+    if (bound)
+      ownership.append(
+        button(
+          'Open session',
+          () => {
+            this.closeAssistants();
+            return this.selectSession(bound.id);
+          },
+          false,
+          'assistant-link'
+        )
+      );
+    card.append(ownership, tiles);
     const activity = element('section', undefined, 'assistant-activity');
     const activityHead = element('div', undefined, 'assistant-section-heading');
     activityHead.append(element('h4', 'Recent activity'));

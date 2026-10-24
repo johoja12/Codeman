@@ -86,6 +86,10 @@
   color: #19122c;
   border-color: #baa0f5;
 }
+.assistant-button.assistant-primary:hover:not(:disabled) {
+  background: #c7b1fa;
+  border-color: #c7b1fa;
+}
 .assistant-accent {
   border-color: var(--assistant-accent);
   color: #e9dfff;

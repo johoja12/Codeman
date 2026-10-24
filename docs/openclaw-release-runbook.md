@@ -29,7 +29,12 @@ gates. This runbook does not authorize deployment or input to production Brain.
 3. Enable the plugin for the intended Telegram account and allowlist one numeric
    private-chat sender. Restart/reload the existing gateway through its normal
    management path; do not start a duplicate production poller.
-4. Explicitly enable and hand off Brain. Send one tool-free marker prompt through
+4. In Assistants, select Brain, enable it if paused, then choose **Connect to
+   messaging** above the connection details. Confirm only after checking the
+   terminal is idle, its input is empty, and no direct tmux attachment is in use.
+   If the status is **Connection unavailable**, messaging already owns the
+   session: open it to inspect, or choose **Take control to reconnect**, review
+   it, then enable and connect again. Send one tool-free marker prompt through
    `/brain`. Record trusted message ID, connector key, request UUID, native turn ID
    and result. Confirm the same session and conversation remained bound and the
    answer appeared only in the initiating private chat.
