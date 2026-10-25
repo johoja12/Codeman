@@ -102,7 +102,7 @@ import {
   remoteLoginShellCommand,
   remoteSshTarget,
   probeRemoteWorker,
-  withRemotePathBootstrap,
+  withRemoteTmuxPath,
 } from './remote-hosts.js';
 import {
   buildDockerBaseArgs,
@@ -157,7 +157,7 @@ import {
   resolveHeadroomRouted,
 } from './config/headroom-routing.js';
 import { ensureDeepSeekStatusShim } from './deepseek-status-shim.js';
-import { restrictTmuxPrefixTable } from './tmux-prefix-table.js';
+import { NESTED_TMUX_PREFIX, nestedPrefixTableResetCommands, restrictTmuxPrefixTable } from './tmux-prefix-table.js';
 
 /** How long a cached process snapshot stays usable. */
 const PROC_SNAPSHOT_TTL_MS = 2000;
@@ -618,9 +618,11 @@ export interface PasteTextCommands {
 
 /**
  * Escape a final `;` for tmux. tmux splits commands on an argument that ENDS in
- * `;` (`set-buffer -- 'a;'` stores `a`, `send-keys -l 'a;'` types `a`, a lone `;`
+ * `;` (`set-buffer -- 'a;'` stores `a`, `send-keys -l -- 'a;'` types `a`, a lone `;`
  * is no argument at all); a final `\;` is its escape for a literal `;`. A `;`
- * anywhere else in the argument is literal already. Exported for unit testing.
+ * anywhere else in the argument is literal already. Every `send-keys -l` passes
+ * `--` before the text, like `set-buffer`, or tmux parses a text that starts with
+ * `-` as its own options. Exported for unit testing.
  */
 export function escapeTmuxTrailingSemicolon(text: string): string {
   return text.endsWith(';') ? `${text.slice(0, -1)}\\;` : text;
@@ -1720,8 +1722,11 @@ export function renderRemoteCliCommand(mode: SessionMode, options: SpawnBridgeOp
  *
  * Emits:
  *   ssh -o BatchMode=yes -t [<COD-107 connection opts>] user@host \
- *     'tmux -L codeman new-session -A -s codeman-<id> -c <path> "cd <path> && exec <cli>" \
- *        \; set -g status off \; set -g mouse off \; set -sg escape-time 0 \; set -g prefix C-q'
+ *     'tmux -L codeman-remote new-session -A -s codeman-ssh-<id> -c <path> "cd <path> && exec <cli>" \
+ *        \; set -t codeman-ssh-<id> status off \; set -t codeman-ssh-<id> mouse off \
+ *        \; set -t codeman-ssh-<id> prefix C-q \; set -s escape-time 0 \; \
+ *        bind-key -T prefix C-q send-prefix \; unbind-key -a -T prefix \; \
+ *        bind-key -T prefix C-q send-prefix \; set -t codeman-ssh-<id> remain-on-exit failed'
  *
  * COD-107 — the connection options (`-p`, `-i`, `-J`, SOCKS `-o ProxyCommand`,
  * arbitrary `-o`) come from the shared `buildSshConnectionArgs(remote)`, so the
@@ -1881,7 +1886,7 @@ export function buildRemoteLaunchCommand(options: {
   // Remote user-env sourcing is handled upstream by `defaultRemoteCommandForMode`
   // / `remoteLoginShellCommand` (`$SHELL -i -l -c`), so agent commands here already
   // cary the remote user's shell env; a per-host override stays authoritative.
-  const paneCommand = `cd ${shellescape(remote.remotePath)} && ${withRemotePathBootstrap(modeCommand)}`;
+  const paneCommand = `cd ${shellescape(remote.remotePath)} && ${withRemoteTmuxPath(modeCommand)}`;
 
   // The tmux command line, with `\;` separating commands so the config `set`s
   // apply on the SAME connection (and are idempotent on reattach). Options are
@@ -1916,7 +1921,7 @@ export function buildRemoteLaunchCommand(options: {
       : [`set -t ${remoteName} mouse off`];
   const historyLimitPrefix =
     historyLimit && Number.isFinite(historyLimit) ? [`set -g history-limit ${Math.floor(historyLimit)}`] : [];
-  const tmuxInvocation = withRemotePathBootstrap(
+  const tmuxInvocation = withRemoteTmuxPath(
     [
       `tmux -L ${REMOTE_TMUX_SOCKET} ${[...historyLimitPrefix, `new-session -A -s ${remoteName} -c ${shellescape(remote.remotePath)} ${shellescape(paneCommand)}`].join(' \\; ')}`,
       `set -t ${remoteName} status off`,
@@ -1930,6 +1935,7 @@ export function buildRemoteLaunchCommand(options: {
       // Per-session scoped (`set -t <name>`, matching #145's hardening) so a shared
       // remote tmux server's other sessions keep their own sizing behavior.
       `set -t ${remoteName} window-size latest`,
+      ...nestedPrefixTableResetCommands(),
       // #210: keep a CRASHED pane so the failure is still on screen. Without this,
       // tmux destroys the pane -> window -> session (and, being the only session,
       // the whole remote server) the instant the pane command exits, which tears the
@@ -1985,7 +1991,7 @@ export function buildRemoteLaunchCommand(options: {
  */
 export function buildRemoteAttachCommand(remote: SessionRemote, remoteSessionName: string): string {
   const socket = remote.owned !== false ? REMOTE_TMUX_SOCKET : 'codeman';
-  const tmuxInvocation = withRemotePathBootstrap(`tmux -L ${socket} attach -t ${shellescape(remoteSessionName)}`);
+  const tmuxInvocation = withRemoteTmuxPath(`tmux -L ${socket} attach -t ${shellescape(remoteSessionName)}`);
   const [ssh, ...connectionArgs] = buildSshConnectionArgs(remote);
   const sshParts = [ssh, ...connectionArgs, '-t', remoteSshTarget(remote), shellescape(tmuxInvocation)];
   return sshParts.join(' ');
@@ -2001,7 +2007,7 @@ export function buildRemoteAttachCommand(remote: SessionRemote, remoteSessionNam
  */
 export function buildRemoteKillCommand(remote: SessionRemote, remoteSessionName: string): string {
   const socket = remote.owned !== false ? REMOTE_TMUX_SOCKET : 'codeman';
-  const tmuxInvocation = withRemotePathBootstrap(`tmux -L ${socket} kill-session -t ${shellescape(remoteSessionName)}`);
+  const tmuxInvocation = withRemoteTmuxPath(`tmux -L ${socket} kill-session -t ${shellescape(remoteSessionName)}`);
   const sshParts = [...buildSshConnectionArgs(remote), remoteSshTarget(remote), shellescape(tmuxInvocation)];
   return sshParts.join(' ');
 }
@@ -2235,8 +2241,12 @@ export function buildDockerLaunchCommand(opts: DockerLaunchOptions): string {
     `new-session -A -s ${dkrName} -c ${workdir} ${shellescape(paneCommand)}`,
     `set -t ${dkrName} status off`,
     `set -t ${dkrName} mouse off`,
-    `set -t ${dkrName} prefix C-q`,
+    `set -t ${dkrName} prefix ${NESTED_TMUX_PREFIX}`,
     'set -s escape-time 0',
+    // Same reduction as the owned-remote chain: the in-container server is
+    // Codeman's (`-L codeman-docker`), and its stock prefix table would move
+    // the inner client to a sibling session on Ctrl+Q then )/(/s/w/L.
+    ...nestedPrefixTableResetCommands(),
   ].join(' \\; ');
 
   const execEnvFlags: string[] = [];
@@ -5498,7 +5508,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     // invocation fetches capture + geometry; a delimiter line separates them.
     if (opts?.visibleFrame) {
       try {
-        const stdout = await runCapture(withRemotePathBootstrap(buildRemoteFrameCommand(target, socket)));
+        const stdout = await runCapture(withRemoteTmuxPath(buildRemoteFrameCommand(target, socket)));
         return stdout === null ? null : parseRemoteFrameCapture(stdout);
       } catch (err) {
         console.error('[TmuxManager] Remote frame capture failed (falling back to local wrapper):', err);
@@ -5507,7 +5517,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
     // The remote login shell may not have tmux on PATH (macOS non-interactive
     // zsh lacks /opt/homebrew/bin) — bootstrap PATH exactly like the launcher.
-    const captureCmd = withRemotePathBootstrap(
+    const captureCmd = withRemoteTmuxPath(
       opts?.fullHistory
         ? buildRemoteFullHistoryCommand(target, socket, opts?.lastLines)
         : `tmux -L ${socket} capture-pane -p -e -t ${shellescape(target)}`

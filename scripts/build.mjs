@@ -198,6 +198,10 @@ run(
   'minify mobile.css',
   'npx esbuild dist/web/public/mobile.css --minify --outfile=dist/web/public/mobile.css --allow-overwrite'
 );
+run(
+  'minify header-divider.js',
+  'npx esbuild dist/web/public/header-divider.js --minify --outfile=dist/web/public/header-divider.js --allow-overwrite'
+);
 
 // 5. Content-hash cache busting
 console.log('\n[build] content-hash cache busting');
@@ -219,6 +223,7 @@ console.log('\n[build] content-hash cache busting');
     'tab-layout-browser.js',
     'app.js',
     'tab-rail-resize.js',
+    'header-divider.js',
     'terminal-ui.js',
     'respawn-ui.js',
     'ralph-panel.js',

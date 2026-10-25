@@ -129,10 +129,20 @@
   const PAGE_KEY_GESTURE_GAP_MS = 150;
   // ...but not for sub-row jitter (0.1 row, ~2px)...
   const PAGE_KEY_MIN_START_ROWS = 0.1;
-  // ...and only for a trackpad-sized opening event. A mouse-wheel notch (100px,
-  // 4 rows) accumulates toward half a screen as before; paging at once on it made
-  // slow notches, each its own gesture past the gap, page a full screen apiece.
+  // ...for any opening event under one page. A trackpad-sized opener (under this many rows) and a
+  // mouse-wheel notch (100px, 4 rows) both page at once; this size is what tells them apart for the debt
+  // (see PAGE_KEY_NOTCH_DEBT_MS). The signal is the opener's size, not the device: a touch contact whose
+  // first touchmove is this many rows or more is treated as a notch too, and so is a brisk trackpad
+  // flick that opens with a large event. Both are fine, and both get the longer debt.
   const PAGE_KEY_IMMEDIATE_MAX_ROWS = 2;
+  // A mouse-wheel notch used to just accumulate toward half a screen, so a mouse showed nothing for the
+  // first 5 notches (7 on Firefox's 3-line notches) and a gesture of a few notches seemed dead. The first
+  // notch of a gesture now pre-pays its page like a trackpad flick does, and the notches that follow repay
+  // it: the same gesture sends the same pages, the first one sooner. The old objection was slow notches,
+  // each its own gesture past the gap, paging a full screen apiece, so a notch's debt outlives the pauses
+  // between notches for this long (a trackpad's lasts PAGE_KEY_DEBT_MS). It applies to any opener of
+  // PAGE_KEY_IMMEDIATE_MAX_ROWS rows or more, whatever device it came from.
+  const PAGE_KEY_NOTCH_DEBT_MS = 3000;
   // A pre-paid page's debt outlives the gesture gap for this long when the next
   // event goes the SAME way, so slow small wheel ticks (40 px every 250 ms, a
   // Firefox 1-line notch) pay it back instead of each pre-paying a page of its own.
@@ -235,19 +245,22 @@
   //    (`ev.touchId`, set by the touch paths per touchstart and carried by that
   //    contact's momentum; a wheel event has none, so wheel and touch never
   //    share a gesture), or, for events outside any contact, after quiet:
-  //    PAGE_KEY_GESTURE_GAP_MS, stretched to PAGE_KEY_DEBT_MS while a pre-paid
-  //    page is still owed in the same direction. One contact is never split by
-  //    time, so a slow drag (one line per 170 ms) is one gesture;
-  //  - a new gesture's trackpad-sized opening event (at least
-  //    PAGE_KEY_MIN_START_ROWS, under PAGE_KEY_IMMEDIATE_MAX_ROWS) pages AT ONCE,
+  //    PAGE_KEY_GESTURE_GAP_MS, stretched to PAGE_KEY_DEBT_MS (PAGE_KEY_NOTCH_DEBT_MS
+  //    when a notch-sized opener pre-paid it) while a pre-paid page is still owed
+  //    in the same direction. One contact is never split by time, so a slow drag
+  //    (one line per 170 ms) is one gesture;
+  //  - a new gesture's opening event (at least PAGE_KEY_MIN_START_ROWS and
+  //    under one page: a trackpad flick, or a mouse notch) pages AT ONCE,
   //    pre-paid: the half screen it skipped is owed back by the rest of the
   //    gesture, so the rate stays one page per half screen. A debt left by a
   //    pre-paid page dies with its gesture;
   //  - a direction change inside a gesture (a reversal within the gap, or
   //    within the same contact) drops a pre-paid debt and accumulates, never
   //    pre-paying, so a +/-3 px trackpad wobble cannot page back and forth;
-  //  - everything else, a wheel notch included, accumulates through
-  //    pageKeysForTravel, carried across notches.
+  //  - a mouse-wheel notch (any opening event under one page, past the trackpad size) pre-pays its page
+  //    the same way, and its debt lasts PAGE_KEY_NOTCH_DEBT_MS, so the notches that follow repay it
+  //    however slowly they come instead of each paging a screen of its own;
+  //  - everything else accumulates through pageKeysForTravel, carried across notches.
   // Returns { state, keys } with keys '' when nothing is due.
   function pageKeysForGesture(state, ev, lines, rows, now) {
     const prev = state || {};
@@ -269,7 +282,8 @@
       gestureStart = false; // the same contact, however long it has been
     } else {
       const quiet = now - prev.lastAt;
-      gestureStart = quiet > (prepaid && !reversed ? PAGE_KEY_DEBT_MS : PAGE_KEY_GESTURE_GAP_MS);
+      const debtMs = prev.notch ? PAGE_KEY_NOTCH_DEBT_MS : PAGE_KEY_DEBT_MS;
+      gestureStart = quiet > (prepaid && !reversed ? debtMs : PAGE_KEY_GESTURE_GAP_MS);
     }
     if (gestureStart || reversed) {
       // A pre-paid debt belongs to its gesture and its direction.
@@ -278,20 +292,34 @@
     }
     if (gestureStart) {
       const size = Math.abs(lines);
-      if (size >= PAGE_KEY_MIN_START_ROWS && size < Math.min(perPage, PAGE_KEY_IMMEDIATE_MAX_ROWS)) {
+      // Plain travel left over from the gesture before (what was left once its debt was repaid) is
+      // not dropped by the new opener: it counts toward the page, so a gesture made of notches pages
+      // once per `perPage` rows of travel, as it did before the first notch paged at once.
+      const carried = pending * dir > 0 ? pending : 0;
+      if (size >= PAGE_KEY_MIN_START_ROWS && size < perPage && (carried + lines) * dir < perPage) {
         // Pre-pay one page; the skipped travel is owed back (pending carries the opposite sign).
         return {
-          state: { pending: lines - dir * perPage, lastAt: now, dir, prepaid: true, touchId },
+          state: {
+            pending: carried + lines - dir * perPage,
+            lastAt: now,
+            dir,
+            prepaid: true,
+            notch: size >= PAGE_KEY_IMMEDIATE_MAX_ROWS,
+            touchId,
+          },
           keys: dir < 0 ? KEY_PAGE_UP : KEY_PAGE_DOWN,
         };
       }
     }
     const step = pageKeysForTravel(pending, lines, rows);
     // A debt carries the sign opposite to its direction; once the travel reaches
-    // or crosses zero it is repaid, and what is left is plain travel (so the
-    // one-second debt lifetime no longer applies).
+    // or crosses zero it is repaid, and what is left is plain travel (so neither
+    // debt lifetime, PAGE_KEY_DEBT_MS or PAGE_KEY_NOTCH_DEBT_MS, applies any more).
     if (prepaid && step.pending * dir >= 0) prepaid = false;
-    return { state: { pending: step.pending, lastAt: now, dir, prepaid, touchId }, keys: step.keys };
+    return {
+      state: { pending: step.pending, lastAt: now, dir, prepaid, notch: prepaid && !!prev.notch, touchId },
+      keys: step.keys,
+    };
   }
 
   const TUI_PROMPT_DEFAULT_ROWS_FROM_BOTTOM = 4;
@@ -366,6 +394,41 @@
       const buf = terminal.buffer.active;
       const line = buf.getLine(buf.baseY + buf.cursorY);
       return !!line && OPENCODE_COMPOSER_RE.test(line.translateToString(true));
+    } catch {
+      return false;
+    }
+  }
+
+  // A Codex selection menu on screen: the "Implement this plan?" prompt, the /model, /permissions and
+  // /review pickers, an approval, a question or the trust prompt. Each draws its options as numbered rows
+  // with the selected one marked `› N. ` (a question indents it two spaces, and its notes field reads
+  // `› Add notes`) and a key-hint footer (`enter select · esc back`, `enter
+  // continue · esc back`, `Press enter to confirm ...`). Codex uses PageUp and PageDown there to move
+  // the SELECTION (measured on 0.164.0: PageDown from option 1 lands on option 3), so a wheel turned
+  // into page keys would walk the cursor through the options, one notch onto "Yes, implement this plan".
+  // Read off the live screen rows (the last `rows` rows of the active buffer), counting non-blank rows from
+  // the bottom: the trust prompt is drawn at the TOP of an otherwise blank screen.
+  const CODEX_MENU_OPTION_RE = /^ {0,2}› (?:\d+\. |Add notes)/;
+  // A wrapped key hint continues on rows that start in lower case (`cancel`, `esc to interrupt`) or with a separator.
+  const CODEX_MENU_HINT_WRAP_RE = /^ {2}[a-z←|]/;
+  const CODEX_MENU_FOOTER_RE = /^ {1,4}(?:Press enter to confirm|enter (?:select|continue)|tab (?:to add|or esc to clear) notes)/;
+  function isCodexSelectionMenu(terminal) {
+    try {
+      const buf = terminal.buffer.active;
+      // The non-blank rows from the bottom of the screen up. A menu's key hints are the last thing drawn, and a
+      // narrow pane wraps them over more rows that start in lower case: nothing else may sit under them, so
+      // an answer that quotes the hints (above the composer, a tip and a status row) is not a menu.
+      const rows = [];
+      for (let y = buf.baseY + terminal.rows - 1; y >= buf.baseY; y--) {
+        const text = buf.getLine(y)?.translateToString(true) ?? '';
+        if (text.trim()) rows.push(text);
+      }
+      let footerAt = 0;
+      while (footerAt < rows.length && !CODEX_MENU_FOOTER_RE.test(rows[footerAt])) {
+        if (!CODEX_MENU_HINT_WRAP_RE.test(rows[footerAt])) return false;
+        footerAt++;
+      }
+      return footerAt < rows.length && rows.slice(footerAt + 1).some((text) => CODEX_MENU_OPTION_RE.test(text));
     } catch {
       return false;
     }
@@ -457,6 +520,7 @@
     classifyPredictInput,
     isCodexComposerRow,
     isOpencodeComposerRow,
+    isCodexSelectionMenu,
     cursorViewportRow,
     CODEX_COMPOSER_ROW_RE,
     OPENCODE_COMPOSER_RE,
@@ -479,6 +543,7 @@
     PAGE_KEY_MIN_START_ROWS,
     PAGE_KEY_IMMEDIATE_MAX_ROWS,
     PAGE_KEY_DEBT_MS,
+    PAGE_KEY_NOTCH_DEBT_MS,
     TUI_PROMPT_DEFAULT_ROWS_FROM_BOTTOM,
     MOBILE_KEYBOARD_DISMISS_EXEMPT_SELECTOR,
     MOBILE_KEYBOARD_DISMISS_TAP_SLOP,
@@ -7696,7 +7761,8 @@ Object.assign(CodemanApp.prototype, {
     // a fix. Scoping the setting away from those modes would be the other
     // option, but it would override an explicit user choice; instead the caller
     // falls through to _maybePageCliTranscript, so the gesture still pages the
-    // CLI's transcript and the setting keeps meaning exactly what it says.
+    // CLI's transcript (or loads unloaded tmux scrollback, see there) and the
+    // setting keeps meaning exactly what it says.
     if (this.loadAppSettingsFromStorage?.()?.terminalWheelLocalScrollback) return false;
     const mode = (target.terminal || this.terminal)?.modes?.mouseTrackingMode;
     if (mode && mode !== 'none') return false;
@@ -7851,27 +7917,33 @@ Object.assign(CodemanApp.prototype, {
    *
    * Guarded by `_localScrollbackIsHollow()` (the `transcriptPageKeys` capability +
    * `baseY === 0`) plus a false forwarding gate, so a session with real local
-   * scrollback is never touched. Shift is excluded on purpose: it is the explicit
-   * "give me local scrollback" gesture and must keep that meaning.
+   * scrollback is never touched, and neither is one whose scrollback tmux still
+   * holds but the last replay did not carry (`paneHistoryLines` > 0): that one
+   * falls through to the local path, whose scroll-to-top pull loads it. Shift is
+   * excluded on purpose: it is the explicit "give me local scrollback" gesture
+   * and must keep that meaning.
    *
-   * The FIRST event of a trackpad-sized gesture (opening under
-   * PAGE_KEY_IMMEDIATE_MAX_ROWS) pages at once. Waiting for half a screen of
+   * The FIRST event of a gesture (any opening event under one page: a trackpad
+   * flick, or a mouse notch) pages at once. Waiting for half a screen of
    * travel (19 rows, ~475px on a 38-row pane) meant an ordinary trackpad flick
    * never sent a key at all. That page is pre-paid: the travel it skipped is
    * owed back by the rest of the gesture, so the rate stays one page per
    * `perPage` rows. A new touch contact (`ev.touchId`), a pause outside a contact
-   * (PAGE_KEY_GESTURE_GAP_MS, or PAGE_KEY_DEBT_MS while a same-direction page is
-   * still owed), a reversal after the gap or a tab switch starts a new gesture;
+   * (PAGE_KEY_GESTURE_GAP_MS; while a same-direction page is still owed,
+   * PAGE_KEY_DEBT_MS, or PAGE_KEY_NOTCH_DEBT_MS when a notch-sized opener pre-paid
+   * it), a reversal after the gap or a tab switch starts a new gesture;
    * one contact is never split by time, and a quick reversal never pre-pays. A
-   * larger opening event is a wheel notch and accumulates as before, so slow
-   * notches still page once per `perPage` rows.
+   * mouse-wheel notch pages at once too, and its debt (PAGE_KEY_NOTCH_DEBT_MS) is repaid by the
+   * notches after it, so a mouse pages once per `perPage` rows of travel with the
+   * first page on the first notch, not the fifth.
    *
    * Consumed WITHOUT paging: a pinch (`ctrlKey`, how Chrome reports a trackpad
    * pinch), a mostly horizontal swipe (both deltas present, |deltaX| > |deltaY|;
    * the touch path locks its own axis before it gets here), and any gesture while
    * the session has an open dialog (tab alert 'action', set by a pending
-   * permission_prompt or elicitation_dialog), so a page key never reaches its
-   * selector.
+   * permission_prompt or elicitation_dialog) or while a Codex selection menu is on
+   * screen (the "Implement this plan?" prompt, a /model picker; see
+   * isCodexSelectionMenu), so a page key never reaches its selector.
    *
    * @returns true when the gesture was consumed here (the caller must not also
    *          scroll locally).
@@ -7896,6 +7968,28 @@ Object.assign(CodemanApp.prototype, {
       this._logScrollRouting('page-keys-dialog-open');
       return true;
     }
+    // Codex's own selection menus (the "Implement this plan?" prompt among them) are not alerts, but PageUp
+    // and PageDown move their selection, so the wheel is consumed there too.
+    if (this._codexMenuOpen()) {
+      this._logScrollRouting('page-keys-menu-open');
+      return true;
+    }
+    // A hollow buffer whose PANE still holds tmux scrollback is unloaded, not
+    // hollow: after a server restart a tab switch replays a byte tail that is
+    // only the attach repaint (baseY 0), and paging from there moved an inline
+    // Claude's composer cursor instead of its transcript. The remembered
+    // `paneHistoryLines` (tmux `#{history_size}`) says a `full=1` pull can add
+    // it, so fall through to local scrolling, whose top-of-buffer pull fetches
+    // it (_maybeLoadMoreHistoryOnScroll -> _maybeRefetchFullHistory). 0 and
+    // unknown keep paging. Page keys already queued belong to the abandoned
+    // route and go with the gesture debt. Not logged as a decision of its own
+    // (it would alternate with the caller's line every frame until the pull
+    // lands): the caller's `local-scrollback` line carries `paneHistoryLines`.
+    if ((this._paneHistoryLines?.get(this.activeSessionId) ?? 0) > 0) {
+      this._pageKeyGesture = null;
+      this._wheelSgrQueue = '';
+      return false;
+    }
     // Leftover travel and the gesture in progress belong to the tab they were made on.
     if (this._pageKeySession !== this.activeSessionId) {
       this._pageKeySession = this.activeSessionId;
@@ -7913,6 +8007,14 @@ Object.assign(CodemanApp.prototype, {
     if (step.keys) this._queueScrollBytes(step.keys);
     this._logScrollRouting('page-keys');
     return true;
+  },
+
+  // Is a Codex selection menu showing in this pane (or the pane `target` names: a tile passes its own
+  // terminal and session)? See isCodexSelectionMenu.
+  _codexMenuOpen(target = {}) {
+    const session = this.sessions?.get(target.sessionId || this.activeSessionId);
+    if (session?.mode !== 'codex') return false;
+    return window.CodemanTerminalInput.isCodexSelectionMenu(target.terminal || this.terminal);
   },
 
   /**
@@ -7937,16 +8039,20 @@ Object.assign(CodemanApp.prototype, {
     // the DECSETs), so the CLI's real tracking state is reported separately.
     const cliTracking = session?.cliMouseTracking === true;
     const baseY = this.terminal?.buffer?.active?.baseY ?? -1;
+    // What tmux still holds for this pane (the last capture's `paneHistoryLines`):
+    // `localScrollbackRows=0` beside a positive count is an UNLOADED buffer,
+    // which _maybePageCliTranscript hands to the local path instead of paging.
+    const paneHistory = this._paneHistoryLines?.get(sessionId);
     const signature =
       `${decision}|${session?.mode}|${session?.cliVersion}|${optOut}|` +
-      `${tracking}|${encoding}|${cliTracking}|${baseY > 0}`;
+      `${tracking}|${encoding}|${cliTracking}|${baseY > 0}|${(paneHistory ?? 0) > 0}`;
     if (!this._scrollRoutingLogged) this._scrollRoutingLogged = new Map();
     if (this._scrollRoutingLogged.get(sessionId) === signature) return;
     this._scrollRoutingLogged.set(sessionId, signature);
     console.log(
       `[scroll] ${sessionId} → ${decision} (mode=${session?.mode || '?'}, cliVersion=${session?.cliVersion || 'unknown'}, ` +
         `localScrollbackOptOut=${optOut}, mouseTracking=${tracking}, mouseEncoding=${encoding}, ` +
-        `cliMouseTracking=${cliTracking}, localScrollbackRows=${baseY})`
+        `cliMouseTracking=${cliTracking}, localScrollbackRows=${baseY}, paneHistoryLines=${paneHistory ?? 'unknown'})`
     );
   },
 

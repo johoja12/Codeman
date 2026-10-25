@@ -70,6 +70,7 @@ import { looksLikeHostReboot, newestPersistedActivity, planRebootRestore } from 
 import { rebootRestoreRegistry } from './reboot-restore-registry.js';
 import { dataPath, getDataDir, CODEMAN_INSTANCE } from '../config/instance.js';
 import { WebhookNotifier, readWebhookConfig } from '../webhook-notify.js';
+import { stopHostSensors } from '../host-sensors.js';
 import type { WebhookUrgency } from '../types/push.js';
 import { webviewFetch } from './webview-egress.js';
 import { readRemoteHosts, rehydrateRemoteHostFields } from '../remote-hosts.js';
@@ -158,6 +159,8 @@ import {
 } from './session-listener-wiring.js';
 import { sessionWaits } from './session-wait-registry.js';
 import { intentStore } from '../intent-store.js';
+import { agentInbox } from './agent-inbox.js';
+import { agentInboxPersistence } from './agent-inbox-persistence.js';
 import { AI_CHECK_MODEL } from '../config/ai-defaults.js';
 import { approvalInbox } from './approval-inbox.js';
 import { SCREEN_BLOCKED_SOURCE } from './screen-blocked.js';
@@ -385,6 +388,7 @@ import {
   registerScheduledRoutes,
   registerHookEventRoutes,
   registerApprovalRoutes,
+  registerInboxRoutes,
   registerRebootRestoreRoutes,
   registerSessionRecoveryRoutes,
   registerReadMyMindRoutes,
@@ -428,6 +432,7 @@ import { registerPerfTraceRoutes } from './routes/perf-trace-routes.js';
 import { mobileInputTraceCollector } from '../perf/mobile-input-trace.js';
 import { isLostWebviewFrameNavigation } from './webview-proxy.js';
 import { CronService } from '../cron/cron-service.js';
+import { caseSessionSettled } from '../case-rename.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -679,6 +684,7 @@ export class WebServer extends EventEmitter {
   private qrAuthFailures: StaleExpirationMap<string, number> | null = null;
   private hookSecretFailures: StaleExpirationMap<string, number> | null = null;
   private userFailures: StaleExpirationMap<string, number> | null = null;
+  private userIpFailures: StaleExpirationMap<string, number> | null = null;
   private pushStore: PushSubscriptionStore = new PushSubscriptionStore();
   /** ntfy / Slack / Discord / generic webhook for the push events; config in webhook.json (0600). */
   private webhookNotifier = new WebhookNotifier(() => readWebhookConfig(getDataDir()), webviewFetch);
@@ -1544,6 +1550,7 @@ export class WebServer extends EventEmitter {
       await this.reconcileWatcherConversation(session);
       return await this.tabLayouts.sessionCreated(session.owner ?? '@single', session.id, options, () => {
         this.sessions.set(session.id, session);
+        caseSessionSettled(session);
         return () => {
           if (this.sessions.get(session.id) === session) this.sessions.delete(session.id);
           if (activityAttached) {
@@ -1740,6 +1747,7 @@ export class WebServer extends EventEmitter {
       this.qrAuthFailures = authState.qrAuthFailures;
       this.hookSecretFailures = authState.hookSecretFailures;
       this.userFailures = authState.userFailures;
+      this.userIpFailures = authState.userIpFailures;
     }
 
     // WebSocket support (terminal I/O — low-latency bidirectional channel)
@@ -2031,6 +2039,7 @@ export class WebServer extends EventEmitter {
     registerScheduledRoutes(this.app, ctx);
     registerHookEventRoutes(this.app, ctx);
     registerApprovalRoutes(this.app, ctx);
+    registerInboxRoutes(this.app, ctx);
     registerRebootRestoreRoutes(this.app, ctx);
     registerSessionRecoveryRoutes(this.app, ctx);
     registerReadMyMindRoutes(this.app, ctx);
@@ -2727,6 +2736,11 @@ export class WebServer extends EventEmitter {
     // The 'exit' here is NOT redundant with the PTY-exit listener: listeners are
     // detached a few lines above, before `session.stop()`, so on a delete the
     // session's own exit event never reaches the registry.
+    // The agent inbox goes with a DELETED session only. killMux=false is shutdown or
+    // detach: mail posted before that is still there when the session is re-attached
+    // (while detached, the routes answer 404, so nothing new arrives). Before
+    // cancelAll, so a reader released by it reads an empty inbox.
+    if (killMux) agentInbox.drop(sessionId);
     sessionWaits.notifySignal(sessionId, 'exit');
     sessionWaits.cancelAll(sessionId);
     approvalInbox.resolveForSession(sessionId, 'session_ended');
@@ -3360,6 +3374,13 @@ export class WebServer extends EventEmitter {
   private async getAgentSkillEnabled(): Promise<boolean> {
     const settings = await this.readSettings();
     return settings.agentSkillEnabled === true;
+  }
+
+  // Whether pending agent-inbox mail is snapshotted to disk (synced
+  // `agentInboxPersistEnabled` setting). Default OFF: an absent key writes nothing.
+  private async getAgentInboxPersistEnabled(): Promise<boolean> {
+    const settings = await this.readSettings();
+    return settings.agentInboxPersistEnabled === true;
   }
 
   // Whether a Claude session installs Codeman's hooks block into its workspace
@@ -4252,6 +4273,10 @@ export class WebServer extends EventEmitter {
     // This prevents race conditions where clients connect before state is ready
     // CRITICAL: Skip in test mode to prevent tests from picking up user sessions
     if (!this.testMode) {
+      // Pending agent mail first (opt-in snapshot), so it is in place before any
+      // route can answer. Pruned against the restored sessions in finalizeRestoredState.
+      const restoredMail = agentInboxPersistence.load(await this.getAgentInboxPersistEnabled());
+      if (restoredMail > 0) console.log(`[AgentInbox] restored ${restoredMail} pending message(s)`);
       const restored = await this.restoreMuxSessions();
       await this.finalizeRestoredState(restored);
       if (restored) await this.autoRecoverBootSessions();
@@ -5258,6 +5283,7 @@ export class WebServer extends EventEmitter {
             this.attachAgentActivity(session);
             await this.reconcileWatcherConversation(session);
             this.sessions.set(session.id, session);
+            caseSessionSettled(session);
             await this.setupSessionListeners(session);
 
             // Auto-attach PTY to the surviving tmux session immediately.
@@ -5377,6 +5403,20 @@ export class WebServer extends EventEmitter {
     this.tabLayouts.markRestorationComplete();
     await this.cleanupStaleSessions();
     await this.tabLayouts.reconcileAfterRestoration();
+    // Same gate as the tab layouts: only a restore that succeeded may decide which
+    // inboxes are orphans. A failed one returns above and leaves every message alone.
+    // Kept: live sessions plus every record state.json still holds (a session that
+    // was not re-adopted this boot but is kept for recovery keeps its mail), plus the
+    // sessions on the reboot-restore offer. `cleanupStaleSessions()` above has already
+    // pruned their records, and a rebuild reuses the old id, so without them a restored
+    // session would come back to an empty inbox. The 12 h TTL bounds what is never rebuilt.
+    const keep = new Set([
+      ...this.sessions.keys(),
+      ...Object.keys(this.store.getSessions()),
+      ...rebootRestoreRegistry.list(() => true).map((entry) => entry.sessionId),
+    ]);
+    const pruned = agentInbox.pruneExcept(keep);
+    if (pruned > 0) console.log(`[AgentInbox] dropped ${pruned} inbox(es) of sessions that did not come back`);
   }
 
   /**
@@ -5562,6 +5602,9 @@ export class WebServer extends EventEmitter {
     // got wrong once.
     void stopDeepSeekWeb();
 
+    // The header's GPU / CPU clock sampler is a Windows child process under WSL, and its idle sweep a timer.
+    stopHostSensors();
+
     // Same teardown rule: the per-endpoint llama-swap log tails are otherwise closed
     // only by the periodic idle sweep, whose interval is disposed just below.
     closeAllLlamaSwapLogTails();
@@ -5578,8 +5621,11 @@ export class WebServer extends EventEmitter {
     sessionWaits.cancelEverything();
     approvalInbox.stop();
     this.keepWarmService.stop();
+    // A post within the debounce window before shutdown would otherwise not reach disk.
+    // Flushed again after `app.close()` below, for a post that lands in between.
+    agentInboxPersistence.flush();
     // Same reason as `cancelEverything` above: an in-flight wake is awaited by a request,
-    // and `app.close()` (the last line of this method) does not abort in-flight requests —
+    // and `app.close()` (at the end of this method) does not abort in-flight requests,
     // so without this a restart during a wake waits out the readiness poll.
     this.remoteWake?.stop();
 
@@ -5720,6 +5766,10 @@ export class WebServer extends EventEmitter {
       this.userFailures.dispose();
       this.userFailures = null;
     }
+    if (this.userIpFailures) {
+      this.userIpFailures.dispose();
+      this.userIpFailures = null;
+    }
     this.activePlanOrchestrators.clear();
     this.cleaningUp.clear();
     this.killingSessions.clear();
@@ -5727,7 +5777,13 @@ export class WebServer extends EventEmitter {
     // Dispose push store (flush pending saves)
     this.pushStore.dispose();
 
-    await this.app.close();
+    try {
+      await this.app.close();
+    } finally {
+      // The routes answer until `app.close()` returns, so a post after the flush above
+      // would otherwise sit in an unref'd debounce timer and never reach disk.
+      agentInboxPersistence.flush();
+    }
   }
 }
 

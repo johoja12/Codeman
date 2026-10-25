@@ -1174,9 +1174,13 @@
     // pages the CLI's own transcript with PageUp/PageDown. Every gate is the
     // primary pane's own, asked for THIS pane (its terminal, its session, never
     // the active one), so the CLI rules stay in terminal-ui.js and this file
-    // names no CLI. The gesture rules (first-event page, notch accumulation,
+    // names no CLI. The gesture rules (first-event page, notch debt,
     // pinch and sideways-swipe consume) are the shared pure
     // CodemanTerminalInput.pageKeysForGesture, run on this tile's own state.
+    // The primary pane's unloaded-scrollback fall-through (`paneHistoryLines`
+    // > 0 with baseY 0, after a restart's tail replay) has no twin here: a tile
+    // loads tmux's rendered history (`full=1`), so it does not share that
+    // tail-select failure, and its non-shell wheel has no pull to fall through to.
     // Returns true when the wheel was consumed here.
     _maybePageCliTranscript(ev) {
       if (this._destroyed || !this.terminal || !ev || ev.shiftKey) return false;
@@ -1210,6 +1214,9 @@
       // session, which is usually not the active one: a page key would move its
       // selector. Consumed, so xterm does not scroll the rows under it either.
       if (app.tabAlerts?.get(this.sessionId) === 'action') return true;
+      // A Codex selection menu is not an alert, but PageUp/PageDown move its selection (see
+      // CodemanTerminalInput.isCodexSelectionMenu), so it consumes the wheel the same way.
+      if (app._codexMenuOpen?.({ terminal: this.terminal, sessionId: this.sessionId })) return true;
       if (ev.ctrlKey || Math.abs(ev.deltaX || 0) > Math.abs(ev.deltaY || 0)) return true;
       if (this._pageKeyGesture?.dir && this._pageKeyGesture.dir !== Math.sign(lines)) this._scrollBytes = '';
       const step = input.pageKeysForGesture(this._pageKeyGesture, ev, lines, this.terminal.rows, performance.now());

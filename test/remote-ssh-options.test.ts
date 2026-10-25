@@ -28,6 +28,8 @@ import {
   buildRemoteCliVersionProbeCommand,
   remoteLoginShellCommand,
   remoteSshTarget,
+  shellescape,
+  withRemoteTmuxPath,
 } from '../src/remote-hosts.js';
 import { buildRemoteLaunchCommand } from '../src/tmux-manager.js';
 import type { SessionRemote } from '../src/types.js';
@@ -179,6 +181,15 @@ describe('COD-107 buildRemoteLaunchCommand — threads connection args', () => {
       'set -s escape-time 0',
       // COD-106 — shared/collaborative sizing, per-session scoped (never -g).
       `set -t ${remoteName} window-size latest`,
+      // #671 — the nested server's prefix table is stock unless this chain
+      // reduces it. Ctrl+Q then ) would switch-client onto a sibling session.
+      // Bind first: a user config that emptied the prefix table makes
+      // `unbind-key -a` fail and tmux drops the rest of the `\;` chain,
+      // including the bind and remain-on-exit. That option stays last because
+      // a remote tmux that rejects `failed` aborts the rest of the chain.
+      'bind-key -T prefix C-q send-prefix',
+      'unbind-key -a -T prefix',
+      'bind-key -T prefix C-q send-prefix',
       // #210 — keep a CRASHED pane for diagnosis. `failed` (not `on`, which would
       // also strand a pane after a clean `exit`), and LAST because tmux aborts the
       // remaining commands of a `\;` chain on error and `failed` needs tmux >= 3.2.
@@ -212,12 +223,12 @@ describe('COD-107 buildRemoteTmuxCheckCommand — same connection options as the
     expect(cmd).toContain(`-i '${HOME}/.ssh/remote_ed25519'`);
     expect(cmd).toContain("-o 'ProxyCommand=nc -X 5 -x 127.0.0.1:1080 %h %p'");
     expect(cmd).toContain('aakht@192.168.55.170');
-    expect(cmd).toContain(`'${REMOTE_PATH_BOOTSTRAP}; command -v tmux'`);
+    expect(cmd).toContain(shellescape(withRemoteTmuxPath('command -v tmux')));
   });
 
-  it('keeps default ssh options while adding the remote PATH bootstrap', () => {
+  it('no advanced options preserve the ssh prefix and wrap the tmux probe', () => {
     expect(buildRemoteTmuxCheckCommand({ username: 'ubuntu', host: '10.0.0.42' })).toBe(
-      `ssh -o BatchMode=yes -o ConnectTimeout=10 ubuntu@10.0.0.42 '${REMOTE_PATH_BOOTSTRAP}; command -v tmux'`
+      `ssh -o BatchMode=yes -o ConnectTimeout=10 ubuntu@10.0.0.42 ${shellescape(withRemoteTmuxPath('command -v tmux'))}`
     );
     expect(buildRemoteTmuxCheckCommand({ username: 'ubuntu', host: '10.0.0.42', port: 2222 })).toContain('-p 2222');
   });

@@ -33,6 +33,9 @@ const SCANNED_FILES = [
   'terminal-split.js',
   'tile-grid.js',
   'terminal-tile.js',
+  // The command palette's new-session agent picker reads its agents from the
+  // injected catalog. Other fork mechanisms in this file are enumerated below.
+  'panels-ui.js',
 ];
 
 /**
@@ -56,6 +59,19 @@ const SCANNED_FILES = [
  * "no unapproved id branches" test either way.
  */
 const ALLOWED_BRANCHES: Record<string, { count: number; reason: string }> = {
+  "panels-ui.js::'codex', 'claude'].includes(": {
+    count: 1,
+    reason: 'fork reboot recovery offers native-metadata refresh only for local built-in Claude/Codex recovery records',
+  },
+  "panels-ui.js::mode === 'claude'": {
+    count: 1,
+    reason:
+      'conversation identity uses the Claude transcript resume id for Claude and the native id for other harnesses',
+  },
+  "panels-ui.js::mode === 'codex'": {
+    count: 1,
+    reason: 'fork remote Codex PDF-link normalization preserves the remote workspace preview path (issue #16)',
+  },
   "session-ui.js::mode === 'shell'": {
     count: 4,
     reason:

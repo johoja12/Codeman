@@ -195,11 +195,11 @@ describe('selectSession acknowledgement gate', () => {
       expect(altNumber.slice(0, 400)).toContain('this.selectSession(target.id);');
 
       for (const [method, call] of [
-        ['nextSession() {', 'this.selectSession(this.sessionOrder[nextIndex]);'],
-        ['prevSession() {', 'this.selectSession(this.sessionOrder[prevIndex]);'],
+        ['nextSession(options = {}) {', 'this.selectSession(order[nextIndex]);'],
+        ['prevSession(options = {}) {', 'this.selectSession(order[prevIndex]);'],
       ]) {
         const body = APP_SOURCE.slice(APP_SOURCE.indexOf(method));
-        expect(body.slice(0, 500)).toContain(call);
+        expect(body.slice(0, 1000)).toContain(call);
       }
 
       // The negative half: no keyboard path may acquire the auto tag. Every

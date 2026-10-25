@@ -31,6 +31,7 @@ import type { TabLayout } from '../../src/tab-layout.js';
 import { dataPath } from '../../src/config/instance.js';
 import { CASES_DIR, resolveCasesDir } from '../../src/web/route-helpers.js';
 import { createUser, invalidateUsersCache } from '../../src/user-store.js';
+import { agentInbox } from '../../src/web/agent-inbox.js';
 
 // Mock execFile so the send-key route's `tmux` invocation is observable (not run for real).
 const { execFile, spawn } = vi.hoisted(() => ({ execFile: vi.fn(), spawn: vi.fn() }));
@@ -2098,6 +2099,17 @@ and effort involved in moving workloads.
       expect(harness.ctx.broadcast).toHaveBeenCalledWith('session:deleted', { id: 'ghost-session' });
     });
 
+    it('a persisted-only delete drops the agent inbox the detach kept', async () => {
+      // Detach (killMux=false) keeps the inbox; retiring the row afterwards is the delete.
+      agentInbox.resetForTests();
+      agentInbox.post('ghost-session', null, 'mail from before the detach');
+      vi.mocked(harness.ctx.store.getSession).mockReturnValueOnce({ id: 'ghost-session', owner: undefined } as never);
+      const res = await harness.app.inject({ method: 'DELETE', url: '/api/sessions/ghost-session' });
+      expect(res.statusCode).toBe(200);
+      expect(agentInbox.pendingCount('ghost-session')).toBe(0);
+      agentInbox.resetForTests();
+    });
+
     it('404s a persisted-only session id the state store does not recognize either', async () => {
       vi.mocked(harness.ctx.store.getSession).mockReturnValueOnce(null);
       const res = await harness.app.inject({
@@ -3938,6 +3950,26 @@ and effort involved in moving workloads.
       expect(row).toBeDefined();
       expect(row.workingDir).toBe(realDir);
       expect(row.workingDir).not.toBe(home);
+    });
+
+    it("resumes a renamed case's conversation in the new folder, not the stale cwd in the transcript", async () => {
+      const home = process.env.HOME as string;
+      const realDir = join(home, 'renamed-case');
+      await mkdir(realDir, { recursive: true });
+
+      const projectKey = realDir.replace(/[^a-zA-Z0-9]/g, '-');
+      const projDir = join(home, '.claude', 'projects', projectKey);
+      await mkdir(projDir, { recursive: true });
+
+      const sessionId = '33333333-3333-3333-3333-333333333333';
+      const line =
+        JSON.stringify({ type: 'user', cwd: join(home, 'old-case-name'), message: { role: 'user', content: 'hi' } }) +
+        '\n';
+      await writeFile(join(projDir, `${sessionId}.jsonl`), line + '#'.repeat(4200 - line.length));
+
+      const res = await harness.app.inject({ method: 'GET', url: `/api/history/sessions?projectKey=${projectKey}` });
+      const row = JSON.parse(res.body).data.sessions.find((s: { sessionId: string }) => s.sessionId === sessionId);
+      expect(row.workingDir).toBe(realDir);
     });
 
     it('prefers the dotdir over a same-named non-dot sibling, and never emits a "//" path', async () => {

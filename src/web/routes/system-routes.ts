@@ -13,6 +13,7 @@ import { totalmem, freemem, loadavg, cpus } from 'node:os';
 import { execSync, spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { dataPath } from '../../config/instance.js';
+import { readHostSensors } from '../../host-sensors.js';
 import { ApiErrorCode, createErrorResponse, getErrorMessage, type NiceConfig } from '../../types.js';
 import { isUnauthenticatedNetworkAcknowledged } from '../network-auth-policy.js';
 import { isMultiUserMode } from '../../config/multiuser.js';
@@ -68,6 +69,8 @@ import { resolveTerminalHistoryConfig } from '../../config/terminal-history.js';
 import { getHeadroomConfig } from '../../config/headroom-routing.js';
 import { fetchHeadroomStatus } from '../../config/headroom-status.js';
 import { reconcileCodexHeadroomPatch } from '../../config/codex-headroom-patch.js';
+import { agentInboxPersistence } from '../agent-inbox-persistence.js';
+import { agentInbox } from '../agent-inbox.js';
 
 /**
  * Defaults for `POST /api/deepseek/install-profile`.
@@ -907,6 +910,13 @@ export function registerSystemRoutes(
     const lifecycleLog = getLifecycleLog();
     for (const s of result.cleaned) {
       lifecycleLog.log({ event: 'stale_cleaned', sessionId: s.id, name: s.name });
+      // A detached session kept its agent inbox. Its record going is the delete only
+      // when no tmux session stands behind it: a detached pane the multiplexer still
+      // lists is re-adopted under the same id at the next boot (restoreMuxSessions,
+      // with or without a state.json record), and its mail must come back with it.
+      // Keeping a pane that died while detached errs toward the 12 h TTL and the boot
+      // prune, the same trade the boot keep set makes.
+      if (!ctx.mux.getSession(s.id)) agentInbox.drop(s.id);
     }
     return { cleanedSessions: result.count };
   });
@@ -1108,9 +1118,17 @@ export function registerSystemRoutes(
     };
   });
 
-  // ========== System Stats ===
-  app.get('/api/system/stats', async () => {
-    return getSystemStats();
+  // ========== System Stats ==========
+
+  // GPU (load, memory, clock) and CPU clock readings are opt-in: the browser adds ?gpu=1 and ?cpumhz=1 only while
+  // the matching header setting is on, so a default install never runs nvidia-smi or reads sysfs.
+  app.get('/api/system/stats', async (req) => {
+    const query = req.query as { gpu?: string; cpumhz?: string };
+    const sensors = await readHostSensors({
+      gpu: query.gpu === '1',
+      cpuMhz: query.cpumhz === '1',
+    });
+    return { ...getSystemStats(), ...sensors };
   });
 
   // ========== Settings ==========
@@ -1232,6 +1250,10 @@ export function registerSystemRoutes(
         workflowRunWatcher,
         'Workflow run watcher'
       );
+
+      // Agent inbox snapshot (default OFF). From `merged` like the toggles above: a
+      // partial PUT that omits the key must not switch it off and delete the file.
+      agentInboxPersistence.setEnabled(merged.agentInboxPersistEnabled === true);
 
       // Handle image watcher toggle dynamically
       toggleService((merged.imageWatcherEnabled as boolean) ?? false, imageWatcher, 'Image watcher', () => {

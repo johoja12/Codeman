@@ -98,6 +98,19 @@ export function remoteLoginShellCommand(command: string): string {
 }
 
 /**
+ * Remote tmux runs in sshd's non-interactive shell, which may omit Homebrew and
+ * per-user binaries. Keep every remote tmux operation on the same PATH. Quoting
+ * the entire assignment preserves spaces in HOME/inherited PATH under dash too.
+ * CLI commands still use their existing login-shell/configuration handling.
+ */
+export function withRemoteTmuxPath(command: string): string {
+  return (
+    'export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"; ' +
+    command
+  );
+}
+
+/**
  * The CLI text a location overlay should launch for `mode`, or null when this build has no
  * entry for it. `overlays.<location>.command` when the entry names one, otherwise the bare
  * binary — which is what every non-claude CLI wants, and why only claude declares a command.
@@ -155,11 +168,12 @@ export function defaultRemoteCommandForMode(mode: SessionMode): string {
   return cli === null ? shellCommand : remoteLoginShellCommand(cli);
 }
 
+/** Shared quoted PATH, retained for existing command builders and tests. */
 export const REMOTE_PATH_BOOTSTRAP =
-  'export PATH=$HOME/.opencode/bin:$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH';
+  'export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"';
 
 export function withRemotePathBootstrap(command: string): string {
-  return `${REMOTE_PATH_BOOTSTRAP}; ${command}`;
+  return withRemoteTmuxPath(command);
 }
 
 export function remoteSshTarget(host: Pick<RemoteHost, 'username' | 'host'>): string {
@@ -264,9 +278,12 @@ export function buildSshConnectionArgv(remote: RemoteSshOptions & Pick<RemoteHos
 export function buildRemoteTmuxCheckCommand(
   host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions
 ): string {
-  const parts = buildSshConnectionArgs(host);
-  parts.push(remoteSshTarget(host), shellescape(withRemotePathBootstrap('command -v tmux')));
-  return parts.join(' ');
+  // ConnectTimeout is now a default of buildSshConnectionArgs (shared with the launch).
+  return [
+    ...buildSshConnectionArgs(host),
+    remoteSshTarget(host),
+    shellescape(withRemoteTmuxPath('command -v tmux')),
+  ].join(' ');
 }
 
 export interface RemoteTmuxCheckResult {
@@ -281,7 +298,7 @@ export function buildRemoteSshAccessCheckCommand(
   host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions
 ): string {
   const parts = buildSshConnectionArgs(host);
-  parts.push(remoteSshTarget(host), shellescape(withRemotePathBootstrap('printf codeman-ssh-ok')));
+  parts.push(remoteSshTarget(host), shellescape(withRemoteTmuxPath('printf codeman-ssh-ok')));
   return parts.join(' ');
 }
 
@@ -438,7 +455,7 @@ export function buildRemoteSessionAliveCommand(
 ): string {
   const [ssh, ...connectionArgs] = buildSshConnectionArgs(host);
   const remoteCmd = `tmux -L codeman-remote has-session -t ${shellescape(remoteSessionName)} 2>/dev/null`;
-  return [ssh, ...connectionArgs, remoteSshTarget(host), shellescape(remoteCmd)].join(' ');
+  return [ssh, ...connectionArgs, remoteSshTarget(host), shellescape(withRemoteTmuxPath(remoteCmd))].join(' ');
 }
 
 /**
@@ -487,7 +504,7 @@ export function buildRemoteWorkerProbeCommand(
 ): string {
   const [ssh, ...args] = buildSshConnectionArgs(remote);
   const socket = remote.owned === false ? 'codeman' : 'codeman-remote';
-  const command = withRemotePathBootstrap(
+  const command = withRemoteTmuxPath(
     `if [ -r /proc/sys/kernel/random/boot_id ]; then cat /proc/sys/kernel/random/boot_id; ` +
       `else sysctl -n kern.boottime 2>/dev/null; fi; ` +
       `if tmux -L ${socket} has-session -t ${shellescape(remoteSessionName)} 2>/dev/null; ` +
@@ -571,7 +588,7 @@ export function buildRemoteListSessionsCommand(
   // separators (tmux expands them); `2>/dev/null` is inside the quoted command.
   const remoteCmd =
     'tmux -L codeman list-sessions -F "#{session_name}\\t#{session_attached}\\t#{session_created}\\t#{session_windows}" 2>/dev/null';
-  parts.push(remoteSshTarget(host), shellescape(withRemotePathBootstrap(remoteCmd)));
+  parts.push(remoteSshTarget(host), shellescape(withRemoteTmuxPath(remoteCmd)));
   return parts.join(' ');
 }
 
@@ -588,7 +605,7 @@ export function buildRemoteRecoveryProbeCommand(
   return [
     ...buildSshConnectionArgs(host),
     remoteSshTarget(host),
-    shellescape(withRemotePathBootstrap(`tmux -L ${socket} has-session -t ${shellescape(name)}`)),
+    shellescape(withRemoteTmuxPath(`tmux -L ${socket} has-session -t ${shellescape(name)}`)),
   ].join(' ');
 }
 
@@ -617,7 +634,7 @@ export function buildRemoteListDirectoriesCommand(
 ): string {
   const parts = buildSshConnectionArgs(host);
   const remoteCmd = `find ${shellescape(remotePath)} -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort`;
-  parts.push(remoteSshTarget(host), shellescape(withRemotePathBootstrap(remoteCmd)));
+  parts.push(remoteSshTarget(host), shellescape(withRemoteTmuxPath(remoteCmd)));
   return parts.join(' ');
 }
 

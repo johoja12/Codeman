@@ -65,6 +65,16 @@ Manager, Attachments, File Viewer, Multi-monitor, Split, Tiles, Plan Usage, Life
 Project Insights, File Browser, Subagents, Approvals Inbox, Read My Mind, Ultracode Agents,
 Ultracode Windows, Cron.
 
+**Host readings** (opt-in, both off by default and per device): **GPU Stats** adds three items after CPU and MEM: GPU load, graphics memory and the GPU clock,
+and **CPU MHz** adds the live CPU clock. Both sets of items live inside **System Stats**, so they show only
+while that chip is on, and nothing is fetched while it is off. An item appears only when the
+host reports it, so a machine with no readable GPU shows nothing extra. Sources: `nvidia-smi` or the amdgpu
+sysfs files for the GPU; inside WSL, the Windows performance counters through `typeperf.exe`, which cover
+any vendor (an Intel GPU gives load and memory in use, but Windows publishes no clock for it, and its memory
+total is taken as half of Windows' RAM, the limit Windows applies to integrated GPUs); and
+`scaling_cur_freq`, `/proc/cpuinfo` or, inside WSL, the Windows `Processor Frequency` counter for the CPU
+clock. Nothing is read, and `nvidia-smi` and `typeperf.exe` are never run, while both are off.
+
 **Bottom bar** (below the chips): **Git status** shows a small indicator at the right of the
 bottom bar, off by default and per device. It reads `● N` uncommitted files, `↑ N` commits not
 pushed, `⚠ N` merge conflicts, `? N` repositories git could not read, or `✓` when everything is
@@ -88,6 +98,13 @@ way; it also enables the `Ctrl+Shift+G` grid toggle on this device. See
 
 This section also holds background-agent tracking, including whether to track agents for
 every session or only the active tab.
+
+**Keep agent inbox across restarts** (under **Cross-session features**, synced, off by
+default) saves the pending `codeman agent post` messages to `agent-inbox.json` in the data
+dir, readable by you only, so they survive a server restart. Off, the agent inbox lives in
+memory and a restart empties it; switching it off deletes the file and keeps what is in
+memory. Messages expire 12 hours after they were posted either way. See
+[Driving Codeman From An Agent](Driving-Codeman-From-An-Agent#the-codeman-agent-commands).
 
 ### Appearance
 

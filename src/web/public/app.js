@@ -1096,7 +1096,7 @@ class CodemanApp {
     // EventSource does not always emit `error` when its initial request hangs.
     // Bound each connection attempt so the usual backoff can recover it.
     this._sseConnectTimeout = null;
-    this._sseConnectTimeoutMs = 15000;
+    this._sseConnectTimeoutMs = window.CodemanSseStale?.CONNECT_TIMEOUT_MS ?? 15000;
 
     // SSE event listener cleanup function (to prevent listener accumulation on reconnect)
     this._sseListenerCleanup = null;
@@ -1116,7 +1116,6 @@ class CodemanApp {
     this._sseLastMessageAt = 0;
     this._sseStaleTimeoutMs = window.CodemanSseStale?.TIMEOUT_MS ?? 45000;
     this._sseStaleWatchdog = null;
-
     // Connection-loss UI (banner + full-screen overlay). The decision itself is
     // pure and lives in constants.js (computeConnectionLossUi); these are just
     // its inputs. `_connDownSince` is the timestamp the transport LEFT the
@@ -2457,6 +2456,8 @@ class CodemanApp {
   }
 
   connectSSE() {
+    // First, before the offline early return: any path into connectSSE
+    // supersedes the previous attempt, and its deadline must go with it.
     this._clearTimer('_sseConnectTimeout');
 
     // Check if browser is offline
@@ -2996,8 +2997,6 @@ class CodemanApp {
     if (data.parentSessionId) this.markConnectionLineEntering?.('lineage:' + data.id);
     this._refreshSessionActivitySurfaces();
     this.updateCost();
-    // Start stats polling when first session appears
-    if (this.sessions.size === 1) this.startSystemStatsPolling();
     if (this._urlSessionId === data.id) this._selectUrlSession();
   }
 
@@ -3057,8 +3056,8 @@ class CodemanApp {
     this.renderMuxSessions?.();
     this.renderRalphStatePanel();  // Update ralph panel after session deleted
     this.renderProjectInsightsPanel();  // Update project insights panel after session deleted
-    // Stop stats polling when no sessions remain
-    if (this.sessions.size === 0) this.stopSystemStatsPolling();
+    // Stats polling keeps going with no session left: the header shows CPU, MEM and the opt-in readings
+    // regardless, and would sit at "--" otherwise.
   }
 
   // SSE wrappers — skip terminal events while WebSocket owns active terminal I/O.
@@ -4486,11 +4485,15 @@ class CodemanApp {
         headersReceivedAt = capture.headersAt;
         data = capture.json?.data ?? {};
       }
-      this._notePaneHistory?.(sessionId, data);
       // Bail on a tab switch mid-fetch: writing here would paint this session's
       // history into the terminal the user is now looking at. The window is two
-      // fetches wide in the fallback case, so this guard is not optional.
+      // fetches wide in the fallback case, so this guard is not optional. The
+      // pane count is recorded only past it: a refresh that lost its owner is
+      // older than whatever the switch back read (it would have overwritten a
+      // fresh 0 with a stale count and held the paging fallback off a hollow
+      // pane), and an error envelope is not a capture at all.
       if (this.activeSessionId !== sessionId || this._terminalRefreshOwner !== refreshOwner) return false;
+      if (capture.json?.success !== false) this._notePaneHistory?.(sessionId, data);
       if (data.terminalBuffer) {
         // This refresh is SERVER-triggered, so a user quietly reading scrollback
         // did not ask for it and must not be dragged to the bottom by it (#259).
@@ -4892,7 +4895,9 @@ class CodemanApp {
         seg('mo', pct(usage?.monthly), false),
       ].filter(Boolean);
       if (!windows.length) return '';
-      const label = labelled ? `<span class="pu-provider">${provider}</span>` : '';
+      // data-short is what the narrowest header densities show instead of the name (header-divider.js).
+      const short = { Claude: 'CL', Codex: 'CX', Copilot: 'CP' }[provider] ?? provider.slice(0, 2).toUpperCase();
+      const label = labelled ? `<span data-short="${short}" class="pu-provider">${provider}</span>` : '';
       return `<span class="pu-row">${label}<span class="pu-windows">${windows.join('<span class="pu-sep">·</span>')}</span></span>`;
     };
     const rows = [row('Claude', data, true), row('Codex', data.codex, false), row('Copilot', data.copilot, false)].filter(
@@ -6521,12 +6526,9 @@ class CodemanApp {
     // survive reloads and SSE reconnects (methods in approvals-ui.js).
     this.seedApprovals?.();
 
-    // Start/stop system stats polling based on session count
-    if (this.sessions.size > 0) {
-      this.startSystemStatsPolling();
-    } else {
-      this.stopSystemStatsPolling();
-    }
+    // Poll the header stats whether or not a session is open (fetchSystemStats skips the call while the
+    // stats pill is hidden); starting restarts the interval, so only start it once.
+    if (!this.systemStatsInterval) this.startSystemStatsPolling();
 
     // CRITICAL: Clean up all floating windows before loading new subagents
     // This prevents memory leaks from ResizeObservers, EventSources, and DOM elements
@@ -7764,24 +7766,7 @@ class CodemanApp {
       // the axis a user reaches for there.
       if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'Enter', ' '].includes(e.key)) return;
 
-      // Rows hidden by the sidebar filter must not be steppable.
-      const tabs = [...container.querySelectorAll('.session-tab:not(.tab-filtered-out)')];
-      // ⚠️ A sorted rail paints its rows with the flex `order` property while the
-      // DOM stays in `sessionOrder` (that is what keeps the Alt+N badge and the
-      // drag model honest), so a DOM-order walk steps around the screen instead of
-      // down it: ArrowDown from the top card lands wherever that session happens to
-      // sit in the tab order. Walk what the eye sees. Read the COMPUTED order, not
-      // the inline one, or web tabs (pinned past the cards by a CSS `order: 9999`
-      // rather than an inline style) read as 0 and the walk starts on them. Array
-      // sort is stable, so equal orders keep DOM order, which is the unsorted case.
-      if (this.isTabRailSorted() || container.classList.contains('tabs-triage')) {
-        const orderOf = (el) => Number(getComputedStyle(el).order) || 0;
-        // Case clusters are boxes in DOM order and a sorted rail orders rows
-        // INSIDE each one, so the box goes first in the key.
-        const boxes = [...container.querySelectorAll(':scope > .tab-cluster')];
-        const boxOf = (el) => boxes.indexOf(el.closest('.tab-cluster'));
-        tabs.sort((a, b) => boxOf(a) - boxOf(b) || orderOf(a) - orderOf(b));
-      }
+      const tabs = this._visibleTabRows(container);
       const currentIndex = tabs.indexOf(document.activeElement);
 
       // Enter or Space activates the tab
@@ -10022,6 +10007,52 @@ class CodemanApp {
   }
 
   // Set up arrow key navigation for session tabs (accessibility)
+  /**
+   * The strip's rows (session and web tabs) in the order the eye reads them,
+   * for any layout except the grouped tree (see _tabTreeItems).
+   */
+  _visibleTabRows(container) {
+    // Rows hidden by the sidebar filter must not be steppable.
+    const tabs = [...container.querySelectorAll('.session-tab:not(.tab-filtered-out)')];
+    // ⚠️ A sorted rail paints its rows with the flex `order` property while the
+    // DOM stays in `sessionOrder` (that is what keeps the Alt+N badge and the
+    // drag model honest), so a DOM-order walk steps around the screen instead of
+    // down it: ArrowDown from the top card lands wherever that session happens to
+    // sit in the tab order. Walk what the eye sees. Read the COMPUTED order, not
+    // the inline one, or web tabs (pinned past the cards by a CSS `order: 9999`
+    // rather than an inline style) read as 0 and the walk starts on them. Array
+    // sort is stable, so equal orders keep DOM order, which is the unsorted case.
+    if (this.isTabRailSorted() || container.classList.contains('tabs-triage')) {
+      const orderOf = (el) => Number(getComputedStyle(el).order) || 0;
+      // Case clusters are boxes in DOM order and a sorted rail orders rows
+      // INSIDE each one, so the box goes first in the key.
+      const boxes = [...container.querySelectorAll(':scope > .tab-cluster')];
+      const boxOf = (el) => boxes.indexOf(el.closest('.tab-cluster'));
+      tabs.sort((a, b) => boxOf(a) - boxOf(b) || orderOf(a) - orderOf(b));
+    }
+    return tabs;
+  }
+
+  /**
+   * Session ids in the order the session list DRAWS them: case boxes, state
+   * groups, a sorted rail and named groups all reorder the screen while
+   * `sessionOrder` stays canonical. Only the phone swipe walks this order
+   * (`nextSession({ visual: true })`); Alt+[ / Alt+], Ctrl+Tab and Alt+1..9 keep
+   * the canonical one, since grouping is a render layer. Web tabs are skipped.
+   */
+  _stripSessionOrder() {
+    const container = document.getElementById('sessionTabs');
+    if (!container) return this.sessionOrder;
+    const rows =
+      container.getAttribute('role') === 'tree'
+        ? this._tabTreeItems(container).filter((el) => el.classList.contains('session-tab'))
+        : this._visibleTabRows(container);
+    // An empty list is a real answer (every row filtered out, a tree collapsed
+    // to nothing): the swipe then goes nowhere, like the strip. Only a missing
+    // strip falls back to the canonical order.
+    return rows.map((row) => row.dataset.id).filter((id) => id && this.sessions.has(id));
+  }
+
 
   /**
    * Visible tree items in the order the eye reads them: each section's header,
@@ -11021,10 +11052,23 @@ class CodemanApp {
     // `force` is the user pressing "Load full history" (#258): they asked once,
     // explicitly, so the scroll-gesture cooldown does not apply. The downgrade
     // guard below still does — a forced pull must not destroy history either.
-    const cooldown = this._fullHistoryRepullUseless?.has(sessionId) ? 60000 : 4000;
+    // A refused pull latches 60 s because the browser then held MORE than tmux
+    // (the downgrade guard below). A tab switch that replayed a hollow tail has
+    // voided that premise: one screen in the browser while the pane holds
+    // scrollback, the state `_maybePageCliTranscript` hands to this pull instead
+    // of paging the CLI. Hold such a buffer to the normal cooldown only, or the
+    // gesture is dead for up to a minute.
+    const unloaded =
+      (this._paneHistoryLines?.get(sessionId) ?? 0) > 0 && (this.terminal?.buffer?.active?.baseY ?? 0) === 0;
+    const cooldown = !unloaded && this._fullHistoryRepullUseless?.has(sessionId) ? 60000 : 4000;
     if (!force && now - (this._fullHistoryRepullAt.get(sessionId) || 0) < cooldown) return;
     this._fullHistoryRepullAt.set(sessionId, now);
     this._fullHistoryRepullInFlight = true;
+    // The session-id check below cannot see a tab switch that came BACK during
+    // the fetch (A -> B -> A): the id matches again while `selectSession` is
+    // replaying its own capture, and the reset below would land in the middle
+    // of that write. The select generation moves on every switch, so it can.
+    const selectGen = this._selectGeneration;
     try {
       const requestStartedAt = performance.now();
       const capture = await this._fetchTerminalCapture(
@@ -11036,7 +11080,13 @@ class CodemanApp {
       const headersReceivedAt = capture.headersAt;
       const payload = capture.json?.data ?? {};
       const bodyParsedAt = performance.now();
-      this._notePaneHistory?.(sessionId, payload);
+      // A completion that outlived a tab switch is older than whatever that
+      // switch recorded about the pane (a switch back re-reads it): keep its
+      // count out of the memory, or it can overwrite a fresh count with a stale one.
+      // An error envelope (a JSON 5xx, `success: false`) is not a capture:
+      // recording its empty data would forget the count and hand the next
+      // gesture back to the paging fallback, the bug this pull exists to avoid.
+      if (selectGen === this._selectGeneration && capture.json?.success !== false) this._notePaneHistory?.(sessionId, payload);
       const buffer = payload.terminalBuffer;
       const timing = {
         trigger: force ? 'full-history-button' : 'full-history-scroll',
@@ -11052,8 +11102,9 @@ class CodemanApp {
         refused: false,
       };
       // Bail on a tab switch mid-fetch: writing here would paint another session's
-      // history into the terminal the user is now looking at.
-      if (!buffer || this.activeSessionId !== sessionId) return;
+      // history into the terminal the user is now looking at, or this session's
+      // over the load a switch back has started.
+      if (!buffer || this.activeSessionId !== sessionId || selectGen !== this._selectGeneration) return;
       const windowRows = this._estimateReplayRows(buffer, this.terminal.cols);
       // A bounded window no longer than the browser's buffer buys nothing, and
       // resetting to rewrite it would jump the viewport on every scroll that
@@ -11125,7 +11176,7 @@ class CodemanApp {
         this._bufferLoadFinishOpts(payload, headersReceivedAt)
       );
       timing.resetAndParseMs = parsedAt - replayStartedAt;
-      if (!completed || this.activeSessionId !== sessionId) return;
+      if (!completed || this.activeSessionId !== sessionId || selectGen !== this._selectGeneration) return;
       // Keep shell tab restores bounded too. A user-triggered full-history pull
       // may be tens of MB; caching it would replay that whole payload again on
       // the next tab switch before the normal 1MB tail fetch replaces it.
@@ -11147,6 +11198,10 @@ class CodemanApp {
       // reached only from a scroll-up gesture, so being dragged down is the
       // exact opposite of what the user asked for.
       this._syncStickyScrollBaseline();
+      // The prompt row moved with the rewrite: re-position the local-echo
+      // overlay there, as the refresh path does (a phone swipe reaches this
+      // pull with unsent text on the overlay).
+      this._localEchoOverlay?.rerender();
       timing.totalMs = performance.now() - requestStartedAt;
       this._recordTerminalLoadTiming(timing);
     } catch {
@@ -11194,7 +11249,10 @@ class CodemanApp {
   /**
    * Remember how much scrollback tmux holds for a session's pane, from any
    * terminal response. Called whether or not the response was written, since
-   * it describes the PANE, not the payload. A response without the field (a
+   * it describes the PANE, not the payload. Three responses are skipped, since
+   * none is the newest word on the pane: an error envelope (`success: false`)
+   * on any path, a refresh that lost its owner, and a history pull whose select
+   * generation moved during the fetch. A response without the field (a
    * byte-history fallback, an older server) forgets it, so the next tab switch
    * goes back to the bounded tail: unknown never counts as empty.
    */
@@ -11764,7 +11822,10 @@ class CodemanApp {
       }
       const data = capture.json?.data ?? {};
       const bodyParsedAt = performance.now();
-      this._notePaneHistory?.(sessionId, data);
+      // An error envelope (a JSON 5xx: _fetchTerminalCapture does not check
+      // `res.ok`) is not a capture: recording its empty data would forget the
+      // count the pane last reported, as in the refresh and the history pull.
+      if (capture.json?.success !== false) this._notePaneHistory?.(sessionId, data);
       // How this load must end, decided here because `chunkedTerminalWrite` is
       // what actually ends it for a non-empty buffer. A tmux pane capture is a
       // point-in-time frame, so nothing that reached the browser after the
@@ -12433,23 +12494,29 @@ class CodemanApp {
     }
   }
 
-  nextSession() {
+  /** `{ visual: true }` walks the order the strip draws (the phone swipe), see _stripSessionOrder. */
+  nextSession(options = {}) {
     // With the tile grid open, Ctrl+Tab and Alt+[ / Alt+] cycle through the tiles.
     if (this._cycleTileFocus?.(1)) return;
-    if (this.sessionOrder.length <= 1) return;
-
-    const currentIndex = this.sessionOrder.indexOf(this.activeSessionId);
-    const nextIndex = (currentIndex + 1) % this.sessionOrder.length;
-    this.selectSession(this.sessionOrder[nextIndex]);
+    const order = options.visual ? this._stripSessionOrder() : this.sessionOrder;
+    // An active session the list does not show (filtered out, or none active on
+    // the home screen) steps in at the first row; a lone row that is not the
+    // active one is still a destination.
+    const currentIndex = order.indexOf(this.activeSessionId);
+    const nextIndex = currentIndex < 0 ? 0 : (currentIndex + 1) % order.length;
+    if (!order[nextIndex] || order[nextIndex] === this.activeSessionId) return;
+    this.selectSession(order[nextIndex]);
   }
 
-  prevSession() {
+  prevSession(options = {}) {
     if (this._cycleTileFocus?.(-1)) return;
-    if (this.sessionOrder.length <= 1) return;
-
-    const currentIndex = this.sessionOrder.indexOf(this.activeSessionId);
-    const prevIndex = (currentIndex - 1 + this.sessionOrder.length) % this.sessionOrder.length;
-    this.selectSession(this.sessionOrder[prevIndex]);
+    const order = options.visual ? this._stripSessionOrder() : this.sessionOrder;
+    // As above, from the other end: a hidden or absent active session steps in
+    // at the last row (the old arithmetic landed on the second to last).
+    const currentIndex = order.indexOf(this.activeSessionId);
+    const prevIndex = currentIndex < 0 ? order.length - 1 : (currentIndex - 1 + order.length) % order.length;
+    if (!order[prevIndex] || order[prevIndex] === this.activeSessionId) return;
+    this.selectSession(order[prevIndex]);
   }
 
   // ═══════════════════════════════════════════════════════════════

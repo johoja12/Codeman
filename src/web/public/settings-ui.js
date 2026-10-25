@@ -522,6 +522,9 @@ Object.assign(CodemanApp.prototype, {
     // Header visibility settings
     document.getElementById('appSettingsShowFontControls').checked = settings.showFontControls ?? defaults.showFontControls ?? false;
     document.getElementById('appSettingsShowSystemStats').checked = settings.showSystemStats ?? defaults.showSystemStats ?? true;
+    // Opt-in host readings after CPU and MEM: all default OFF.
+    document.getElementById('appSettingsShowGpuStats').checked = settings.showGpuStats ?? defaults.showGpuStats ?? false;
+    document.getElementById('appSettingsShowCpuMhz').checked = settings.showCpuMhz ?? defaults.showCpuMhz ?? false;
     document.getElementById('appSettingsHeaderStatsStyle').value = this.resolveHeaderStatsStyle(settings);
     document.getElementById('appSettingsShowLifecycleLog').checked = settings.showLifecycleLog ?? defaults.showLifecycleLog ?? false;
     document.getElementById('appSettingsShowResponseViewer').checked = settings.showResponseViewer ?? defaults.showResponseViewer ?? false;
@@ -546,6 +549,8 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('appSettingsShowUltracodeAgents').checked = settings.showUltracodeAgents ?? defaults.showUltracodeAgents ?? false;
     // Approvals Inbox: synced, default OFF (opt-in; only an explicit true enables).
     document.getElementById('appSettingsApprovalsInbox').checked = settings.approvalsInboxEnabled === true;
+    // Agent inbox snapshot on disk: synced, default OFF.
+    document.getElementById('appSettingsAgentInboxPersist').checked = settings.agentInboxPersistEnabled === true;
     // Custom Model Endpoint Profiles: synced, default OFF. The toggle governs both
     // the Run-menu picker's generated entries and this settings panel's visibility;
     // the endpoint list itself is server state, loaded on demand below.
@@ -3076,6 +3081,8 @@ Object.assign(CodemanApp.prototype, {
       // Header visibility settings
       showFontControls: document.getElementById('appSettingsShowFontControls').checked,
       showSystemStats: document.getElementById('appSettingsShowSystemStats').checked,
+      showGpuStats: document.getElementById('appSettingsShowGpuStats').checked,
+      showCpuMhz: document.getElementById('appSettingsShowCpuMhz').checked,
       headerStatsStyle: document.getElementById('appSettingsHeaderStatsStyle').value,
       showLifecycleLog: document.getElementById('appSettingsShowLifecycleLog').checked,
       showResponseViewer: document.getElementById('appSettingsShowResponseViewer').checked,
@@ -3094,6 +3101,7 @@ Object.assign(CodemanApp.prototype, {
       configBackupEnabled: document.getElementById('appSettingsConfigBackup').checked,
       configBackupDir: document.getElementById('appSettingsConfigBackupDir').value.trim(),
       ...this._configBackupRetentionPayload(_prev),
+      agentInboxPersistEnabled: document.getElementById('appSettingsAgentInboxPersist').checked,
       readMyMindEnabled: document.getElementById('appSettingsReadMyMind').checked,
       ultracodeFloatingWindows: document.getElementById('appSettingsUltracodeFloatingWindows').checked,
       showMultiMonitorButton: document.getElementById('appSettingsShowMultiMonitorButton').checked,
@@ -3430,6 +3438,9 @@ Object.assign(CodemanApp.prototype, {
       showCronButton: _crb,
       // Per-device bottom-bar indicator, absent from SettingsUpdateSchema (.strict()): it must not reach the PUT.
       showGitStatus: _sgs,
+      // Opt-in header readings (GPU Stats, CPU MHz): per-device and absent from the .strict() schema.
+      showGpuStats: _sgp,
+      showCpuMhz: _scm,
       gitStatusTree: _gst,
       gitStatusMaxRepos: _gsm,
       gitStatusTimeoutSeconds: _gst2,
@@ -4393,6 +4404,8 @@ Object.assign(CodemanApp.prototype, {
         // Header visibility - hide everything on mobile
         showFontControls: false,
         showSystemStats: false,
+        showGpuStats: false,
+        showCpuMhz: false,
         showTokenCount: false,
         showCost: false,
         // Panel visibility - hide panels on mobile (not enough space)
@@ -5323,7 +5336,7 @@ Object.assign(CodemanApp.prototype, {
    */
   _displaySettingKeySet() {
     const displayKeys = new Set([
-      'showFontControls', 'showSystemStats', 'headerStatsStyle', 'showTokenCount', 'showCost',
+      'showFontControls', 'showSystemStats', 'showGpuStats', 'showCpuMhz', 'headerStatsStyle', 'showTokenCount', 'showCost',
       'showLifecycleLog', 'showResponseViewer', 'showRedrawButton',
       'showMonitor', 'showProjectInsights', 'showFileBrowser', 'showSubagents',
       'subagentActiveTabOnly', 'tabTwoRows', 'showTabCliLogos', 'tabOrientation', 'tabRailWidth', 'tabRailDetail', 'tabRailSort', 'tabArrangement', 'tabStateOrder', 'sessionListLayout', 'sessionSidebarFontSize', 'localEchoEnabled', 'cjkInputEnabled', 'extendedKeyboardBar',

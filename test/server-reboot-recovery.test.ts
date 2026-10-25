@@ -163,6 +163,9 @@ describe('server reboot recovery snapshot', () => {
       return { count: cleaned.length, cleaned };
     });
     const store = {
+      // Both reboot-offer planning and inbox pruning read the complete persisted
+      // set. Keep this fixture tied to the same map stale cleanup mutates.
+      getSessions: vi.fn(() => Object.fromEntries(savedStates)),
       getSession: vi.fn((id: string) => savedStates.get(id) ?? null),
       getSessionRecoveries: vi.fn(() => recoveries),
       upsertSessionRecovery: vi.fn((recovery: SessionRecoveryRecord) => recoveries.push(recovery)),

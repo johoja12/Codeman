@@ -830,38 +830,18 @@ Object.assign(CodemanApp.prototype, {
    * run modes like the rest, and neither `agy` nor `pi` is likely to be installed.
    */
   _refreshRunModeAvailability(menu) {
-    // A DOCKER case runs its agents INSIDE the container, so host CLI
-    // availability answers the wrong question: the host may have no claude at
-    // all while the container ships one, and gating on the host hides a mode
-    // that would have worked. Adoption records what the container really has
-    // (`availableModes`); an owned container runs our base image, which ships
-    // every CLI, so an absent list means "do not gate" rather than "nothing".
     // Same source every run* path reads the selected case from.
     const caseName = document.getElementById('quickStartCase')?.value;
     const activeCase = caseName ? (this.cases || []).find((c) => c.name === caseName) : null;
     const isDocker = activeCase?.location === 'docker';
-    // Prefer a LIVE probe over the value stored at attach time: a container's
-    // CLIs can be installed or removed long after the case was linked, and a
-    // case linked before that field existed has none at all.
-    const containerModes = isDocker
-      ? this._dockerCaseModes?.[caseName] || activeCase.docker?.availableModes || null
-      : null;
     if (isDocker && !this._dockerCaseModes?.[caseName]) void this._probeDockerCaseModes(activeCase, menu);
-    // An unreachable container hides every agent mode and explains why, instead
-    // of silently offering modes that cannot start.
-    //
-    // ⚠️ ADOPTED cases only. For an OWNED case a missing container is the normal
-    // state before the first session — the launch chain creates and starts it — so
-    // reporting it as a fault hid every agent mode on a freshly linked Docker case
-    // behind "start it yourself first", for a container Codeman was about to create.
+    // An unreachable (adopted) container hides every agent mode and explains why,
+    // instead of silently offering modes that cannot start; see _runModeAvailableForCase.
     const probeError = isDocker ? this._dockerCaseProbeError?.[caseName] : null;
     for (const option of menu.querySelectorAll('.run-mode-option[data-mode]')) {
       const mode = option.dataset.mode;
       if (!mode || mode === 'shell') continue;
-      let available;
-      if (isDocker) available = probeError ? false : containerModes ? containerModes.includes(mode) : true;
-      else available = this.isCliAvailable(mode);
-      option.style.display = available ? 'flex' : 'none';
+      option.style.display = this._runModeAvailableForCase(mode, caseName) ? 'flex' : 'none';
     }
     this._renderRunModeNotice(menu, probeError);
     // DeepSeek is the one mode whose availability has two halves: `dsh` can be
@@ -878,6 +858,44 @@ Object.assign(CodemanApp.prototype, {
     // all (and is the honest thing to offer there).
     const dsWeb = menu.querySelector('#runModeDeepSeekWeb');
     if (dsWeb) dsWeb.style.display = avail.deepseekBinary ? 'flex' : 'none';
+  },
+
+  /**
+   * Does the case named `caseName` offer agent run mode `mode`? The ONE rule
+   * behind the Run menu's entries (_refreshRunModeAvailability) and the Cmd+K
+   * new-session row's agents (_commandPaletteAgentChoices, panels-ui.js), so the
+   * two never disagree on what a case can start. Shell needs no CLI and is
+   * never gated; both callers skip it before asking.
+   *
+   * Reads only what is already known and never starts a container probe: the
+   * Run menu starts one (_probeDockerCaseModes), and its answer lands in
+   * _dockerCaseModes, which this reads. Until then (a probe still in flight)
+   * the stored availableModes decide, else nothing is gated.
+   */
+  _runModeAvailableForCase(mode, caseName) {
+    const activeCase = caseName ? (this.cases || []).find((c) => c.name === caseName) : null;
+    if (activeCase?.location === 'docker') {
+      // A DOCKER case runs its agents INSIDE the container, so host CLI
+      // availability answers the wrong question: the host may have no claude at
+      // all while the container ships one, and gating on the host hides a mode
+      // that would have worked. Adoption records what the container really has
+      // (`availableModes`); an owned container runs our base image, which ships
+      // every CLI, so an absent list means "do not gate" rather than "nothing".
+      //
+      // An unreachable container offers no agent mode. ⚠️ Only an ADOPTED case
+      // ever records that error: for an OWNED case a missing container is the
+      // normal state before the first session (the launch chain creates and
+      // starts it), so reporting it as a fault hid every agent mode on a freshly
+      // linked Docker case behind "start it yourself first", for a container
+      // Codeman was about to create.
+      if (this._dockerCaseProbeError?.[caseName]) return false;
+      // Prefer a LIVE probe over the value stored at attach time: a container's
+      // CLIs can be installed or removed long after the case was linked, and a
+      // case linked before that field existed has none at all.
+      const containerModes = this._dockerCaseModes?.[caseName] || activeCase.docker?.availableModes || null;
+      return containerModes ? containerModes.includes(mode) : true;
+    }
+    return this.isCliAvailable(mode);
   },
 
   /** Render every enabled agent entry from the server's registry projection. */
@@ -6266,6 +6284,12 @@ Object.assign(CodemanApp.prototype, {
                     title="${reorderTitle || 'Move up'}" ${isFirst ? 'disabled' : ''}>&#x25B2;</button>
             <button class="case-manage-btn" onclick="app.moveCaseDown(${escapeHtml(JSON.stringify(c.name))})"
                     title="${reorderTitle || 'Move down'}" ${isLast ? 'disabled' : ''}>&#x25BC;</button>
+            ${
+              c.location === 'docker' || c.location === 'remote'
+                ? ''
+                : `<button class="case-manage-btn" onclick="app.renameCase(${escapeHtml(JSON.stringify(c.name))})"
+                    title="Rename case (and its folder)">&#x270E;</button>`
+            }
             <button class="case-manage-btn case-manage-btn-delete" onclick="app.deleteCase(${escapeHtml(JSON.stringify(c.name))})"
                     title="Delete case">&#x2715;</button>
           </div>
@@ -6296,6 +6320,113 @@ Object.assign(CodemanApp.prototype, {
     this.cases = reordered;
     this.renderCaseManageList();
     await this.saveCaseOrder(reordered.map(c => c.name));
+  },
+
+  /**
+   * Rename a case and its folder (POST /api/cases/:name/rename), in the app's own dialog.
+   *
+   * A linked case shows a checkbox for renaming the real folder too (unticked = the name only). When live
+   * sessions have the folder open the server refuses and lists them; the dialog then lists them and its button
+   * becomes "Stop sessions and rename", so they are only stopped after a second, explicit press. Errors from
+   * the server (a taken name, a folder another program has open) stay inside the dialog so the name can be fixed.
+   */
+  renameCase(name) {
+    const info = (this.cases || []).find((c) => c.name === name);
+    this._renameCaseState = { name, linked: Boolean(info?.linked), stop: false, busy: false };
+    const input = document.getElementById('renameCaseInput');
+    const label = document.getElementById('renameCaseLabel');
+    if (label) label.textContent = `New name for "${name}"`;
+    if (input) input.value = name;
+    const row = document.getElementById('renameCaseFolderRow');
+    row?.classList.toggle('hidden', !info?.linked);
+    const box = document.getElementById('renameCaseFolder');
+    if (box) box.checked = false;
+    const hint = document.getElementById('renameCaseFolderHint');
+    if (hint) hint.textContent = info?.linked ? `${info.path}  (unticked: only the name in this list changes)` : '';
+    document.getElementById('renameCaseNote')?.classList.toggle('hidden', Boolean(info?.linked));
+    this._renameCaseNotice('');
+    const submit = document.getElementById('renameCaseSubmit');
+    if (submit) submit.textContent = 'Rename';
+    document.getElementById('renameCaseModal')?.classList.add('active');
+    input?.focus?.();
+    input?.select?.();
+  },
+
+  closeRenameCase() {
+    document.getElementById('renameCaseModal')?.classList.remove('active');
+    this._renameCaseState = null;
+  },
+
+  /** Show (or clear, with '') a message inside the rename dialog. */
+  _renameCaseNotice(message) {
+    const el = document.getElementById('renameCaseError');
+    if (!el) return;
+    el.textContent = message;
+    el.classList.toggle('hidden', !message);
+  },
+
+  async submitRenameCase() {
+    const state = this._renameCaseState;
+    if (!state || state.busy) return;
+    const name = state.name;
+    const newName = (document.getElementById('renameCaseInput')?.value || '').trim();
+    if (!newName || newName === name) {
+      this._renameCaseNotice('Enter a different name.');
+      return;
+    }
+    if (!/^[a-zA-Z0-9_-]+$/.test(newName)) {
+      this._renameCaseNotice('Use only letters, numbers, hyphens and underscores.');
+      return;
+    }
+    const body = { newName };
+    if (state.linked) body.renameFolder = Boolean(document.getElementById('renameCaseFolder')?.checked);
+    if (state.stop) body.stopSessions = true;
+    state.busy = true;
+    const submit = document.getElementById('renameCaseSubmit');
+    if (submit) submit.disabled = true;
+    try {
+      const res = await fetch(`/api/cases/${encodeURIComponent(name)}/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({ success: false, error: 'Unexpected response' }));
+      if (data.requiresStop) {
+        const list = (data.sessions || []).map((s) => `${s.name}`).join(', ');
+        state.stop = true;
+        this._renameCaseNotice(`These sessions have the folder open: ${list}. They will be closed (their tabs go away and nothing is restarted) before the folder is renamed.`);
+        if (submit) submit.textContent = 'Stop sessions and rename';
+        return;
+      }
+      if (!data.success) {
+        // A rename that failed after closing sessions says so: their tabs are gone either way.
+        const closed = Number(data.stoppedSessions) || 0;
+        const message = data.error || 'Failed to rename the case.';
+        this._renameCaseNotice(
+          closed > 0 ? `${message} (${closed} session${closed === 1 ? ' was' : 's were'} already closed.)` : message
+        );
+        return;
+      }
+      this.closeRenameCase();
+      this.showToast(`Case renamed to "${newName}"`, 'success');
+      // The per-case run options are stored under the case name in this browser.
+      try {
+        const stored = localStorage.getItem('caseSettings_' + name);
+        if (stored !== null) {
+          localStorage.setItem('caseSettings_' + newName, stored);
+          localStorage.removeItem('caseSettings_' + name);
+        }
+      } catch { /* storage blocked: the options fall back to their defaults */ }
+      const select = document.getElementById('quickStartCase');
+      const current = select?.value;
+      await this.loadQuickStartCases(current === name ? newName : current);
+      this.renderCaseManageList();
+    } catch (err) {
+      this._renameCaseNotice('Failed to rename the case: ' + err.message);
+    } finally {
+      state.busy = false;
+      if (submit) submit.disabled = false;
+    }
   },
 
   async deleteCase(name) {

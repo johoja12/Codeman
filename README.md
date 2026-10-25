@@ -603,7 +603,7 @@ loginctl enable-linger $USER
 1. First request → browser shows Basic Auth prompt (username: `admin` or `CODEMAN_USERNAME`)
 2. On success → server issues a `codeman_session` cookie (24h TTL, auto-extends on activity)
 3. Subsequent requests authenticate silently via cookie
-4. 10 failed attempts per IP → 429 rate limit (15-minute decay)
+4. 10 failed attempts per IP → 429 rate limit (15-minute decay). In multi-user mode the per-IP cap is 50, and each account allows 10 failed guesses per IP; past either, even a correct password from that IP waits for the decay, while the account still logs in from another IP
 
 **Always set `CODEMAN_PASSWORD`** before exposing via tunnel — without it, anyone with the URL has full access to your sessions.
 
@@ -693,7 +693,7 @@ By default Codeman launches sessions with `--dangerously-skip-permissions`, so t
 
 - **Loopback by default** — the server binary binds `127.0.0.1`, reachable only from the same machine, so the no-password default is safe out of the box (the guided installer asks about network access and configures the binding + password for you). Binding a non-loopback host without `CODEMAN_PASSWORD` _starts but prints a loud warning_ with three concrete fixes (set a password, loopback + an authenticated tunnel, or explicitly acknowledge with `--allow-unauthenticated-network`)
 - **Optional auth, real sessions** — HTTP Basic via `CODEMAN_USERNAME` (default `admin`) / `CODEMAN_PASSWORD`. Success issues an opaque 256-bit `codeman_session` cookie (`randomBytes(32)`) — validated server-side, not client-signed, so it can't be forged offline (24h TTL, auto-extend, device-context audit log)
-- **Per-IP rate limiting** — 10 failed attempts → `429` with `Retry-After` (15-min decay). A valid cookie or correct password recovers _immediately_ even while an attacker hammers the same IP — important because all tunnel traffic shares one loopback IP. QR auth has its own separate limiter
+- **Per-IP rate limiting** — 10 failed attempts → `429` with `Retry-After` (15-min decay). A valid cookie or correct password recovers _immediately_ even while an attacker hammers the same IP — important because all tunnel traffic shares one loopback IP. Multi-user mode allows 50 failures per IP instead, plus 10 failed guesses per account from one IP; both are checked before the password, so past either a correct password from that IP also waits for the decay, while the account still logs in from another IP. QR auth has its own separate limiter
 - **Configurable permission mode** - `--dangerously-skip-permissions` is only the default. **App Settings → Agents & CLIs → Claude → Startup Mode** can switch new sessions to Anthropic's classifier-guarded `auto` mode (low-prompt, needs Claude Code 2.1.207+), `normal` prompting, or an explicit allowed-tools list. In multi-user mode, non-granted users are forced to `auto`, and shell sessions / skip-permissions require an explicit per-user grant
 
 ### Always-on browser hardening (v0.9.5)
@@ -1011,6 +1011,9 @@ codeman agent read "$SID" --tail 3000                     # terminal tail, ANSI 
 codeman agent send "$SID" 'run the tests, then print WORKDONE followed by _4711'   # hook-less modes (opencode, pi, …): ask for the marker in halves …
 codeman agent wait "$SID" --match WORKDONE_4711           # … and wait on the joined form, which the prompt's echo never contains
 codeman agent interrupt "$SID"                            # a bare ESC, conversation intact
+codeman agent post "$SID" 'context for later, not a prompt'   # stored in its inbox, not typed into the pane
+codeman agent inbox --wait --timeout 300000               # your own inbox: blocks while nothing is new
+codeman agent ack <msg-id>                                # remove what you handled (read never removes)
 codeman agent rm "$SID"                                   # any session except this one
 ```
 
@@ -1090,6 +1093,7 @@ REST over Fastify — **~230 handlers across 25 route modules**, plus an SSE str
 | `GET`    | `/api/sessions/:id/last-response` | The last answer as clean text, read from the transcript (claude, codex, deepseek) |
 | `GET`    | `/api/sessions/:id/wait`   | Block until a signal fires (`?until=stop,idle,exit&timeout=&fresh=`); a timeout is a `200` |
 | `GET`    | `/api/sessions/:id/wait-output` | Block until a literal string appears (`?match=&nocase=&from=now\|buffer&timeout=`) |
+| `POST` / `GET` | `/api/sessions/:id/inbox` | Agent inbox: post `{text}` / read every pending message (`?wait=` blocks while nothing is new); `POST …/inbox/ack {ids}` removes them, receiver only |
 | `GET`    | `/api/sessions/unified`    | Unified live + history list (Session Manager) — `?q=&limit=`                       |
 | `POST`   | `/api/sessions/:id/pin`    | Pin/unpin in the Session Manager (`{pinned}`)                                      |
 | `PUT`    | `/api/session-order`       | Sync tab order across devices (`{order: [ids]}`)                                   |
