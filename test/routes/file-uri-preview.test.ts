@@ -567,31 +567,34 @@ describe('POST /api/sessions/:id/file-uri-preview', () => {
     expect(execFile).toHaveBeenCalledTimes(1);
   });
 
-  it('allows an unlisted remote artifact after same-origin one-file approval', async () => {
-    const remote: SessionRemote = {
-      hostId: 'mac-mini',
-      label: 'Mac mini',
-      host: 'remote.example',
-      username: 'ann',
-      remotePath: '/Users/ann/project',
-    };
-    const remotePath = '/Users/ann/custom/one-off.png';
-    ctx._session.remote = remote;
-    mockRemoteSsh({ filePath: remotePath, size: 18, workspace: remote.remotePath, homes: ['/Users/ann'] });
+  it.each(['png', 'yaml'])(
+    'allows an unlisted remote %s artifact after same-origin one-file approval',
+    async (extension) => {
+      const remote: SessionRemote = {
+        hostId: 'mac-mini',
+        label: 'Mac mini',
+        host: 'remote.example',
+        username: 'ann',
+        remotePath: '/Users/ann/project',
+      };
+      const remotePath = `/Users/ann/custom/one-off.${extension}`;
+      ctx._session.remote = remote;
+      mockRemoteSsh({ filePath: remotePath, size: 18, workspace: remote.remotePath, homes: ['/Users/ann'] });
 
-    const response = await postUri(pathToFileURL(remotePath).href, {
-      allowUnlistedPath: true,
-      host: 'codeman.test',
-      origin: 'http://codeman.test',
-    });
+      const response = await postUri(pathToFileURL(remotePath).href, {
+        allowUnlistedPath: true,
+        host: 'codeman.test',
+        origin: 'http://codeman.test',
+      });
 
-    expect(response.statusCode).toBe(200);
-    expect(response.json()).toMatchObject({
-      success: true,
-      data: { fileName: 'one-off.png', attachmentId: expect.stringMatching(/^att_/) },
-    });
-    expect(execFile).toHaveBeenCalledTimes(1);
-  });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        success: true,
+        data: { fileName: `one-off.${extension}`, attachmentId: expect.stringMatching(/^att_/) },
+      });
+      expect(execFile).toHaveBeenCalledTimes(1);
+    }
+  );
 
   it('rejects one-file approval requests without a same-origin request header', async () => {
     ctx._session.remote = {
