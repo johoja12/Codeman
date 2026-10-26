@@ -4823,7 +4823,6 @@ Object.assign(CodemanApp.prototype, {
         ...(extraSshOptions.length ? { extraSshOptions } : {}),
         ...(wakeMac ? { wakeMac } : {}),
         ...(wakeCommand ? { wakeCommand } : {}),
-        ...(codexCommand ? { commands: { codex: codexCommand } } : {}),
       };
       const hostRes = await fetch('/api/remote-hosts', {
         method: 'POST',

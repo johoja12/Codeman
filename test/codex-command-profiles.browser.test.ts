@@ -108,6 +108,67 @@ describe('COD-351 Codex command profiles in Chromium', () => {
       }
     });
   });
+  it.each([
+    { value: 'default', selection: { kind: 'default' } },
+    { value: 'profile:p-work', selection: { kind: 'profile', profileId: 'p-work' } },
+    { value: 'custom', selection: { kind: 'custom', command: 'exec codx personal' } },
+  ])('links a remote case with $value without rewriting host command settings', async ({ value, selection }) => {
+    const submitted: Array<{ path: string; body: Record<string, unknown> }> = [];
+    for (const path of ['/api/remote-hosts', '/api/cases/remote-link']) {
+      await page.route(`**${path}`, async (route) => {
+        submitted.push({ path, body: route.request().postDataJSON() });
+        const existingHost = path === '/api/remote-hosts' && value === 'profile:p-work';
+        await route.fulfill({
+          status: existingHost ? 409 : 200,
+          contentType: 'application/json',
+          body: JSON.stringify(
+            existingHost ? { success: false, errorCode: 'ALREADY_EXISTS' } : { success: true, data: {} }
+          ),
+        });
+      });
+    }
+    await page.evaluate(async () => {
+      const app = (window as any).app;
+      document.getElementById('case-remote')!.style.display = 'block';
+      app.closeCreateCaseModal = () => {};
+      app.loadQuickStartCases = async () => {};
+      app.saveLastUsedCase = async () => {};
+      await app.loadCodexCommandProfiles();
+      const submit = document.createElement('button');
+      submit.id = 'submitRemoteFixture';
+      submit.textContent = 'Link remote fixture';
+      submit.onclick = () => app.linkRemoteCase();
+      document.body.append(submit);
+    });
+    await page.locator('#remoteCaseName').fill('remote-fixture');
+    await page.locator('#remoteCasePath').fill('/srv/demo');
+    await page.locator('#remoteHostId').fill('test-host');
+    await page.locator('#remoteHostAddress').fill('remote.example');
+    await page.locator('#remoteHostUsername').fill('tester');
+    await page.locator('#remoteHostPort').fill('2222');
+    await page.selectOption('#remoteCaseCodexProfile', value);
+    if (value === 'custom') await page.locator('#remoteCaseCodexCommandCustomInput').fill('exec codx personal');
+    await page.locator('#submitRemoteFixture').click();
+    await expect
+      .poll(() => page.evaluate(() => (window as any).__toasts))
+      .toContainEqual({ message: 'Remote case "remote-fixture" linked', type: 'success' });
+    expect(submitted).toEqual([
+      {
+        path: '/api/remote-hosts',
+        body: { id: 'test-host', label: 'test-host', host: 'remote.example', username: 'tester', port: 2222 },
+      },
+      {
+        path: '/api/cases/remote-link',
+        body: {
+          name: 'remote-fixture',
+          hostId: 'test-host',
+          remotePath: '/srv/demo',
+          codexCommandSelection: selection,
+        },
+      },
+    ]);
+  });
+
   it('loads Default, alphabetic profiles and Custom, then emits one selection payload', async () => {
     await page.evaluate(() => (window as any).app.loadCodexCommandProfiles());
     expect(await page.locator('#remoteCaseCodexProfile option').allTextContents()).toEqual([
