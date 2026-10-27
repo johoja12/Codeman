@@ -1607,6 +1607,19 @@ export const SettingsUpdateSchema = z
     /** Hours after the last real prompt during which keep-alives are sent (default 2, DEFAULT_KEEP_WARM_MAX_HOURS). */
     promptCacheKeepWarmMaxHours: z.number().min(0.5).max(24).optional(),
     /**
+     * Git fetch on an interval (src/git-fetch-scheduler.ts): `git fetch` for the repositories the Git panel
+     * lists, run on a timer instead of only on the panel's Fetch click. SYNCED, default OFF, because the
+     * server is what runs it: `git fetch` is the only git command the Git panel runs that writes (cloning
+     * and worktree management write too, but only when the user asked for them at the moment they asked), and
+     * the only one that can run later by itself, on a timer, and the only one that can run a repository's own
+     * hooks (`reference-transaction`, `pre-auto-gc` through the automatic maintenance a fetch triggers, config
+     * commands such as `credential.helper`), so nothing runs on a timer until the user turns this on. Cap in seconds between runs (30 to 3600, default 300). A
+     * session can override both in Session Options → Git; `null` there clears the override, and sessions
+     * sharing one folder are fetched by one run.
+     */
+    gitFetchEnabled: z.boolean().optional(),
+    gitFetchIntervalSeconds: z.number().int().min(30).max(3600).optional(),
+    /**
      * Spawned tabs follow their parent: a session created by another one keeps
      * following its parent's tab (into its group, moving with it) until moved by
      * hand. SYNCED, default OFF, because the server does the placement:
@@ -1663,6 +1676,13 @@ export const SettingsUpdateSchema = z
      */
     agentInboxPersistEnabled: z.boolean().optional(),
     /**
+     * Experimental agent coordination (src/web/routes/agent-session-routes.ts): bounded
+     * inspection and the guarded stage/submit routes behind `codeman agent inspect|stage|submit`.
+     * SYNCED, default OFF: the routes are labeled experimental and may change in a minor or
+     * patch release, so automation has to opt in. While OFF, all three routes answer 403.
+     */
+    agentCoordinationEnabled: z.boolean().optional(),
+    /**
      * Read My Mind predictor model override. Empty/absent = the AI-checker
      * default (opus: prediction quality is the product and it runs only on an
      * explicit press). Shell-safety is validated again at spawn time.
@@ -1672,7 +1692,7 @@ export const SettingsUpdateSchema = z
     // Action field (NOT persisted): explicit per-request acknowledgment that the
     // operator accepts exposing an UNAUTHENTICATED public tunnel (no CODEMAN_PASSWORD).
     // Lets the UI enable a tunnel after a confirm dialog without the
-    // CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK env var. Stripped before persisting.
+    // CODEMAN_ALLOW_UNAUTHENTICATED_TUNNEL opt-in. Stripped before persisting.
     acknowledgeUnauthTunnel: z.boolean().optional(),
     tabTwoRows: z.boolean().optional(),
     // COD-286: session tabs across the top vs a vertical rail beside the terminal.
@@ -2098,6 +2118,15 @@ export const AutoResumeSchema = z.object({
 
 /** `POST /api/sessions/:id/keep-warm`: `null` clears the session's choice so the app-wide default applies. */
 export const KeepWarmSchema = z.object({ enabled: z.boolean().nullable() });
+
+/**
+ * `POST /api/sessions/:id/git-fetch-settings`: `null` clears the session's choice so the app-wide default
+ * applies. Both fields are optional, so a row that saves on its own does not clear the other.
+ */
+export const GitFetchSettingsSchema = z.object({
+  enabled: z.boolean().nullable().optional(),
+  intervalSeconds: z.number().int().min(30).max(3600).nullable().optional(),
+});
 
 /** POST /api/sessions/:id/pin (COD-139) — explicit pin state for idempotency. */
 export const PinSessionSchema = z.object({
@@ -2605,3 +2634,15 @@ export const CustomModelSelectionSchema = z.union([
   }),
   z.object({ clear: z.literal(true) }),
 ]);
+
+/** Agent inspection bounds are bytes of evidence, independent of the JSON envelope. */
+export const AgentInspectQuerySchema = z
+  .object({
+    maxBytes: z.coerce.number().int().min(1).max(65536).default(8192),
+    since: z.string().uuid().optional(),
+  })
+  .strict();
+export const AgentStageSchema = z.object({ message: z.string().min(1).max(8192) }).strict();
+export const AgentSubmitSchema = z
+  .object({ stageId: z.string().uuid(), confirmSha: z.string().regex(/^[a-f0-9]{64}$/) })
+  .strict();

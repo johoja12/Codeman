@@ -7,23 +7,26 @@ export function isExplicitlyEnabled(value: string | undefined): boolean {
 }
 
 /**
- * True when running the app unauthenticated on a public network is acknowledged:
- * either a password is configured (`CODEMAN_PASSWORD`) so requests are gated, or
- * the operator has explicitly opted into unauthenticated network exposure via
- * `CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK` (the same opt-in the non-loopback bind
- * guard in server.ts honours, alongside the `--allow-unauthenticated-network` flag).
- *
- * Used by the bind guard and — stricter — by the tunnel-start guard (COD-55): a
- * Cloudflare quick tunnel publishes the app to a public *.trycloudflare.com URL,
- * so starting one WITHOUT this being true would expose unauthenticated terminal
- * control (effectively RCE) to the internet.
- *
- * @param allowFlag optional CLI-level acknowledgement (e.g. the parsed
- *   `--allow-unauthenticated-network` flag) ORed with the env opt-in.
+ * True when an unauthenticated non-loopback BIND is acceptable: either a password is
+ * set (auth active) or the operator explicitly acknowledged it. Quiets the startup
+ * warning only; it does not cover the Cloudflare tunnel (#706), which has its own
+ * acknowledgement below.
  */
 export function isUnauthenticatedNetworkAcknowledged(allowFlag = false): boolean {
   if (process.env.CODEMAN_PASSWORD) return true;
   return allowFlag || isExplicitlyEnabled(process.env.CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK);
+}
+
+/**
+ * True when the operator opted in to an unauthenticated public Cloudflare tunnel:
+ * `--allow-unauthenticated-tunnel` (passed in as `allowFlag`) or
+ * CODEMAN_ALLOW_UNAUTHENTICATED_TUNNEL. Used by the tunnel-enable guard (COD-55) in
+ * place of a login. Kept apart from the network acknowledgement on purpose (#706):
+ * install.sh writes that one for every passwordless LAN install, and it must never
+ * also publish the machine to the internet. install.sh never writes this one.
+ */
+export function isUnauthenticatedTunnelAcknowledged(allowFlag = false): boolean {
+  return allowFlag || isExplicitlyEnabled(process.env.CODEMAN_ALLOW_UNAUTHENTICATED_TUNNEL);
 }
 
 export function isLoopbackBindHost(host: string): boolean {

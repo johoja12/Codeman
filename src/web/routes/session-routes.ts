@@ -41,6 +41,7 @@ import {
   type RemoteHost,
 } from '../../types.js';
 import {
+  GuardedInputBusyError,
   Session,
   cliTakesSessionModel,
   isAltScreenStripMode,
@@ -63,6 +64,7 @@ import {
   AutoCompactSchema,
   AutoResumeSchema,
   KeepWarmSchema,
+  GitFetchSettingsSchema,
   PinSessionSchema,
   CheckpointSchema,
   ImageWatcherSchema,
@@ -123,11 +125,11 @@ import {
   resolveCasesDir,
   resolveParentSessionId,
   sessionCapacityMessage,
-  SETTINGS_PATH,
   validatePathWithinBase,
   waitCapacityResponse,
   abortOnClientHangUp,
 } from '../route-helpers.js';
+import { mutateSettingsFile } from '../settings-writer.js';
 import { buildAgentCaseMarker, writeAgentCaseMarker } from '../../agent-case-marker.js';
 import { agentInbox } from '../agent-inbox.js';
 import { canUsernameRunPrivilegedCommands, resolveClaudeModeForUsername } from '../../user-store.js';
@@ -2439,6 +2441,32 @@ export function registerSessionRoutes(
       }
     }
 
+    // A guarded submit (agent-staging.ts) holds the input lease for the few
+    // milliseconds of its conditional Enter, and input that arrives meanwhile is held
+    // and written in arrival order after it. A TAGGED request is refused for that span
+    // (the lease plus the held input's drain) rather than overtake held input: say so
+    // instead of answering 200 for bytes that were never written, and give the seq
+    // back so the browser's durable queue (which keeps a frame on any 409, and whose
+    // POST drainer sends one frame at a time) delivers it on its next retry. An
+    // UNTAGGED request has no retry behind it (the phone accessory keys and the Stop
+    // button's Ctrl+C are fire-and-forget POSTs that never read the answer), so it is
+    // held instead, like a WebSocket frame: `writeViaMux` takes its own turn behind
+    // the lease, and the raw write below is held explicitly. Nothing from here to the
+    // write below awaits, so the lease cannot be taken in between.
+    const refuseGuarded = () =>
+      reply
+        .code(409)
+        .send(
+          createErrorResponse(
+            ApiErrorCode.CONFLICT,
+            'A guarded submit is in progress on this session; nothing was written. Retry the input.'
+          )
+        );
+    if (!duplicate && tagged && session.guardedInputHeld === true) {
+      session.forgetInputSeq(clientId as string, seq as number);
+      return refuseGuarded();
+    }
+
     // Only a waiting request pays for the tmux probe: the browser's plain input path
     // (thousands of calls per session) must stay exec-free.
     const workerDead = wantsWait ? await workerIsDead(ctx.mux, session) : false;
@@ -2549,7 +2577,38 @@ export function registerSessionRoutes(
       // Same rollback. NOT an error response, deliberately: a session can
       // legitimately have no PTY yet (created but not started), and callers have
       // always been able to write to one without a 4xx.
-      delivered = session.write(inputStr, { fromUser: true });
+      //
+      // During a guarded submit (untagged only: a tagged one was refused above) the
+      // write is held and runs in arrival order once the lease is released. The answer
+      // is a 200 once held; a send-and-wait reads `delivered` from the held write. Only
+      // a full hold queue refuses, after releasing the waiter registered above.
+      let heldWrite: Promise<boolean> | null = null;
+      if (session.guardedInputHeld === true) {
+        let settle!: (written: boolean) => void;
+        const written = new Promise<boolean>((resolve) => {
+          settle = resolve;
+        });
+        const held = session.holdForGuardedLease(
+          () => {
+            let ok = false;
+            try {
+              ok = session.write(inputStr, { fromUser: true });
+            } finally {
+              settle(ok);
+            }
+          },
+          inputStr.length,
+          inputStr
+        );
+        if (held === 'full') {
+          abort.abort();
+          stopDeathWatch();
+          return refuseGuarded();
+        }
+        if (held === 'held') heldWrite = written;
+      }
+      if (heldWrite && !waitPromise) return {};
+      delivered = heldWrite ? await heldWrite : session.write(inputStr, { fromUser: true });
       if (!delivered && tagged) {
         session.forgetInputSeq(clientId as string, seq as number);
       }
@@ -2760,7 +2819,7 @@ export function registerSessionRoutes(
   // own `capabilities.newline`. Claude Code's Ink input recognizes 0x0a as "insert newline" vs
   // 0x0d (carriage return = submit).
 
-  app.post('/api/sessions/:id/send-key', async (req) => {
+  app.post('/api/sessions/:id/send-key', async (req, reply) => {
     const { id } = req.params as { id: string };
     const body = req.body as Record<string, unknown>;
     const key = typeof body?.key === 'string' ? body.key : '';
@@ -2808,6 +2867,11 @@ export function registerSessionRoutes(
           })
       );
     } catch (err) {
+      // A guarded submit's lease holds the key until its Enter is out; only a full
+      // hold queue refuses it, and that is a retryable conflict, not a tmux failure.
+      if (err instanceof GuardedInputBusyError) {
+        return reply.code(409).send(createErrorResponse(ApiErrorCode.CONFLICT, err.message));
+      }
       console.error('[Server] send-key failed:', err);
       return createErrorResponse(ApiErrorCode.INTERNAL_ERROR, 'tmux send-keys failed');
     }
@@ -4024,6 +4088,40 @@ export function registerSessionRoutes(
     };
   });
 
+  // ========== Git fetch on an interval ==========
+
+  // Per-session override for the fetch interval (src/git-fetch-scheduler.ts), which is what the Session
+  // Options rows say it is: two sessions on one folder can hold different choices, and that folder is
+  // fetched when the first of them is due. `null` on either field clears this session's choice so the
+  // app-wide setting applies again, and a field left out of the body leaves the other half as it was: the
+  // Session Options rows save on their own. Refused for a remote or Docker session, exactly as the Git
+  // panel excludes them: a container can write to the repository it mounts, so git there would run that
+  // repository's own configuration on the host.
+  app.post('/api/sessions/:id/git-fetch-settings', async (req) => {
+    const { id } = req.params as { id: string };
+    const body = parseBody(GitFetchSettingsSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id, req);
+    if (session.remote || session.docker) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Git fetch does not run for remote or Docker sessions');
+    }
+
+    const enabled = 'enabled' in body ? (body.enabled ?? undefined) : session.gitFetchEnabled;
+    const intervalSeconds =
+      'intervalSeconds' in body ? (body.intervalSeconds ?? undefined) : session.gitFetchIntervalSeconds;
+    session.setGitFetchSettings(enabled, intervalSeconds);
+    persistAndBroadcastSession(ctx, session);
+
+    return {
+      success: true,
+      data: {
+        gitFetchSettings: {
+          enabled: session.gitFetchEnabled ?? null,
+          intervalSeconds: session.gitFetchIntervalSeconds ?? null,
+        },
+      },
+    };
+  });
+
   // ========== Auto-Resume (usage-limit pause) ==========
 
   app.post('/api/sessions/:id/auto-resume', async (req) => {
@@ -5062,28 +5160,14 @@ export function registerSessionRoutes(
       // settings.json, readable by every user through GET /api/settings, so a non-admin's
       // case name is not written there in multi-user mode (writes are admin-only, like
       // PUT /api/settings). isAdmin is always true in single-user mode.
+      // Awaited and serialized with every other settings.json writer (mutateSettingsFile): the
+      // un-awaited write this replaced could land after the response, over a settings save.
       if (isAdmin(req)) {
         try {
-          const settingsFilePath = SETTINGS_PATH;
-          let settings: Record<string, unknown> = {};
-          try {
-            settings = JSON.parse(await fs.readFile(settingsFilePath, 'utf-8'));
-          } catch (err) {
-            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-          }
-          settings.lastUsedCase = caseName;
-          const dir = dirname(settingsFilePath);
-          if (!existsSync(dir)) {
-            mkdirSync(dir, { recursive: true });
-          }
-          // Use async write to avoid blocking event loop
-          fs.writeFile(settingsFilePath, JSON.stringify(settings, null, 2)).catch((err) => {
-            // Non-critical but log for debugging
-            console.warn('[Server] Failed to save settings (lastUsedCase):', err);
-          });
+          await mutateSettingsFile((settings) => ({ ...settings, lastUsedCase: caseName }));
         } catch (err) {
-          // Non-critical but log for debugging
-          console.warn('[Server] Failed to prepare settings update:', err);
+          // Non-critical: the session is already running.
+          console.warn('[Server] Failed to save settings (lastUsedCase):', getErrorMessage(err));
         }
       }
 

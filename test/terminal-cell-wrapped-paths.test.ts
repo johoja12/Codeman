@@ -1,4 +1,4 @@
-// Port: none (pure functions + the link provider in a vm context — no browser, no server).
+// Port: none (pure functions + the link provider in a vm context: no browser, no server).
 //
 // Absolute file paths codex word-wrapped inside a markdown table cell were not
 // clickable: the first fragment has no extension and the continuation has no
@@ -57,6 +57,58 @@ const TABLE: Row[] = [
   { text: ROW2 },
   { text: '' },
 ];
+const LISTINGS = [
+  ['/tmp/x', '/tmp/x/dir', '/tmp/x/dir/a.png'],
+  ['  ⎿  /home/u/proj/src', '     /home/u/proj/src/a.ts'],
+  ['4.0K    /tmp/foo/bar/', '8.0K    /tmp/foo/baz.png'],
+  ['/home/u/proj/docs:', 'guide.md  notes.md'],
+  ['Created /tmp/out', 'report.md written next to it'],
+];
+
+// A directory that is the whole value of its cell, over the next record's file
+// name in the same column. A wrapper breaks a path after `/` or `-`, never inside
+// a name, so none of these is one path: each cell keeps its own link.
+const WHOLE_VALUE_SHAPES: Array<{ rows: string[]; dir: string; file: string }> = [
+  { rows: ['  Repo        /home/u/proj', '  Config      config.yaml'], dir: '/home/u/proj', file: 'config.yaml' },
+  {
+    rows: ['  Workspace    /home/u/proj/app', '  Entry        main.py'],
+    dir: '/home/u/proj/app',
+    file: 'main.py',
+  },
+  {
+    rows: ['│ Workspace │ /home/u/proj/app │', '│ Entry     │ main.py          │'],
+    dir: '/home/u/proj/app',
+    file: 'main.py',
+  },
+  { rows: ['  Output dir   /tmp/build/out', '  Log          build.log'], dir: '/tmp/build/out', file: 'build.log' },
+  {
+    rows: ['  Path                 Purpose', '  /home/u/proj/src     sources', '  index.ts             entry'],
+    dir: '/home/u/proj/src',
+    file: 'index.ts',
+  },
+];
+// The same records where the directory DOES end on a break character: the label
+// on the next row (`Entry`, `│ Helper │`) says it is a new record, since a wrapper
+// wraps every column of one table row together and leaves the label cell blank.
+const LABELLED_RECORD_SHAPES: Array<{ rows: string[]; dir: string; file: string }> = [
+  {
+    rows: ['  Workspace    /home/u/proj/app/', '  Entry        main.py'],
+    dir: '/home/u/proj/app/',
+    file: 'main.py',
+  },
+  {
+    rows: ['│ Source │ /home/u/proj/src/ │', '│ Helper │ lib/util.ts       │'],
+    dir: '/home/u/proj/src/',
+    file: 'lib/util.ts',
+  },
+  { rows: ['  Prefix    /tmp/run-', '  Suffix    log.txt'], dir: '/tmp/run-', file: 'log.txt' },
+];
+const SEPARATE_RECORD_SHAPES = [...WHOLE_VALUE_SHAPES, ...LABELLED_RECORD_SHAPES];
+// Known trade-off: with no label to tell them apart, a directory written WITH its
+// trailing slash over a relative path in the same column reads exactly like a
+// wrap at `/`, so it still joins.
+const TRAILING_SLASH_TRADE_OFF = ['  /home/u/proj/src/     sources', '  lib/util.ts           helpers'];
+
 const BEFORE = '/tmp/demo-check/docs/review/BLDMESH-243/before-overview.png';
 const AFTER = '/tmp/demo-check/docs/review/BLDMESH-243/after-overview.png';
 
@@ -68,6 +120,30 @@ describe('terminalCellWrappedPaths', () => {
       const hits = find(fakeBuffer(TABLE, COLS), row);
       expect(hits.map((h) => h.path).sort()).toEqual([AFTER, BEFORE]);
     }
+  });
+
+  it.each(LISTINGS.map((lines) => [lines]))('does not join independent listing rows: %j', (lines) => {
+    const rows = lines.map((text) => ({ text }));
+    for (let row = 0; row < rows.length; row++) expect(find(fakeBuffer(rows, COLS), row)).toEqual([]);
+  });
+
+  it.each(SEPARATE_RECORD_SHAPES.map((shape) => [shape.rows, shape]))(
+    'does not join a directory cell onto the next record: %j',
+    (_rows, shape) => {
+      const rows = shape.rows.map((text) => ({ text }));
+      for (let row = 0; row < rows.length; row++) expect(find(fakeBuffer(rows, COLS), row)).toEqual([]);
+    }
+  );
+
+  it('does not join a fragment that ends on `_` (codex wraps cells only after `/` or `-`)', () => {
+    const rows = [{ text: '   shot (/tmp/demo/docs/review_' }, { text: '   before.png)' }];
+    expect(find(fakeBuffer(rows, COLS), 0)).toEqual([]);
+    expect(find(fakeBuffer(rows, COLS), 1)).toEqual([]);
+  });
+
+  it('still joins an unlabelled trailing-slash directory over a relative path in its column (known trade-off)', () => {
+    const rows = TRAILING_SLASH_TRADE_OFF.map((text) => ({ text }));
+    expect(find(fakeBuffer(rows, COLS), 1).map((h) => h.path)).toEqual(['/home/u/proj/src/lib/util.ts']);
   });
 
   it('places the segments on the path cells only', () => {
@@ -114,6 +190,28 @@ describe('terminalCellWrappedPaths', () => {
     expect(hits.map((h) => h.path)).toEqual(['/tmp/demo/very/long/nested/file.png']);
     expect(hits[0].segments.map((s) => s.row)).toEqual([0, 1, 2]);
   });
+
+  it('follows a path down a box-drawn table cell (Claude Code renders tables with │ borders)', () => {
+    const rows = [
+      { text: '│ Before         │ /tmp/demo/docs/review/ │ After │ /tmp/demo/docs/review/BLD- │' },
+      { text: '│                │ before-overview.png    │       │ 243/after-overview.png     │' },
+    ];
+    const hits = find(fakeBuffer(rows, COLS), 1);
+    expect(hits.map((h) => h.path).sort()).toEqual([
+      '/tmp/demo/docs/review/BLD-243/after-overview.png',
+      '/tmp/demo/docs/review/before-overview.png',
+    ]);
+    const before = hits.find((h) => h.path.endsWith('before-overview.png'))!;
+    expect(before.segments).toEqual([
+      { row: 0, startCol: rows[0].text.indexOf('/tmp/'), endCol: rows[0].text.indexOf('/review/') + 8 },
+      { row: 1, startCol: rows[1].text.indexOf('before'), endCol: rows[1].text.indexOf('.png') + 4 },
+    ]);
+  });
+
+  it('does not take a box border or the next cell into a path', () => {
+    const rows = [{ text: '│ /tmp/demo/docs/ │ x │' }, { text: '│ │ notes.md       │ y │' }];
+    expect(find(fakeBuffer(rows, COLS), 0)).toEqual([]);
+  });
 });
 
 describe('terminal link provider with cell-wrapped paths', () => {
@@ -151,6 +249,8 @@ describe('terminal link provider with cell-wrapped paths', () => {
       openFilePreview: vi.fn(),
       openLogViewerWindow: vi.fn(),
       _openTerminalUrl: proto._openTerminalUrl,
+      _resolveLinkedFilePath: proto._resolveLinkedFilePath,
+      _isExternalPreviewPath: () => false,
       registerFilePathLinkProvider: proto.registerFilePathLinkProvider,
     };
     app.registerFilePathLinkProvider.call(app);
@@ -163,6 +263,39 @@ describe('terminal link provider with cell-wrapped paths', () => {
     };
     return { provide, app };
   }
+
+  it.each(LISTINGS.map((lines) => [lines]))('preserves ordinary listing links: %j', (lines) => {
+    const { provide } = harness(lines.map((text) => ({ text })));
+    const expected = [
+      ['/tmp/x', '/tmp/x/dir', '/tmp/x/dir/a.png'],
+      ['/home/u/proj/src', '/home/u/proj/src/a.ts'],
+      ['/tmp/foo/bar/', '/tmp/foo/baz.png'],
+      ['/home/u/proj/docs', 'guide.md'],
+      ['/tmp/out', 'report.md'],
+    ][LISTINGS.indexOf(lines)];
+    for (let row = 0; row < lines.length; row++) {
+      expect(provide(row + 1).map((link) => link.text)).toContain(expected[row]);
+    }
+  });
+
+  it.each(SEPARATE_RECORD_SHAPES.map((shape) => [shape.rows, shape]))(
+    'keeps the folder link and the file link of the next record: %j',
+    (_rows, shape) => {
+      const { provide, app } = harness(shape.rows.map((text) => ({ text })));
+      const dirLine = shape.rows.findIndex((text) => text.includes(shape.dir)) + 1;
+      const fileLine = shape.rows.findIndex((text) => text.includes(shape.file)) + 1;
+      const all = [...provide(dirLine), ...provide(fileLine)].map((link) => link.text);
+      expect(all.some((text) => text.includes(shape.dir + shape.file))).toBe(false);
+      const dirLink = provide(dirLine).find((link) => link.text === shape.dir);
+      expect(dirLink, `${shape.dir} on row ${dirLine}`).toBeDefined();
+      expect(dirLink!.range.start.y).toBe(dirLine);
+      const fileLink = provide(fileLine).find((link) => link.text === shape.file);
+      expect(fileLink, `${shape.file} on row ${fileLine}`).toBeDefined();
+      expect(fileLink!.range.start.y).toBe(fileLine);
+      fileLink!.activate(null, fileLink!.text);
+      expect(app.openFilePreview).not.toHaveBeenCalledWith(shape.dir + shape.file, 's1');
+    }
+  );
 
   it('makes both screenshot paths clickable from either row and opens the whole path', () => {
     const { provide, app } = harness(TABLE);

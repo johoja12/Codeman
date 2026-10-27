@@ -78,7 +78,7 @@ Never push, tag, publish, open releases or post announcements on `Ark0N/Codeman`
 
 GitHub CI runs `npm run check:lockfile`, so lockfile drift fails the build even if the `version-packages` script is bypassed.
 
-**Version**: 1.45.0 (must match `package.json`)
+**Version**: 1.46.0 (must match `package.json`)
 
 ## Fork Workflow: GitHub + gh (this checkout)
 
@@ -444,7 +444,7 @@ Frontend JS modules have `@fileoverview` with `@dependency`/`@loadorder` tags. L
 | **Rate limit**    | Single-user: 10 failed/IP. Multi-user: 50/IP and 10/(username, IP) before verify; 10 failed/username after verify (15min decay). QR and hook-secret use separate buckets                                                                                              |
 | **Hook bypass**   | `/api/hook-event` + `/api/status-telemetry` skip Basic auth (localhost-only, schema-validated), but when auth is active the loopback bypass requires `X-Codeman-Hook-Secret` **unconditionally** (Codeman cannot detect a user's own loopback reverse proxy) |
 | **Lost-frame page** | The THIRD unauthenticated 200: a framed `text/html` navigation (`Sec-Fetch-Dest: iframe\|frame`) to a path that is NOT a registered route (plus a credential-less `/`) gets the static web-tab recovery page before the credential checks. ⚠️ An unauthenticated caller can use it to enumerate the route table (accepted). → [architecture-invariants#layer-by-layer-detail](docs/architecture-invariants.md#layer-by-layer-detail) |
-| **Tunnel**        | Enabling a tunnel **refuses** without `CODEMAN_PASSWORD` unless exposure is acknowledged via `CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK=1` or the per-request `acknowledgeUnauthTunnel:true` action field (never persisted) |
+| **Tunnel**        | Enabling a tunnel **refuses** without `CODEMAN_PASSWORD` unless exposure is acknowledged via `CODEMAN_ALLOW_UNAUTHENTICATED_TUNNEL=1` or the per-request `acknowledgeUnauthTunnel:true` action field (never persisted) |
 | **Validation**    | Zod schemas, Unicode-aware path allowlist regex, env prefix allowlist (`CLAUDE_CODE_*`/`OPENCODE_*`/`CODEX_*`/`GEMINI_*`/`GOOGLE_*`/`ANTIGRAVITY_*`/`PI_*`/`GROK_*`/`XAI_*`/`DSH_*`/`DEEPSEEK_*`)                                                        |
 | **Headers**       | CORS localhost-only, CSP, X-Frame-Options, HSTS if HTTPS                                                                                                                                                     |
 
@@ -540,3 +540,10 @@ Two constraints worth knowing before you touch them: the env-derived PTY buffer 
 **`install.sh`** (repo root) is the public `curl | bash` installer: it installs Node/tmux/git/build tools, clones to `~/.codeman/app`, builds, and offers a systemd/launchd service, asking every question BEFORE the unattended build (log in `~/.codeman/install.log`). Network access is Tailscale / LAN / local-only; re-runs preserve the existing binding AND password (`read_existing_binding()`). ⚠️ Compose the hand-start env only in `start_command_hint`/`export_bind_env`, and call `stop_background_helpers` before `exec`. ⚠️ Tailscale rename is opt-in (default NO, never under `--yes`/non-interactive); NEVER `tailscale serve reset`, touch a mapping it did not create, run `tailscale funnel` or advertise a Service (`test/install-sh-invariants.test.ts`). ⚠️ Stay **bash 3.2** clean (no `declare -A`, `mapfile`, namerefs, `${x,,}`, here-strings, empty-array expansion under `set -u`). ⚠️ Execute only commands from the generated CLI block (`CLI_INSTALL_CMD_TRUSTED`, `npm run generate:cli-catalog`). → [architecture-invariants#installsh-the-public-installer](docs/architecture-invariants.md#installsh-the-public-installer)
 
 Other key scripts: `scripts/tmux-manager.sh` (safe tmux mgmt), `scripts/tunnel.sh [quick|named] start|stop|status|url` (quick = random trycloudflare URL, default; `named setup|enable` = fixed-hostname tunnel via `scripts/codeman-tunnel-named.service`; bare `start|stop|url` still means quick), `scripts/run-beta.sh` (isolated beta instance), `scripts/build-agent-image.mjs` (docker base image), `scripts/self-update.sh` (detached updater). Production services: `scripts/codeman-web.service`, `scripts/codeman-tunnel.service`. **Always set `CODEMAN_PASSWORD`** before exposing via tunnel.
+
+## Upstream 1.46 integration rules
+
+- Agent inspect/stage/submit are experimental and opt-in (`agentCoordinationEnabled`, default OFF). Guarded submits hold arriving input in order; tagged POST input retries on 409, WebSocket input ACKs only after delivery, and a full hold queue closes with 1013. Preserve assistant input ownership and checkpoint delivery through these boundaries.
+- Visible tmux frame and caret are captured together; full-history replay retains the fork's remote history and relative cursor handling. Keyboard row holds apply only to eligible local untracked sessions; viewer sizing ownership remains authoritative.
+- File links use the shared spaced/wrapped path grammar and cell mapping while retaining strict file URI resolution, originating-session preview ownership and the blocked-path one-file approval flow.
+- All settings.json read-modify-writes serialize through `mutateSettingsFile`. Tunnel exposure has its own acknowledgement, separate from the non-loopback bind flag.

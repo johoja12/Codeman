@@ -48,6 +48,7 @@ function loadTerminalUiPrototype() {
       addEventListener: vi.fn(),
       removeEventListener: vi.fn(),
       open: openSpy,
+      confirm: vi.fn(() => true),
       document: { documentElement: { dataset: {} } },
     },
   });
@@ -143,6 +144,7 @@ function makeHarness(
     openFileUriPreview: fileUriSpy,
     openLogViewerWindow: logSpy,
     _openTerminalUrl: proto._openTerminalUrl,
+    _resolveLinkedFilePath: proto._resolveLinkedFilePath,
     _terminalCellFromClientPoint: proto._terminalCellFromClientPoint,
     _activateTerminalLinkAtPoint: proto._activateTerminalLinkAtPoint,
     registerFilePathLinkProvider: proto.registerFilePathLinkProvider,

@@ -140,6 +140,7 @@ import { getLifecycleLog } from '../session-lifecycle-log.js';
 import {
   applyWorkspaceHooks,
   pruneAgentSessionPreambles,
+  readGitFetchSettings,
   readKeepWarmSettingsOrThrow,
   readPlanUsageTelemetryEnabled,
   removeAgentSessionPreamble,
@@ -165,6 +166,10 @@ import { AI_CHECK_MODEL } from '../config/ai-defaults.js';
 import { approvalInbox } from './approval-inbox.js';
 import { SCREEN_BLOCKED_SOURCE } from './screen-blocked.js';
 import { PromptCacheKeepWarmService } from '../prompt-cache-keepwarm.js';
+import { fetchWorkspaceOnce } from '../git-fetch.js';
+import { GitFetchScheduler } from '../git-fetch-scheduler.js';
+import { probePathKind } from '../utils/bounded-path-probe.js';
+import { defaultDockerWorkspaces } from './routes/git-status-routes.js';
 import { composerIsEmpty, plainFrame } from '../session-submit-verifier.js';
 import { detectUsageLimitPause } from '../usage-limit-patterns.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
@@ -357,6 +362,7 @@ import { resolveTerminalHistoryConfig } from '../config/terminal-history.js';
 import { MAX_PASTE_IMAGE_BYTES } from '../config/buffer-limits.js';
 import { SseEvent, approvalResolvedEventPayload } from './sse-events.js';
 import { MAX_ROUTE_PARAM_LENGTH } from './route-helpers.js';
+import { mutateSettingsFile } from './settings-writer.js';
 import { getLatestPlanUsage, setLatestCodexPlanUsage, setLatestCopilotPlanUsage } from './plan-usage-latest.js';
 import { telemetrySignature } from '../usage-telemetry.js';
 import { readCodexPlanUsage, resolveCodexBinaryPath } from '../utils/codex-cli-resolver.js';
@@ -398,6 +404,7 @@ import {
   registerCaseRoutes,
   registerWorktreeRoutes,
   registerSessionRoutes,
+  registerAgentSessionRoutes,
   registerRespawnRoutes,
   registerRalphRoutes,
   registerPlanRoutes,
@@ -484,6 +491,7 @@ import {
   STATS_COLLECTION_INTERVAL_MS,
   INACTIVITY_TIMEOUT_MS,
   CRON_TICK_INTERVAL,
+  GIT_FETCH_TICK_INTERVAL_MS,
 } from '../config/server-timing.js';
 
 /**
@@ -601,6 +609,37 @@ export class WebServer extends EventEmitter {
     },
     log: (message) => console.log(message),
   });
+  // Git fetch on an interval (git-fetch-scheduler.ts): the due-tracking lives in the service; the server
+  // lends it the facts a decision needs and stores what it reports on the session. A field initializer for
+  // the same reason as the keep-warm one above, and the scheduler reads the app setting FRESH on every tick:
+  // that is what makes a live toggle take effect on the next tick, and what makes turning it off actually
+  // stop the fetching. Default OFF, so an install that never enabled it spawns nothing at all.
+  private readonly gitFetchScheduler = new GitFetchScheduler({
+    sessionIds: () => this.sessions.keys(),
+    getSession: (id) => this.sessions.get(id),
+    readSettings: readGitFetchSettings,
+    // The same Docker list the panel's Fetch button uses: the rule has to be one rule. It rejects on a list
+    // that cannot be read, and the tick then fetches nothing (fail closed).
+    dockerWorkspaces: defaultDockerWorkspaces,
+    // Bounded probe, DEFAULT options (rule #516): a tick is a bulk scan, so it keeps the stall cap and must
+    // never be handed `pastCap`. A folder on a mount that stopped answering is skipped, not fetched.
+    probePath: (path) => probePathKind(path),
+    // Through the join, so the tick and the panel's Fetch button are the same run: a click on a folder the
+    // tick is already fetching joins it rather than starting a second `git fetch` in the same clone, and the
+    // run that gets published is the one that ran, with its own trigger.
+    fetch: (cwd, opts, trigger) => fetchWorkspaceOnce(cwd, opts, trigger),
+    publish: (id, status) => {
+      const session = this.sessions.get(id);
+      if (!session?.setGitFetchStatus(status)) return;
+      // No new SSE event: the status rides the session state the page already listens for, and the Git
+      // panel polls on its own clock. It is written to disk with the rest of the record, but the restore
+      // copies only the fields its own config lists and this is not one of them (src/types/session.ts), so
+      // what a run found is the panel's truth for the life of the session, not across a restart.
+      this.persistSessionState(session);
+      this.broadcast(SseEvent.SessionUpdated, this.getSessionStateWithRespawn(session));
+    },
+    log: (message) => console.log(message),
+  });
   /**
    * Wake-on-LAN registry, returned by `registerSessionRoutes`. Held for its LIFETIME
    * only — `drop()` on session cleanup, `stop()` on shutdown. Waking from here would
@@ -694,6 +733,8 @@ export class WebServer extends EventEmitter {
   private windowTitle: string;
   private readonly indexHtmlPath: string;
   private readonly allowUnauthenticatedNetwork: boolean;
+  /** `--allow-unauthenticated-tunnel`; the tunnel guard reads it through the route context (#706). */
+  private readonly allowUnauthenticatedTunnel: boolean;
   private _pasteImageGcStop: (() => void) | null = null;
   private _eventLoopMonitor: EventLoopMonitorHandle | null = null;
   /** Opt-in hooks-only listener on the docker bridge gateway (CODEMAN_DOCKER_BRIDGE_HOOKS). */
@@ -717,12 +758,15 @@ export class WebServer extends EventEmitter {
     // the prefix as an evidence object (9 upstream tests failed, none of them loudly).
     // Downstream-only params go LAST.
     basePath: string = '',
-    agentProcessEvidence: AgentProcessEvidenceOptions = {}
+    agentProcessEvidenceOrTunnel: AgentProcessEvidenceOptions | boolean = {},
+    allowUnauthenticatedTunnel: boolean = false
   ) {
     super();
     this.setMaxListeners(0);
     this.host = host;
     this.port = port;
+    const agentProcessEvidence = typeof agentProcessEvidenceOrTunnel === 'boolean' ? {} : agentProcessEvidenceOrTunnel;
+    if (typeof agentProcessEvidenceOrTunnel === 'boolean') allowUnauthenticatedTunnel = agentProcessEvidenceOrTunnel;
     this.localClaudeRuntimeVersion = agentProcessEvidence.runtimeVersion ?? getClaudeCliVersion() ?? undefined;
     this.agentProcessMatcherRegistry = agentProcessEvidence.matcherRegistry;
     this.agentProcessInspectionSource = agentProcessEvidence.source ?? LOCAL_PROCESS_INSPECTION_SOURCE;
@@ -732,6 +776,7 @@ export class WebServer extends EventEmitter {
     this.testMode = testMode;
     this.allowUnauthenticatedNetwork =
       allowUnauthenticatedNetwork || isExplicitlyEnabled(process.env.CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK);
+    this.allowUnauthenticatedTunnel = allowUnauthenticatedTunnel;
     this.titleHostname = titleHostname || getHostname();
     this.windowTitle = `codeman:${this.titleHostname}`;
     this.indexHtmlPath = join(__dirname, 'public', 'index.html');
@@ -1660,6 +1705,7 @@ export class WebServer extends EventEmitter {
       scheduledRuns: this.scheduledRuns,
       teamWatcher: this.teamWatcher,
       tunnelManager: this.tunnelManager,
+      allowUnauthenticatedTunnel: this.allowUnauthenticatedTunnel,
       pushStore: this.pushStore,
       startScheduledRun: this.startScheduledRun.bind(this),
       stopScheduledRun: this.stopScheduledRun.bind(this),
@@ -2044,6 +2090,21 @@ export class WebServer extends EventEmitter {
     registerSessionRecoveryRoutes(this.app, ctx);
     registerReadMyMindRoutes(this.app, ctx);
     registerGitStatusRoutes(this.app, ctx);
+    // Git fetch on an interval: this is only the wake-up, the scheduler itself decides what is due. Off in
+    // tests for the same reason as the polls below: a test drives `tick()` directly instead of waiting on
+    // a timer the harness would have to keep alive. The setting is read FRESH inside `tick()`, so turning
+    // it on takes effect on the next tick and turning it off actually stops the fetching.
+    if (!this.testMode) {
+      this.cleanup.setInterval(
+        () => {
+          this.gitFetchScheduler.tick().catch((err) => {
+            console.error('[git fetch] interval tick failed:', getErrorMessage(err));
+          });
+        },
+        GIT_FETCH_TICK_INTERVAL_MS,
+        { description: 'git fetch interval checker' }
+      );
+    }
     registerStatusTelemetryRoutes(this.app, ctx);
     registerSystemRoutes(this.app, ctx);
     registerCaseRoutes(this.app, ctx);
@@ -2273,6 +2334,7 @@ export class WebServer extends EventEmitter {
     // The registry's lifetime is the server's: it drops per-session wake state on every
     // cleanup path and resolves in-flight wakes on shutdown.
     this.remoteWake = registerSessionRoutes(this.app, ctx);
+    registerAgentSessionRoutes(this.app, ctx);
     registerRespawnRoutes(this.app, ctx);
     registerRalphRoutes(this.app, ctx);
     registerPlanRoutes(this.app, ctx);
@@ -2529,6 +2591,9 @@ export class WebServer extends EventEmitter {
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     this.keepWarmService.remove(sessionId);
+    // A closed session takes its place in the fetch schedule with it: otherwise a detached-and-forgotten id
+    // would still count as tracked, and its next run would land on a session that no longer exists.
+    this.gitFetchScheduler.remove(sessionId);
     const pinned = session?.pinned === true || this.store.getSession(sessionId)?.pinned === true;
     if (coordinateLayout && session && killMux && !pinned) {
       return this.tabLayouts.runSessionDeletion([{ id: sessionId, owner: session.owner }], async () => {
@@ -2956,6 +3021,16 @@ export class WebServer extends EventEmitter {
     html = html.replace(
       '</head>',
       () => `<script>window.__codemanTranscriptPageKeys=${JSON.stringify(pageKeyClis)};</script>\n</head>`
+    );
+    // Which run modes keep their PTY rows under a phone keyboard (inline renderers,
+    // the `keyboardHold` capability; `_keyboardHoldEligible` in terminal-ui.js). Same
+    // shape and reasoning as the page-key list above.
+    const keyboardHoldClis = enabledClis()
+      .filter((entry) => entry.capabilities.keyboardHold === 'inline')
+      .map((entry) => entry.id);
+    html = html.replace(
+      '</head>',
+      () => `<script>window.__codemanKeyboardHoldModes=${JSON.stringify(keyboardHoldClis)};</script>\n</head>`
     );
     if (!soloSessionId && process.env.CODEMAN_GESTURE === '1') {
       html = html.replace('</head>', () => `<script>window.__codemanGestureAvailable=true;</script>\n</head>`);
@@ -4570,16 +4645,12 @@ export class WebServer extends EventEmitter {
     // Tunnel only starts when user clicks the toggle in the UI — never on boot.
     // Reset persisted tunnelEnabled so the UI toggle reflects actual state.
     if (await this.isTunnelEnabled()) {
-      const settingsPath = dataPath('settings.json');
       try {
-        const content = await fs.readFile(settingsPath, 'utf-8');
-        const settings = JSON.parse(content);
-        settings.tunnelEnabled = false;
-        await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      } catch {
-        /* ignore */
+        await mutateSettingsFile((settings) => ({ ...settings, tunnelEnabled: false }));
+        console.log('Cloudflare tunnel setting reset (tunnel only starts on explicit UI toggle)');
+      } catch (err) {
+        console.warn('Could not reset the Cloudflare tunnel setting:', getErrorMessage(err));
       }
-      console.log('Cloudflare tunnel setting reset (tunnel only starts on explicit UI toggle)');
     }
 
     // Start team watcher for agent team awareness (always on — lightweight polling)
@@ -4776,6 +4847,9 @@ export class WebServer extends EventEmitter {
     }
     if (saved.autoClearEnabled !== undefined || saved.autoClearThreshold !== undefined) {
       session.setAutoClear(saved.autoClearEnabled ?? false, saved.autoClearThreshold);
+    }
+    if (saved.gitFetchEnabled !== undefined || saved.gitFetchIntervalSeconds !== undefined) {
+      session.setGitFetchSettings(saved.gitFetchEnabled, saved.gitFetchIntervalSeconds);
     }
     if (saved.autoResumeEnabled) {
       // The stamp is re-armed by default, because a Codeman restart leaves the
@@ -5076,6 +5150,11 @@ export class WebServer extends EventEmitter {
               // below, a future `expiresAt` re-arms the timer once the pane is attached.
               lastRealPromptAt: savedState?.lastRealPromptAt,
               keepWarmEnabled: savedState?.keepWarmEnabled,
+              // The session's own fetch switch and interval, carried over rather than reset to the app default:
+              // the choice is the user's and outlives the run that made it. The scheduler reads them fresh
+              // on its next tick, so a restored session is back on its own schedule without a restart.
+              gitFetchEnabled: savedState?.gitFetchEnabled,
+              gitFetchIntervalSeconds: savedState?.gitFetchIntervalSeconds,
               // Conversations this pane provably owned, oldest first. Its tail is
               // the conversation the CLI was on when the server stopped, which is
               // what a re-attach must point the viewer at instead of the launch id.
@@ -5621,6 +5700,9 @@ export class WebServer extends EventEmitter {
     sessionWaits.cancelEverything();
     approvalInbox.stop();
     this.keepWarmService.stop();
+    // Stops the fetch sweep from starting another run while the server is closing; a git process already
+    // running is left to finish, which is what a fetch does to a repository nothing else is touching.
+    this.gitFetchScheduler.stop();
     // A post within the debounce window before shutdown would otherwise not reach disk.
     // Flushed again after `app.close()` below, for a post that lands in between.
     agentInboxPersistence.flush();
@@ -5794,9 +5876,20 @@ export async function startWebServer(
   host: string = '127.0.0.1',
   titleHostname?: string,
   allowUnauthenticatedNetwork: boolean = false,
-  basePath: string = ''
+  basePath: string = '',
+  allowUnauthenticatedTunnel: boolean = false
 ): Promise<WebServer> {
-  const server = new WebServer(port, https, testMode, host, titleHostname, allowUnauthenticatedNetwork, basePath, {});
+  const server = new WebServer(
+    port,
+    https,
+    testMode,
+    host,
+    titleHostname,
+    allowUnauthenticatedNetwork,
+    basePath,
+    {},
+    allowUnauthenticatedTunnel
+  );
   await server.start();
   return server;
 }

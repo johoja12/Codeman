@@ -69,8 +69,8 @@ const ALLOWED_BRANCHES: Record<string, { count: number; reason: string }> = {
       'conversation identity uses the Claude transcript resume id for Claude and the native id for other harnesses',
   },
   "panels-ui.js::mode === 'codex'": {
-    count: 1,
-    reason: 'fork remote Codex PDF-link normalization preserves the remote workspace preview path (issue #16)',
+    count: 2,
+    reason: 'fork remote Codex PDF-link normalization (#16) and guarded one-file preview from blocked log links (#23)',
   },
   "session-ui.js::mode === 'shell'": {
     count: 4,

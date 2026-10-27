@@ -299,8 +299,8 @@ describe('openLinkThroughWebTabIfLoopback', () => {
 
 describe('callers consult the hook first', () => {
   it('terminal URL links try the web tab before window.open', () => {
-    // Downstream's activate() delegates to _openTerminalUrl(), so BOTH the desktop
-    // click and the mobile touch-tap path consult the hook. Read that function.
+    // URL links (and OSC 8 links) open through _openTerminalUrl(), so the desktop
+    // click and the mobile touch-tap path both consult the hook. Read that function.
     const activate = TERMINAL_UI.indexOf('_openTerminalUrl(text) {');
     expect(activate).toBeGreaterThan(-1);
     const body = TERMINAL_UI.slice(activate, TERMINAL_UI.indexOf('},', activate));

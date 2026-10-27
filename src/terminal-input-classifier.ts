@@ -1,3 +1,4 @@
+/** @fileoverview Distinguish complete terminal focus/mouse reports from keyboard-bearing input. */
 const FOCUS_REPORT_LENGTH = 3;
 const X10_REPORT_LENGTH = 6;
 

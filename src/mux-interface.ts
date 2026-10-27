@@ -350,9 +350,10 @@ export interface TerminalMultiplexer extends EventEmitter {
   // ========== Input ==========
 
   /**
-   * Send input to a session via tmux send-keys.
+   * Send input to a session via tmux send-keys. The optional internal Enter-only
+   * guard runs synchronously immediately before transport dispatch.
    */
-  sendInput(sessionId: string, input: string): Promise<boolean>;
+  sendInput(sessionId: string, input: string, options?: { beforeDispatch?: () => boolean }): Promise<boolean>;
 
   /**
    * Submit one checkpoint command with duplicate-safe text/Enter acknowledgements.

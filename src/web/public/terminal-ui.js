@@ -1284,6 +1284,9 @@ Object.assign(CodemanApp.prototype, {
     if (MobileDetection.isTouchDevice()) {
       this.terminal.onCursorMove(() => this._syncMobileHelperTextareaToCursor());
       this.terminal.onRender(() => this._syncMobileHelperTextareaToCursor());
+      // Keep the live content above the keyboard while the rows are held.
+      this.terminal.onCursorMove(() => this._applyKeyboardClip());
+      this.terminal.onRender(() => this._applyKeyboardClip());
     }
 
     // Renderer liveness — see _startRenderLivenessWatchdog. Registered for every
@@ -2506,7 +2509,8 @@ Object.assign(CodemanApp.prototype, {
    */
   _resolveLinkedFilePath(filePath, sessionId) {
     if (typeof resolveLinkedFilePath !== 'function') return filePath;
-    return resolveLinkedFilePath(filePath, this.sessions?.get?.(sessionId)?.workingDir);
+    const session = this.sessions?.get?.(sessionId);
+    return resolveLinkedFilePath(filePath, window.CodemanFilePaths.relativeResolutionBase(session?.workingDir, session));
   },
 
   /**
@@ -3032,8 +3036,11 @@ Object.assign(CodemanApp.prototype, {
         // measures the SAME lines and the two must not disagree.
         // Bounded so a screenful of full-width output (wide tables, box drawing)
         // cannot make every hover stitch and re-scan the entire viewport.
+        // `terminalLinkLine` widens that once more to the rows of a URL the CLI
+        // wrapped short of the edge (a table cell or an indented paragraph),
+        // where nothing marks the break and no row is full width.
         const MAX_STITCHED_ROWS = 12;
-        const logical = window.CodemanTerminalLines?.terminalLogicalLine(
+        const logical = window.CodemanTerminalLines?.terminalLinkLine(
           buffer,
           bufferLineNumber - 1,
           terminal.cols,
@@ -3063,6 +3070,8 @@ Object.assign(CodemanApp.prototype, {
         const extentStart = urlExtent ? Math.min(urlExtent.startRow, logical.startRow) : logical.startRow;
         const extentEnd = urlExtent ? Math.max(urlExtent.endRow, logical.endRow) : logical.endRow;
         const rowTexts = [];
+        const rowNumbers = [];
+        let columnsAfterUrl = null;
         const rowOffsets = [];
         const rowColStarts = [];
         const markerOffsets = [];
@@ -3080,6 +3089,7 @@ Object.assign(CodemanApp.prototype, {
           // URL cell. They occupy real cells, but cannot sit between the URL's
           // first fragment and its indented continuation in the scan text.
           if (r === extentStart && urlExtent?.firstRowUrlEnd != null) {
+            columnsAfterUrl = rowText.slice(urlExtent.firstRowUrlEnd);
             rowText = rowText.slice(0, urlExtent.firstRowUrlEnd);
           }
           // A HARD wrap (the program wrapped the line itself, so nothing is flagged
@@ -3093,10 +3103,22 @@ Object.assign(CodemanApp.prototype, {
             rowText = rowText.slice(colStart);
           }
           if (r === extentStart || !row.isWrapped) markerOffsets.push(stitchedOffset);
+          rowNumbers.push(r);
           rowOffsets.push(stitchedOffset);
           rowTexts.push(rowText);
           rowColStarts.push(colStart);
           stitchedOffset += rowText.length;
+        }
+        if (columnsAfterUrl?.trim()) {
+          rowTexts.push(' ');
+          rowOffsets.push(stitchedOffset);
+          rowColStarts.push(rowColStarts[rowColStarts.length - 1] + rowTexts[rowTexts.length - 2].length);
+          rowNumbers.push(extentEnd);
+          stitchedOffset++;
+          rowTexts.push(columnsAfterUrl);
+          rowOffsets.push(stitchedOffset);
+          rowColStarts.push(urlExtent.firstRowUrlEnd);
+          rowNumbers.push(extentStart);
         }
         const lineText = rowTexts.join('');
 
@@ -3107,7 +3129,7 @@ Object.assign(CodemanApp.prototype, {
          * path's underline or touch hit target. */
         const offsetPositions = new Map();
         for (let i = 0; i < rowTexts.length; i++) {
-          const row = buffer.getLine(extentStart + i);
+          const row = buffer.getLine(rowNumbers[i]);
           const text = rowTexts[i];
           if (/^[\x20-\x7e]*$/.test(text)) continue;
           const rowPositions = [];
@@ -3116,34 +3138,48 @@ Object.assign(CodemanApp.prototype, {
               const cell = row.getCell(column);
               if (!cell || cell.getWidth() === 0) continue;
               const chars = cell.getChars() || ' ';
-              for (let k = 0; k < chars.length; k++) rowPositions.push({ x: column + 1, y: extentStart + i + 1 });
+              for (let k = 0; k < chars.length; k++) rowPositions.push({ x: column + 1, y: rowNumbers[i] + 1 });
             }
           }
           // Drop the stripped indent's cells so offset 0 of this row's text still
           // points at the first character that survived the strip.
           if (rowColStarts[i]) rowPositions.splice(0, rowColStarts[i]);
           for (let k = 0; k < text.length; k++) {
-            offsetPositions.set(rowOffsets[i] + k, rowPositions[k] || { x: k + rowColStarts[i] + 1, y: extentStart + i + 1 });
+            offsetPositions.set(rowOffsets[i] + k, rowPositions[k] || { x: k + rowColStarts[i] + 1, y: rowNumbers[i] + 1 });
           }
         }
         const coordAt = (index) => {
           const mapped = offsetPositions.get(index);
           if (mapped) return mapped;
           for (let i = rowOffsets.length - 1; i >= 0; i--) {
-            if (index >= rowOffsets[i]) return { x: index - rowOffsets[i] + rowColStarts[i] + 1, y: extentStart + i + 1 };
+            if (index >= rowOffsets[i]) return { x: index - rowOffsets[i] + rowColStarts[i] + 1, y: rowNumbers[i] + 1 };
           }
           return { x: index + 1, y: extentStart + 1 };
         };
 
-        // Paths codex word-wrapped inside a table cell (see terminalCellWrappedPaths
-        // in constants.js). They follow their own cell down the rows, which the
+        const linkRowSegments = (from, to) => {
+          const pieces = [];
+          let start = from;
+          for (let i = from + 1; i < to; i++) {
+            if (coordAt(i).y !== coordAt(i - 1).y && !buffer.getLine(coordAt(i).y - 1)?.isWrapped) {
+              pieces.push([start, i]);
+              start = i;
+            }
+          }
+          pieces.push([start, to]);
+          return pieces;
+        };
+
+        // Paths a CLI word-wrapped inside a table cell (terminalCellWrappedPaths,
+        // constants.js). They follow their own cell down the rows, which the
         // linear stitch above cannot do for a multi-column table, so they are
         // found from the buffer directly and claim their cells over the rest.
         const cellWrappedPaths = (
           window.CodemanTerminalLines?.terminalCellWrappedPaths?.(buffer, bufferLineNumber - 1, 4) ?? []
         ).filter((hit) => !/(^|\/)\.\.(\/|$)/.test(hit.path));
 
-        if ((!lineText || !lineText.includes('/')) && cellWrappedPaths.length === 0) {
+        // A path needs a `/` or an extension's `.`; a line with neither has no link.
+        if (!lineText || (!lineText.includes('/') && !lineText.includes('.') && cellWrappedPaths.length === 0)) {
           callback(undefined);
           return;
         }
@@ -3323,7 +3359,6 @@ Object.assign(CodemanApp.prototype, {
         // The literal lives in constants.js because the response viewer linkifies
         // the SAME paths out of markdown — one definition, two consumers. A fresh
         // instance per call: `lastIndex` is per-object state.
-        const extPattern = absoluteFilePathPattern();
 
         // Pattern 4: Bash() tool output
         const bashPattern = /Bash\([^)]*?(\/(?:home|tmp|var|etc|opt)[^\s"'<>|;&\)\n\x00-\x1f]+)/g;
@@ -3343,7 +3378,7 @@ Object.assign(CodemanApp.prototype, {
           // the workspace has to be registered as an attachment first — the
           // workspace-confined routes can only 404 on it — which is what
           // openExternalPathPreview does before previewing by id.
-          if (text.startsWith('~/') || previewsInFileViewer(text)) {
+          if (text.startsWith('~/') || previewsInFileViewer(text) || rendersAsPage(text) || self._isExternalPreviewPath?.(text, originatingSessionId)) {
             if (self._isExternalPreviewPath?.(text, originatingSessionId)) {
               const pending = self.openExternalPathPreview(text, originatingSessionId);
               if (pending && typeof pending.catch === 'function') {
@@ -3369,24 +3404,24 @@ Object.assign(CodemanApp.prototype, {
           const endCol = startCol + displayPath.length;
           if (overlapsLink(startCol, endCol)) return;
 
-          const start = coordAt(startCol);
-          const end = coordAt(endCol - 1);
           reserveLink(startCol, endCol);
 
-          links.push({
-            text: displayPath,
-            range: { start, end },
-            decorations: { pointerCursor: true, underline: true },
-            activate() {
-              activateFilePath(filePath);
-            },
-            hover() {
-              setHovered(true);
-            },
-            leave() {
-              setHovered(false);
-            },
-          });
+          for (const [from, to] of linkRowSegments(startCol, endCol)) {
+            links.push({
+              text: displayPath,
+              range: { start: coordAt(from), end: coordAt(to - 1) },
+              decorations: { pointerCursor: true, underline: true },
+              activate() {
+                activateFilePath(filePath);
+              },
+              hover() {
+                setHovered(true);
+              },
+              leave() {
+                setHovered(false);
+              },
+            });
+          }
         };
 
         // Match all patterns — URLs first so they take priority
@@ -3397,39 +3432,42 @@ Object.assign(CodemanApp.prototype, {
         const previewScan = originatingSessionId
           ? findPreviewReferences(lineText, workingDir, originatingSession, markerOffsets)
           : { references: [], suppressedRanges: [], blockedPreviewRanges: [], isBlockedPreview: () => false };
+
         for (const range of previewScan.suppressedRanges) reserveLink(range.startIndex, range.endIndex);
 
         const addPreviewLink = (reference) => {
-          const start = coordAt(reference.startIndex);
-          const end = coordAt(reference.endIndex - 1);
           if (overlapsLink(reference.startIndex, reference.endIndex)) return;
           reserveLink(reference.startIndex, reference.endIndex);
 
-          links.push({
-            text: reference.text,
-            range: { start, end },
-            decorations: { pointerCursor: true, underline: true },
-            activate() {
-              if (reference.absolutePath) {
-                try {
-                  const pending = self.openExternalPathPreview(reference.absolutePath, originatingSessionId);
-                  if (pending && typeof pending.catch === 'function') {
-                    pending.catch((err) => console.error('Failed to open external path preview:', err));
+          for (const [from, to] of linkRowSegments(reference.startIndex, reference.endIndex)) {
+            links.push({
+              text: reference.text,
+              range: { start: coordAt(from), end: coordAt(to - 1) },
+              decorations: { pointerCursor: true, underline: true },
+              activate() {
+                if (reference.absolutePath) {
+                  try {
+                    const pending = self.openExternalPathPreview(reference.absolutePath, originatingSessionId);
+                    if (pending && typeof pending.catch === 'function') {
+                      pending.catch((err) => console.error('Failed to open external path preview:', err));
+                    }
+                  } catch (err) {
+                    console.error('Failed to open external path preview:', err);
                   }
-                } catch (err) {
-                  console.error('Failed to open external path preview:', err);
+                  return;
                 }
-                return;
-              }
-              self.openFilePreview(reference.relativePath, originatingSessionId);
-            },
-            hover() {
-              setHovered(true);
-            },
-            leave() {
-              setHovered(false);
-            },
-          });
+                const hardWrappedAbsolute = reference.text.startsWith('/') &&
+                  coordAt(reference.startIndex).y !== coordAt(reference.endIndex - 1).y;
+                self.openFilePreview(hardWrappedAbsolute ? reference.text : reference.relativePath, originatingSessionId);
+              },
+              hover() {
+                setHovered(true);
+              },
+              leave() {
+                setHovered(false);
+              },
+            });
+          }
         };
 
         // Marker-qualified external paths need the attachment resolver rather
@@ -3455,17 +3493,75 @@ Object.assign(CodemanApp.prototype, {
           if (!reference.absolutePath) addPreviewLink(reference);
         }
 
-        extPattern.lastIndex = 0;
-        while ((match = extPattern.exec(lineText)) !== null) {
-          addLogLink(match[1], match.index);
+        for (const reference of findFilePathLinks(lineText)) {
+          const startIndex = reference.index;
+          const endIndex = startIndex + reference.path.length;
+          const prefix = lineText.slice(0, startIndex);
+          const suffix = lineText.slice(endIndex);
+          const labeledParent = reference.path.startsWith('../') && reference.path.includes(' ') &&
+            /^\s*(?:path|file|saved to):\s*$/i.test(prefix);
+          if (reference.path.includes('//') || (/(^|\/)\.\.(\/|$)/.test(reference.path) && !labeledParent)) continue;
+          if (reference.folder) {
+            // A directory in a table cell is complete. A prefix before prose or another path is not.
+            if (suffix && !/^(?: {2,}| *[│┃║|])/.test(suffix)) continue;
+            if (previewScan.blockedPreviewRanges.some((range) => startIndex < range.endIndex && endIndex > range.startIndex)) continue;
+          } else if (!labeledParent) {
+            if (previewScan.suppressedRanges.some((range) => startIndex < range.endIndex && endIndex > range.startIndex)) continue;
+            if (previewScan.isBlockedPreview(reference.path, startIndex, endIndex)) continue;
+            if (reference.path.includes(' ') && previewScan.blockedPreviewRanges.some((range) => startIndex < range.endIndex && endIndex > range.startIndex)) continue;
+          }
+          if (!reference.folder && !reference.path.includes('/')) {
+            const inTable = / {2,}|[│┃║|]/.test(prefix);
+            const startsListing = !prefix.trim() && /^\s+\S/.test(suffix);
+            if (!inTable && !startsListing) continue;
+          }
+          if (labeledParent) {
+            // The shared parser bounded this labeled path. Normalize before passing it to guarded preview routes.
+            const resolved = self._resolveLinkedFilePath(reference.path, originatingSessionId);
+            const start = coordAt(startIndex);
+            const end = coordAt(endIndex - 1);
+            links.push({ text: reference.path, range: { start, end },
+              decorations: { pointerCursor: true, underline: true },
+              activate() {
+                if (self._isExternalPreviewPath?.(resolved, originatingSessionId)) {
+                  self.openExternalPathPreview(resolved, originatingSessionId);
+                } else self.openFilePreview(resolved, originatingSessionId);
+              },
+              hover() { setHovered(true); }, leave() { setHovered(false); } });
+            continue;
+          }
+          if (reference.folder) {
+            const start = coordAt(reference.index);
+            const end = coordAt(reference.index + reference.path.length - 1);
+            const firstCell = (start.y - 1) * cols + start.x;
+            const lastCell = (end.y - 1) * cols + end.x;
+            if (links.some((link) => firstCell <= (link.range.end.y - 1) * cols + link.range.end.x &&
+              lastCell >= (link.range.start.y - 1) * cols + link.range.start.x)) continue;
+            reserveLink(reference.index, reference.index + reference.path.length);
+            links.push({ text: reference.path, range: { start, end },
+              decorations: { pointerCursor: true, underline: true },
+              activate() { self.openFolderGrid(self._resolveLinkedFilePath(reference.path, originatingSessionId), originatingSessionId); },
+              hover() { setHovered(true); }, leave() { setHovered(false); } });
+          } else addLogLink(self._resolveLinkedFilePath(reference.path, originatingSessionId), reference.index, reference.path);
         }
 
-        // One link per row segment, each opening the WHOLE path (the COD-448 URL
-        // rule). A fragment of the same cells linked by another detector (a
+
+        // One link per row segment, each opening the WHOLE path (as for a wrapped
+        // URL). A fragment of the same cells linked by another detector (a
         // relative `243/after-overview.png`, say) would open the wrong file, so
         // the cell-wrapped path displaces it.
-        if (cellWrappedPaths.length > 0) {
-          const claimed = cellWrappedPaths.flatMap((hit) => hit.segments);
+        // A path the line stitch already linked keeps its existing row ranges.
+        const cellOnlyPaths = cellWrappedPaths.filter(
+          (hit) =>
+            !links.some(
+              (l) =>
+                l.text === hit.path &&
+                l.range.start.y === hit.segments[0].row + 1 &&
+                l.range.start.x === hit.segments[0].startCol + 1
+            )
+        );
+        if (cellOnlyPaths.length > 0) {
+          const claimed = cellOnlyPaths.flatMap((hit) => hit.segments);
           const overlapsClaim = (link) =>
             claimed.some((seg) => {
               const y = seg.row + 1;
@@ -3477,7 +3573,7 @@ Object.assign(CodemanApp.prototype, {
           for (let i = links.length - 1; i >= 0; i--) {
             if (overlapsClaim(links[i])) links.splice(i, 1);
           }
-          for (const hit of cellWrappedPaths) {
+          for (const hit of cellOnlyPaths) {
             for (const seg of hit.segments) {
               links.push({
                 text: hit.path,
@@ -3557,7 +3653,7 @@ Object.assign(CodemanApp.prototype, {
     return {
       activate: (_event, text) => {
         if (/^https?:\/\/[^\s\x00-\x1f]+$/i.test(text)) {
-          this._openTerminalUrl(text);
+          if (window.confirm(`Open this link?\n\n${text}`)) this._openTerminalUrl(text);
           return;
         }
         const sessionId = getSessionId();
@@ -8413,10 +8509,122 @@ Object.assign(CodemanApp.prototype, {
     // timer and the resize observer, where an exception takes the rest of the
     // callback (the padding fit, the scroll restore, the SIGWINCH) with it.
     try {
-      return window.CodemanTerminalGeometry.clampTerminalDimensions(this.fitAddon?.proposeDimensions());
+      const dims = window.CodemanTerminalGeometry.clampTerminalDimensions(this.fitAddon?.proposeDimensions());
+      // Rows held under the on-screen keyboard (see keyboardClipPx): the
+      // container shrank, the PTY must not. Columns still follow the container.
+      const held = this._keyboardHeldRowsActive?.();
+      if (dims && held) dims.rows = Math.max(dims.rows, held);
+      return dims;
     } catch {
       return null;
     }
+  },
+
+  /**
+   * Rows held while the on-screen keyboard is up, or 0. Set by KeyboardHandler
+   * on the show transition when `keyboardHoldsRows` is on (default), cleared on
+   * hide and on a shape change. Every geometry read goes through
+   * getTerminalDimensions(), so holding it there holds the fit, the PTY resize
+   * and every capture-geometry comparison alike.
+   * @returns {number}
+   */
+  _keyboardHeldRowsActive() {
+    if (!(this._keyboardHeldRows > 0)) return 0;
+    return typeof KeyboardHandler !== 'undefined' && KeyboardHandler.keyboardVisible ? this._keyboardHeldRows : 0;
+  },
+
+  /**
+   * May the keyboard hold this session's rows? Only an INLINE renderer (the
+   * `keyboardHold` capability, read from `window.__codemanKeyboardHoldModes`,
+   * never an id literal here): a CLI that lays out the full height (codex) cannot
+   * show both its content and its composer above the keyboard and must be
+   * resized, as before. Never while the CLI reports mouse tracking (Claude's
+   * fullscreen mode), and never for a remote or docker session, whose pane hosts
+   * a nested client. Absent data means no hold. Per-device setting
+   * `keyboardHoldsRows`, default ON.
+   */
+  _keyboardHoldEligible(sessionId = this.activeSessionId) {
+    if (this.loadAppSettingsFromStorage?.()?.keyboardHoldsRows === false) return false;
+    const session = sessionId ? this.sessions?.get(sessionId) : null;
+    if (!session || session.remote || session.docker || session.cliMouseTracking) return false;
+    const modes = window.__codemanKeyboardHoldModes;
+    return Array.isArray(modes) && modes.includes(session.mode || 'claude');
+  },
+
+  /**
+   * Drop a hold the active session no longer qualifies for (switched to a CLI
+   * that resizes, entered fullscreen, setting turned off) and, unless the caller
+   * resizes itself (selectSession), fit and tell the PTY at once, which is the
+   * old keyboard behavior. Never re-holds: a session that becomes eligible with
+   * the keyboard already up keeps the short rows until the keyboard closes.
+   */
+  _reconcileKeyboardHold({ resize = true } = {}) {
+    if (!this._keyboardHeldRows || this._keyboardHoldEligible()) return;
+    this._releaseKeyboardHold();
+    if (resize && this.activeSessionId) this.sendResize(this.activeSessionId)?.catch?.(() => {});
+  },
+
+  /**
+   * End a keyboard row hold and put the screen back in place (no offset, no
+   * overlay bound). Shared by KeyboardHandler (keyboard hide, shape change)
+   * and _reconcileKeyboardHold.
+   * @returns {boolean} whether a hold was released
+   */
+  _releaseKeyboardHold() {
+    if (!this._keyboardHeldRows) return false;
+    this._keyboardHeldRows = 0;
+    this._applyKeyboardClip();
+    return true;
+  },
+
+  /**
+   * Scroll the (held, taller than its box) terminal screen so the live content
+   * sits above the keyboard, and bound the local-echo overlay to the rows that
+   * are visible. Runs on every render and cursor move while the hold is active;
+   * resets once when it ends.
+   */
+  _applyKeyboardClip() {
+    const container = this.terminal?.element?.parentElement;
+    if (!container) return;
+    const rows = this._keyboardHeldRowsActive() ? this.terminal.rows : 0;
+    const cellHeight = rows ? this.terminal._core?._renderService?.dimensions?.css?.cell?.height : 0;
+    const viewHeight = rows ? container.clientHeight : 0;
+    let clip = 0;
+    if (cellHeight && viewHeight) {
+      const buffer = this.terminal.buffer.active;
+      const following = buffer.viewportY >= buffer.baseY;
+      let lastContentRow = -1;
+      if (following) {
+        for (let row = rows - 1; row >= 0; row--) {
+          if (buffer.getLine(buffer.baseY + row)?.translateToString(true).trim()) {
+            lastContentRow = row;
+            break;
+          }
+        }
+      }
+      clip = window.CodemanTerminalGeometry.keyboardClipPx({
+        rows,
+        cellHeight,
+        viewHeight,
+        cursorRow: buffer.cursorY,
+        lastContentRow,
+        following,
+        viewportY: buffer.viewportY,
+        baseY: buffer.baseY,
+      });
+    }
+    if (clip !== (this._keyboardClipPx || 0)) {
+      this._keyboardClipPx = clip;
+      if (clip) container.style.setProperty('--kb-clip', `${clip}px`);
+      else container.style.removeProperty('--kb-clip');
+    }
+    // Bounded whenever rows are held, even at offset 0 (a prompt near the top
+    // still has held rows below it, under the keyboard). setRowLimit dedupes.
+    this._localEchoOverlay?.setRowLimit?.(
+      cellHeight && viewHeight
+        ? window.CodemanTerminalGeometry.keyboardVisibleRowLimit(clip, viewHeight, cellHeight)
+        : null
+    );
   },
 
   /**
@@ -8446,7 +8654,10 @@ Object.assign(CodemanApp.prototype, {
   syncTerminalGeometry() {
     if (!this.fitAddon || !this.terminal) return null;
     try {
-      this.fitAddon.fit();
+      // fit() would shrink xterm to the keyboard-shortened box before the held
+      // rows put it back: skip it while they are held (_resizeTerminalTo below
+      // still applies the container's columns).
+      if (!this._keyboardHeldRowsActive?.()) this.fitAddon.fit();
     } catch {
       /* a disposed or unattached terminal cannot be fitted; fall through to the read */
     }
@@ -8471,8 +8682,9 @@ Object.assign(CodemanApp.prototype, {
    * part of the scrollback in between. The mobile retry asks every 30 seconds,
    * so that happened on a timer for as long as the refusal lasted. So the
    * columns stay at the PTY's (the #464 invariant: the browser never draws at
-   * a width the PTY does not have), the rows follow the container (they are
-   * never adopted, see reconcilePtyGeometry), and the container's columns go
+   * a width the PTY does not have), the rows follow the container or the
+   * keyboard hold (they are never adopted, see reconcilePtyGeometry and
+   * getTerminalDimensions), and the container's columns go
    * out as the request. An accepted request is adopted by the report.
    *
    * @returns {{cols: number, rows: number}|null} the geometry to request
