@@ -86,6 +86,51 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 describe('exact assistant session recovery', () => {
+  it('manual handoff supersedes an in-flight startup recovery without stranding its input lock', async () => {
+    original.pid = 101; // The PTY changed on server restart; native conversation survived.
+    manager.clearRecoveryHandoff(a.id);
+    let release!: (ready: boolean) => void;
+    let entered!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    adapter.composerEmpty = () => {
+      entered();
+      return new Promise<boolean>((resolve) => {
+        release = resolve;
+      });
+    };
+    const automatic = recovery.tick();
+    await waiting;
+    expect(manager.inputAllowed(original.id, 'anything')).toBe(false);
+    await manager.handoff(a, a.revision, true);
+    release(true);
+    await automatic;
+    expect(manager.availability(a).requestExecution).toBe(true);
+    expect(store.get(a.id)?.binding?.generation).toBe(a.binding?.generation);
+  });
+  it('explicit handoff releases a stale recovery hold and can actually deliver input', async () => {
+    manager.holdRecoverySession(original.id);
+    expect(manager.availability(a).requestExecution).toBe(false);
+    expect(manager.inputAllowed(original.id, 'wrong-permit')).toBe(false);
+    let guard: (permit?: string) => boolean = () => false;
+    original.setAssistantInputGuard = (g) => {
+      guard = g;
+    };
+    original.writeViaMux = async (text, options) => {
+      if (!guard(options.assistantPermit)) return false;
+      writes.push(text);
+      return true;
+    };
+    await manager.handoff(a, a.revision, true);
+    expect(manager.inputAllowed(original.id)).toBe(false);
+    expect(manager.inputAllowed(original.id, 'wrong-permit')).toBe(false);
+    const r = manager.submit(a, 'connection check', 'stale-recovery-hold-1234');
+    await manager.tick();
+    expect(writes).toEqual(['connection check\r']);
+    expect(ledger.get(r.id)?.status).toBe('dispatching');
+  });
+
   it('recreates a deleted idle session, preserves native identity and token grants, restores handoff', async () => {
     const issued = store.issueToken(a, 'connector', ['read', 'submit', 'cancel']);
     sessions.delete(original.id);

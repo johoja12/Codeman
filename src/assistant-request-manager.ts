@@ -164,6 +164,7 @@ export class AssistantRequestManager {
         h.generation === a.binding?.generation &&
         h.session === live &&
         h.pid === live.pid &&
+        this.inputAllowed(live.id, h.permit) &&
         !needsAttention &&
         !this.automationBusy(live.id) &&
         !this.takingControl.has(a.id)
