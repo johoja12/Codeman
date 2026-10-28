@@ -190,6 +190,12 @@ export class AssistantRecovery {
       profile = { name: a.name, codexConfig: {} };
       reason = 'Session credentials cannot be restored automatically; use desktop recovery';
     }
+    // Explicit handoff has already validated the live native identity and idle
+    // composer. It supersedes a pending recovery for this session, including a
+    // hold orphaned when an earlier recovery record was replaced by handoff.
+    const previous = this.records.find((r) => r.assistantId === a.id);
+    if (previous?.candidateId) this.requests.releaseRecoverySession(previous.candidateId);
+    this.requests.releaseRecoverySession(session.id);
     this.records = this.records.filter((r) => r.assistantId !== a.id);
     this.records.push({
       assistantId: a.id,
