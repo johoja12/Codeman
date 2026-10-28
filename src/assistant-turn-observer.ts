@@ -4,6 +4,7 @@ export type TurnObservation =
   | { state: 'waiting' }
   | { state: 'running'; turnId: string; pendingInput?: CodexPendingInput }
   | { state: 'completed'; turnId: string; text: string }
+  | { state: 'failed'; turnId: string; reason: string }
   | { state: 'unknown'; reason: string };
 
 export function observeAssistantTurn(
@@ -106,6 +107,34 @@ export function observeAssistantTurn(
     }
     return { state: 'running', turnId, ...(pendingInput ? { pendingInput } : {}) };
   }
+  const completion = completions[0];
+  if (
+    completion.turn_id === turnId &&
+    events.indexOf(completion) > events.indexOf(users[0]) &&
+    completion.last_agent_message === null &&
+    (completion.error as { codex_error_info?: string } | undefined)?.codex_error_info === 'server_overloaded' &&
+    !finals.length
+  ) {
+    // A provider failure before any tools is safe to finish as failed, without
+    // replay. Once tools were called their partial effects require review, even
+    // when the CLI is idle: subprocesses can finish after task_complete.
+    const noTools =
+      events.every((p) =>
+        ['task_started', 'task_complete', 'item_completed', 'token_count', 'thread_settings_applied'].includes(
+          String(p.type)
+        )
+      ) &&
+      !rows.some((r) => r.type === 'response_item' && !['message', 'reasoning'].includes(String(r.payload?.type))) &&
+      items.every((p) => ['UserMessage', 'AgentMessage', 'Reasoning'].includes(item(p)?.type ?? ''));
+    return noTools
+      ? { state: 'failed', turnId, reason: 'Native Codex model is at capacity. No tools ran; no automatic replay.' }
+      : {
+          state: 'unknown',
+          reason: 'Native Codex model is at capacity after tool use; review partial work before resuming.',
+        };
+  }
+  if (completion.error)
+    return { state: 'unknown', reason: 'Native Codex turn failed; review partial work before resuming.' };
   const final = finals[0];
   const text =
     final && item(final)?.content?.every((c) => c.type === 'Text' && typeof c.text === 'string')

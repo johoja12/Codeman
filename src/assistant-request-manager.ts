@@ -531,8 +531,18 @@ export class AssistantRequestManager {
           reason: undefined,
           pendingInput: undefined,
         });
-      else if (result.state === 'unknown') this.change(latest, { status: 'outcome_unknown', reason: result.reason });
-      else if (Date.now() >= r.deadline && !latest.pendingInput)
+      else if (result.state === 'failed')
+        this.change(latest, {
+          status: 'failed',
+          turnId: result.turnId,
+          reason: result.reason,
+          reconciled: true,
+          pendingInput: undefined,
+        });
+      else if (result.state === 'unknown') {
+        if (latest.status !== 'outcome_unknown' || latest.reason !== result.reason)
+          this.change(latest, { status: 'outcome_unknown', reason: result.reason });
+      } else if (Date.now() >= r.deadline && !latest.pendingInput)
         this.change(latest, {
           status: 'outcome_unknown',
           reason: 'Observation deadline exceeded; task may still be running',
