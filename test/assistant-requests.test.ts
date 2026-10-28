@@ -128,6 +128,91 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true });
 });
 describe('durable assistant requests', () => {
+  function capacityTurn(prompt: string, withTools = false, id = 'capacity-turn') {
+    return (
+      row({ type: 'task_started', turn_id: id }) +
+      row({
+        type: 'item_completed',
+        thread_id: conversationId,
+        turn_id: id,
+        item: { type: 'UserMessage', content: [{ type: 'text', text: prompt }] },
+      }) +
+      (withTools
+        ? JSON.stringify({
+            type: 'response_item',
+            payload: {
+              type: 'custom_tool_call',
+              call_id: 'tool-1',
+              name: 'functions',
+              input: 'run command',
+            },
+          }) + '\n'
+        : '') +
+      row({
+        type: 'task_complete',
+        turn_id: id,
+        last_agent_message: null,
+        error: { codex_error_info: 'server_overloaded', message: 'at capacity' },
+      })
+    );
+  }
+  it('finishes capacity errors before tool use as failed and allows later requests without replay', async () => {
+    const a = await ready();
+    const r = manager.submit(a, 'hello', 'capacity-key-123456789');
+    await manager.tick();
+    appendFileSync(file, capacityTurn('hello'));
+    await manager.tick();
+    expect(ledger.get(r.id)).toMatchObject({ status: 'failed', reconciled: true });
+    expect(ledger.get(r.id)?.result).toBeUndefined();
+    expect(manager.availability(a)).toMatchObject({ requestExecution: true, handedOff: true, needsAttention: false });
+    expect(manager.submit(a, 'hello', 'capacity-key-123456789').id).toBe(r.id);
+    await manager.tick();
+    expect(writes).toEqual(['hello\r']);
+    manager.submit(a, 'new request', 'capacity-next-123456789');
+    await manager.tick();
+    expect(writes).toEqual(['hello\r', 'new request\r']);
+  });
+  it('keeps partial capacity failures blocked, with a specific reason and no repeated unchanged ledger writes', async () => {
+    const a = await ready();
+    const r = manager.submit(a, 'hello', 'partial-capacity-123456789');
+    await manager.tick();
+    appendFileSync(file, capacityTurn('hello', true));
+    await manager.tick();
+    const failed = ledger.get(r.id)!;
+    expect(failed.status).toBe('outcome_unknown');
+    expect(failed.reason).toContain('review partial work');
+    expect(manager.availability(a).requestExecution).toBe(false);
+    await manager.tick();
+    expect(ledger.get(r.id)?.revision).toBe(failed.revision);
+    expect(writes).toEqual(['hello\r']);
+  });
+  it('rejects foreign capacity completions and unknown tool evidence', () => {
+    const native = capacityTurn('hello');
+    expect(
+      observeAssistantTurn(
+        native.replace('"task_complete","turn_id":"capacity-turn"', '"task_complete","turn_id":"foreign"'),
+        conversationId,
+        'hello'
+      ).state
+    ).toBe('unknown');
+    expect(observeAssistantTurn(native, conversationId, 'other').state).toBe('unknown');
+    const tool = JSON.stringify({ type: 'response_item', payload: { type: 'future_tool_call' } }) + '\n';
+    expect(observeAssistantTurn(native + tool, conversationId, 'hello').state).toBe('unknown');
+    expect(observeAssistantTurn(native + row({ type: 'unknown_tool_event' }), conversationId, 'hello').state).toBe(
+      'unknown'
+    );
+    expect(
+      observeAssistantTurn(
+        turn('hello').replace(
+          '"last_agent_message":"result"',
+          '"last_agent_message":"result","error":{"codex_error_info":"server_overloaded"}'
+        ),
+        conversationId,
+        'hello'
+      ).state
+    ).toBe('unknown');
+  });
+
   it('deduplicates across restart, conflicts on changed payload, and never replays completed work', async () => {
     const a = await ready();
     const r = manager.submit(a, 'hello', 'same-key-123456789');
