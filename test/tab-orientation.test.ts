@@ -130,9 +130,16 @@ describe('vertical tab rail wiring (COD-286)', () => {
   });
 
   it('skips the horizontal auto-wrap machinery while vertical', () => {
-    const start = appJs.indexOf('updateTabOverflowMode() {');
-    expect(start).toBeGreaterThan(-1);
-    const overflow = appJs.slice(start, start + 4000);
+    // Upstream split the layout entrypoint from the wrap decision. Read the whole
+    // decision helper rather than depending on a fixed source-window length.
+    const entry = appJs.indexOf('updateTabOverflowMode() {');
+    const start = appJs.indexOf('_decideTabOverflow(container) {', entry);
+    const end = appJs.indexOf('\n  _applyHeaderRightWrap(', start);
+    expect(entry).toBeGreaterThan(-1);
+    expect(start).toBeGreaterThan(entry);
+    expect(end).toBeGreaterThan(start);
+    expect(appJs.slice(entry, start)).toContain('this._decideTabOverflow(container)');
+    const overflow = appJs.slice(start, end);
     expect(overflow).toContain('resolveTabOrientation');
     // The vertical branch must bail out before the measure-and-wrap logic.
     expect(overflow).toContain('shouldAutoWrapTabs');

@@ -3564,27 +3564,11 @@ class CodemanApp {
     if (responseSessionId) body.dataset.rvSessionId = responseSessionId;
     if (body.dataset.rvBound === '1') return;
     body.dataset.rvBound = '1';
-    body.addEventListener('click', async (ev) => {
-      const messageCopyBtn = ev.target.closest('.rv-message-copy');
-      if (messageCopyBtn) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        const message = messageCopyBtn.closest('.rv-message');
-        const source = message?.querySelector('.rv-text');
-        await this._copyResponseViewerPayload(this._prepareResponseViewerClipboard(source), {
-          controlEl: messageCopyBtn,
-          successMessage: 'Copied section as rich text',
-          fallbackMessage: 'Rich clipboard unavailable; copied section as plain text',
-          emptyMessage: 'No section content to copy',
-          failureMessage: 'Failed to copy section',
-        });
-        return;
-      }
-
-      // File path (_linkifyFilePaths): open it in the preview overlay. An
-      // out-of-workspace path has to be registered as an attachment first —
-      // the workspace-confined routes can only 404 on it — which is exactly
-      // what openExternalPathPreview does before previewing by id.
+    // The two link kinds whose href is a placeholder the browser cannot open
+    // (`#`, `#fragment`). Returns true when it took the event.
+    const openPlaceholderLink = (ev) => {
+      // File path (_linkifyFilePaths): open it in the preview overlay, which
+      // resolves workspace and out-of-workspace paths alike.
       const pathLink = ev.target.closest('a.rv-path');
       if (pathLink) {
         ev.preventDefault();
@@ -3605,7 +3589,7 @@ class CodemanApp {
         if (filePath && pathLink.dataset.folder) this.openFolderGrid(target || filePath, sessionId);
         else if (filePath && this._isExternalPreviewPath?.(target || filePath, sessionId)) this.openExternalPathPreview(target || filePath, sessionId)?.catch?.((err) => console.error('External path preview failed:', err));
         else if (filePath) this.openFilePreview(target || filePath, sessionId);
-        return;
+        return true;
       }
 
       // An in-document link (`[Install](#installation)`). The browser must not follow it: with
@@ -3622,8 +3606,34 @@ class CodemanApp {
           const calm = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches;
           target.scrollIntoView({ block: 'start', behavior: calm ? 'auto' : 'smooth' });
         }
+        return true;
+      }
+      return false;
+    };
+    // A middle click fires auxclick, never click, so the browser followed the
+    // placeholder and opened the dashboard root in a new tab: do what a click
+    // does instead. A real URL keeps the browser's own middle click.
+    body.addEventListener('auxclick', (ev) => {
+      if (ev.button === 1) openPlaceholderLink(ev);
+    });
+    body.addEventListener('click', async (ev) => {
+      const messageCopyBtn = ev.target.closest('.rv-message-copy');
+      if (messageCopyBtn) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const message = messageCopyBtn.closest('.rv-message');
+        const source = message?.querySelector('.rv-text');
+        await this._copyResponseViewerPayload(this._prepareResponseViewerClipboard(source), {
+          controlEl: messageCopyBtn,
+          successMessage: 'Copied section as rich text',
+          fallbackMessage: 'Rich clipboard unavailable; copied section as plain text',
+          emptyMessage: 'No section content to copy',
+          failureMessage: 'Failed to copy section',
+        });
         return;
       }
+
+      if (openPlaceholderLink(ev)) return;
 
       // A `localhost` URL in the agent's answer: from another device that can
       // only load through the server, so hand it to a proxied web tab
@@ -8623,7 +8633,7 @@ class CodemanApp {
     // tabs-auto-wrap is measured, not derived from settings — updateTabOverflowMode()
     // drops it in sidebar mode, but drop it here too so nothing paints wrapped
     // for a frame before the next measure.
-    if (sidebar) tabsEl.classList.remove('tabs-auto-wrap');
+    if (sidebar) tabsEl.classList.remove('tabs-auto-wrap', 'tabs-corner');
     // Collapse/expand changes whether the filter is reachable, so re-evaluate it
     // here too — not only at the render tails.
     this.applySidebarFilter(this._sidebarFilter);
@@ -9626,7 +9636,14 @@ class CodemanApp {
   updateTabOverflowMode() {
     const container = this.$('sessionTabs');
     if (!container) return;
+    // The corner takes the toolbar out of the header's flow, which widens the
+    // strip, so it goes before the wrap is measured and comes back once decided.
+    container.classList.remove('tabs-corner');
+    this._decideTabOverflow(container);
+    this._syncTabStripCorner(container);
+  }
 
+  _decideTabOverflow(container) {
     // Lineage routing room (session-lineage.js) changes the strip's padding and
     // row gap, so it is decided before the wrap is measured below.
     this._syncLineageGutter?.();
@@ -9660,7 +9677,7 @@ class CodemanApp {
 
     if (manualTwoRows || deviceType !== 'desktop') {
       container.classList.remove('tabs-auto-wrap');
-      this._applyHeaderRightWrap(deviceType, false, false);
+      this._applyHeaderRightWrap(deviceType, manualTwoRows, false);
       // Wrap decided: the state labels' column follows it (_sizeTabTriageGutter).
       this._sizeTabTriageGutter(container, this._lastTabTriage);
       return;
@@ -9674,13 +9691,6 @@ class CodemanApp {
     if (container.classList.contains('tabs-triage') || container.classList.contains('tabs-ledger')) {
       container.classList.add('tabs-auto-wrap');
       this._sizeTabTriageGutter(container, this._lastTabTriage);
-      return;
-    }
-
-    if (manualTwoRows || deviceType !== 'desktop') {
-      container.classList.remove('tabs-auto-wrap');
-      // Manual two-rows on desktop wraps the header too; non-desktop never wraps.
-      this._applyHeaderRightWrap(deviceType, manualTwoRows, false);
       return;
     }
 
@@ -9741,6 +9751,87 @@ class CodemanApp {
     appShell.classList.toggle('mobile-header-utilities-expanded', expanded);
     toggle.setAttribute('aria-expanded', String(expanded));
     window.dispatchEvent(new Event('resize'));
+  }
+
+  /**
+   * L-shaped header strip: once the classic strip wraps, the toolbar
+   * (#headerRight) sits over the strip's top-right corner (styles.css,
+   * `.tabs-corner`) and the rows under the first one run the header's full
+   * width beneath it. The strip keeps the toolbar's corner clear with a float
+   * sized here, from the toolbar's own box, so a toolbar that wraps onto more
+   * lines (header-divider.js) or gains a reading keeps every tab out from
+   * under it. The grouped arrangements (state, case, ledger) lay their rows
+   * out themselves and keep the plain strip.
+   */
+  _syncTabStripCorner(container) {
+    const right = this.$('headerRight');
+    const on =
+      !!right &&
+      container.offsetParent !== null &&
+      !!container.parentElement?.classList.contains('session-tabs-host') &&
+      (container.classList.contains('tabs-auto-wrap') || container.classList.contains('tabs-two-rows')) &&
+      !container.classList.contains('tabs-triage') &&
+      !container.classList.contains('tabs-clusters') &&
+      !container.classList.contains('tabs-ledger') &&
+      MobileDetection.getDeviceType() === 'desktop';
+    const off = () => {
+      container.classList.remove('tabs-corner');
+      container.style.removeProperty('--tab-corner-width');
+      container.style.removeProperty('--tab-corner-height');
+    };
+    // A strip past its max-height scrolls, and the float would scroll its tabs
+    // under the toolbar, which stays put: keep the plain wrap. The plain strip
+    // is measured here (updateTabOverflowMode took .tabs-corner off), before
+    // the class goes on; toggling it on a scrolled strip lets scroll anchoring
+    // move the strip.
+    if (!on || container.scrollHeight > container.clientHeight + 1) {
+      off();
+      return;
+    }
+    container.classList.add('tabs-corner');
+    if (!this._tabCornerObserver && typeof ResizeObserver !== 'undefined') {
+      let frame = 0;
+      // A toolbar that changes size (a reading arrives, the divider settles)
+      // moves the tabs without a render: re-decide the wrap and the corner, and
+      // redraw the lineage routes that follow the tabs.
+      this._tabCornerObserver = new ResizeObserver(() => {
+        if (frame) return;
+        frame = requestAnimationFrame(() => {
+          frame = 0;
+          const strip = this.$('sessionTabs');
+          if (!strip || !/\btabs-(corner|auto-wrap|two-rows)\b/.test(strip.className)) return;
+          this.updateTabOverflowMode();
+          this.updateConnectionLines?.();
+        });
+      });
+      this._tabCornerObserver.observe(right);
+    }
+    const style = getComputedStyle(container);
+    const strip = container.getBoundingClientRect();
+    const box = right.getBoundingClientRect();
+    // The float sits at the strip's content padding edge (the plain strip did
+    // not scroll, so scrollTop is 0).
+    const contentTop = strip.top + parseFloat(style.paddingTop);
+    const contentLeft = strip.left + container.clientLeft + parseFloat(style.paddingLeft);
+    const contentRight = strip.left + container.clientLeft + container.clientWidth - parseFloat(style.paddingRight);
+    // A first tab that cannot fit beside the toolbar would drop the whole first
+    // line below it and leave an empty band: keep the plain strip instead.
+    const firstTab = container.querySelector(':scope > .session-tab');
+    if (firstTab && box.left - 8 - contentLeft < firstTab.offsetWidth + 2) {
+      off();
+      return;
+    }
+    const width = `${Math.max(0, Math.ceil(contentRight - box.left + 8))}px`;
+    const height = `${Math.max(0, Math.ceil(box.bottom - contentTop))}px`;
+    if (container.style.getPropertyValue('--tab-corner-width') !== width) {
+      container.style.setProperty('--tab-corner-width', width);
+    }
+    if (container.style.getPropertyValue('--tab-corner-height') !== height) {
+      container.style.setProperty('--tab-corner-height', height);
+    }
+    // A plain strip just under its max-height can pass it once the float is in:
+    // fall back to the plain strip, which fit.
+    if (container.scrollHeight > container.clientHeight + 1) off();
   }
 
   /**

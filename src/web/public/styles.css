@@ -617,6 +617,45 @@ body {
   padding-left: var(--lineage-spine-channel);
 }
 
+/* L-shaped strip (`_syncTabStripCorner()`, app.js): a wrapped classic strip
+   runs the header's full width, the toolbar sits over its top-right corner,
+   and only the rows beside the toolbar stop short of it. A flex line cannot
+   be shortened on its own, so the strip lays its tabs out inline, around a
+   float the size of the toolbar's box (measured into --tab-corner-width and
+   --tab-corner-height). The strip is a scroll container, so it contains the
+   float and is never shorter than the toolbar it now holds up; a strip that
+   would actually scroll keeps the plain wrap instead. Inline tabs space their
+   rows with a bottom margin (the old row-gap, lineage's included); the strip
+   carries no font size of its own, so the whitespace between tabs is 0 wide. */
+.header:has(> .session-tabs-host > .session-tabs.tabs-corner) > .header-right {
+  position: absolute;
+  top: 0.35rem;
+  right: 0.75rem;
+}
+
+.session-tabs-host > .session-tabs.tabs-corner {
+  display: block;
+  font-size: 0;
+  padding-bottom: 0;
+}
+
+.session-tabs-host > .session-tabs.tabs-corner::before {
+  content: '';
+  float: right;
+  width: var(--tab-corner-width, 0px);
+  height: var(--tab-corner-height, 0px);
+}
+
+.session-tabs-host > .session-tabs.tabs-corner > .session-tab {
+  display: inline-flex;
+  vertical-align: top;
+  margin: 0 2px var(--lineage-row-gap, 4px) 0;
+}
+
+.session-tabs-host > .session-tabs.lineage-tree.tabs-corner {
+  padding-bottom: calc(var(--lineage-bottom-room) - var(--lineage-row-gap));
+}
+
 .session-tabs::-webkit-scrollbar {
   width: 4px;
   height: 0;
@@ -14680,13 +14719,21 @@ html:is([data-skin="paper-gray"], [data-skin="solarized-light"], [data-skin="cat
 
 /* ---- File Viewer rendered markdown ----
    Styling comes from the Response Viewer's .rv-text rules; .rv-text itself
-   carries no padding or base font (the chat card supplies those). */
+   carries no padding or base font (the chat card supplies those).
+
+   No width cap. The window is whatever the user drags or expands it to, so the
+   document must reflow to fill it; the fixed 960px reading column this rule
+   shipped before the resize grip existed stops reflow once the window is wider
+   than the cap. --rv-content-max: none lets ASCII-diagram blocks
+   (.rv-text .rv-diagram-wrap, capped by that variable with a 720px fallback
+   meant for the Response Viewer) follow the rest of the document too. Pinned by
+   test/file-preview-window.test.ts. */
 
 .file-preview-body > .file-preview-md {
   padding: 1rem 1.25rem 2rem;
   font-size: 15px;
   line-height: 1.55;
-  max-width: 960px;
+  --rv-content-max: none;
 }
 
 /* Relative links in the document are rebased onto a.rv-path so the Response

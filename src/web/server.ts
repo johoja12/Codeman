@@ -384,6 +384,7 @@ import { isMultiUserMode } from '../config/multiuser.js';
 import { bootstrapInitialAdmin, hasUsers, resolveClaudeModeForUsername } from '../user-store.js';
 import { canUsernameRunPrivilegedCommands } from '../user-store.js';
 import { installRouteErrorHandler } from './route-error-handler.js';
+import { installEmptyApiPostParser } from './request-body-parser.js';
 import { isExplicitlyEnabled, isLoopbackBindHost, buildHostPolicy, type HostPolicy } from './network-auth-policy.js';
 import {
   registerPushRoutes,
@@ -1796,6 +1797,9 @@ export class WebServer extends EventEmitter {
       this.userIpFailures = authState.userIpFailures;
     }
 
+    // Bodyless API POSTs may arrive as empty chunked streams through a proxy.
+    installEmptyApiPostParser(this.app);
+
     // WebSocket support (terminal I/O — low-latency bidirectional channel)
     await this.app.register(fastifyWebsocket);
 
@@ -3149,15 +3153,23 @@ export class WebServer extends EventEmitter {
     this.runSummaryTrackers.set(session.id, summaryTracker);
     summaryTracker.recordSessionStarted(session.mode, session.workingDir, getCli(session.mode)?.label);
 
-    // Set working directory for Ralph tracker to auto-load @fix_plan.md (not supported for external CLI
-    // sessions). COD-416/Q23: was a hardcoded opencode|codex|gemini list, stale since pi/grok/
-    // deepseek/omp were added; the comment already said what it meant.
+    // Set working directory for Ralph tracker to auto-load @fix_plan.md (not supported for external CLIs).
+    // A remote session's workingDir is a path on the remote host, and the watcher reads and
+    // fs.watch()es it on the LOCAL disk, so a remote session only records the path: the fix plan stays
+    // authoritative as for a local session (keeping the output-based completion guessers off), and its
+    // file is read over ssh only on an explicit import (fix-plan/read).
     if (!isExternalCliMode(session.mode)) {
-      session.ralphTracker.setWorkingDir(session.workingDir);
+      if (session.remote) {
+        session.ralphTracker.setRemoteWorkingDir(session.workingDir);
+      } else {
+        session.ralphTracker.setWorkingDir(session.workingDir);
+      }
     }
 
-    // Start watching for new images in this session's working directory (if enabled globally and per-session)
-    if ((await this.isImageWatcherEnabled()) && session.imageWatcherEnabled) {
+    // Start watching for new images in this session's working directory (if enabled globally and per-session).
+    // A remote session's workingDir is a path on the remote host, and the watcher watches it on the LOCAL
+    // disk, so it is skipped there (the per-session and app-wide toggles skip it too).
+    if ((await this.isImageWatcherEnabled()) && session.imageWatcherEnabled && !session.remote) {
       imageWatcher.watchSession(session.id, session.workingDir);
     }
 
