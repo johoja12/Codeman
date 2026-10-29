@@ -143,6 +143,18 @@ export function observeAssistantTurn(
           .join('')
       : undefined;
   if (
+    text === '' &&
+    completion.turn_id === turnId &&
+    (completion.last_agent_message === null || completion.last_agent_message === '') &&
+    events.indexOf(completion) > events.indexOf(final) &&
+    events.indexOf(final) > events.indexOf(users[0])
+  )
+    return {
+      state: 'failed',
+      turnId,
+      reason: 'Native turn completed without a text response; work may be complete. No automatic replay.',
+    };
+  if (
     !text ||
     text.length > 1000000 ||
     completions[0].turn_id !== turnId ||

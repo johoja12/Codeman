@@ -128,6 +128,36 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true });
 });
 describe('durable assistant requests', () => {
+  it('treats an exact empty native final as a stopped response failure, never unknown or task success', async () => {
+    const a = await ready();
+    const r = manager.submit(a, 'silent task', 'empty-native-123456789');
+    await manager.tick();
+    appendFileSync(file, turn('silent task', '').replace('"last_agent_message":""', '"last_agent_message":null'));
+    await manager.tick();
+    expect(ledger.get(r.id)).toMatchObject({ status: 'failed', reconciled: true });
+    expect(ledger.get(r.id)?.reason).toContain('completed without a text response');
+    expect(ledger.get(r.id)?.result).toBeUndefined();
+    expect(manager.availability(a).requestExecution).toBe(true);
+    expect(manager.submit(a, 'silent task', 'empty-native-123456789').id).toBe(r.id);
+    expect(writes).toEqual(['silent task\r']);
+  });
+  it('does not accept missing or foreign empty completion evidence', () => {
+    const empty = turn('silent task', '').replace('"last_agent_message":""', '"last_agent_message":null');
+    expect(observeAssistantTurn(empty, conversationId, 'other').state).toBe('unknown');
+    expect(
+      observeAssistantTurn(
+        empty.replace('"last_agent_message":null', '"last_agent_message":"foreign"'),
+        conversationId,
+        'silent task'
+      ).state
+    ).toBe('unknown');
+    const missing = empty
+      .split('\n')
+      .filter((l) => !l.includes('final_answer'))
+      .join('\n');
+    expect(observeAssistantTurn(missing, conversationId, 'silent task').state).toBe('unknown');
+  });
+
   function capacityTurn(prompt: string, withTools = false, id = 'capacity-turn') {
     return (
       row({ type: 'task_started', turn_id: id }) +
