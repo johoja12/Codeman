@@ -59,3 +59,22 @@ not another execution. After a service or session recovery, verify exact native
 identity and explicitly rebind/handoff; never create a replacement conversation
 implicitly. Rolling back code must retain new durable files; incompatible or
 corrupt ledgers must fail closed rather than be reset.
+
+## Automatic idle handoff recovery
+
+A previously connected, enabled assistant reconnects after a 30-second recovery
+wait when its handoff disappears and its original native conversation is idle,
+its composer is empty, and no uncertain request remains. Server startup also
+observes its existing 60-second restoration grace period. This applies to all
+supported assistant modes, not only Brain.
+
+A request-review recovery block is reconsidered when exact native evidence
+settles the request. An exact Codex completion with an empty final response is
+recorded as a response failure, without replay or a fabricated success report;
+it does not permanently block later requests. The recovery log records scheduling
+and restored messaging ownership.
+
+**Take control** disables and disarms the assistant, so automatic recovery does
+not override intentional desktop ownership. Identity/owner changes, nonempty
+composers, genuinely uncertain execution and exhausted recovery attempts still
+require review.

@@ -245,11 +245,33 @@ export class AssistantRecovery {
   private async recover(r: RecoveryRecord): Promise<void> {
     const a = this.assistants.get(r.assistantId);
     if (!a?.enabled || !a.binding || JSON.stringify(a.binding) !== JSON.stringify(r.binding)) return;
-    if (r.state === 'blocked' || Date.now() < r.nextAt) return;
+    if (r.state === 'blocked') {
+      // Only a transient request-review block can clear from new exact native
+      // evidence. Identity, owner, composer and exhausted-retry blocks stay manual.
+      if (
+        r.reason !== 'Review interrupted or uncertain work before recovering this assistant' ||
+        this.requests.hasUnresolved(a.id)
+      )
+        return;
+      r.state = 'armed';
+      r.reason = undefined;
+      r.nextAt = Date.now() + 30000;
+      this.save();
+      console.info(`[AssistantRecovery] Request resolved; idle handoff scheduled for ${a.id}`);
+      return;
+    }
+    if (Date.now() < r.nextAt) return;
     const old = this.session(r.binding.sessionId);
     if (r.state === 'armed' && old?.pid === r.pid && !old.paneExit) {
       this.capturePlacement(old.id);
-      return;
+      if (this.requests.availability(a).handedOff) return;
+      if (old.status !== 'idle' || old.assistantPendingWrites || Date.now() - old.assistantLastInputAt < 30000) return;
+      if (!r.nextAt) {
+        r.nextAt = Date.now() + 30000;
+        this.save();
+        console.info(`[AssistantRecovery] Missing handoff; idle recovery scheduled for ${a.id}`);
+        return;
+      }
     }
     // Uncertain work is never rebound or replayed. Desktop review must come first.
     if (this.requests.hasUnresolved(a.id))
@@ -323,6 +345,7 @@ export class AssistantRecovery {
       r.startedAt = undefined;
       this.requests.releaseRecoverySession(candidate.id);
       this.save();
+      console.info(`[AssistantRecovery] Messaging handoff restored for ${a.id}`);
     } catch {
       // Fixed message: launch errors can contain owner commands or credentials.
       r.reason = 'Recovery failed; waiting before retry. Open Assistants if review is needed';

@@ -86,6 +86,77 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 describe('exact assistant session recovery', () => {
+  it('restores a missing same-session handoff after 30 seconds, without replay or a new launcher', async () => {
+    let now = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    manager.clearRecoveryHandoff(a.id);
+    await recovery.tick();
+    expect(manager.availability(a).handedOff).toBe(false);
+    now += 29999;
+    await recovery.tick();
+    expect(manager.availability(a).handedOff).toBe(false);
+    now++;
+    await recovery.tick();
+    expect(manager.availability(store.get(a.id)!).requestExecution).toBe(true);
+    expect(store.get(a.id)?.binding?.sessionId).toBe(original.id);
+    expect(adapter.create).not.toHaveBeenCalled();
+    expect(writes).toEqual([]);
+  });
+  it('rechecks a transient unresolved-work block once exact completion evidence settles the request', async () => {
+    let now = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const r = manager.submit(a, 'silent task', 'late-empty-native-123456789');
+    await manager.tick();
+    const row = (payload: object) => JSON.stringify({ type: 'event_msg', payload }) + '\n';
+    appendFileSync(
+      file,
+      row({ type: 'task_started', turn_id: 'late-turn' }) +
+        row({
+          type: 'item_completed',
+          thread_id: conversation,
+          turn_id: 'late-turn',
+          item: { type: 'UserMessage', content: [{ type: 'text', text: 'silent task' }] },
+        })
+    );
+    now = r.deadline + 1;
+    await manager.tick();
+    now += 30000;
+    await manager.tick();
+    expect(recovery.status(a.id)?.state).toBe('blocked');
+    appendFileSync(
+      file,
+      row({
+        type: 'item_completed',
+        thread_id: conversation,
+        turn_id: 'late-turn',
+        item: { type: 'AgentMessage', phase: 'final_answer', content: [{ type: 'Text', text: '' }] },
+      }) + row({ type: 'task_complete', turn_id: 'late-turn', last_agent_message: null })
+    );
+    await manager.tick();
+    expect(ledger.get(r.id)?.status).toBe('failed');
+    expect(manager.availability(a).handedOff).toBe(false);
+    now += 30000;
+    await manager.tick();
+    expect(manager.availability(store.get(a.id)!).requestExecution).toBe(true);
+    expect(writes).toEqual(['silent task\r']);
+  });
+  it('never retakes an explicit desktop takeover or a nonempty composer', async () => {
+    let now = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    manager.clearRecoveryHandoff(a.id);
+    adapter.composerEmpty = async () => false;
+    await recovery.tick();
+    now += 30000;
+    await recovery.tick();
+    expect(manager.availability(a).handedOff).toBe(false);
+    expect(writes).toEqual([]);
+    await manager.takeControl(a);
+    now += 120000;
+    await recovery.tick();
+    expect(manager.availability(store.get(a.id)!).handedOff).toBe(false);
+    expect(recovery.status(a.id)).toBeUndefined();
+  });
+
   it('manual handoff supersedes an in-flight startup recovery without stranding its input lock', async () => {
     original.pid = 101; // The PTY changed on server restart; native conversation survived.
     manager.clearRecoveryHandoff(a.id);
