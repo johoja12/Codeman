@@ -7538,6 +7538,10 @@ Object.assign(CodemanApp.prototype, {
     } else {
       this.terminal?.focus();
     }
+    if (typeof _crashDiag !== 'undefined') {
+      const handler = typeof KeyboardHandler !== 'undefined' ? KeyboardHandler : null;
+      _crashDiag.log(`KEYBOARD_FOCUS: focused=${this._isMobileTerminalInputFocused()} gesture=${typeof navigator !== 'undefined' ? navigator.userActivation?.isActive : undefined} cached=${handler?.keyboardVisible} height=${Math.round(window.visualViewport?.height || 0)} baseline=${Math.round(handler?.initialViewportHeight || 0)} min=${Math.round(handler?._keyboardMinHeight || 0)}`);
+    }
   },
 
   /**
@@ -7550,6 +7554,23 @@ Object.assign(CodemanApp.prototype, {
     if (!this._isMobileTerminalInputFocused()) return false;
     const touch = typeof MobileDetection !== 'undefined' && MobileDetection.isTouchDevice?.();
     if (!touch || typeof KeyboardHandler === 'undefined') return true;
+    // Native dismissal can leave both textarea focus and our cached flag set.
+    // A menu tap happens to repair this by moving focus to a button. Re-read
+    // the viewport on the terminal tap instead, using the resize detector's
+    // existing hide thresholds; never blur a genuinely visible keyboard.
+    const viewport = window.visualViewport;
+    if (KeyboardHandler.keyboardVisible && viewport?.height > 0 &&
+        viewport.width === KeyboardHandler.lastViewportWidth &&
+        typeof KeyboardHandler.handleViewportResize === 'function') {
+      const baseline = KeyboardHandler.initialViewportHeight;
+      const minimum = KeyboardHandler._keyboardMinHeight;
+      const grewPastKeyboard = minimum > 0 && viewport.height - minimum > KeyboardHandler.KEYBOARD_GONE_GROWTH_PX;
+      if ((baseline > 0 && baseline - viewport.height < 100) || grewPastKeyboard) {
+        KeyboardHandler.handleViewportResize();
+        if (typeof _crashDiag !== 'undefined')
+          _crashDiag.log(`KEYBOARD_RECHECK: height=${Math.round(viewport.height)} baseline=${Math.round(baseline)} min=${Math.round(minimum)} up=${KeyboardHandler.keyboardVisible}`);
+      }
+    }
     return KeyboardHandler.keyboardVisible === true;
   },
 

@@ -67,3 +67,22 @@ not established by this comparison; they must not be dismissed as unrelated.
 The broader smoke gate remains red. The candidate frontend test deployment was
 explicitly requested after these failures were reported; this is not an all-green
 release or a verified native-keyboard completion.
+
+## Header-menu clue: cached keyboard state without native focus transition
+
+The reporter identified the top-right header menu as a reliable workaround.
+A fresh full-page test against production reproduced the state transition using
+only disposable shells: with a missed keyboard-hide resize, the terminal retains
+focus and `keyboardVisible` stays true. Direct focus yields zero new focus events;
+tapping the actual header menu first yields one fresh focus event on retry.
+
+The new candidate rechecks the current same-width visual viewport against the
+existing resize detector's hide thresholds before trusting the visible flag. It
+uses the canonical resize handler to repair a stale flag, then the existing
+mobile focus helper can perform a synchronous blur/refocus. A genuinely shrunken
+keyboard viewport is left alone (no blur/refocus bounce).
+
+The full-page candidate produced one fresh direct focus event without the menu;
+the menu path also remained valid. This proves the stale state/focus transition,
+not native OS keyboard presentation. Bounded KEYBOARD_RECHECK and KEYBOARD_FOCUS
+breadcrumbs capture flag/viewport/focus state without typed text for phone RCA.

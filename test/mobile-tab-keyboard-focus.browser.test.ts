@@ -187,3 +187,67 @@ describe('mobile sheet delayed search focus', () => {
     }
   });
 });
+
+describe('header-menu workaround and stale keyboard visibility', () => {
+  let browser: Browser;
+  beforeAll(async () => {
+    browser = await chromium.launch({ headless: true });
+  });
+  afterAll(async () => {
+    await browser.close();
+  });
+  async function keyboardPage() {
+    const page = await browser.newPage({ viewport: { width: 440, height: 852 }, hasTouch: true, isMobile: true });
+    await page.setContent(
+      '<meta name="viewport" content="width=device-width,initial-scale=1"><div class="app"><header class="header"><button id="menu" class="mobile-header-utility-toggle">Menu</button></header><textarea id="terminal" class="xterm-helper-textarea"></textarea></div>'
+    );
+    await page.addScriptTag({
+      content: `
+      window.MobileDetection={isTouchDevice:()=>true,updateAppHeight(){}};
+      window.hideEvents=0;window.focusEvents=0;
+      window.KeyboardHandler={${method('mobile-handlers.js', 'handleViewportResize')},
+        keyboardVisible:true,initialViewportHeight:visualViewport.height,
+        _keyboardMinHeight:visualViewport.height-300,lastViewportWidth:visualViewport.width,
+        KEYBOARD_GONE_GROWTH_PX:150,_releaseHeldRows(){return false},onKeyboardHide(){hideEvents++},
+        onKeyboardShow(){},updateLayoutForKeyboard(){},_deferViewportSettle(){},_scheduleViewportSettle(){}};
+      window.app={${['_mobileKeyboardIsUp', '_focusMobileTerminalInput', '_isMobileTerminalInputFocused', '_blurMobileTerminalInput'].map((n) => method('terminal-ui.js', n)).join(',')},
+        ${method('app.js', 'toggleMobileHeaderUtilities')},_syncMobileHelperTextareaToCursor(){},
+        terminal:{textarea:document.getElementById('terminal'),focus(){this.textarea.focus()}}};
+      document.getElementById('menu').onclick=()=>app.toggleMobileHeaderUtilities();
+      app.terminal.focus();
+      document.getElementById('terminal').addEventListener('focus',()=>focusEvents++);
+    `,
+    });
+    return page;
+  }
+  it('creates a fresh focus without requiring the header-menu detour when a hide resize was missed', async () => {
+    const page = await keyboardPage();
+    try {
+      await page.evaluate('app._focusMobileTerminalInput()');
+      expect(await page.evaluate('focusEvents')).toBe(1);
+      expect(await page.evaluate('KeyboardHandler.keyboardVisible')).toBe(false);
+      expect(await page.evaluate('hideEvents')).toBe(1);
+      expect(await page.evaluate(() => document.activeElement?.id)).toBe('terminal');
+      await page.locator('#menu').tap();
+      expect(await page.locator('#menu').getAttribute('aria-expanded')).toBe('true');
+      await page.evaluate('focusEvents=0;app._focusMobileTerminalInput()');
+      expect(await page.evaluate('focusEvents')).toBe(1);
+    } finally {
+      await page.close();
+    }
+  });
+  it('does not blur/refocus an actually shrunken keyboard viewport', async () => {
+    const page = await keyboardPage();
+    try {
+      await page.setViewportSize({ width: 440, height: 552 });
+      await page.evaluate(
+        'KeyboardHandler._keyboardMinHeight=visualViewport.height;focusEvents=0;app._focusMobileTerminalInput()'
+      );
+      expect(await page.evaluate('focusEvents')).toBe(0);
+      expect(await page.evaluate('hideEvents')).toBe(0);
+      expect(await page.evaluate('KeyboardHandler.keyboardVisible')).toBe(true);
+    } finally {
+      await page.close();
+    }
+  });
+});
