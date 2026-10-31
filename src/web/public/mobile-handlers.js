@@ -312,7 +312,7 @@ const KeyboardHandler = {
     this._traceKeyboardState('init');
     if (typeof _crashDiag !== 'undefined') {
       _crashDiag.log(
-        `KEYBOARD_BUILD: lifecycle-v5 ua=${typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown'}`
+        `KEYBOARD_BUILD: lifecycle-v6 ua=${typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown'}`
       );
     }
 
@@ -466,6 +466,14 @@ const KeyboardHandler = {
       // While the keyboard is open, size the app to the visual viewport so
       // xterm's bottom row and cursor sit above the OS keyboard.
       document.documentElement.style.setProperty('--app-height', `${currentHeight}px`);
+      // Reconciliation after foreground recovery can see the OLD shrunken
+      // viewport again. Only a newly observed shrink can own input focus;
+      // otherwise its eventual restore could cancel a newer focus request.
+      this._keyboardFocusOwner =
+        currentHeight < this.lastViewportHeight && typeof app !== 'undefined'
+          ? app._mobileKeyboardFocusGeneration
+          : undefined;
+      this._keyboardFocusOwnerInput = this._keyboardFocusOwner !== undefined ? document.activeElement : undefined;
       this.onKeyboardShow();
       this._traceKeyboardState('viewport-show');
     }
@@ -697,9 +705,23 @@ const KeyboardHandler = {
 
   /** Called when keyboard hides */
   onKeyboardHide() {
-    // A delayed closing resize can belong to an earlier dismiss, after the
-    // user has already requested a new open. Geometry must never blur input;
-    // explicit dismissal and stale-focus recovery own that decision (#35).
+    // Native dismiss keeps xterm focused on iOS. Release that old editing
+    // session before the next tap, but never a newer open request: its focus
+    // generation differs from the request that produced this visible keyboard.
+    const owner = this._keyboardFocusOwner;
+    const ownerInput = this._keyboardFocusOwnerInput;
+    this._keyboardFocusOwner = undefined;
+    this._keyboardFocusOwnerInput = undefined;
+    if (
+      Number.isSafeInteger(owner) &&
+      typeof app !== 'undefined' &&
+      owner === app._mobileKeyboardFocusGeneration &&
+      ownerInput === document.activeElement &&
+      app._isMobileTerminalInputFocused?.()
+    ) {
+      app._blurMobileTerminalInput();
+      this._traceKeyboardState('owned-hide-release');
+    }
 
     // Hide keyboard accessory bar
     if (typeof KeyboardAccessoryBar !== 'undefined') {
@@ -915,7 +937,7 @@ const KeyboardHandler = {
     const focus = this._isTerminalInput(active) ? 'terminal' : this._editableHasFocus() ? 'editor' : 'none';
     this._traceKeyboardInputBox(reason);
     _crashDiag.log(
-      `KEYBOARD_STATE: v5 ${reason} focus=${focus} visible=${this.keyboardVisible} height=${Math.round(viewport?.height || 0)} width=${Math.round(viewport?.width || 0)} offset=${Math.round(viewport?.offsetTop || 0)} scale=${viewport?.scale || 1} layout=${window.innerHeight} baseline=${Math.round(this.initialViewportHeight)} min=${Math.round(this._keyboardMinHeight)} page=${document.visibilityState}`
+      `KEYBOARD_STATE: v6 ${reason} focus=${focus} visible=${this.keyboardVisible} height=${Math.round(viewport?.height || 0)} width=${Math.round(viewport?.width || 0)} offset=${Math.round(viewport?.offsetTop || 0)} scale=${viewport?.scale || 1} layout=${window.innerHeight} baseline=${Math.round(this.initialViewportHeight)} min=${Math.round(this._keyboardMinHeight)} owner=${this._keyboardFocusOwner} request=${typeof app !== 'undefined' ? app._mobileKeyboardFocusGeneration : undefined} page=${document.visibilityState}`
     );
   },
 
@@ -945,7 +967,7 @@ const KeyboardHandler = {
       }
       const rounded = (value) => Math.round(value);
       _crashDiag.log(
-        `KEYBOARD_BOX: v5 ${reason} ${JSON.stringify({
+        `KEYBOARD_BOX: v6 ${reason} ${JSON.stringify({
           rect: [rect.left, rect.top, rect.right, rect.bottom].map(rounded),
           clip: [left, top, right, bottom].map(rounded),
           intersects:
@@ -965,7 +987,7 @@ const KeyboardHandler = {
         })}`
       );
     } catch {
-      _crashDiag.log(`KEYBOARD_BOX: v5 ${reason} unavailable`);
+      _crashDiag.log(`KEYBOARD_BOX: v6 ${reason} unavailable`);
     }
   },
 

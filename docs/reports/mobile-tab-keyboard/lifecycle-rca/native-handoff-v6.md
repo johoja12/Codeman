@@ -1,0 +1,13 @@
+# Native editing-focus handoff correction (#35)
+
+The reporter's v5 phone trace shows failed and successful opens with identical input geometry: rectangle [12,640,13,641], clip [0,74,440,723], editable/not disabled, app height 763, menu open. Request 14 has focusout/focusin about 1 ms apart and no keyboard at 350 ms; request 15 follows a focus release about 108 ms before refocus and the viewport shrinks roughly 102 ms later. Request 12 also retains focus for 1000 ms without opening while onscreen and editable. The reporter separately confirms opening and closing the menu enables reopening.
+
+This excludes clipping/readonly/bad calibration in those recorded failures. It is consistent with a native editing-focus handoff problem; it does not expose WebKit's internal keyboard policy or prove all failures have one cause.
+
+The correction releases native-dismissed terminal focus before the next gesture, with ownership protection: a newly observed keyboard shrink records the focus generation and exact input node. Hide releases only that same node if no newer explicit focus request exists. A late closing resize cannot blur a newer request, another input, or a new input whose old shrunken geometry was merely reconciled after foreground recovery. Reconciliation without an observed shrink does not claim ownership.
+
+A terminal touchstart also releases leftover focused input when the keyboard is already down, before touchend performs the new focus. A visible keyboard is preserved. No timer retries focus. Calibration and late-focus protections from the previous correction remain intact.
+
+Validation: the native-dismiss ownership regression first failed on v5 and passes with this correction; 214 related tests pass, including all previous race/calibration cases, newer-focus protection at 0/80/200/349 ms, old-geometry reconciliation and a different terminal node receiving native focus. Seventeen browser regressions pass, including real touchstart/touchend separation with the actual compatibility-mouse guard, 20 owned dismiss cycles and 25 overlapping closing transitions. The full mobile keyboard suite passed 56 tests. Realistic smoke passed 86 checks with zero failures and one unconfigured external-remote skip. A separate disposable real shell passed 30 touch reopen/command-execution cycles (normal owned dismiss and late closing transitions), with no browser page errors. Static checks/build are recorded on the issue after completion.
+
+Chromium and synthetic viewport changes verify event ordering, focus ownership and delivered input, not actual OS keyboard presentation. The deployed candidate still needs the reporter's native phone confirmation. Keep #35 open and #37 draft until that result.

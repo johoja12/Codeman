@@ -1647,6 +1647,9 @@ Object.assign(CodemanApp.prototype, {
           // made the next transcript tap run the tap-to-CLOSE toggle on a
           // keyboard that was not there, so it never opened.
           tapStartedWithTerminalFocus = this._mobileKeyboardIsUp();
+          // A dismissed keyboard can leave native editing focus behind. Release
+          // it at gesture start, before touchend spends this tap on reopening.
+          if (!tapStartedWithTerminalFocus) this._prepareMobileTerminalFocusGesture();
           // Classifying scans the whole viewport with translateToString, and
           // this runs at the start of EVERY gesture including scroll drags.
           // Cache the result for the touchend of this same gesture rather than
@@ -7523,14 +7526,21 @@ Object.assign(CodemanApp.prototype, {
     return hasMenuPrompt && hasMenuChoice && /^\s*(?:[❯›]\s*)?\d+[.)]\s/.test(tappedLine);
   },
 
+  _prepareMobileTerminalFocusGesture() {
+    if (!this._isMobileTerminalInputFocused() || this._mobileKeyboardIsUp()) return false;
+    this._blurMobileTerminalInput();
+    if (typeof KeyboardHandler !== 'undefined') KeyboardHandler._traceKeyboardState?.('gesture-release');
+    return true;
+  },
+
   _focusMobileTerminalInput(source = 'terminal-tap') {
+    // Every explicit focus request supersedes the keyboard's prior owner. Set
+    // this BEFORE focus/geometry callbacks, including synchronous re-entrancy.
+    const request = this._mobileKeyboardFocusGeneration = (this._mobileKeyboardFocusGeneration || 0) + 1;
     this._syncMobileHelperTextareaToCursor();
-    // COD-467: WebKit ignores focus() on the element that already has focus, so
-    // a textarea that kept focus after the keyboard went away (app/tab switch,
-    // lock) could never bring the keyboard back. Blur first, in the same tap
-    // handler, so the focus() below is a real focus change inside a user
-    // gesture, which is what iOS requires to show the keyboard. Only when the
-    // keyboard is actually down: with it up this would make it bounce.
+    // Fallback for callers without a terminal touchstart (e.g. tab selection).
+    // Terminal taps release stale focus in the earlier gesture phase; an OS
+    // hide normally releases its own focus before any new gesture begins.
     if (this._isMobileTerminalInputFocused() && !this._mobileKeyboardIsUp()) this._blurMobileTerminalInput();
     const cjkInput = document.getElementById('cjkInput');
     if (cjkInput?.classList.contains('cjk-input-visible')) {
@@ -7542,11 +7552,10 @@ Object.assign(CodemanApp.prototype, {
       const handler = typeof KeyboardHandler !== 'undefined' ? KeyboardHandler : null;
       _crashDiag.log(`KEYBOARD_FOCUS: focused=${this._isMobileTerminalInputFocused()} gesture=${typeof navigator !== 'undefined' ? navigator.userActivation?.isActive : undefined} cached=${handler?.keyboardVisible} height=${Math.round(window.visualViewport?.height || 0)} baseline=${Math.round(handler?.initialViewportHeight || 0)} min=${Math.round(handler?._keyboardMinHeight || 0)}`);
       // Observe delayed native viewport/focus changes without retrying focus.
-      const request = this._keyboardFocusRequestId = (this._keyboardFocusRequestId || 0) + 1;
       handler?._traceKeyboardState?.(`request-${request}-${source}`);
       for (const delay of [350, 1000]) {
         setTimeout(() => {
-          if (request !== this._keyboardFocusRequestId || document.visibilityState === 'hidden') return;
+          if (request !== this._mobileKeyboardFocusGeneration || document.visibilityState === 'hidden') return;
           handler?._traceKeyboardState?.(`request-${request}-after-${delay}ms`);
         }, delay);
       }

@@ -1,0 +1,31 @@
+{
+  "nativeKeyboardVerified": false,
+  "phoneTraceObserved": true,
+  "comparison": {
+    "inputRect": [
+      12,
+      640,
+      13,
+      641
+    ],
+    "clip": [
+      0,
+      74,
+      440,
+      723
+    ],
+    "readonly": false,
+    "disabled": false,
+    "menuExpanded": true,
+    "failedRequest": {
+      "id": 14,
+      "blurFocusGapMs": 1,
+      "keyboardVisibleAfter350ms": false
+    },
+    "successfulRequest": {
+      "id": 15,
+      "blurFocusGapMs": 108,
+      "keyboardVisibleAfter350ms": true
+    }
+  }
+}

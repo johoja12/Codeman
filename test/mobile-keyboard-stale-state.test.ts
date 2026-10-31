@@ -82,13 +82,15 @@ function loadKeyboardHandler() {
     getElementById: () => null,
     querySelector: () => null,
   };
+  const app = {
+    _mobileKeyboardFocusGeneration: 0,
+    relayoutMobileSubagentWindows: () => {},
+    _isMobileTerminalInputFocused: () => !!doc.activeElement?.classList.contains('xterm-helper-textarea'),
+    _blurMobileTerminalInput: () => doc.activeElement?.blur(),
+  };
   const context = vm.createContext({
     console,
-    app: {
-      relayoutMobileSubagentWindows: () => {},
-      _isMobileTerminalInputFocused: () => !!doc.activeElement?.classList.contains('xterm-helper-textarea'),
-      _blurMobileTerminalInput: () => doc.activeElement?.blur(),
-    },
+    app,
     navigator: {
       userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) CriOS/130 Mobile/15E148',
       maxTouchPoints: 5,
@@ -131,7 +133,11 @@ function loadKeyboardHandler() {
       else timers.push(t);
     }
   };
-  return { handler, resize, fire, advance, doc, bodyClasses, hides };
+  const requestFocus = (input: FakeEl) => {
+    app._mobileKeyboardFocusGeneration++;
+    doc.activeElement = input;
+  };
+  return { handler, resize, fire, advance, doc, bodyClasses, hides, requestFocus };
 }
 
 const terminalTextarea = (onBlur = () => {}): FakeEl => ({
@@ -234,18 +240,18 @@ describe('COD-467 stale FOCUS: coming back to the page releases the hidden texta
 describe('keyboard lifecycle interleavings (#35)', () => {
   for (const delay of [0, 80, 200, 349]) {
     it(`does not let the previous closing resize blur a reopen after ${delay}ms`, () => {
-      const { handler, resize, fire, advance, doc } = loadKeyboardHandler();
+      const { handler, resize, fire, advance, doc, requestFocus } = loadKeyboardHandler();
       const blur = vi.fn(() => {
         doc.activeElement = null;
       });
       const input = terminalTextarea(blur);
-      doc.activeElement = input;
+      requestFocus(input);
       resize(FULL - KEYBOARD, FULL);
       // Explicit dismiss, then a new focus before the old close animation ends.
       input.blur();
       fire('focusout');
       advance(delay);
-      doc.activeElement = input;
+      requestFocus(input);
       resize(FULL, FULL);
       expect(doc.activeElement).toBe(input);
       expect(blur).toHaveBeenCalledTimes(1);
@@ -258,6 +264,61 @@ describe('keyboard lifecycle interleavings (#35)', () => {
       expect(handler.keyboardVisible).toBe(true);
     });
   }
+
+  it('releases native-dismissed focus before the next gesture when its request still owns the keyboard', () => {
+    const { handler, resize, doc, requestFocus } = loadKeyboardHandler();
+    const blur = vi.fn(() => {
+      doc.activeElement = null;
+    });
+    const input = terminalTextarea(blur);
+    requestFocus(input);
+    resize(FULL - KEYBOARD, FULL);
+    // OS dismiss restores geometry but leaves the original editable DOM focus.
+    resize(FULL, FULL);
+    expect(doc.activeElement).toBeNull();
+    expect(blur).toHaveBeenCalledTimes(1);
+    expect(handler.initialViewportHeight).toBe(FULL);
+    // A subsequent gesture starts from released focus rather than same-task refocus.
+    requestFocus(input);
+    resize(FULL - KEYBOARD, FULL);
+    expect(doc.activeElement).toBe(input);
+    expect(handler.keyboardVisible).toBe(true);
+  });
+
+  it('does not release a different terminal input that acquired focus natively', () => {
+    const { resize, doc, requestFocus } = loadKeyboardHandler();
+    const first = terminalTextarea(() => {
+      doc.activeElement = null;
+    });
+    const second = terminalTextarea(() => {
+      doc.activeElement = null;
+    });
+    requestFocus(first);
+    resize(FULL - KEYBOARD, FULL);
+    // A tile or another native input can focus without using the main helper.
+    doc.activeElement = second;
+    resize(FULL, FULL);
+    expect(doc.activeElement).toBe(second);
+  });
+
+  it('does not let reconciliation of an old shrunken viewport own a newer focus request', () => {
+    const { handler, resize, fire, doc, requestFocus } = loadKeyboardHandler();
+    const input = terminalTextarea(() => {
+      doc.activeElement = null;
+    });
+    requestFocus(input);
+    resize(FULL - KEYBOARD, FULL);
+    doc.visibilityState = 'hidden';
+    fire('visibilitychange');
+    doc.visibilityState = 'visible';
+    fire('visibilitychange');
+    requestFocus(input);
+    // No fresh shrink occurred: this is still the previous keyboard geometry.
+    resize(FULL - KEYBOARD, FULL);
+    resize(FULL, FULL);
+    expect(doc.activeElement).toBe(input);
+    expect(handler.keyboardVisible).toBe(false);
+  });
 
   it('preserves keyboard-free calibration across foreground recovery before closing resize', () => {
     const { handler, resize, fire, doc } = loadKeyboardHandler();
