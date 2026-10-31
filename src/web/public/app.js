@@ -9751,6 +9751,10 @@ class CodemanApp {
     appShell.classList.toggle('mobile-header-utilities-expanded', expanded);
     toggle.setAttribute('aria-expanded', String(expanded));
     window.dispatchEvent(new Event('resize'));
+    if (typeof KeyboardHandler !== 'undefined') {
+      KeyboardHandler._traceKeyboardState?.(expanded ? 'header-menu-open' : 'header-menu-close');
+      setTimeout(() => KeyboardHandler._traceKeyboardState?.('header-menu-settled'), 350);
+    }
   }
 
   /**

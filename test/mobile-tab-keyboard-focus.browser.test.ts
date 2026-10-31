@@ -328,6 +328,33 @@ describe('header-menu workaround and stale keyboard visibility', () => {
       await page.close();
     }
   });
+  it('records clipped input geometry without recording text or changing focus', async () => {
+    const page = await browser.newPage({ viewport: { width: 440, height: 852 } });
+    try {
+      await page.setContent(`<div style="position:absolute;left:20px;top:100px;width:200px;height:100px;overflow:hidden">
+        <textarea id="terminal" class="xterm-helper-textarea" style="position:absolute;left:5px;top:170px;width:1px;height:1px;padding:0;border:0"></textarea>
+        </div><textarea id="editor"></textarea>`);
+      await page.addScriptTag({
+        content: `
+        window.logs=[];window._crashDiag={log:message=>logs.push(message)};
+        window.KeyboardHandler={${['_traceKeyboardInputBox', '_isTerminalInput'].map((n) => method('mobile-handlers.js', n, 'KeyboardHandler')).join(',')}};
+        window.app={terminal:{textarea:document.getElementById('terminal')}};
+        document.getElementById('terminal').value='PRIVATE_TYPED_CONTENT';
+        document.getElementById('editor').focus();
+        KeyboardHandler._traceKeyboardInputBox('before-menu');
+        document.getElementById('terminal').style.top='20px';
+        KeyboardHandler._traceKeyboardInputBox('after-menu');
+      `,
+      });
+      const logs = (await page.evaluate('logs')) as string[];
+      expect(logs[0]).toContain('"intersects":false');
+      expect(logs[1]).toContain('"intersects":true');
+      expect(logs.join('')).not.toContain('PRIVATE_TYPED_CONTENT');
+      expect(await page.evaluate(() => document.activeElement?.id)).toBe('editor');
+    } finally {
+      await page.close();
+    }
+  });
   it('does not blur/refocus an actually shrunken keyboard viewport', async () => {
     const page = await keyboardPage();
     try {

@@ -312,7 +312,7 @@ const KeyboardHandler = {
     this._traceKeyboardState('init');
     if (typeof _crashDiag !== 'undefined') {
       _crashDiag.log(
-        `KEYBOARD_BUILD: lifecycle-v4 ua=${typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown'}`
+        `KEYBOARD_BUILD: lifecycle-v5 ua=${typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown'}`
       );
     }
 
@@ -913,9 +913,60 @@ const KeyboardHandler = {
     const viewport = window.visualViewport;
     const active = document.activeElement;
     const focus = this._isTerminalInput(active) ? 'terminal' : this._editableHasFocus() ? 'editor' : 'none';
+    this._traceKeyboardInputBox(reason);
     _crashDiag.log(
-      `KEYBOARD_STATE: v4 ${reason} focus=${focus} visible=${this.keyboardVisible} height=${Math.round(viewport?.height || 0)} width=${Math.round(viewport?.width || 0)} offset=${Math.round(viewport?.offsetTop || 0)} scale=${viewport?.scale || 1} layout=${window.innerHeight} baseline=${Math.round(this.initialViewportHeight)} min=${Math.round(this._keyboardMinHeight)} page=${document.visibilityState}`
+      `KEYBOARD_STATE: v5 ${reason} focus=${focus} visible=${this.keyboardVisible} height=${Math.round(viewport?.height || 0)} width=${Math.round(viewport?.width || 0)} offset=${Math.round(viewport?.offsetTop || 0)} scale=${viewport?.scale || 1} layout=${window.innerHeight} baseline=${Math.round(this.initialViewportHeight)} min=${Math.round(this._keyboardMinHeight)} page=${document.visibilityState}`
     );
+  },
+
+  _traceKeyboardInputBox(reason) {
+    if (typeof _crashDiag === 'undefined') return;
+    try {
+      const active = document.activeElement;
+      const input = this._isTerminalInput(active) ? active : typeof app !== 'undefined' ? app.terminal?.textarea : null;
+      if (!input?.getBoundingClientRect) return;
+      const rect = input.getBoundingClientRect();
+      const viewport = window.visualViewport;
+      let left = viewport?.offsetLeft || 0;
+      let top = viewport?.offsetTop || 0;
+      let right = left + (viewport?.width || window.innerWidth);
+      let bottom = top + (viewport?.height || window.innerHeight);
+      for (let parent = input.parentElement; parent; parent = parent.parentElement) {
+        const style = getComputedStyle(parent);
+        const box = parent.getBoundingClientRect();
+        if (/auto|scroll|hidden|clip/.test(style.overflowX)) {
+          left = Math.max(left, box.left);
+          right = Math.min(right, box.right);
+        }
+        if (/auto|scroll|hidden|clip/.test(style.overflowY)) {
+          top = Math.max(top, box.top);
+          bottom = Math.min(bottom, box.bottom);
+        }
+      }
+      const rounded = (value) => Math.round(value);
+      _crashDiag.log(
+        `KEYBOARD_BOX: v5 ${reason} ${JSON.stringify({
+          rect: [rect.left, rect.top, rect.right, rect.bottom].map(rounded),
+          clip: [left, top, right, bottom].map(rounded),
+          intersects:
+            rect.width > 0 &&
+            rect.height > 0 &&
+            rect.right > left &&
+            rect.left < right &&
+            rect.bottom > top &&
+            rect.top < bottom,
+          active: active === input,
+          activeTag: active?.tagName || 'none',
+          readonly: input.readOnly,
+          disabled: input.disabled,
+          inputMode: input.inputMode,
+          appHeight: getComputedStyle(document.documentElement).getPropertyValue('--app-height').trim(),
+          menu: !!document.querySelector('.header.mobile-utilities-expanded'),
+        })}`
+      );
+    } catch {
+      _crashDiag.log(`KEYBOARD_BOX: v5 ${reason} unavailable`);
+    }
   },
 
   /** The terminal's own text inputs (xterm's helper textarea, the CJK textarea). */
