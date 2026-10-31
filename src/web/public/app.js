@@ -11627,8 +11627,18 @@ class CodemanApp {
     // fails toward acknowledging rather than toward an alert that can never be
     // cleared.
     const userInitiated = options?.auto !== true;
-    const focusTerminalWithoutActivation = () => {
-      const focusTerminal = () => this.terminal.focus();
+    const touchDevice = typeof MobileDetection !== 'undefined' && MobileDetection.isTouchDevice();
+    const focusTerminalWithoutActivation = (fromGesture = false) => {
+      const focusTerminal = () => {
+        if (touchDevice && fromGesture) {
+          // An explicit tab choice retires the previous terminal's selection.
+          // Otherwise its focus guard immediately blurs the new input target.
+          this._clearTouchSelection?.();
+          this._touchSelectionFocusGuardUntil = 0;
+          if (this._focusMobileTerminalInput) this._focusMobileTerminalInput();
+          else this.terminal.focus();
+        } else this.terminal.focus();
+      };
       if (this._terminalViewerActivity?.runWithoutActivation) {
         this._terminalViewerActivity.runWithoutActivation(focusTerminal);
       } else {
@@ -11650,7 +11660,7 @@ class CodemanApp {
         this.applyTerminalFontPolicy?.(this.sessions.get(sessionId)?.mode);
         try { this.syncTerminalGeometry?.(); } catch {}
         this._terminalViewerActivity?.activate('session-select');
-        if (this.terminal && this._shouldFocusTerminalForTabSwitch(options)) focusTerminalWithoutActivation();
+        if (this.terminal && this._shouldFocusTerminalForTabSwitch(options)) focusTerminalWithoutActivation(true);
       }
       return;
     }
@@ -11698,10 +11708,6 @@ class CodemanApp {
     // Explicit mobile selection opens the keyboard. App-driven selection only
     // preserves an already-visible keyboard; boot/replay must not pop it open.
     const shouldFocusTerminal = this._shouldFocusTerminalForTabSwitch(options);
-    if (shouldFocusTerminal && this.terminal) {
-      focusTerminalWithoutActivation();
-    }
-
     const _selStart = performance.now();
     const _selName = this.sessions.get(sessionId)?.name || sessionId.slice(0,8);
     _crashDiag.log(`SELECT: ${_selName}`);
@@ -11751,6 +11757,10 @@ class CodemanApp {
     // typing on the ordered WS path instead of briefly accumulating offline.
     this._connectWs(sessionId);
     this.hideWelcome();
+    // Reveal the terminal and update its input mode BEFORE spending the tap's
+    // synchronous focus. A display:none webview terminal rejects focus; doing
+    // it again after the network await cannot summon the native mobile keyboard.
+    if (shouldFocusTerminal && this.terminal) focusTerminalWithoutActivation(userInitiated);
     // Terminal-pane entrance: plays for a freshly created session, and on every
     // switch when that option is on. Transform/opacity/clip-path only, xterm's
     // FitAddon reads the untransformed layout box, so this cannot reach the PTY.
@@ -12305,7 +12315,9 @@ class CodemanApp {
       idleCb(() => this._refreshSessionPanels(sessionId, selectGen));
 
       _crashDiag.log('FOCUS');
-      if (shouldFocusTerminal && this.terminal) focusTerminalWithoutActivation();
+      // Mobile input was focused synchronously while visible. Do not steal it
+      // back after a slow restore if the user has since tapped another control.
+      if (shouldFocusTerminal && this.terminal && !touchDevice) focusTerminalWithoutActivation();
       this.scrollToLastNonEmptyLine();
       // If we switched INTO this tab while the soft keyboard is already up, no
       // viewport-resize transition fires (handleViewportResize only runs

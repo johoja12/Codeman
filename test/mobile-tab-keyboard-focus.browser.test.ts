@@ -36,8 +36,8 @@ async function harness(browser: Browser, touch = true): Promise<Page> {
     window._crashDiag={log(){}};window.focusCalls=0;
     window.app={${methods},activeSessionId:'a',isSoloWindow:true,detachedSessions:new Set(),
       sessions:new Map([['b',{name:'b'}]]),_selectGeneration:0,
-      terminal:{focus(){focusCalls++;document.getElementById('terminal').focus()}},
-      _clearTimer(){},_flushLocalEchoTo(){},_setTerminalLoadState(){},_cleanupPreviousSession(){throw Error('STOP_BEFORE_SESSION_IO')},markIdleAlertSeen(){}};
+      terminal:{options:{},focus(){focusCalls++;document.getElementById('terminal').focus()}},
+      _clearTimer(){},_flushLocalEchoTo(){},_setTerminalLoadState(){},_cleanupPreviousSession(){},_userScrollback(){return 100000},_renderHistoryTruncationBanner(){},_updateSseSubscription(){},_queueTransportActivationReconcile(){},_connectWs(){},hideWelcome(){},playTerminalEntrance(){throw Error('STOP_BEFORE_SESSION_IO')},markIdleAlertSeen(){}};
     const select=app.selectSession;app.selectSession=(...args)=>select.apply(app,args).catch(e=>{
       if(e.message!=='STOP_BEFORE_SESSION_IO')throw e;
     });
@@ -82,8 +82,64 @@ describe('explicit mobile tab keyboard focus', () => {
     try {
       await page.evaluate('app.selectSession("b",{auto:true})');
       expect(await page.evaluate('focusCalls')).toBe(0);
-      await page.evaluate('KeyboardHandler.keyboardVisible=true;app.selectSession("b",{auto:true})');
+      await page.evaluate(
+        'KeyboardHandler.keyboardVisible=true;app.activeSessionId="a";app.selectSession("b",{auto:true})'
+      );
       expect(await page.evaluate('focusCalls')).toBe(1);
+    } finally {
+      await page.close();
+    }
+  });
+  it('reveals a webview-hidden terminal before spending the synchronous focus', async () => {
+    const page = await harness(browser);
+    try {
+      await page.evaluate(() => {
+        const input = document.getElementById('terminal')!;
+        const wrap = document.createElement('div');
+        wrap.id = 'hidden-terminal';
+        input.before(wrap);
+        wrap.append(input);
+        wrap.style.display = 'none';
+        (window as any).app._hideWebviewLayer = () => {
+          wrap.style.display = '';
+        };
+      });
+      await page.locator('#other').tap();
+      expect(await page.evaluate(() => document.activeElement?.id)).toBe('terminal');
+    } finally {
+      await page.close();
+    }
+  });
+  it('retires the previous text selection guard on an explicit tab tap', async () => {
+    const page = await harness(browser);
+    try {
+      await page.evaluate(() => {
+        const app = (window as any).app;
+        app._touchSelecting = true;
+        app._clearTouchSelection = () => {
+          app._touchSelecting = false;
+        };
+        document.getElementById('terminal')!.addEventListener('focus', (e) => {
+          if (app._touchSelecting) (e.target as HTMLElement).blur();
+        });
+      });
+      await page.locator('#other').tap();
+      expect(await page.evaluate(() => document.activeElement?.id)).toBe('terminal');
+    } finally {
+      await page.close();
+    }
+  });
+  it('uses the mobile input target after mode setup, including CJK input', async () => {
+    const page = await harness(browser);
+    try {
+      await page.evaluate(() => {
+        const field = document.createElement('textarea');
+        field.id = 'cjkInput';
+        document.body.append(field);
+        (window as any).app._focusMobileTerminalInput = () => field.focus();
+      });
+      await page.locator('#other').tap();
+      expect(await page.evaluate(() => document.activeElement?.id)).toBe('cjkInput');
     } finally {
       await page.close();
     }
@@ -126,6 +182,101 @@ describe('mobile sheet delayed search focus', () => {
       expect(await page.evaluate(() => document.activeElement?.id)).toBe('terminal');
       expect(await page.evaluate('MobileTabSheet.isOpen()')).toBe(false);
       await page.screenshot({ path: '/tmp/mobile-tab-keyboard-focus.png' });
+    } finally {
+      await page.close();
+    }
+  });
+});
+
+describe('header-menu workaround and stale keyboard visibility', () => {
+  let browser: Browser;
+  beforeAll(async () => {
+    browser = await chromium.launch({ headless: true });
+  });
+  afterAll(async () => {
+    await browser.close();
+  });
+  async function keyboardPage() {
+    const page = await browser.newPage({ viewport: { width: 440, height: 852 }, hasTouch: true, isMobile: true });
+    await page.setContent(
+      '<meta name="viewport" content="width=device-width,initial-scale=1"><div class="app"><header class="header"><button id="menu" class="mobile-header-utility-toggle">Menu</button></header><textarea id="terminal" class="xterm-helper-textarea"></textarea></div>'
+    );
+    await page.addScriptTag({
+      content: `
+      window.MobileDetection={isTouchDevice:()=>true,updateAppHeight(){}};
+      window.hideEvents=0;window.focusEvents=0;
+      window.KeyboardHandler={${method('mobile-handlers.js', 'handleViewportResize')},${method('mobile-handlers.js', 'onKeyboardHide')},
+        keyboardVisible:true,initialViewportHeight:visualViewport.height,
+        _keyboardMinHeight:visualViewport.height-300,lastViewportWidth:visualViewport.width,
+        KEYBOARD_GONE_GROWTH_PX:150,_releaseHeldRows(){return false},resetLayout(){hideEvents++},_scheduleViewportSettle(){},
+        onKeyboardShow(){},updateLayoutForKeyboard(){},_deferViewportSettle(){},_scheduleViewportSettle(){}};
+      window.app={${['_mobileKeyboardIsUp', '_focusMobileTerminalInput', '_isMobileTerminalInputFocused', '_blurMobileTerminalInput'].map((n) => method('terminal-ui.js', n)).join(',')},
+        ${method('app.js', 'toggleMobileHeaderUtilities')},_syncMobileHelperTextareaToCursor(){},relayoutMobileSubagentWindows(){},
+        terminal:{textarea:document.getElementById('terminal'),focus(){this.textarea.focus()}}};
+      document.getElementById('menu').onclick=()=>app.toggleMobileHeaderUtilities();
+      app.terminal.focus();
+      document.getElementById('terminal').addEventListener('focus',()=>focusEvents++);
+    `,
+    });
+    return page;
+  }
+  it('creates a fresh focus without requiring the header-menu detour when a hide resize was missed', async () => {
+    const page = await keyboardPage();
+    try {
+      await page.evaluate('app._focusMobileTerminalInput()');
+      expect(await page.evaluate('focusEvents')).toBe(1);
+      expect(await page.evaluate('KeyboardHandler.keyboardVisible')).toBe(false);
+      expect(await page.evaluate('hideEvents')).toBe(1);
+      expect(await page.evaluate(() => document.activeElement?.id)).toBe('terminal');
+      await page.locator('#menu').tap();
+      expect(await page.locator('#menu').getAttribute('aria-expanded')).toBe('true');
+      await page.evaluate('focusEvents=0;app._focusMobileTerminalInput()');
+      expect(await page.evaluate('focusEvents')).toBe(1);
+    } finally {
+      await page.close();
+    }
+  });
+  it('releases retained terminal focus after each of 25 native dismiss cycles', async () => {
+    const page = await keyboardPage();
+    try {
+      await page.evaluate(`
+        window.cycleHeight=visualViewport.height;
+        window.fullHeight=cycleHeight;
+        Object.defineProperty(visualViewport,'height',{configurable:true,get:()=>cycleHeight});
+        window.cycleResults=[];
+        document.getElementById('menu').onclick=()=>app._focusMobileTerminalInput();
+      `);
+      for (let cycle = 0; cycle < 25; cycle++) {
+        await page.locator('#menu').tap();
+        expect(await page.evaluate(() => document.activeElement?.id)).toBe('terminal');
+        await page.evaluate(`
+          cycleHeight=fullHeight-300;KeyboardHandler.handleViewportResize();
+          if (!KeyboardHandler.keyboardVisible) throw Error('show not detected');
+          cycleHeight=fullHeight;KeyboardHandler.handleViewportResize();
+        `);
+        expect(await page.evaluate('KeyboardHandler.keyboardVisible')).toBe(false);
+        expect(await page.evaluate(() => document.activeElement?.id)).not.toBe('terminal');
+      }
+      // A hide notification must not take focus from a different editor.
+      await page.evaluate(`
+        const other=document.createElement('textarea');other.id='other-editor';
+        document.body.append(other);other.focus();KeyboardHandler.onKeyboardHide();
+      `);
+      expect(await page.evaluate(() => document.activeElement?.id)).toBe('other-editor');
+    } finally {
+      await page.close();
+    }
+  });
+  it('does not blur/refocus an actually shrunken keyboard viewport', async () => {
+    const page = await keyboardPage();
+    try {
+      await page.setViewportSize({ width: 440, height: 552 });
+      await page.evaluate(
+        'KeyboardHandler._keyboardMinHeight=visualViewport.height;focusEvents=0;app._focusMobileTerminalInput()'
+      );
+      expect(await page.evaluate('focusEvents')).toBe(0);
+      expect(await page.evaluate('hideEvents')).toBe(0);
+      expect(await page.evaluate('KeyboardHandler.keyboardVisible')).toBe(true);
     } finally {
       await page.close();
     }
