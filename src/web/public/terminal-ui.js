@@ -7523,7 +7523,7 @@ Object.assign(CodemanApp.prototype, {
     return hasMenuPrompt && hasMenuChoice && /^\s*(?:[❯›]\s*)?\d+[.)]\s/.test(tappedLine);
   },
 
-  _focusMobileTerminalInput() {
+  _focusMobileTerminalInput(source = 'terminal-tap') {
     this._syncMobileHelperTextareaToCursor();
     // COD-467: WebKit ignores focus() on the element that already has focus, so
     // a textarea that kept focus after the keyboard went away (app/tab switch,
@@ -7541,6 +7541,15 @@ Object.assign(CodemanApp.prototype, {
     if (typeof _crashDiag !== 'undefined') {
       const handler = typeof KeyboardHandler !== 'undefined' ? KeyboardHandler : null;
       _crashDiag.log(`KEYBOARD_FOCUS: focused=${this._isMobileTerminalInputFocused()} gesture=${typeof navigator !== 'undefined' ? navigator.userActivation?.isActive : undefined} cached=${handler?.keyboardVisible} height=${Math.round(window.visualViewport?.height || 0)} baseline=${Math.round(handler?.initialViewportHeight || 0)} min=${Math.round(handler?._keyboardMinHeight || 0)}`);
+      // Observe delayed native viewport/focus changes without retrying focus.
+      const request = this._keyboardFocusRequestId = (this._keyboardFocusRequestId || 0) + 1;
+      handler?._traceKeyboardState?.(`request-${request}-${source}`);
+      for (const delay of [350, 1000]) {
+        setTimeout(() => {
+          if (request !== this._keyboardFocusRequestId || document.visibilityState === 'hidden') return;
+          handler?._traceKeyboardState?.(`request-${request}-after-${delay}ms`);
+        }, delay);
+      }
     }
   },
 

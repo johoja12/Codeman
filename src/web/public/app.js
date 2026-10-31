@@ -11635,7 +11635,7 @@ class CodemanApp {
           // Otherwise its focus guard immediately blurs the new input target.
           this._clearTouchSelection?.();
           this._touchSelectionFocusGuardUntil = 0;
-          if (this._focusMobileTerminalInput) this._focusMobileTerminalInput();
+          if (this._focusMobileTerminalInput) this._focusMobileTerminalInput('session-tab');
           else this.terminal.focus();
         } else this.terminal.focus();
       };

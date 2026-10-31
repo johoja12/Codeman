@@ -309,9 +309,17 @@ const KeyboardHandler = {
     // swallows a real keyboard.
     this.lastViewportWidth = window.visualViewport?.width || window.innerWidth;
 
+    this._traceKeyboardState('init');
+    if (typeof _crashDiag !== 'undefined') {
+      _crashDiag.log(
+        `KEYBOARD_BUILD: lifecycle-v4 ua=${typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown'}`
+      );
+    }
+
     // Simple focus handler - scroll input into view after keyboard appears
     this._focusinHandler = (e) => {
       const target = e.target;
+      if (this._isTerminalInput(target)) this._traceKeyboardState('focusin-terminal');
       if (!this.isInputElement(target)) return;
 
       // Wait for keyboard animation, then scroll input into view
@@ -327,7 +335,8 @@ const KeyboardHandler = {
     // or throttledResize and the mobile resize retry keep skipping and the
     // terminal never grows back. The settle lets a refocus land first (the
     // accessory bar and the keyboard tap fix both hand focus straight back).
-    this._focusoutHandler = () => {
+    this._focusoutHandler = (e) => {
+      if (this._isTerminalInput(e?.target)) this._traceKeyboardState('focusout-terminal');
       clearTimeout(this._focusSettleTimer);
       this._focusSettleTimer = setTimeout(() => {
         this._focusSettleTimer = null;
@@ -347,6 +356,7 @@ const KeyboardHandler = {
       const active = document.activeElement;
       if (this._isTerminalInput(active)) active.blur?.();
       this.forceKeyboardHidden();
+      this._traceKeyboardState('foreground');
     };
     document.addEventListener('visibilitychange', this._visibilityHandler);
 
@@ -457,6 +467,7 @@ const KeyboardHandler = {
       // xterm's bottom row and cursor sit above the OS keyboard.
       document.documentElement.style.setProperty('--app-height', `${currentHeight}px`);
       this.onKeyboardShow();
+      this._traceKeyboardState('viewport-show');
     }
     // Keyboard hidden (viewport grew back close to initial)
     // Use 100px threshold (not 50) to handle iOS address bar drift,
@@ -476,6 +487,7 @@ const KeyboardHandler = {
       this._releaseHeldRows();
       document.body.classList.remove('keyboard-visible');
       this.onKeyboardHide();
+      this._traceKeyboardState('viewport-hide');
       // Re-sync --app-height now that keyboard is gone (MobileDetection skipped
       // updates while keyboardVisible was true)
       MobileDetection.updateAppHeight();
@@ -685,13 +697,9 @@ const KeyboardHandler = {
 
   /** Called when keyboard hides */
   onKeyboardHide() {
-    // A native dismiss can leave the helper textarea focused. Release it on
-    // the hide transition, rather than blur/refocus within the next tap: mobile
-    // browsers can coalesce that pair and leave the keyboard closed (#35).
-    // Do not disturb another input the user has selected in the meantime.
-    if (typeof app !== 'undefined' && app._isMobileTerminalInputFocused?.()) {
-      app._blurMobileTerminalInput();
-    }
+    // A delayed closing resize can belong to an earlier dismiss, after the
+    // user has already requested a new open. Geometry must never blur input;
+    // explicit dismissal and stale-focus recovery own that decision (#35).
 
     // Hide keyboard accessory bar
     if (typeof KeyboardAccessoryBar !== 'undefined') {
@@ -884,18 +892,30 @@ const KeyboardHandler = {
   /** Check if element is an input that triggers keyboard (excludes terminal) */
   /**
    * COD-467: leave keyboard mode NOW, whatever the resize detector last saw.
-   * The baseline becomes the current height, so if the keyboard is still
-   * animating closed the next resize only grows past it (no false re-show).
+   * Keep the last keyboard-free baseline: a focus or visibility event can
+   * arrive before the closing viewport animation. Using that shrunken height
+   * as the baseline makes the next open undetectable (#35).
    */
   forceKeyboardHidden() {
     if (!this.keyboardVisible) return;
     this.keyboardVisible = false;
     this._keyboardMinHeight = 0;
     document.body.classList.remove('keyboard-visible');
-    this.initialViewportHeight = window.visualViewport?.height || window.innerHeight;
     this.onKeyboardHide();
+    this._traceKeyboardState('force-hidden');
     MobileDetection.updateAppHeight();
     this.updateLayoutForKeyboard();
+  },
+
+  /** Content-free observations only: never focus or blur from a diagnostic. */
+  _traceKeyboardState(reason) {
+    if (typeof _crashDiag === 'undefined') return;
+    const viewport = window.visualViewport;
+    const active = document.activeElement;
+    const focus = this._isTerminalInput(active) ? 'terminal' : this._editableHasFocus() ? 'editor' : 'none';
+    _crashDiag.log(
+      `KEYBOARD_STATE: v4 ${reason} focus=${focus} visible=${this.keyboardVisible} height=${Math.round(viewport?.height || 0)} width=${Math.round(viewport?.width || 0)} offset=${Math.round(viewport?.offsetTop || 0)} scale=${viewport?.scale || 1} layout=${window.innerHeight} baseline=${Math.round(this.initialViewportHeight)} min=${Math.round(this._keyboardMinHeight)} page=${document.visibilityState}`
+    );
   },
 
   /** The terminal's own text inputs (xterm's helper textarea, the CJK textarea). */

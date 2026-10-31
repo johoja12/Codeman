@@ -6,12 +6,20 @@ import { chromium, type Browser, type Page } from 'playwright';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const publicDir = resolve(import.meta.dirname, '../src/web/public');
-function method(file: string, name: string): string {
+function method(file: string, name: string, owner?: string): string {
   const source = readFileSync(resolve(publicDir, file), 'utf8');
   const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
   let result = '';
   const visit = (node: ts.Node) => {
-    if (ts.isMethodDeclaration(node) && node.name.getText(tree) === name) result = node.getText(tree);
+    if (ts.isMethodDeclaration(node) && node.name.getText(tree) === name) {
+      const declaration = ts.isObjectLiteralExpression(node.parent) ? node.parent.parent : null;
+      if (
+        !owner ||
+        (declaration && ts.isVariableDeclaration(declaration) && declaration.name.getText(tree) === owner)
+      ) {
+        result = node.getText(tree);
+      }
+    }
     ts.forEachChild(node, visit);
   };
   visit(tree);
@@ -205,11 +213,11 @@ describe('header-menu workaround and stale keyboard visibility', () => {
       content: `
       window.MobileDetection={isTouchDevice:()=>true,updateAppHeight(){}};
       window.hideEvents=0;window.focusEvents=0;
-      window.KeyboardHandler={${method('mobile-handlers.js', 'handleViewportResize')},${method('mobile-handlers.js', 'onKeyboardHide')},
+      window.KeyboardHandler={${['init', 'handleViewportResize', 'onKeyboardHide', 'forceKeyboardHidden', '_isTerminalInput', '_editableHasFocus', 'isInputElement'].map((n) => method('mobile-handlers.js', n, 'KeyboardHandler')).join(',')},
         keyboardVisible:true,initialViewportHeight:visualViewport.height,
         _keyboardMinHeight:visualViewport.height-300,lastViewportWidth:visualViewport.width,
-        KEYBOARD_GONE_GROWTH_PX:150,_releaseHeldRows(){return false},resetLayout(){hideEvents++},_scheduleViewportSettle(){},
-        onKeyboardShow(){},updateLayoutForKeyboard(){},_deferViewportSettle(){},_scheduleViewportSettle(){}};
+        KEYBOARD_GONE_GROWTH_PX:150,KEYBOARD_FOCUS_SETTLE_MS:350,_releaseHeldRows(){return false},resetLayout(){hideEvents++},_scheduleViewportSettle(){},
+        onKeyboardShow(){},_traceKeyboardState(){},updateLayoutForKeyboard(){},_deferViewportSettle(){},_scheduleViewportSettle(){}};
       window.app={${['_mobileKeyboardIsUp', '_focusMobileTerminalInput', '_isMobileTerminalInputFocused', '_blurMobileTerminalInput'].map((n) => method('terminal-ui.js', n)).join(',')},
         ${method('app.js', 'toggleMobileHeaderUtilities')},_syncMobileHelperTextareaToCursor(){},relayoutMobileSubagentWindows(){},
         terminal:{textarea:document.getElementById('terminal'),focus(){this.textarea.focus()}}};
@@ -236,14 +244,14 @@ describe('header-menu workaround and stale keyboard visibility', () => {
       await page.close();
     }
   });
-  it('releases retained terminal focus after each of 25 native dismiss cycles', async () => {
+  it('preserves a new focus through each of 25 delayed closing viewport transitions', async () => {
     const page = await keyboardPage();
     try {
       await page.evaluate(`
         window.cycleHeight=visualViewport.height;
         window.fullHeight=cycleHeight;
         Object.defineProperty(visualViewport,'height',{configurable:true,get:()=>cycleHeight});
-        window.cycleResults=[];
+        KeyboardHandler.keyboardVisible=false;KeyboardHandler.init();
         document.getElementById('menu').onclick=()=>app._focusMobileTerminalInput();
       `);
       for (let cycle = 0; cycle < 25; cycle++) {
@@ -252,10 +260,14 @@ describe('header-menu workaround and stale keyboard visibility', () => {
         await page.evaluate(`
           cycleHeight=fullHeight-300;KeyboardHandler.handleViewportResize();
           if (!KeyboardHandler.keyboardVisible) throw Error('show not detected');
-          cycleHeight=fullHeight;KeyboardHandler.handleViewportResize();
+          app.terminal.textarea.blur();
         `);
+        // Reopen before the preceding close has restored the visual viewport.
+        await page.waitForTimeout([0, 16, 80, 200][cycle % 4]);
+        await page.locator('#menu').tap();
+        await page.evaluate('cycleHeight=fullHeight;KeyboardHandler.handleViewportResize()');
         expect(await page.evaluate('KeyboardHandler.keyboardVisible')).toBe(false);
-        expect(await page.evaluate(() => document.activeElement?.id)).not.toBe('terminal');
+        expect(await page.evaluate(() => document.activeElement?.id)).toBe('terminal');
       }
       // A hide notification must not take focus from a different editor.
       await page.evaluate(`
@@ -263,6 +275,55 @@ describe('header-menu workaround and stale keyboard visibility', () => {
         document.body.append(other);other.focus();KeyboardHandler.onKeyboardHide();
       `);
       expect(await page.evaluate(() => document.activeElement?.id)).toBe('other-editor');
+    } finally {
+      await page.close();
+    }
+  });
+  it('retains calibration when returning before the close animation completes', async () => {
+    const page = await keyboardPage();
+    try {
+      await page.evaluate(`
+        window.cycleHeight=visualViewport.height;window.fullHeight=cycleHeight;
+        Object.defineProperty(visualViewport,'height',{configurable:true,get:()=>cycleHeight});
+        KeyboardHandler.keyboardVisible=false;KeyboardHandler.init();
+        cycleHeight=fullHeight-300;KeyboardHandler.handleViewportResize();
+        window.fakeVisibility='hidden';
+        Object.defineProperty(document,'visibilityState',{configurable:true,get:()=>fakeVisibility});
+        document.dispatchEvent(new Event('visibilitychange'));
+        fakeVisibility='visible';document.dispatchEvent(new Event('visibilitychange'));
+      `);
+      expect(await page.evaluate('KeyboardHandler.initialViewportHeight===fullHeight')).toBe(true);
+      // A real resize may already have reconciled the still-obscured viewport.
+      expect(await page.evaluate(() => document.activeElement?.id)).not.toBe('terminal');
+      await page.evaluate(`
+        document.getElementById('menu').onclick=()=>app._focusMobileTerminalInput();
+      `);
+      await page.locator('#menu').tap();
+      await page.evaluate('KeyboardHandler.handleViewportResize()');
+      expect(await page.evaluate('KeyboardHandler.keyboardVisible')).toBe(true);
+      expect(await page.evaluate(() => document.activeElement?.id)).toBe('terminal');
+    } finally {
+      await page.close();
+    }
+  });
+  it('observes a focus request without stealing a different editor after the tap', async () => {
+    const page = await keyboardPage();
+    try {
+      await page.evaluate(`
+        window._crashDiag={log(){}};window.observations=[];
+        KeyboardHandler._traceKeyboardState=reason=>observations.push(reason);
+        app._focusMobileTerminalInput('session-tab');
+        const editor=document.createElement('textarea');editor.id='other-editor';
+        document.body.append(editor);editor.focus();
+      `);
+      await page.waitForTimeout(1150);
+      expect(await page.evaluate(() => document.activeElement?.id)).toBe('other-editor');
+      expect(await page.evaluate('observations')).toEqual([
+        'viewport-hide',
+        'request-1-session-tab',
+        'request-1-after-350ms',
+        'request-1-after-1000ms',
+      ]);
     } finally {
       await page.close();
     }

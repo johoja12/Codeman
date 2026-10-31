@@ -84,7 +84,11 @@ function loadKeyboardHandler() {
   };
   const context = vm.createContext({
     console,
-    app: { relayoutMobileSubagentWindows: () => {} },
+    app: {
+      relayoutMobileSubagentWindows: () => {},
+      _isMobileTerminalInputFocused: () => !!doc.activeElement?.classList.contains('xterm-helper-textarea'),
+      _blurMobileTerminalInput: () => doc.activeElement?.blur(),
+    },
     navigator: {
       userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) CriOS/130 Mobile/15E148',
       maxTouchPoints: 5,
@@ -227,6 +231,70 @@ describe('COD-467 stale FOCUS: coming back to the page releases the hidden texta
   });
 });
 
+describe('keyboard lifecycle interleavings (#35)', () => {
+  for (const delay of [0, 80, 200, 349]) {
+    it(`does not let the previous closing resize blur a reopen after ${delay}ms`, () => {
+      const { handler, resize, fire, advance, doc } = loadKeyboardHandler();
+      const blur = vi.fn(() => {
+        doc.activeElement = null;
+      });
+      const input = terminalTextarea(blur);
+      doc.activeElement = input;
+      resize(FULL - KEYBOARD, FULL);
+      // Explicit dismiss, then a new focus before the old close animation ends.
+      input.blur();
+      fire('focusout');
+      advance(delay);
+      doc.activeElement = input;
+      resize(FULL, FULL);
+      expect(doc.activeElement).toBe(input);
+      expect(blur).toHaveBeenCalledTimes(1);
+      expect(handler.keyboardVisible).toBe(false);
+      // The new keyboard's own opening resize is still classified correctly.
+      resize(FULL - KEYBOARD, FULL);
+      expect(handler.keyboardVisible).toBe(true);
+      advance(500);
+      expect(doc.activeElement).toBe(input);
+      expect(handler.keyboardVisible).toBe(true);
+    });
+  }
+
+  it('preserves keyboard-free calibration across foreground recovery before closing resize', () => {
+    const { handler, resize, fire, doc } = loadKeyboardHandler();
+    doc.activeElement = terminalTextarea(() => {
+      doc.activeElement = null;
+    });
+    resize(FULL - KEYBOARD, FULL);
+    doc.visibilityState = 'hidden';
+    fire('visibilitychange');
+    doc.visibilityState = 'visible';
+    fire('visibilitychange');
+    expect(handler.initialViewportHeight).toBe(FULL);
+    expect(handler.keyboardVisible).toBe(false);
+    // Reopen before restoration: the same smaller viewport must remain detectable.
+    doc.activeElement = terminalTextarea();
+    resize(FULL - KEYBOARD, FULL);
+    expect(handler.keyboardVisible).toBe(true);
+    expect(handler.initialViewportHeight).toBe(FULL);
+  });
+
+  it('keeps calibration when the focus-out fallback fires before the closing animation', () => {
+    const { handler, resize, fire, advance, doc } = loadKeyboardHandler();
+    doc.activeElement = terminalTextarea();
+    resize(FULL - KEYBOARD, FULL);
+    doc.activeElement = null;
+    fire('focusout');
+    advance(500);
+    expect(handler.initialViewportHeight).toBe(FULL);
+    doc.activeElement = terminalTextarea();
+    resize(FULL - KEYBOARD, FULL);
+    expect(handler.keyboardVisible).toBe(true);
+    resize(FULL - TOOLBARS, FULL - TOOLBARS);
+    expect(handler.keyboardVisible).toBe(false);
+    expect(handler.initialViewportHeight).toBe(FULL - TOOLBARS);
+  });
+});
+
 // ── terminal-ui.js: the tap decision ──────────────────────────────────────
 function loadTapApp(opts: { keyboardVisible: boolean }) {
   const CodemanApp = function CodemanApp(this: unknown) {};
@@ -281,7 +349,7 @@ describe('COD-467 stale FOCUS: a tap opens the keyboard when the textarea is foc
     expect(loadTapApp({ keyboardVisible: true }).app._mobileKeyboardIsUp()).toBe(true);
   });
 
-  it('prompt-row tap: re-focus is blur THEN focus, so WebKit shows the keyboard', () => {
+  it('prompt-row tap: requests fresh focus with blur followed by focus', () => {
     const { app, calls } = loadTapApp({ keyboardVisible: false });
     app._handleMobileTerminalTap(touch, app._mobileKeyboardIsUp(), 'input');
     expect(calls).toEqual(['blur', 'focus']);
