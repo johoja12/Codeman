@@ -1,7 +1,9 @@
 # Follow-up RCA: native keyboard still fails (#35)
 
-Status: candidate only; not a verified native-phone fix. Production is unchanged
-from PR #36. Upstream PR #746 is draft pending this investigation.
+Status: the candidate frontend was deployed for phone testing after the user's
+explicit deployment request. Native-phone keyboard behavior remains unverified.
+Backend artifacts and unrelated checkout work were preserved. Upstream PR #746
+and fork PR #37 remain draft pending this investigation.
 
 ## Confirmed gaps in the first fix
 
@@ -32,7 +34,8 @@ restore stays passive with the keyboard hidden. Desktop's late focus is unchange
 ## Verification and limits
 
 - Full configured mobile keyboard/tab suites: deployed **76 passed, 12 failed**;
-  baseline **75 passed, 13 failed** (88 cases each). All 12 deployed failures also
+  baseline **75 passed, 13 failed**; candidate **76 passed, 12 failed** (88 cases
+  each). All 12 deployed and candidate failures also
   occur on the baseline. The additional baseline failure is the old touch-focus
   test's stale `preserveKeyboard` expectation. These suites are not fully green.
 - Candidate: **172 related tests and 9 focused browser checks passed**; typecheck,
@@ -61,4 +64,6 @@ frozen deployed version and candidate each passed **84**, failed **2**, skipped
 late history and reveal text before a divider). Historical baseline runs also
 showed these failures, but the fresh baseline was green. Their cause is therefore
 not established by this comparison; they must not be dismissed as unrelated.
-The broader smoke gate remains red and the candidate is not deployed.
+The broader smoke gate remains red. The candidate frontend test deployment was
+explicitly requested after these failures were reported; this is not an all-green
+release or a verified native-keyboard completion.
