@@ -685,6 +685,14 @@ const KeyboardHandler = {
 
   /** Called when keyboard hides */
   onKeyboardHide() {
+    // A native dismiss can leave the helper textarea focused. Release it on
+    // the hide transition, rather than blur/refocus within the next tap: mobile
+    // browsers can coalesce that pair and leave the keyboard closed (#35).
+    // Do not disturb another input the user has selected in the meantime.
+    if (typeof app !== 'undefined' && app._isMobileTerminalInputFocused?.()) {
+      app._blurMobileTerminalInput();
+    }
+
     // Hide keyboard accessory bar
     if (typeof KeyboardAccessoryBar !== 'undefined') {
       KeyboardAccessoryBar.hide();

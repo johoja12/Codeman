@@ -205,13 +205,13 @@ describe('header-menu workaround and stale keyboard visibility', () => {
       content: `
       window.MobileDetection={isTouchDevice:()=>true,updateAppHeight(){}};
       window.hideEvents=0;window.focusEvents=0;
-      window.KeyboardHandler={${method('mobile-handlers.js', 'handleViewportResize')},
+      window.KeyboardHandler={${method('mobile-handlers.js', 'handleViewportResize')},${method('mobile-handlers.js', 'onKeyboardHide')},
         keyboardVisible:true,initialViewportHeight:visualViewport.height,
         _keyboardMinHeight:visualViewport.height-300,lastViewportWidth:visualViewport.width,
-        KEYBOARD_GONE_GROWTH_PX:150,_releaseHeldRows(){return false},onKeyboardHide(){hideEvents++},
+        KEYBOARD_GONE_GROWTH_PX:150,_releaseHeldRows(){return false},resetLayout(){hideEvents++},_scheduleViewportSettle(){},
         onKeyboardShow(){},updateLayoutForKeyboard(){},_deferViewportSettle(){},_scheduleViewportSettle(){}};
       window.app={${['_mobileKeyboardIsUp', '_focusMobileTerminalInput', '_isMobileTerminalInputFocused', '_blurMobileTerminalInput'].map((n) => method('terminal-ui.js', n)).join(',')},
-        ${method('app.js', 'toggleMobileHeaderUtilities')},_syncMobileHelperTextareaToCursor(){},
+        ${method('app.js', 'toggleMobileHeaderUtilities')},_syncMobileHelperTextareaToCursor(){},relayoutMobileSubagentWindows(){},
         terminal:{textarea:document.getElementById('terminal'),focus(){this.textarea.focus()}}};
       document.getElementById('menu').onclick=()=>app.toggleMobileHeaderUtilities();
       app.terminal.focus();
@@ -232,6 +232,37 @@ describe('header-menu workaround and stale keyboard visibility', () => {
       expect(await page.locator('#menu').getAttribute('aria-expanded')).toBe('true');
       await page.evaluate('focusEvents=0;app._focusMobileTerminalInput()');
       expect(await page.evaluate('focusEvents')).toBe(1);
+    } finally {
+      await page.close();
+    }
+  });
+  it('releases retained terminal focus after each of 25 native dismiss cycles', async () => {
+    const page = await keyboardPage();
+    try {
+      await page.evaluate(`
+        window.cycleHeight=visualViewport.height;
+        window.fullHeight=cycleHeight;
+        Object.defineProperty(visualViewport,'height',{configurable:true,get:()=>cycleHeight});
+        window.cycleResults=[];
+        document.getElementById('menu').onclick=()=>app._focusMobileTerminalInput();
+      `);
+      for (let cycle = 0; cycle < 25; cycle++) {
+        await page.locator('#menu').tap();
+        expect(await page.evaluate(() => document.activeElement?.id)).toBe('terminal');
+        await page.evaluate(`
+          cycleHeight=fullHeight-300;KeyboardHandler.handleViewportResize();
+          if (!KeyboardHandler.keyboardVisible) throw Error('show not detected');
+          cycleHeight=fullHeight;KeyboardHandler.handleViewportResize();
+        `);
+        expect(await page.evaluate('KeyboardHandler.keyboardVisible')).toBe(false);
+        expect(await page.evaluate(() => document.activeElement?.id)).not.toBe('terminal');
+      }
+      // A hide notification must not take focus from a different editor.
+      await page.evaluate(`
+        const other=document.createElement('textarea');other.id='other-editor';
+        document.body.append(other);other.focus();KeyboardHandler.onKeyboardHide();
+      `);
+      expect(await page.evaluate(() => document.activeElement?.id)).toBe('other-editor');
     } finally {
       await page.close();
     }
