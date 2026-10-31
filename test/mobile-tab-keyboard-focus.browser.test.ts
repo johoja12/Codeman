@@ -36,8 +36,8 @@ async function harness(browser: Browser, touch = true): Promise<Page> {
     window._crashDiag={log(){}};window.focusCalls=0;
     window.app={${methods},activeSessionId:'a',isSoloWindow:true,detachedSessions:new Set(),
       sessions:new Map([['b',{name:'b'}]]),_selectGeneration:0,
-      terminal:{focus(){focusCalls++;document.getElementById('terminal').focus()}},
-      _clearTimer(){},_flushLocalEchoTo(){},_setTerminalLoadState(){},_cleanupPreviousSession(){throw Error('STOP_BEFORE_SESSION_IO')},markIdleAlertSeen(){}};
+      terminal:{options:{},focus(){focusCalls++;document.getElementById('terminal').focus()}},
+      _clearTimer(){},_flushLocalEchoTo(){},_setTerminalLoadState(){},_cleanupPreviousSession(){},_userScrollback(){return 100000},_renderHistoryTruncationBanner(){},_updateSseSubscription(){},_queueTransportActivationReconcile(){},_connectWs(){},hideWelcome(){},playTerminalEntrance(){throw Error('STOP_BEFORE_SESSION_IO')},markIdleAlertSeen(){}};
     const select=app.selectSession;app.selectSession=(...args)=>select.apply(app,args).catch(e=>{
       if(e.message!=='STOP_BEFORE_SESSION_IO')throw e;
     });
@@ -82,8 +82,64 @@ describe('explicit mobile tab keyboard focus', () => {
     try {
       await page.evaluate('app.selectSession("b",{auto:true})');
       expect(await page.evaluate('focusCalls')).toBe(0);
-      await page.evaluate('KeyboardHandler.keyboardVisible=true;app.selectSession("b",{auto:true})');
+      await page.evaluate(
+        'KeyboardHandler.keyboardVisible=true;app.activeSessionId="a";app.selectSession("b",{auto:true})'
+      );
       expect(await page.evaluate('focusCalls')).toBe(1);
+    } finally {
+      await page.close();
+    }
+  });
+  it('reveals a webview-hidden terminal before spending the synchronous focus', async () => {
+    const page = await harness(browser);
+    try {
+      await page.evaluate(() => {
+        const input = document.getElementById('terminal')!;
+        const wrap = document.createElement('div');
+        wrap.id = 'hidden-terminal';
+        input.before(wrap);
+        wrap.append(input);
+        wrap.style.display = 'none';
+        (window as any).app._hideWebviewLayer = () => {
+          wrap.style.display = '';
+        };
+      });
+      await page.locator('#other').tap();
+      expect(await page.evaluate(() => document.activeElement?.id)).toBe('terminal');
+    } finally {
+      await page.close();
+    }
+  });
+  it('retires the previous text selection guard on an explicit tab tap', async () => {
+    const page = await harness(browser);
+    try {
+      await page.evaluate(() => {
+        const app = (window as any).app;
+        app._touchSelecting = true;
+        app._clearTouchSelection = () => {
+          app._touchSelecting = false;
+        };
+        document.getElementById('terminal')!.addEventListener('focus', (e) => {
+          if (app._touchSelecting) (e.target as HTMLElement).blur();
+        });
+      });
+      await page.locator('#other').tap();
+      expect(await page.evaluate(() => document.activeElement?.id)).toBe('terminal');
+    } finally {
+      await page.close();
+    }
+  });
+  it('uses the mobile input target after mode setup, including CJK input', async () => {
+    const page = await harness(browser);
+    try {
+      await page.evaluate(() => {
+        const field = document.createElement('textarea');
+        field.id = 'cjkInput';
+        document.body.append(field);
+        (window as any).app._focusMobileTerminalInput = () => field.focus();
+      });
+      await page.locator('#other').tap();
+      expect(await page.evaluate(() => document.activeElement?.id)).toBe('cjkInput');
     } finally {
       await page.close();
     }
