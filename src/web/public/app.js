@@ -10275,9 +10275,9 @@ class CodemanApp {
     // instead of switching to it; on a window too narrow for the grid it is an
     // ordinary click.
     if ((event?.ctrlKey || event?.metaKey) && this.addSessionToTiles?.(sessionId)) return;
-    // On touch with the keyboard hidden, blur the tapped tab so switching
-    // sessions doesn't pop the on-screen keyboard. Focus policy itself lives
-    // in selectSession via _shouldFocusTerminalForTabSwitch().
+    // A hidden mobile keyboard can leave the terminal textarea focused. Blur
+    // first so this explicit tap can reopen it with a fresh synchronous focus.
+    // Automatic selections keep their passive focus policy in selectSession().
     const keyboardOpen = typeof KeyboardHandler !== 'undefined' && KeyboardHandler.keyboardVisible === true;
     if (!keyboardOpen && MobileDetection.isTouchDevice()) {
       document.activeElement?.blur?.();
@@ -11590,11 +11590,12 @@ class CodemanApp {
     bar.hidden = false;
   }
 
-  _shouldFocusTerminalForTabSwitch() {
+  _shouldFocusTerminalForTabSwitch(options = {}) {
     if (typeof MobileDetection === 'undefined' || !MobileDetection.isTouchDevice()) {
       return true;
     }
-    return typeof KeyboardHandler !== 'undefined' && KeyboardHandler.keyboardVisible;
+    return options.auto !== true ||
+      (typeof KeyboardHandler !== 'undefined' && KeyboardHandler.keyboardVisible);
   }
 
   async selectSession(sessionId, options = {}) {
@@ -11626,6 +11627,14 @@ class CodemanApp {
     // fails toward acknowledging rather than toward an alert that can never be
     // cleared.
     const userInitiated = options?.auto !== true;
+    const focusTerminalWithoutActivation = () => {
+      const focusTerminal = () => this.terminal.focus();
+      if (this._terminalViewerActivity?.runWithoutActivation) {
+        this._terminalViewerActivity.runWithoutActivation(focusTerminal);
+      } else {
+        focusTerminal();
+      }
+    };
     // Terminal sizing activity currently shares this audited `auto: true`
     // intent contract: app-restored selections stay passive, human choices own.
     // `!activeWebviewId`: with a dashboard foregrounded, re-selecting the
@@ -11641,6 +11650,7 @@ class CodemanApp {
         this.applyTerminalFontPolicy?.(this.sessions.get(sessionId)?.mode);
         try { this.syncTerminalGeometry?.(); } catch {}
         this._terminalViewerActivity?.activate('session-select');
+        if (this.terminal && this._shouldFocusTerminalForTabSwitch(options)) focusTerminalWithoutActivation();
       }
       return;
     }
@@ -11685,17 +11695,9 @@ class CodemanApp {
     // programmatic focus() within the user-gesture call stack (e.g. tab click).
     // After the first await the gesture context is lost and focus() is silently
     // ignored, leaving the keyboard unable to send input to the terminal.
-    // Desktop always focuses; touch focuses only while the on-screen keyboard
-    // is already open (so a tab switch doesn't pop the keyboard).
-    const shouldFocusTerminal = this._shouldFocusTerminalForTabSwitch();
-    const focusTerminalWithoutActivation = () => {
-      const focusTerminal = () => this.terminal.focus();
-      if (this._terminalViewerActivity?.runWithoutActivation) {
-        this._terminalViewerActivity.runWithoutActivation(focusTerminal);
-      } else {
-        focusTerminal();
-      }
-    };
+    // Explicit mobile selection opens the keyboard. App-driven selection only
+    // preserves an already-visible keyboard; boot/replay must not pop it open.
+    const shouldFocusTerminal = this._shouldFocusTerminalForTabSwitch(options);
     if (shouldFocusTerminal && this.terminal) {
       focusTerminalWithoutActivation();
     }

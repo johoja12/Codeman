@@ -431,13 +431,18 @@ const MobileTabSheet = {
     const scrim = document.getElementById('mobileTabScrim');
     const pill = document.getElementById('mobileTabPill');
     if (!sheet || !scrim) return;
+    clearTimeout(this._searchFocusTimer);
+    this._searchFocusTimer = null;
     const willOpen = typeof open === 'boolean' ? open : !sheet.classList.contains('open');
     sheet.classList.toggle('open', willOpen);
     scrim.classList.toggle('open', willOpen);
     if (pill) pill.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
     if (willOpen) {
       this.render();
-      setTimeout(() => document.getElementById('mobileTabSearch')?.focus(), 180);
+      this._searchFocusTimer = setTimeout(() => {
+        this._searchFocusTimer = null;
+        if (this.isOpen()) document.getElementById('mobileTabSearch')?.focus();
+      }, 180);
       document.body.style.overflow = 'hidden';
     } else {
       document.body.style.overflow = '';
@@ -547,10 +552,12 @@ const MobileTabSheet = {
     listEl.innerHTML = html.join('');
   },
   activate(id) {
-    try {
-      window.app.selectSession(id);
-    } catch {}
+    // Retire delayed search focus before handing the gesture to the terminal.
     this.toggle(false);
+    try {
+      if (window.app.handleSessionTabClick) window.app.handleSessionTabClick(null, id);
+      else window.app.selectSession(id);
+    } catch {}
   },
   closeTab(id) {
     try {
