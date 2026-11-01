@@ -218,7 +218,7 @@ describe('header-menu workaround and stale keyboard visibility', () => {
         _keyboardMinHeight:visualViewport.height-300,lastViewportWidth:visualViewport.width,
         KEYBOARD_GONE_GROWTH_PX:150,KEYBOARD_FOCUS_SETTLE_MS:350,_releaseHeldRows(){return false},resetLayout(){hideEvents++},_scheduleViewportSettle(){},
         _traceKeyboardState(){},updateLayoutForKeyboard(){},_deferViewportSettle(){},_scheduleViewportSettle(){}};
-      window.app={${['_mobileKeyboardIsUp', '_prepareMobileTerminalFocusGesture', '_installMobileTapMouseGuard', '_suppressTrustedTapMouseEvents', '_focusMobileTerminalInput', '_restoreMobileTerminalPageFocus', '_isMobileTerminalInputFocused', '_blurMobileTerminalInput'].map((n) => method('terminal-ui.js', n)).join(',')},
+      window.app={${['_mobileKeyboardIsUp', '_prepareMobileTerminalFocusGesture', '_installMobileTapMouseGuard', '_suppressTrustedTapMouseEvents', '_focusMobileTerminalInput', '_isMobileTerminalInputFocused', '_blurMobileTerminalInput'].map((n) => method('terminal-ui.js', n)).join(',')},
         ${method('app.js', 'toggleMobileHeaderUtilities')},_syncMobileHelperTextareaToCursor(){},relayoutMobileSubagentWindows(){},
         terminal:{textarea:document.getElementById('terminal'),focus(){this.textarea.focus()}}};
       document.getElementById('menu').onclick=()=>app.toggleMobileHeaderUtilities();
@@ -533,74 +533,99 @@ describe('header-menu workaround and stale keyboard visibility', () => {
       await page.close();
     }
   });
-  it('requests page focus before input focus when iOS native dismissal unfocused the page', async () => {
+  it('permits native page activation on a lost-focus tap without duplicating CLI mouse actions', async () => {
     const page = await keyboardPage();
     try {
       await page.evaluate(`
         MobileDetection.isIOS=()=>true;KeyboardHandler.keyboardVisible=false;
-        window.pageFocused=false;window.focusOrder=[];
+        window.pageFocused=false;window.cliMouseEvents=0;window.nativeDefaults=[];
         Object.defineProperty(document,'hasFocus',{configurable:true,value:()=>pageFocused});
-        window.focus=()=>{focusOrder.push('page');pageFocused=true};
-        const original=app.terminal.focus.bind(app.terminal);
-        app.terminal.focus=()=>{focusOrder.push('input');original()};
-        const input=app.terminal.textarea;
-        window.originalInput=input;input.value='keep this draft';input.setSelectionRange(2,6);
-        window.inputEvents=0;input.addEventListener('input',()=>inputEvents++);
-        document.getElementById('menu').onclick=()=>app._focusMobileTerminalInput();
+        window.focus=()=>{}; // Reproduce the phone declining script window.focus().
+        const surface=document.createElement('div');surface.id='native-surface';
+        surface.style.cssText='height:80px;background:#ddd';document.body.append(surface);
+        app.terminal.element=surface;app._installMobileTapMouseGuard();
+        surface.addEventListener('touchend',()=>{
+          app._suppressTrustedTapMouseEvents();app._focusMobileTerminalInput();
+        });
+        // Model only the native activation default: the cancelled v10 mousedown
+        // must not activate the page. This does not simulate an OS keyboard.
+        window.lastNativeMouseDown=null;
+        document.addEventListener('mousedown',event=>lastNativeMouseDown=event,true);
+        document.addEventListener('mouseup',()=>{
+          nativeDefaults.push(lastNativeMouseDown.defaultPrevented);
+          if(!lastNativeMouseDown.defaultPrevented)pageFocused=true;
+        },true);
+        for(const kind of ['mousedown','mouseup','click'])
+          surface.addEventListener(kind,()=>cliMouseEvents++);
       `);
-      await page.locator('#menu').tap();
-      expect(await page.evaluate('focusOrder')).toEqual(['page', 'input']);
+      await page.locator('#native-surface').tap();
+      expect(await page.evaluate('nativeDefaults')).toEqual([false]);
       expect(await page.evaluate('document.hasFocus()')).toBe(true);
-      expect(await page.evaluate('app.terminal.textarea===originalInput')).toBe(true);
-      expect(await page.evaluate('originalInput.value')).toBe('keep this draft');
-      expect(await page.evaluate('[originalInput.selectionStart,originalInput.selectionEnd]')).toEqual([2, 6]);
-      await page.keyboard.type('X');
-      expect(await page.evaluate('inputEvents')).toBe(1);
-      await page.evaluate('pageFocused=false;focusOrder=[];originalInput.blur()');
-      await page.waitForTimeout(500);
-      expect(await page.evaluate('focusOrder')).toEqual([]);
-      expect(await page.evaluate(() => document.activeElement?.id)).not.toBe('terminal');
-    } finally {
-      await page.close();
-    }
-  });
-
-  it('does not loop or retry if the browser declines page focus', async () => {
-    const page = await keyboardPage();
-    try {
-      await page.evaluate(`
-        MobileDetection.isIOS=()=>true;KeyboardHandler.keyboardVisible=false;
-        Object.defineProperty(document,'hasFocus',{configurable:true,value:()=>false});
-        window.pageRequests=0;window.focus=()=>pageRequests++;
-        document.getElementById('menu').onclick=()=>app._focusMobileTerminalInput();
-      `);
-      await page.locator('#menu').tap();
-      await page.waitForTimeout(1100);
-      expect(await page.evaluate('pageRequests')).toBe(1);
+      expect(await page.evaluate('cliMouseEvents')).toBe(0);
       expect(await page.evaluate(() => document.activeElement?.id)).toBe('terminal');
     } finally {
       await page.close();
     }
   });
 
-  for (const state of ['page-focused', 'non-ios', 'hidden', 'no-gesture']) {
-    it(`does not request window focus for ${state}`, async () => {
+  for (const interruption of [
+    'page-focused',
+    'newer-request',
+    'other-editor',
+    'expired',
+    'session-change',
+    'selection',
+  ]) {
+    it(`cancels native-click recovery safely for ${interruption}`, async () => {
       const page = await keyboardPage();
       try {
-        await page.evaluate((state) => {
+        await page.evaluate((kind) => {
           const w = window as any;
-          w.MobileDetection.isIOS = () => state !== 'non-ios';
-          Object.defineProperty(document, 'hasFocus', { configurable: true, value: () => state === 'page-focused' });
-          if (state === 'hidden')
-            Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
-          if (state === 'no-gesture')
-            Object.defineProperty(navigator, 'userActivation', { configurable: true, value: { isActive: false } });
-          w.pageRequests = 0;
-          w.focus = () => w.pageRequests++;
-          document.getElementById('menu')!.onclick = () => w.app._restoreMobileTerminalPageFocus();
-        }, state);
-        await page.locator('#menu').tap();
-        expect(await page.evaluate('pageRequests')).toBe(0);
+          w.MobileDetection.isIOS = () => true;
+          w.KeyboardHandler.keyboardVisible = false;
+          w.pageFocused = kind === 'page-focused';
+          w.cliMouseEvents = 0;
+          w.nativeDefaults = [];
+          Object.defineProperty(document, 'hasFocus', { configurable: true, value: () => w.pageFocused });
+          const surface = document.createElement('div');
+          surface.id = 'native-surface';
+          surface.style.cssText = 'height:80px;background:#ddd';
+          document.body.append(surface);
+          w.app.terminal.element = surface;
+          w.app._installMobileTapMouseGuard();
+          surface.addEventListener('touchend', () => {
+            w.app._suppressTrustedTapMouseEvents();
+            w.app._focusMobileTerminalInput();
+          });
+          let down: MouseEvent;
+          document.addEventListener(
+            'mousedown',
+            (event) => {
+              down = event;
+              if (kind === 'newer-request') w.app._mobileKeyboardFocusGeneration++;
+              if (kind === 'expired' && w.app._mobileNativeClickFocusRequest)
+                w.app._mobileNativeClickFocusRequest.expires = 0;
+              if (kind === 'session-change') w.app.activeSessionId = 'another-session';
+              if (kind === 'selection') w.app._touchSelectionActive = true;
+              if (kind === 'other-editor') {
+                const editor = document.createElement('textarea');
+                editor.id = 'editor';
+                document.body.append(editor);
+                editor.focus();
+              }
+            },
+            true
+          );
+          document.addEventListener('mouseup', () => w.nativeDefaults.push(down.defaultPrevented), true);
+          for (const type of ['mousedown', 'mouseup', 'click'])
+            surface.addEventListener(type, () => w.cliMouseEvents++);
+        }, interruption);
+        await page.locator('#native-surface').tap();
+        expect(await page.evaluate('nativeDefaults')).toEqual([true]);
+        expect(await page.evaluate('cliMouseEvents')).toBe(0);
+        expect(await page.evaluate('app._mobileNativeClickFocusRequest')).toBeNull();
+        if (interruption === 'other-editor')
+          expect(await page.evaluate(() => document.activeElement?.id)).toBe('editor');
       } finally {
         await page.close();
       }

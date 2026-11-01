@@ -357,6 +357,27 @@ describe('terminal touch tap mouse guard', () => {
     expect(event.stopImmediatePropagation).toHaveBeenCalledOnce();
   });
 
+  it('retains OpenCode click fallback except during native focus recovery', () => {
+    const { app } = loadTerminalUiHarness();
+    app._shouldForwardClickToForegroundTui = () => true;
+    app._sendForegroundTuiClick = vi.fn();
+    app._suppressTrustedTapMouseEvents();
+    const event = {
+      isTrusted: true,
+      button: 0,
+      clientX: 10,
+      clientY: 20,
+      preventDefault: vi.fn(),
+      stopPropagation: vi.fn(),
+    };
+    expect(app._handleForegroundTuiClick(event)).toBe(true);
+    expect(app._sendForegroundTuiClick).toHaveBeenCalledOnce();
+    app._sendForegroundTuiClick.mockClear();
+    app._mobileNativeClickFocusRequest = {};
+    expect(app._handleForegroundTuiClick(event)).toBe(false);
+    expect(app._sendForegroundTuiClick).not.toHaveBeenCalled();
+  });
+
   it('allows the app synthetic mouse event through the tap window', () => {
     const { app } = loadTerminalUiHarness();
     const { element, dispatch } = createElementHarness();

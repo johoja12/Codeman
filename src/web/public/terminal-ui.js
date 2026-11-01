@@ -622,6 +622,8 @@ Object.assign(CodemanApp.prototype, {
   },
 
   _handleForegroundTuiClick(ev) {
+    if (ev.isTrusted && this._mobileNativeClickFocusRequest &&
+        performance.now() <= (this._trustedTapMouseSuppressUntil || 0)) return false;
     // Keep the fork's click support independent of the scrolling comparison.
     if (!this._shouldForwardClickToForegroundTui() || ev.button !== 0) return false;
     ev.preventDefault();
@@ -1660,7 +1662,10 @@ Object.assign(CodemanApp.prototype, {
             // Cancel xterm/browser focus before the compatibility click can
             // open the OS keyboard. Content taps are re-emitted as SGR on
             // touchend. History taps remain focusable.
-            ev.preventDefault();
+            // An unfocused iOS page needs the browser's native activation
+            // event. The mouse guard still blocks CLI actions, and arms a
+            // trusted-click focus recovery only if this tap wants input (#35).
+            if (!MobileDetection.isIOS?.() || document.hasFocus()) ev.preventDefault();
             this._blurMobileTerminalInput();
           }
           // Hold still and this press becomes a text selection. Cancelled by any
@@ -7527,34 +7532,14 @@ Object.assign(CodemanApp.prototype, {
   },
 
   _prepareMobileTerminalFocusGesture() {
+    this._mobileNativeClickFocusRequest = null;
     if (!this._isMobileTerminalInputFocused() || this._mobileKeyboardIsUp()) return false;
     this._blurMobileTerminalInput();
     if (typeof KeyboardHandler !== 'undefined') KeyboardHandler._traceKeyboardState?.('gesture-release');
     return true;
   },
 
-  _restoreMobileTerminalPageFocus() {
-    // Native iOS keyboard dismissal can unfocus the page while a later touch
-    // focuses the textarea only. The phone then reports activeElement correctly
-    // but document.hasFocus() stays false and no keyboard appears (#35).
-    // Request page focus FIRST, only in a live user gesture on this visible page.
-    // Browser focus requests are best-effort; never retry from a timer.
-    if (!MobileDetection.isIOS?.() || document.visibilityState !== 'visible' ||
-        typeof document.hasFocus !== 'function' || document.hasFocus() ||
-        typeof navigator === 'undefined' || navigator.userActivation?.isActive !== true) return;
-    let accepted = false;
-    try {
-      window.focus();
-      accepted = document.hasFocus();
-    } catch {
-      // A browser can reject focus; the normal input gesture still proceeds.
-    }
-    if (typeof _crashDiag !== 'undefined')
-      _crashDiag.log(`KEYBOARD_PAGE_FOCUS: v10 requested=true after=${accepted}`);
-  },
-
   _focusMobileTerminalInput(source = 'terminal-tap') {
-    this._restoreMobileTerminalPageFocus();
     this._syncMobileHelperTextareaToCursor();
     const cjkInput = document.getElementById('cjkInput');
     const target = cjkInput?.classList.contains('cjk-input-visible') ? cjkInput : this.terminal?.textarea;
@@ -7596,6 +7581,18 @@ Object.assign(CodemanApp.prototype, {
         handler._traceKeyboardState?.('tab-focus-owner-transfer');
       }, handler.KEYBOARD_FOCUS_SETTLE_MS || 350);
     }
+    // Script window.focus() was declined on the phone. Preserve the native
+    // compatibility mouse default that can activate its page, then focus from
+    // that trusted click. Never forward those mouse events to the CLI.
+    this._mobileNativeClickFocusRequest = source === 'terminal-tap' &&
+      MobileDetection.isIOS?.() && document.visibilityState === 'visible' &&
+      typeof document.hasFocus === 'function' && !document.hasFocus() &&
+      typeof navigator !== 'undefined' && navigator.userActivation?.isActive === true &&
+      !handler?.keyboardVisible && target ? {
+        target, element: this.terminal?.element, sessionId: this.activeSessionId,
+        generation: this._mobileKeyboardFocusGeneration,
+        expires: performance.now() + (window.CodemanTerminalInput?.TOUCH_COMPAT_MOUSE_SUPPRESS_MS || 450),
+      } : null;
     if (typeof _crashDiag !== 'undefined') {
       const handler = typeof KeyboardHandler !== 'undefined' ? KeyboardHandler : null;
       _crashDiag.log(`KEYBOARD_FOCUS: focused=${this._isMobileTerminalInputFocused()} gesture=${typeof navigator !== 'undefined' ? navigator.userActivation?.isActive : undefined} cached=${handler?.keyboardVisible} retains=${retainsFocus} height=${Math.round(window.visualViewport?.height || 0)} baseline=${Math.round(handler?.initialViewportHeight || 0)} min=${Math.round(handler?._keyboardMinHeight || 0)}`);
@@ -8339,11 +8336,28 @@ Object.assign(CodemanApp.prototype, {
     const suppressTrustedCompatMouse = (ev) => {
       const suppressUntil = this._trustedTapMouseSuppressUntil || 0;
       if (!ev.isTrusted || performance.now() > suppressUntil) return;
-      ev.preventDefault();
+      const request = this._mobileNativeClickFocusRequest;
+      const recover = request && ev.button === 0 && performance.now() <= request.expires &&
+        request.element === el && request.target?.isConnected &&
+        request.sessionId === this.activeSessionId &&
+        request.generation === this._mobileKeyboardFocusGeneration &&
+        document.visibilityState === 'visible' && !this._touchSelectionActive &&
+        !(typeof KeyboardHandler !== 'undefined' && KeyboardHandler.keyboardVisible) &&
+        (document.activeElement === request.target || document.activeElement === document.body);
+      // stopImmediatePropagation fences xterm/CLI reports. preventDefault also
+      // blocks native page activation, so omit it only for the armed reopen.
+      if (!recover) ev.preventDefault();
       ev.stopImmediatePropagation();
+      if (recover && typeof _crashDiag !== 'undefined')
+        _crashDiag.log(`KEYBOARD_NATIVE_CLICK: v11 ${ev.type} page=${document.hasFocus()}`);
+      if (ev.type === 'click') {
+        this._mobileNativeClickFocusRequest = null;
+        if (recover) this._focusMobileTerminalInput('native-click-recovery');
+      }
     };
     el.addEventListener('mousedown', suppressTrustedCompatMouse, true);
     el.addEventListener('mouseup', suppressTrustedCompatMouse, true);
+    el.addEventListener('click', suppressTrustedCompatMouse, true);
   },
 
   _suppressTrustedTapMouseEvents() {
