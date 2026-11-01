@@ -213,7 +213,7 @@ describe('header-menu workaround and stale keyboard visibility', () => {
       content: `
       window.MobileDetection={isTouchDevice:()=>true,updateAppHeight(){}};
       window.hideEvents=0;window.focusEvents=0;
-      window.KeyboardHandler={${['init', 'handleViewportResize', 'onKeyboardHide', 'onKeyboardShow', 'forceKeyboardHidden', '_isTerminalInput', '_editableHasFocus', 'isInputElement'].map((n) => method('mobile-handlers.js', n, 'KeyboardHandler')).join(',')},
+      window.KeyboardHandler={${['init', 'cleanup', 'handleViewportResize', 'onKeyboardHide', 'onKeyboardShow', 'forceKeyboardHidden', '_isTerminalInput', '_editableHasFocus', 'isInputElement'].map((n) => method('mobile-handlers.js', n, 'KeyboardHandler')).join(',')},
         keyboardVisible:true,initialViewportHeight:visualViewport.height,
         _keyboardMinHeight:visualViewport.height-300,lastViewportWidth:visualViewport.width,
         KEYBOARD_GONE_GROWTH_PX:150,KEYBOARD_FOCUS_SETTLE_MS:350,_releaseHeldRows(){return false},resetLayout(){hideEvents++},_scheduleViewportSettle(){},
@@ -275,7 +275,7 @@ describe('header-menu workaround and stale keyboard visibility', () => {
     }
   });
 
-  it('releases an owned native dismiss before the next of 20 reopen gestures', async () => {
+  it('retains dismiss ownership after prompt taps while the keyboard is open', async () => {
     const page = await keyboardPage();
     try {
       await page.evaluate(`
@@ -283,10 +283,18 @@ describe('header-menu workaround and stale keyboard visibility', () => {
         Object.defineProperty(visualViewport,'height',{configurable:true,get:()=>cycleHeight});
         KeyboardHandler.keyboardVisible=false;KeyboardHandler.init();
         document.getElementById('menu').onclick=()=>app._focusMobileTerminalInput();
+        const surface=document.createElement('div');surface.id='prompt-surface';
+        surface.style.cssText='height:60px;background:#ddd';document.body.append(surface);
+        app.terminal.element=surface;app._installMobileTapMouseGuard();
+        surface.addEventListener('touchstart',()=>app._prepareMobileTerminalFocusGesture());
+        surface.addEventListener('touchend',()=>{
+          app._suppressTrustedTapMouseEvents();app._focusMobileTerminalInput();
+        });
       `);
       for (let cycle = 0; cycle < 20; cycle++) {
         await page.locator('#menu').tap();
         await page.evaluate('cycleHeight=fullHeight-300;KeyboardHandler.handleViewportResize()');
+        for (let tap = 0; tap < cycle % 3; tap++) await page.locator('#prompt-surface').tap();
         expect(await page.evaluate('KeyboardHandler._keyboardFocusOwner===app._mobileKeyboardFocusGeneration')).toBe(
           true
         );
@@ -294,6 +302,32 @@ describe('header-menu workaround and stale keyboard visibility', () => {
         expect(await page.evaluate(() => document.activeElement?.id)).not.toBe('terminal');
         expect(await page.evaluate('KeyboardHandler.initialViewportHeight===fullHeight')).toBe(true);
       }
+    } finally {
+      await page.close();
+    }
+  });
+
+  it('survives listener reconnect with the keyboard open, then dismisses and reopens', async () => {
+    const page = await keyboardPage();
+    try {
+      await page.evaluate(`
+        window.cycleHeight=visualViewport.height;window.fullHeight=cycleHeight;
+        Object.defineProperty(visualViewport,'height',{configurable:true,get:()=>cycleHeight});
+        KeyboardHandler.keyboardVisible=false;KeyboardHandler.init();
+        app._focusMobileTerminalInput();
+        cycleHeight=fullHeight-300;KeyboardHandler.handleViewportResize();
+        KeyboardHandler.cleanup();KeyboardHandler.init();KeyboardHandler.handleViewportResize();
+      `);
+      expect(await page.evaluate('KeyboardHandler.initialViewportHeight===fullHeight')).toBe(true);
+      expect(await page.evaluate('KeyboardHandler.keyboardVisible')).toBe(true);
+      expect(await page.evaluate(() => document.activeElement?.id)).toBe('terminal');
+      await page.evaluate('cycleHeight=fullHeight;KeyboardHandler.handleViewportResize()');
+      expect(await page.evaluate(() => document.activeElement?.id)).not.toBe('terminal');
+      await page.evaluate(`document.getElementById('menu').onclick=()=>app._focusMobileTerminalInput()`);
+      await page.locator('#menu').tap();
+      await page.evaluate('cycleHeight=fullHeight-300;KeyboardHandler.handleViewportResize()');
+      expect(await page.evaluate('KeyboardHandler.keyboardVisible')).toBe(true);
+      expect(await page.evaluate(() => document.activeElement?.id)).toBe('terminal');
     } finally {
       await page.close();
     }

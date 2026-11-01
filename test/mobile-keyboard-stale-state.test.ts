@@ -301,6 +301,21 @@ describe('keyboard lifecycle interleavings (#35)', () => {
     expect(doc.activeElement).toBe(second);
   });
 
+  it('preserves open-keyboard calibration when reconnect reinitializes the listeners', () => {
+    const { handler, resize, doc, requestFocus } = loadKeyboardHandler();
+    const input = terminalTextarea(() => {
+      doc.activeElement = null;
+    });
+    requestFocus(input);
+    resize(FULL - KEYBOARD, FULL);
+    handler.cleanup();
+    handler.init();
+    resize(FULL - KEYBOARD, FULL);
+    expect(handler.initialViewportHeight).toBe(FULL);
+    expect(handler.keyboardVisible).toBe(true);
+    expect(doc.activeElement).toBe(input);
+  });
+
   it('does not let reconciliation of an old shrunken viewport own a newer focus request', () => {
     const { handler, resize, fire, doc, requestFocus } = loadKeyboardHandler();
     const input = terminalTextarea(() => {
@@ -408,6 +423,24 @@ describe('COD-467 stale FOCUS: a tap opens the keyboard when the textarea is foc
   it('"keyboard up" for the tap toggle means focused AND visible, not just focused', () => {
     expect(loadTapApp({ keyboardVisible: false }).app._mobileKeyboardIsUp()).toBe(false);
     expect(loadTapApp({ keyboardVisible: true }).app._mobileKeyboardIsUp()).toBe(true);
+  });
+
+  it('retains the opening generation when tapping an already-focused prompt with keyboard up', () => {
+    const { app, calls } = loadTapApp({ keyboardVisible: true });
+    app._mobileKeyboardFocusGeneration = 7;
+    app._focusMobileTerminalInput();
+    app._focusMobileTerminalInput();
+    expect(app._mobileKeyboardFocusGeneration).toBe(7);
+    expect(calls).toEqual(['focus', 'focus']);
+  });
+
+  it('advances the opening generation for a real focus transfer while keyboard remains up', () => {
+    const { app, doc } = loadTapApp({ keyboardVisible: true });
+    app._mobileKeyboardFocusGeneration = 7;
+    doc.activeElement = terminalTextarea(); // another terminal/CJK target owns focus
+    app._focusMobileTerminalInput();
+    expect(app._mobileKeyboardFocusGeneration).toBe(8);
+    expect(doc.activeElement).toBe(app.terminal.textarea);
   });
 
   it('prompt-row tap: requests fresh focus with blur followed by focus', () => {

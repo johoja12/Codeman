@@ -303,16 +303,21 @@ const KeyboardHandler = {
     if (this._initialized) return;
     this._initialized = true;
 
-    this.initialViewportHeight = window.visualViewport?.height || window.innerHeight;
-    this.lastViewportHeight = this.initialViewportHeight;
-    // Seed the width too, or the first resize event reads as a shape change and
-    // swallows a real keyboard.
-    this.lastViewportWidth = window.visualViewport?.width || window.innerWidth;
+    const height = window.visualViewport?.height || window.innerHeight;
+    const width = window.visualViewport?.width || window.innerWidth;
+    // SSE reconnect tears down/reinstalls these listeners while input can
+    // remain open. Retain its calibrated baseline on the same display width;
+    // adopting the shrunken height would turn the next event into a false hide.
+    if (!(this.keyboardVisible && this.lastViewportWidth === width && this.initialViewportHeight > 0)) {
+      this.initialViewportHeight = height;
+    }
+    this.lastViewportHeight = height;
+    this.lastViewportWidth = width;
 
     this._traceKeyboardState('init');
     if (typeof _crashDiag !== 'undefined') {
       _crashDiag.log(
-        `KEYBOARD_BUILD: lifecycle-v6 ua=${typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown'}`
+        `KEYBOARD_BUILD: lifecycle-v7 ua=${typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown'}`
       );
     }
 
@@ -712,13 +717,16 @@ const KeyboardHandler = {
     const ownerInput = this._keyboardFocusOwnerInput;
     this._keyboardFocusOwner = undefined;
     this._keyboardFocusOwnerInput = undefined;
-    if (
+    const release =
       Number.isSafeInteger(owner) &&
       typeof app !== 'undefined' &&
       owner === app._mobileKeyboardFocusGeneration &&
       ownerInput === document.activeElement &&
-      app._isMobileTerminalInputFocused?.()
-    ) {
+      app._isMobileTerminalInputFocused?.();
+    // Retain the last close decision even if subsequent failed taps fill the
+    // breadcrumb ring. No input contents are recorded.
+    this._lastKeyboardHide = `owner:${owner},generation:${typeof app !== 'undefined' ? app._mobileKeyboardFocusGeneration : undefined},same:${ownerInput === document.activeElement},release:${!!release}`;
+    if (release) {
       app._blurMobileTerminalInput();
       this._traceKeyboardState('owned-hide-release');
     }
@@ -937,7 +945,7 @@ const KeyboardHandler = {
     const focus = this._isTerminalInput(active) ? 'terminal' : this._editableHasFocus() ? 'editor' : 'none';
     this._traceKeyboardInputBox(reason);
     _crashDiag.log(
-      `KEYBOARD_STATE: v6 ${reason} focus=${focus} visible=${this.keyboardVisible} height=${Math.round(viewport?.height || 0)} width=${Math.round(viewport?.width || 0)} offset=${Math.round(viewport?.offsetTop || 0)} scale=${viewport?.scale || 1} layout=${window.innerHeight} baseline=${Math.round(this.initialViewportHeight)} min=${Math.round(this._keyboardMinHeight)} owner=${this._keyboardFocusOwner} request=${typeof app !== 'undefined' ? app._mobileKeyboardFocusGeneration : undefined} page=${document.visibilityState}`
+      `KEYBOARD_STATE: v7 ${reason} focus=${focus} visible=${this.keyboardVisible} height=${Math.round(viewport?.height || 0)} width=${Math.round(viewport?.width || 0)} offset=${Math.round(viewport?.offsetTop || 0)} scale=${viewport?.scale || 1} layout=${window.innerHeight} baseline=${Math.round(this.initialViewportHeight)} min=${Math.round(this._keyboardMinHeight)} owner=${this._keyboardFocusOwner} request=${typeof app !== 'undefined' ? app._mobileKeyboardFocusGeneration : undefined} hide=${this._lastKeyboardHide || 'none'} page=${document.visibilityState}`
     );
   },
 
@@ -967,7 +975,7 @@ const KeyboardHandler = {
       }
       const rounded = (value) => Math.round(value);
       _crashDiag.log(
-        `KEYBOARD_BOX: v6 ${reason} ${JSON.stringify({
+        `KEYBOARD_BOX: v7 ${reason} ${JSON.stringify({
           rect: [rect.left, rect.top, rect.right, rect.bottom].map(rounded),
           clip: [left, top, right, bottom].map(rounded),
           intersects:
@@ -987,7 +995,7 @@ const KeyboardHandler = {
         })}`
       );
     } catch {
-      _crashDiag.log(`KEYBOARD_BOX: v6 ${reason} unavailable`);
+      _crashDiag.log(`KEYBOARD_BOX: v7 ${reason} unavailable`);
     }
   },
 

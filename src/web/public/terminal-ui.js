@@ -7534,15 +7534,18 @@ Object.assign(CodemanApp.prototype, {
   },
 
   _focusMobileTerminalInput(source = 'terminal-tap') {
-    // Every explicit focus request supersedes the keyboard's prior owner. Set
-    // this BEFORE focus/geometry callbacks, including synchronous re-entrancy.
-    const request = this._mobileKeyboardFocusGeneration = (this._mobileKeyboardFocusGeneration || 0) + 1;
     this._syncMobileHelperTextareaToCursor();
-    // Fallback for callers without a terminal touchstart (e.g. tab selection).
-    // Terminal taps release stale focus in the earlier gesture phase; an OS
-    // hide normally releases its own focus before any new gesture begins.
-    if (this._isMobileTerminalInputFocused() && !this._mobileKeyboardIsUp()) this._blurMobileTerminalInput();
     const cjkInput = document.getElementById('cjkInput');
+    const target = cjkInput?.classList.contains('cjk-input-visible') ? cjkInput : this.terminal?.textarea;
+    const keyboardUp = this._mobileKeyboardIsUp();
+    // A caret tap that merely retains the same open input is not a new open.
+    // Counting it invalidated ownership, so the later native dismiss could
+    // leave stale editing focus behind. Actual opens/transfers still supersede
+    // the previous request BEFORE blur/focus callbacks can run (#35).
+    const retainsFocus = keyboardUp && !!target && document.activeElement === target;
+    if (!retainsFocus) this._mobileKeyboardFocusGeneration = (this._mobileKeyboardFocusGeneration || 0) + 1;
+    // Fallback for callers without a terminal touchstart (e.g. tab selection).
+    if (this._isMobileTerminalInputFocused() && !keyboardUp) this._blurMobileTerminalInput();
     if (cjkInput?.classList.contains('cjk-input-visible')) {
       cjkInput.focus();
     } else {
@@ -7550,12 +7553,13 @@ Object.assign(CodemanApp.prototype, {
     }
     if (typeof _crashDiag !== 'undefined') {
       const handler = typeof KeyboardHandler !== 'undefined' ? KeyboardHandler : null;
-      _crashDiag.log(`KEYBOARD_FOCUS: focused=${this._isMobileTerminalInputFocused()} gesture=${typeof navigator !== 'undefined' ? navigator.userActivation?.isActive : undefined} cached=${handler?.keyboardVisible} height=${Math.round(window.visualViewport?.height || 0)} baseline=${Math.round(handler?.initialViewportHeight || 0)} min=${Math.round(handler?._keyboardMinHeight || 0)}`);
+      _crashDiag.log(`KEYBOARD_FOCUS: focused=${this._isMobileTerminalInputFocused()} gesture=${typeof navigator !== 'undefined' ? navigator.userActivation?.isActive : undefined} cached=${handler?.keyboardVisible} retains=${retainsFocus} height=${Math.round(window.visualViewport?.height || 0)} baseline=${Math.round(handler?.initialViewportHeight || 0)} min=${Math.round(handler?._keyboardMinHeight || 0)}`);
       // Observe delayed native viewport/focus changes without retrying focus.
+      const request = this._keyboardFocusRequestId = (this._keyboardFocusRequestId || 0) + 1;
       handler?._traceKeyboardState?.(`request-${request}-${source}`);
       for (const delay of [350, 1000]) {
         setTimeout(() => {
-          if (request !== this._mobileKeyboardFocusGeneration || document.visibilityState === 'hidden') return;
+          if (request !== this._keyboardFocusRequestId || document.visibilityState === 'hidden') return;
           handler?._traceKeyboardState?.(`request-${request}-after-${delay}ms`);
         }, delay);
       }
