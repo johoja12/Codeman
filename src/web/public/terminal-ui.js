@@ -7533,6 +7533,28 @@ Object.assign(CodemanApp.prototype, {
     return true;
   },
 
+  _revalidateMobileTerminalInputLayout(target) {
+    const handler = typeof KeyboardHandler !== 'undefined' ? KeyboardHandler : null;
+    if (!MobileDetection.isIOS?.() || !target?.isConnected ||
+        handler?.keyboardVisible || handler?._nativeTerminalDismissedInput !== target ||
+        document.activeElement === target || target.readOnly || target.disabled) return;
+    // A native close can leave WebKit's editable view stale although DOM focus
+    // and its rectangle look valid. A menu reflow revives it on the phone (#35).
+    // Rebuild only this unfocused input's layout, synchronously in the opening
+    // gesture. Keep the node, listeners, value, selection and terminal grid.
+    const display = target.style.getPropertyValue('display');
+    const priority = target.style.getPropertyPriority('display');
+    try {
+      target.style.setProperty('display', 'none', 'important');
+      target.getBoundingClientRect();
+    } finally {
+      if (display) target.style.setProperty('display', display, priority);
+      else target.style.removeProperty('display');
+    }
+    target.getBoundingClientRect();
+    handler._traceKeyboardState?.('native-input-layout-revalidated');
+  },
+
   _focusMobileTerminalInput(source = 'terminal-tap') {
     this._syncMobileHelperTextareaToCursor();
     const cjkInput = document.getElementById('cjkInput');
@@ -7546,6 +7568,7 @@ Object.assign(CodemanApp.prototype, {
     if (!retainsFocus) this._mobileKeyboardFocusGeneration = (this._mobileKeyboardFocusGeneration || 0) + 1;
     // Fallback for callers without a terminal touchstart (e.g. tab selection).
     if (this._isMobileTerminalInputFocused() && !keyboardUp) this._blurMobileTerminalInput();
+    if (!keyboardUp) this._revalidateMobileTerminalInputLayout(target);
     if (cjkInput?.classList.contains('cjk-input-visible')) {
       cjkInput.focus();
     } else {

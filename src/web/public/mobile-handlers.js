@@ -317,7 +317,7 @@ const KeyboardHandler = {
     this._traceKeyboardState('init');
     if (typeof _crashDiag !== 'undefined') {
       _crashDiag.log(
-        `KEYBOARD_BUILD: lifecycle-v7 ua=${typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown'}`
+        `KEYBOARD_BUILD: lifecycle-v9 ua=${typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown'}`
       );
     }
 
@@ -691,6 +691,7 @@ const KeyboardHandler = {
 
   /** Called when keyboard appears */
   onKeyboardShow() {
+    this._nativeTerminalDismissedInput = undefined;
     // Show keyboard accessory bar
     if (typeof KeyboardAccessoryBar !== 'undefined') {
       KeyboardAccessoryBar.show();
@@ -727,6 +728,7 @@ const KeyboardHandler = {
     // breadcrumb ring. No input contents are recorded.
     this._lastKeyboardHide = `owner:${owner},generation:${typeof app !== 'undefined' ? app._mobileKeyboardFocusGeneration : undefined},same:${ownerInput === document.activeElement},release:${!!release}`;
     if (release) {
+      this._nativeTerminalDismissedInput = ownerInput;
       app._blurMobileTerminalInput();
       this._traceKeyboardState('owned-hide-release');
     }
@@ -945,7 +947,7 @@ const KeyboardHandler = {
     const focus = this._isTerminalInput(active) ? 'terminal' : this._editableHasFocus() ? 'editor' : 'none';
     this._traceKeyboardInputBox(reason);
     _crashDiag.log(
-      `KEYBOARD_STATE: v8 ${reason} focus=${focus} visible=${this.keyboardVisible} height=${Math.round(viewport?.height || 0)} width=${Math.round(viewport?.width || 0)} offset=${Math.round(viewport?.offsetTop || 0)} scale=${viewport?.scale || 1} layout=${window.innerHeight} baseline=${Math.round(this.initialViewportHeight)} min=${Math.round(this._keyboardMinHeight)} owner=${this._keyboardFocusOwner} request=${typeof app !== 'undefined' ? app._mobileKeyboardFocusGeneration : undefined} hide=${this._lastKeyboardHide || 'none'} page=${document.visibilityState}`
+      `KEYBOARD_STATE: v9 ${reason} focus=${focus} visible=${this.keyboardVisible} height=${Math.round(viewport?.height || 0)} width=${Math.round(viewport?.width || 0)} offset=${Math.round(viewport?.offsetTop || 0)} scale=${viewport?.scale || 1} layout=${window.innerHeight} baseline=${Math.round(this.initialViewportHeight)} min=${Math.round(this._keyboardMinHeight)} owner=${this._keyboardFocusOwner} request=${typeof app !== 'undefined' ? app._mobileKeyboardFocusGeneration : undefined} hide=${this._lastKeyboardHide || 'none'} page=${document.visibilityState}`
     );
   },
 
@@ -975,7 +977,7 @@ const KeyboardHandler = {
       }
       const rounded = (value) => Math.round(value);
       _crashDiag.log(
-        `KEYBOARD_BOX: v7 ${reason} ${JSON.stringify({
+        `KEYBOARD_BOX: v9 ${reason} ${JSON.stringify({
           rect: [rect.left, rect.top, rect.right, rect.bottom].map(rounded),
           clip: [left, top, right, bottom].map(rounded),
           intersects:
@@ -987,6 +989,9 @@ const KeyboardHandler = {
             rect.top < bottom,
           active: active === input,
           activeTag: active?.tagName || 'none',
+          pageFocus: document.hasFocus(),
+          rendered: input.getClientRects().length,
+          inert: !!input.closest('[inert]'),
           readonly: input.readOnly,
           disabled: input.disabled,
           inputMode: input.inputMode,
@@ -995,7 +1000,7 @@ const KeyboardHandler = {
         })}`
       );
     } catch {
-      _crashDiag.log(`KEYBOARD_BOX: v7 ${reason} unavailable`);
+      _crashDiag.log(`KEYBOARD_BOX: v9 ${reason} unavailable`);
     }
   },
 

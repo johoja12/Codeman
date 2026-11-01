@@ -218,7 +218,7 @@ describe('header-menu workaround and stale keyboard visibility', () => {
         _keyboardMinHeight:visualViewport.height-300,lastViewportWidth:visualViewport.width,
         KEYBOARD_GONE_GROWTH_PX:150,KEYBOARD_FOCUS_SETTLE_MS:350,_releaseHeldRows(){return false},resetLayout(){hideEvents++},_scheduleViewportSettle(){},
         _traceKeyboardState(){},updateLayoutForKeyboard(){},_deferViewportSettle(){},_scheduleViewportSettle(){}};
-      window.app={${['_mobileKeyboardIsUp', '_prepareMobileTerminalFocusGesture', '_installMobileTapMouseGuard', '_suppressTrustedTapMouseEvents', '_focusMobileTerminalInput', '_isMobileTerminalInputFocused', '_blurMobileTerminalInput'].map((n) => method('terminal-ui.js', n)).join(',')},
+      window.app={${['_mobileKeyboardIsUp', '_prepareMobileTerminalFocusGesture', '_installMobileTapMouseGuard', '_suppressTrustedTapMouseEvents', '_focusMobileTerminalInput', '_revalidateMobileTerminalInputLayout', '_isMobileTerminalInputFocused', '_blurMobileTerminalInput'].map((n) => method('terminal-ui.js', n)).join(',')},
         ${method('app.js', 'toggleMobileHeaderUtilities')},_syncMobileHelperTextareaToCursor(){},relayoutMobileSubagentWindows(){},
         terminal:{textarea:document.getElementById('terminal'),focus(){this.textarea.focus()}}};
       document.getElementById('menu').onclick=()=>app.toggleMobileHeaderUtilities();
@@ -533,6 +533,76 @@ describe('header-menu workaround and stale keyboard visibility', () => {
       await page.close();
     }
   });
+  it('rebuilds only the dismissed iOS input layout before refocusing, preserving its state', async () => {
+    const page = await keyboardPage();
+    try {
+      await page.evaluate(`
+        MobileDetection.isIOS=()=>true;
+        window.cycleHeight=visualViewport.height;window.fullHeight=cycleHeight;
+        Object.defineProperty(visualViewport,'height',{configurable:true,get:()=>cycleHeight});
+        KeyboardHandler.keyboardVisible=false;KeyboardHandler.init();
+        app._focusMobileTerminalInput();
+        cycleHeight=fullHeight-300;KeyboardHandler.handleViewportResize();
+        cycleHeight=fullHeight;KeyboardHandler.handleViewportResize();
+        const input=app.terminal.textarea;
+        window.originalInput=input;input.value='keep this draft';input.setSelectionRange(2,6);
+        input.style.setProperty('display','block','important');
+        window.layoutSamples=[];window.inputEvents=0;
+        input.addEventListener('input',()=>inputEvents++);
+        const rect=input.getBoundingClientRect.bind(input);
+        input.getBoundingClientRect=()=>{layoutSamples.push(getComputedStyle(input).display);return rect()};
+        document.getElementById('menu').onclick=()=>app._focusMobileTerminalInput();
+        input.addEventListener('focus',()=>layoutSamples.push('focus'));
+      `);
+      await page.locator('#menu').tap();
+      expect(await page.evaluate('layoutSamples')).toEqual(['none', 'block', 'focus']);
+      expect(await page.evaluate('app.terminal.textarea===originalInput')).toBe(true);
+      expect(await page.evaluate('originalInput.value')).toBe('keep this draft');
+      expect(await page.evaluate('[originalInput.selectionStart,originalInput.selectionEnd]')).toEqual([2, 6]);
+      expect(await page.evaluate('originalInput.style.getPropertyPriority("display")')).toBe('important');
+      await page.keyboard.type('X');
+      expect(await page.evaluate('inputEvents')).toBe(1);
+      await page.evaluate('originalInput.blur()');
+      await page.waitForTimeout(500);
+      expect(await page.evaluate(() => document.activeElement?.id)).not.toBe('terminal');
+    } finally {
+      await page.close();
+    }
+  });
+
+  for (const state of ['keyboard-open', 'non-ios', 'other-editor']) {
+    it(`does not rebuild or change focus for ${state}`, async () => {
+      const page = await keyboardPage();
+      try {
+        await page.evaluate((state) => {
+          const w = window as any;
+          w.MobileDetection.isIOS = () => state !== 'non-ios';
+          w.KeyboardHandler.keyboardVisible = state === 'keyboard-open';
+          w.KeyboardHandler._nativeTerminalDismissedInput = w.app.terminal.textarea;
+          w.samples = 0;
+          const input = w.app.terminal.textarea;
+          input.getBoundingClientRect = () => {
+            w.samples++;
+            return { width: 1, height: 1 };
+          };
+          if (state === 'other-editor') {
+            const editor = document.createElement('textarea');
+            editor.id = 'editor';
+            document.body.append(editor);
+            editor.focus();
+            w.app._revalidateMobileTerminalInputLayout(editor);
+          } else w.app._revalidateMobileTerminalInputLayout(input);
+        }, state);
+        expect(await page.evaluate('samples')).toBe(0);
+        expect(await page.evaluate(() => document.activeElement?.id)).toBe(
+          state === 'other-editor' ? 'editor' : 'terminal'
+        );
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
   it('does not blur/refocus an actually shrunken keyboard viewport', async () => {
     const page = await keyboardPage();
     try {
