@@ -7533,29 +7533,28 @@ Object.assign(CodemanApp.prototype, {
     return true;
   },
 
-  _revalidateMobileTerminalInputLayout(target) {
-    const handler = typeof KeyboardHandler !== 'undefined' ? KeyboardHandler : null;
-    if (!MobileDetection.isIOS?.() || !target?.isConnected ||
-        handler?.keyboardVisible || handler?._nativeTerminalDismissedInput !== target ||
-        document.activeElement === target || target.readOnly || target.disabled) return;
-    // A native close can leave WebKit's editable view stale although DOM focus
-    // and its rectangle look valid. A menu reflow revives it on the phone (#35).
-    // Rebuild only this unfocused input's layout, synchronously in the opening
-    // gesture. Keep the node, listeners, value, selection and terminal grid.
-    const display = target.style.getPropertyValue('display');
-    const priority = target.style.getPropertyPriority('display');
+  _restoreMobileTerminalPageFocus() {
+    // Native iOS keyboard dismissal can unfocus the page while a later touch
+    // focuses the textarea only. The phone then reports activeElement correctly
+    // but document.hasFocus() stays false and no keyboard appears (#35).
+    // Request page focus FIRST, only in a live user gesture on this visible page.
+    // Browser focus requests are best-effort; never retry from a timer.
+    if (!MobileDetection.isIOS?.() || document.visibilityState !== 'visible' ||
+        typeof document.hasFocus !== 'function' || document.hasFocus() ||
+        typeof navigator === 'undefined' || navigator.userActivation?.isActive !== true) return;
+    let accepted = false;
     try {
-      target.style.setProperty('display', 'none', 'important');
-      target.getBoundingClientRect();
-    } finally {
-      if (display) target.style.setProperty('display', display, priority);
-      else target.style.removeProperty('display');
+      window.focus();
+      accepted = document.hasFocus();
+    } catch {
+      // A browser can reject focus; the normal input gesture still proceeds.
     }
-    target.getBoundingClientRect();
-    handler._traceKeyboardState?.('native-input-layout-revalidated');
+    if (typeof _crashDiag !== 'undefined')
+      _crashDiag.log(`KEYBOARD_PAGE_FOCUS: v10 requested=true after=${accepted}`);
   },
 
   _focusMobileTerminalInput(source = 'terminal-tap') {
+    this._restoreMobileTerminalPageFocus();
     this._syncMobileHelperTextareaToCursor();
     const cjkInput = document.getElementById('cjkInput');
     const target = cjkInput?.classList.contains('cjk-input-visible') ? cjkInput : this.terminal?.textarea;
@@ -7568,7 +7567,6 @@ Object.assign(CodemanApp.prototype, {
     if (!retainsFocus) this._mobileKeyboardFocusGeneration = (this._mobileKeyboardFocusGeneration || 0) + 1;
     // Fallback for callers without a terminal touchstart (e.g. tab selection).
     if (this._isMobileTerminalInputFocused() && !keyboardUp) this._blurMobileTerminalInput();
-    if (!keyboardUp) this._revalidateMobileTerminalInputLayout(target);
     if (cjkInput?.classList.contains('cjk-input-visible')) {
       cjkInput.focus();
     } else {
