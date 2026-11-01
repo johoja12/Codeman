@@ -307,6 +307,95 @@ describe('header-menu workaround and stale keyboard visibility', () => {
     }
   });
 
+  it('transfers dismiss ownership after a settled tab choice with the keyboard open', async () => {
+    const page = await keyboardPage();
+    try {
+      await page.evaluate(`
+        window.cycleHeight=visualViewport.height;window.fullHeight=cycleHeight;
+        Object.defineProperty(visualViewport,'height',{configurable:true,get:()=>cycleHeight});
+        KeyboardHandler.keyboardVisible=false;KeyboardHandler.init();
+        document.getElementById('menu').onclick=()=>app._focusMobileTerminalInput('session-tab');
+      `);
+      for (let cycle = 0; cycle < 6; cycle++) {
+        await page.locator('#menu').tap();
+        await page.evaluate('cycleHeight=fullHeight-300;KeyboardHandler.handleViewportResize()');
+        // A tab/search choice moves focus temporarily, while the OS keyboard stays up.
+        await page.locator('#menu').tap();
+        await page.waitForTimeout(420);
+        expect(await page.evaluate('KeyboardHandler._keyboardFocusOwner===app._mobileKeyboardFocusGeneration')).toBe(
+          true
+        );
+        await page.evaluate('cycleHeight=fullHeight;KeyboardHandler.handleViewportResize()');
+        expect(await page.evaluate(() => document.activeElement?.id)).not.toBe('terminal');
+      }
+    } finally {
+      await page.close();
+    }
+  });
+
+  for (const interruption of ['other-editor', 'new-request', 'closing-geometry']) {
+    it(`does not adopt a settled tab request after ${interruption}`, async () => {
+      const page = await keyboardPage();
+      try {
+        await page.evaluate(`
+          window.cycleHeight=visualViewport.height;window.fullHeight=cycleHeight;
+          Object.defineProperty(visualViewport,'height',{configurable:true,get:()=>cycleHeight});
+          KeyboardHandler.keyboardVisible=false;KeyboardHandler.init();
+          app._focusMobileTerminalInput();
+          cycleHeight=fullHeight-300;KeyboardHandler.handleViewportResize();
+          window.oldOwner=KeyboardHandler._keyboardFocusOwner;
+          app.terminal.textarea.blur();app._focusMobileTerminalInput('session-tab');
+        `);
+        await page.evaluate((kind) => {
+          const w = window as any;
+          if (kind === 'other-editor') {
+            const other = document.createElement('textarea');
+            other.id = 'other-editor';
+            document.body.append(other);
+            other.focus();
+          } else if (kind === 'new-request') {
+            w.app.terminal.textarea.blur();
+            w.app._focusMobileTerminalInput();
+          } else {
+            w.cycleHeight += 50;
+            w.KeyboardHandler.handleViewportResize();
+          }
+        }, interruption);
+        await page.waitForTimeout(420);
+        expect(await page.evaluate('KeyboardHandler._keyboardFocusOwner===oldOwner')).toBe(true);
+        expect(await page.evaluate(() => document.activeElement?.id)).toBe(
+          interruption === 'other-editor' ? 'other-editor' : 'terminal'
+        );
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
+  for (const delay of [0, 80, 200, 349]) {
+    it(`protects a tab opening from the previous keyboard close at ${delay}ms`, async () => {
+      const page = await keyboardPage();
+      try {
+        await page.evaluate(`
+          window.cycleHeight=visualViewport.height;window.fullHeight=cycleHeight;
+          Object.defineProperty(visualViewport,'height',{configurable:true,get:()=>cycleHeight});
+          KeyboardHandler.keyboardVisible=false;KeyboardHandler.init();
+          app._focusMobileTerminalInput();
+          cycleHeight=fullHeight-300;KeyboardHandler.handleViewportResize();
+          app.terminal.textarea.blur();
+          app._focusMobileTerminalInput('session-tab');
+          setTimeout(()=>{cycleHeight=fullHeight;KeyboardHandler.handleViewportResize()},${delay});
+        `);
+        await page.waitForTimeout(500);
+        expect(await page.evaluate(() => document.activeElement?.id)).toBe('terminal');
+        expect(await page.evaluate('KeyboardHandler.keyboardVisible')).toBe(false);
+        expect(await page.evaluate('KeyboardHandler._keyboardFocusOwner')).toBeUndefined();
+      } finally {
+        await page.close();
+      }
+    });
+  }
+
   it('survives listener reconnect with the keyboard open, then dismisses and reopens', async () => {
     const page = await keyboardPage();
     try {

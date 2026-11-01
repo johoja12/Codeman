@@ -7551,6 +7551,30 @@ Object.assign(CodemanApp.prototype, {
     } else {
       this.terminal?.focus();
     }
+    // A tab/search choice can reuse the visible keyboard without another
+    // viewport shrink. Transfer dismiss ownership only after that request has
+    // settled; a pending close must still leave a newer opening focused (#35).
+    const handler = typeof KeyboardHandler !== 'undefined' ? KeyboardHandler : null;
+    const viewport = window.visualViewport;
+    const transferGeneration = this._mobileKeyboardFocusGeneration;
+    const transferHeight = viewport?.height;
+    const transferWidth = viewport?.width;
+    if (source === 'session-tab' && !retainsFocus && handler?.keyboardVisible &&
+        Number.isSafeInteger(handler._keyboardFocusOwner) &&
+        transferHeight > 0 && transferHeight <= handler._keyboardMinHeight + 2 &&
+        handler.initialViewportHeight - transferHeight > 150) {
+      setTimeout(() => {
+        if (this._mobileKeyboardFocusGeneration !== transferGeneration ||
+            document.visibilityState !== 'visible' || !handler.keyboardVisible ||
+            !Number.isSafeInteger(handler._keyboardFocusOwner) ||
+            document.activeElement !== target || !this._isMobileTerminalInputFocused() ||
+            viewport?.height !== transferHeight || viewport?.width !== transferWidth ||
+            viewport.height > handler._keyboardMinHeight + 2) return;
+        handler._keyboardFocusOwner = transferGeneration;
+        handler._keyboardFocusOwnerInput = target;
+        handler._traceKeyboardState?.('tab-focus-owner-transfer');
+      }, handler.KEYBOARD_FOCUS_SETTLE_MS || 350);
+    }
     if (typeof _crashDiag !== 'undefined') {
       const handler = typeof KeyboardHandler !== 'undefined' ? KeyboardHandler : null;
       _crashDiag.log(`KEYBOARD_FOCUS: focused=${this._isMobileTerminalInputFocused()} gesture=${typeof navigator !== 'undefined' ? navigator.userActivation?.isActive : undefined} cached=${handler?.keyboardVisible} retains=${retainsFocus} height=${Math.round(window.visualViewport?.height || 0)} baseline=${Math.round(handler?.initialViewportHeight || 0)} min=${Math.round(handler?._keyboardMinHeight || 0)}`);

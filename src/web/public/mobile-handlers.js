@@ -945,7 +945,7 @@ const KeyboardHandler = {
     const focus = this._isTerminalInput(active) ? 'terminal' : this._editableHasFocus() ? 'editor' : 'none';
     this._traceKeyboardInputBox(reason);
     _crashDiag.log(
-      `KEYBOARD_STATE: v7 ${reason} focus=${focus} visible=${this.keyboardVisible} height=${Math.round(viewport?.height || 0)} width=${Math.round(viewport?.width || 0)} offset=${Math.round(viewport?.offsetTop || 0)} scale=${viewport?.scale || 1} layout=${window.innerHeight} baseline=${Math.round(this.initialViewportHeight)} min=${Math.round(this._keyboardMinHeight)} owner=${this._keyboardFocusOwner} request=${typeof app !== 'undefined' ? app._mobileKeyboardFocusGeneration : undefined} hide=${this._lastKeyboardHide || 'none'} page=${document.visibilityState}`
+      `KEYBOARD_STATE: v8 ${reason} focus=${focus} visible=${this.keyboardVisible} height=${Math.round(viewport?.height || 0)} width=${Math.round(viewport?.width || 0)} offset=${Math.round(viewport?.offsetTop || 0)} scale=${viewport?.scale || 1} layout=${window.innerHeight} baseline=${Math.round(this.initialViewportHeight)} min=${Math.round(this._keyboardMinHeight)} owner=${this._keyboardFocusOwner} request=${typeof app !== 'undefined' ? app._mobileKeyboardFocusGeneration : undefined} hide=${this._lastKeyboardHide || 'none'} page=${document.visibilityState}`
     );
   },
 
