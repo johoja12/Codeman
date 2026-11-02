@@ -1,0 +1,400 @@
+[
+  {
+    "label": "baseline",
+    "scenario": "closed-keyboard",
+    "focus": "app-loaded device-mobile touch-device",
+    "terminalFocused": false,
+    "cjkFocused": false,
+    "trace": [],
+    "selectionGuard": false
+  },
+  {
+    "label": "baseline",
+    "scenario": "same-tab",
+    "focus": "app-loaded device-mobile touch-device",
+    "terminalFocused": false,
+    "cjkFocused": false,
+    "trace": [],
+    "selectionGuard": false
+  },
+  {
+    "label": "baseline",
+    "scenario": "webview-return",
+    "focus": "app-loaded device-mobile touch-device",
+    "terminalFocused": false,
+    "cjkFocused": false,
+    "trace": [],
+    "selectionGuard": false
+  },
+  {
+    "label": "baseline",
+    "scenario": "cjk-input",
+    "focus": "app-loaded device-mobile touch-device cjk-input-visible",
+    "terminalFocused": false,
+    "cjkFocused": false,
+    "trace": [],
+    "selectionGuard": false
+  },
+  {
+    "label": "baseline",
+    "scenario": "selection-guard",
+    "focus": "app-loaded device-mobile touch-device",
+    "terminalFocused": false,
+    "cjkFocused": false,
+    "trace": [],
+    "selectionGuard": false
+  },
+  {
+    "label": "baseline",
+    "scenario": "stale-helper-offscreen",
+    "focus": "app-loaded device-mobile touch-device",
+    "terminalFocused": false,
+    "cjkFocused": false,
+    "trace": [],
+    "selectionGuard": false
+  },
+  {
+    "label": "baseline",
+    "scenario": "intentional-focus-during-load",
+    "focus": "rca-other-field",
+    "terminalFocused": false,
+    "cjkFocused": false,
+    "trace": [],
+    "selectionGuard": false
+  },
+  {
+    "label": "baseline",
+    "pageErrors": [],
+    "nativeKeyboardVerified": false
+  },
+  {
+    "label": "deployed",
+    "scenario": "closed-keyboard",
+    "focus": "xterm-helper-textarea",
+    "terminalFocused": true,
+    "cjkFocused": false,
+    "trace": [
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": true,
+        "visible": true,
+        "top": 50,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      },
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": true,
+        "visible": true,
+        "top": 50,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      }
+    ],
+    "selectionGuard": false
+  },
+  {
+    "label": "deployed",
+    "scenario": "same-tab",
+    "focus": "xterm-helper-textarea",
+    "terminalFocused": true,
+    "cjkFocused": false,
+    "trace": [
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": true,
+        "visible": true,
+        "top": 50,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      }
+    ],
+    "selectionGuard": false
+  },
+  {
+    "label": "deployed",
+    "scenario": "webview-return",
+    "focus": "xterm-helper-textarea",
+    "terminalFocused": true,
+    "cjkFocused": false,
+    "trace": [
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": false,
+        "visible": false,
+        "top": 0,
+        "width": 0,
+        "height": 0,
+        "activation": true
+      },
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": true,
+        "visible": true,
+        "top": 50,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      }
+    ],
+    "selectionGuard": false
+  },
+  {
+    "label": "deployed",
+    "scenario": "cjk-input",
+    "focus": "cjkInput",
+    "terminalFocused": false,
+    "cjkFocused": true,
+    "trace": [
+      {
+        "target": "cjkInput",
+        "accepted": true,
+        "visible": true,
+        "top": 775.609375,
+        "width": 393,
+        "height": 36.390625,
+        "activation": true
+      },
+      {
+        "target": "cjkInput",
+        "accepted": true,
+        "visible": true,
+        "top": 775.609375,
+        "width": 393,
+        "height": 36.390625,
+        "activation": true
+      }
+    ],
+    "selectionGuard": false
+  },
+  {
+    "label": "deployed",
+    "scenario": "selection-guard",
+    "focus": "app-loaded device-mobile touch-device",
+    "terminalFocused": false,
+    "cjkFocused": false,
+    "trace": [
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": false,
+        "visible": true,
+        "top": 95,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      },
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": false,
+        "visible": true,
+        "top": 50,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      }
+    ],
+    "selectionGuard": false
+  },
+  {
+    "label": "deployed",
+    "scenario": "stale-helper-offscreen",
+    "focus": "xterm-helper-textarea",
+    "terminalFocused": true,
+    "cjkFocused": false,
+    "trace": [
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": true,
+        "visible": true,
+        "top": 50,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      },
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": true,
+        "visible": true,
+        "top": 50,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      }
+    ],
+    "selectionGuard": false
+  },
+  {
+    "label": "deployed",
+    "scenario": "intentional-focus-during-load",
+    "focus": "xterm-helper-textarea",
+    "terminalFocused": true,
+    "cjkFocused": false,
+    "trace": [
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": true,
+        "visible": true,
+        "top": 50,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      },
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": true,
+        "visible": true,
+        "top": 50,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      }
+    ],
+    "selectionGuard": false
+  },
+  {
+    "label": "deployed",
+    "pageErrors": [],
+    "nativeKeyboardVerified": false
+  },
+  {
+    "label": "candidate",
+    "scenario": "closed-keyboard",
+    "focus": "xterm-helper-textarea",
+    "terminalFocused": true,
+    "cjkFocused": false,
+    "trace": [
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": true,
+        "visible": true,
+        "top": 50,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      }
+    ],
+    "selectionGuard": false
+  },
+  {
+    "label": "candidate",
+    "scenario": "same-tab",
+    "focus": "xterm-helper-textarea",
+    "terminalFocused": true,
+    "cjkFocused": false,
+    "trace": [
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": true,
+        "visible": true,
+        "top": 50,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      }
+    ],
+    "selectionGuard": false
+  },
+  {
+    "label": "candidate",
+    "scenario": "webview-return",
+    "focus": "xterm-helper-textarea",
+    "terminalFocused": true,
+    "cjkFocused": false,
+    "trace": [
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": true,
+        "visible": true,
+        "top": 50,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      }
+    ],
+    "selectionGuard": false
+  },
+  {
+    "label": "candidate",
+    "scenario": "cjk-input",
+    "focus": "cjkInput",
+    "terminalFocused": false,
+    "cjkFocused": true,
+    "trace": [
+      {
+        "target": "cjkInput",
+        "accepted": true,
+        "visible": true,
+        "top": 775.609375,
+        "width": 393,
+        "height": 36.390625,
+        "activation": true
+      }
+    ],
+    "selectionGuard": false
+  },
+  {
+    "label": "candidate",
+    "scenario": "selection-guard",
+    "focus": "xterm-helper-textarea",
+    "terminalFocused": true,
+    "cjkFocused": false,
+    "trace": [
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": true,
+        "visible": true,
+        "top": 95,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      }
+    ],
+    "selectionGuard": false
+  },
+  {
+    "label": "candidate",
+    "scenario": "stale-helper-offscreen",
+    "focus": "xterm-helper-textarea",
+    "terminalFocused": true,
+    "cjkFocused": false,
+    "trace": [
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": true,
+        "visible": true,
+        "top": 50,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      }
+    ],
+    "selectionGuard": false
+  },
+  {
+    "label": "candidate",
+    "scenario": "intentional-focus-during-load",
+    "focus": "rca-other-field",
+    "terminalFocused": false,
+    "cjkFocused": false,
+    "trace": [
+      {
+        "target": "xterm-helper-textarea",
+        "accepted": true,
+        "visible": true,
+        "top": 50,
+        "width": 1,
+        "height": 1,
+        "activation": true
+      }
+    ],
+    "selectionGuard": false
+  },
+  {
+    "label": "candidate",
+    "pageErrors": [],
+    "nativeKeyboardVerified": false
+  }
+]

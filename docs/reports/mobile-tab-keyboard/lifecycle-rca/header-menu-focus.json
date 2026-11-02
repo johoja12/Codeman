@@ -1,0 +1,32 @@
+[
+  {
+    "label": "deployed",
+    "direct": {
+      "freshFocusEvents": 0,
+      "keyboardVisible": true,
+      "focused": true
+    },
+    "afterMenu": {
+      "freshFocusEvents": 1,
+      "focused": true,
+      "expanded": "true"
+    },
+    "errors": [],
+    "nativeKeyboardVerified": false
+  },
+  {
+    "label": "candidate",
+    "direct": {
+      "freshFocusEvents": 1,
+      "keyboardVisible": false,
+      "focused": true
+    },
+    "afterMenu": {
+      "freshFocusEvents": 1,
+      "focused": true,
+      "expanded": "true"
+    },
+    "errors": [],
+    "nativeKeyboardVerified": false
+  }
+]

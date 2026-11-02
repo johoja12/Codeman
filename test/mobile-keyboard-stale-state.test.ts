@@ -82,9 +82,15 @@ function loadKeyboardHandler() {
     getElementById: () => null,
     querySelector: () => null,
   };
+  const app = {
+    _mobileKeyboardFocusGeneration: 0,
+    relayoutMobileSubagentWindows: () => {},
+    _isMobileTerminalInputFocused: () => !!doc.activeElement?.classList.contains('xterm-helper-textarea'),
+    _blurMobileTerminalInput: () => doc.activeElement?.blur(),
+  };
   const context = vm.createContext({
     console,
-    app: { relayoutMobileSubagentWindows: () => {} },
+    app,
     navigator: {
       userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) CriOS/130 Mobile/15E148',
       maxTouchPoints: 5,
@@ -127,7 +133,11 @@ function loadKeyboardHandler() {
       else timers.push(t);
     }
   };
-  return { handler, resize, fire, advance, doc, bodyClasses, hides };
+  const requestFocus = (input: FakeEl) => {
+    app._mobileKeyboardFocusGeneration++;
+    doc.activeElement = input;
+  };
+  return { handler, resize, fire, advance, doc, bodyClasses, hides, requestFocus };
 }
 
 const terminalTextarea = (onBlur = () => {}): FakeEl => ({
@@ -227,6 +237,140 @@ describe('COD-467 stale FOCUS: coming back to the page releases the hidden texta
   });
 });
 
+describe('keyboard lifecycle interleavings (#35)', () => {
+  for (const delay of [0, 80, 200, 349]) {
+    it(`does not let the previous closing resize blur a reopen after ${delay}ms`, () => {
+      const { handler, resize, fire, advance, doc, requestFocus } = loadKeyboardHandler();
+      const blur = vi.fn(() => {
+        doc.activeElement = null;
+      });
+      const input = terminalTextarea(blur);
+      requestFocus(input);
+      resize(FULL - KEYBOARD, FULL);
+      // Explicit dismiss, then a new focus before the old close animation ends.
+      input.blur();
+      fire('focusout');
+      advance(delay);
+      requestFocus(input);
+      resize(FULL, FULL);
+      expect(doc.activeElement).toBe(input);
+      expect(blur).toHaveBeenCalledTimes(1);
+      expect(handler.keyboardVisible).toBe(false);
+      // The new keyboard's own opening resize is still classified correctly.
+      resize(FULL - KEYBOARD, FULL);
+      expect(handler.keyboardVisible).toBe(true);
+      advance(500);
+      expect(doc.activeElement).toBe(input);
+      expect(handler.keyboardVisible).toBe(true);
+    });
+  }
+
+  it('releases native-dismissed focus before the next gesture when its request still owns the keyboard', () => {
+    const { handler, resize, doc, requestFocus } = loadKeyboardHandler();
+    const blur = vi.fn(() => {
+      doc.activeElement = null;
+    });
+    const input = terminalTextarea(blur);
+    requestFocus(input);
+    resize(FULL - KEYBOARD, FULL);
+    // OS dismiss restores geometry but leaves the original editable DOM focus.
+    resize(FULL, FULL);
+    expect(doc.activeElement).toBeNull();
+    expect(blur).toHaveBeenCalledTimes(1);
+    expect(handler.initialViewportHeight).toBe(FULL);
+    // A subsequent gesture starts from released focus rather than same-task refocus.
+    requestFocus(input);
+    resize(FULL - KEYBOARD, FULL);
+    expect(doc.activeElement).toBe(input);
+    expect(handler.keyboardVisible).toBe(true);
+  });
+
+  it('does not release a different terminal input that acquired focus natively', () => {
+    const { resize, doc, requestFocus } = loadKeyboardHandler();
+    const first = terminalTextarea(() => {
+      doc.activeElement = null;
+    });
+    const second = terminalTextarea(() => {
+      doc.activeElement = null;
+    });
+    requestFocus(first);
+    resize(FULL - KEYBOARD, FULL);
+    // A tile or another native input can focus without using the main helper.
+    doc.activeElement = second;
+    resize(FULL, FULL);
+    expect(doc.activeElement).toBe(second);
+  });
+
+  it('preserves open-keyboard calibration when reconnect reinitializes the listeners', () => {
+    const { handler, resize, doc, requestFocus } = loadKeyboardHandler();
+    const input = terminalTextarea(() => {
+      doc.activeElement = null;
+    });
+    requestFocus(input);
+    resize(FULL - KEYBOARD, FULL);
+    handler.cleanup();
+    handler.init();
+    resize(FULL - KEYBOARD, FULL);
+    expect(handler.initialViewportHeight).toBe(FULL);
+    expect(handler.keyboardVisible).toBe(true);
+    expect(doc.activeElement).toBe(input);
+  });
+
+  it('does not let reconciliation of an old shrunken viewport own a newer focus request', () => {
+    const { handler, resize, fire, doc, requestFocus } = loadKeyboardHandler();
+    const input = terminalTextarea(() => {
+      doc.activeElement = null;
+    });
+    requestFocus(input);
+    resize(FULL - KEYBOARD, FULL);
+    doc.visibilityState = 'hidden';
+    fire('visibilitychange');
+    doc.visibilityState = 'visible';
+    fire('visibilitychange');
+    requestFocus(input);
+    // No fresh shrink occurred: this is still the previous keyboard geometry.
+    resize(FULL - KEYBOARD, FULL);
+    resize(FULL, FULL);
+    expect(doc.activeElement).toBe(input);
+    expect(handler.keyboardVisible).toBe(false);
+  });
+
+  it('preserves keyboard-free calibration across foreground recovery before closing resize', () => {
+    const { handler, resize, fire, doc } = loadKeyboardHandler();
+    doc.activeElement = terminalTextarea(() => {
+      doc.activeElement = null;
+    });
+    resize(FULL - KEYBOARD, FULL);
+    doc.visibilityState = 'hidden';
+    fire('visibilitychange');
+    doc.visibilityState = 'visible';
+    fire('visibilitychange');
+    expect(handler.initialViewportHeight).toBe(FULL);
+    expect(handler.keyboardVisible).toBe(false);
+    // Reopen before restoration: the same smaller viewport must remain detectable.
+    doc.activeElement = terminalTextarea();
+    resize(FULL - KEYBOARD, FULL);
+    expect(handler.keyboardVisible).toBe(true);
+    expect(handler.initialViewportHeight).toBe(FULL);
+  });
+
+  it('keeps calibration when the focus-out fallback fires before the closing animation', () => {
+    const { handler, resize, fire, advance, doc } = loadKeyboardHandler();
+    doc.activeElement = terminalTextarea();
+    resize(FULL - KEYBOARD, FULL);
+    doc.activeElement = null;
+    fire('focusout');
+    advance(500);
+    expect(handler.initialViewportHeight).toBe(FULL);
+    doc.activeElement = terminalTextarea();
+    resize(FULL - KEYBOARD, FULL);
+    expect(handler.keyboardVisible).toBe(true);
+    resize(FULL - TOOLBARS, FULL - TOOLBARS);
+    expect(handler.keyboardVisible).toBe(false);
+    expect(handler.initialViewportHeight).toBe(FULL - TOOLBARS);
+  });
+});
+
 // ── terminal-ui.js: the tap decision ──────────────────────────────────────
 function loadTapApp(opts: { keyboardVisible: boolean }) {
   const CodemanApp = function CodemanApp(this: unknown) {};
@@ -281,7 +425,25 @@ describe('COD-467 stale FOCUS: a tap opens the keyboard when the textarea is foc
     expect(loadTapApp({ keyboardVisible: true }).app._mobileKeyboardIsUp()).toBe(true);
   });
 
-  it('prompt-row tap: re-focus is blur THEN focus, so WebKit shows the keyboard', () => {
+  it('retains the opening generation when tapping an already-focused prompt with keyboard up', () => {
+    const { app, calls } = loadTapApp({ keyboardVisible: true });
+    app._mobileKeyboardFocusGeneration = 7;
+    app._focusMobileTerminalInput();
+    app._focusMobileTerminalInput();
+    expect(app._mobileKeyboardFocusGeneration).toBe(7);
+    expect(calls).toEqual(['focus', 'focus']);
+  });
+
+  it('advances the opening generation for a real focus transfer while keyboard remains up', () => {
+    const { app, doc } = loadTapApp({ keyboardVisible: true });
+    app._mobileKeyboardFocusGeneration = 7;
+    doc.activeElement = terminalTextarea(); // another terminal/CJK target owns focus
+    app._focusMobileTerminalInput();
+    expect(app._mobileKeyboardFocusGeneration).toBe(8);
+    expect(doc.activeElement).toBe(app.terminal.textarea);
+  });
+
+  it('prompt-row tap: requests fresh focus with blur followed by focus', () => {
     const { app, calls } = loadTapApp({ keyboardVisible: false });
     app._handleMobileTerminalTap(touch, app._mobileKeyboardIsUp(), 'input');
     expect(calls).toEqual(['blur', 'focus']);

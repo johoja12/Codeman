@@ -1,0 +1,40 @@
+{
+  "states": [
+    {
+      "label": "keyboard visible",
+      "height": 420,
+      "baseline": 750,
+      "keyboard": true,
+      "focused": true,
+      "blurs": 0
+    },
+    {
+      "label": "return before closing resize",
+      "height": 420,
+      "baseline": 420,
+      "keyboard": false,
+      "focused": false,
+      "blurs": 1
+    },
+    {
+      "label": "new focus while viewport remains keyboard sized",
+      "height": 420,
+      "baseline": 420,
+      "keyboard": false,
+      "focused": true,
+      "blurs": 1
+    }
+  ],
+  "rapidReopen": {
+    "beforeOldClose": {
+      "focused": true,
+      "keyboard": true
+    },
+    "afterOldClose": {
+      "focused": false,
+      "keyboard": false,
+      "blurs": 1
+    }
+  },
+  "nativeKeyboardVerified": false
+}

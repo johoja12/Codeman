@@ -1160,10 +1160,20 @@ describe('Virtual Keyboard', () => {
           )
         );
         app.terminal.focus();
-        // COD-467: "keyboard up" is focus AND a visible keyboard. Headless Chromium
-        // has no on-screen keyboard, so say so explicitly; focus alone is now the
-        // stale-focus case (keyboard gone, textarea still focused), where a tap
-        // must REOPEN the keyboard rather than run this close toggle.
+        // Model the visible keyboard's viewport as well as its cached flag.
+        // A true flag with a full-height viewport is the missed-hide-resize
+        // regression, not this second-tap-to-dismiss scenario.
+        const viewport = window.visualViewport!;
+        const originalHeight = Object.getOwnPropertyDescriptor(viewport, 'height');
+        const fullHeight = viewport.height;
+        Object.defineProperty(viewport, 'height', { configurable: true, value: fullHeight - 300 });
+        (window as any).__restoreKeyboardViewport35 = () => {
+          if (originalHeight) Object.defineProperty(viewport, 'height', originalHeight);
+          else delete (viewport as any).height;
+        };
+        KeyboardHandler.initialViewportHeight = fullHeight;
+        KeyboardHandler._keyboardMinHeight = fullHeight - 300;
+        KeyboardHandler.lastViewportWidth = viewport.width;
         KeyboardHandler.keyboardVisible = true;
 
         const screen = app.terminal.element?.querySelector('.xterm-screen');
@@ -1196,6 +1206,8 @@ describe('Virtual Keyboard', () => {
       // dismiss. The prompt row is unaffected and still positions the caret.
       const activeClass = await page.evaluate(() => {
         const cls = document.activeElement?.className;
+        (window as any).__restoreKeyboardViewport35?.();
+        delete (window as any).__restoreKeyboardViewport35;
         KeyboardHandler.keyboardVisible = false; // never leak into the next test
         return cls;
       });
