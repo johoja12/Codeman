@@ -74,6 +74,139 @@ describe('COD-343 Case Management default groups in Chromium', () => {
     await browser.close();
   });
 
+  async function newCaseForm() {
+    await page.route('**/api/tab-layout', (route) =>
+      route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({ success: true, data: { layout: { groups } } }),
+      })
+    );
+    await page.evaluate(() => {
+      const app = (window as any).__app;
+      app.caseEditOriginalName = null;
+      app.loadQuickStartCases = async () => {};
+      app.saveLastUsedCase = async () => {};
+      document.body.insertAdjacentHTML(
+        'beforeend',
+        '<input id="linkCaseName" value="fresh"><input id="linkCasePath" value="/tmp/fresh"><input id="newCaseName" value="fresh"><input id="newCaseDescription"><input type="checkbox" id="newCaseDocker">'
+      );
+    });
+    await page.evaluate(() => (window as any).__app.loadCaseEditDefaultGroup(null));
+    expect(await page.locator('#caseEditDefaultGroup').isEnabled()).toBe(true);
+    await page.selectOption('#caseEditDefaultGroup', 'group-tcc');
+  }
+
+  it('loads selectable owner groups for a new case and saves the choice before closing Link Case', async () => {
+    await newCaseForm();
+    const requests: unknown[] = [];
+    await page.route('**/api/cases/link', async (route) => {
+      requests.push(route.request().postDataJSON());
+      await route.fulfill({ contentType: 'application/json', body: '{"success":true}' });
+    });
+    await page.route('**/api/cases/fresh/default-group', async (route) => {
+      requests.push(route.request().postDataJSON());
+      await route.fulfill({ contentType: 'application/json', body: '{"success":true}' });
+    });
+    await page.evaluate(() => (window as any).__app.linkCase());
+    expect(requests).toEqual([
+      { name: 'fresh', path: '/tmp/fresh', codexCommandSelection: { kind: 'default' } },
+      { groupId: 'group-tcc' },
+    ]);
+    expect(await page.evaluate(() => (window as any).__app.caseEditOriginalName)).toBeNull();
+  });
+
+  it('saves a remote case group after linking without contacting a real host', async () => {
+    await newCaseForm();
+    await page.evaluate(() => {
+      const values: Record<string, string> = {
+        remoteCaseName: 'fresh',
+        remoteCasePath: '/srv/fresh',
+        remoteHostId: 'test',
+        remoteHostAddress: 'example.test',
+        remoteHostUsername: 'test',
+        remoteHostPort: '',
+        remoteHostIdentityFile: '',
+        remoteHostSocksProxy: '',
+        remoteHostJumpHost: '',
+        remoteHostWakeMac: '',
+        remoteHostWakeCommand: '',
+        remoteHostExtraSshOptions: '',
+      };
+      for (const [id, value] of Object.entries(values)) {
+        const input = document.createElement('input');
+        input.id = id;
+        input.value = value;
+        document.body.append(input);
+      }
+    });
+    for (const endpoint of ['remote-hosts', 'cases/remote-link'])
+      await page.route(`**/api/${endpoint}`, (route) =>
+        route.fulfill({ contentType: 'application/json', body: '{"success":true}' })
+      );
+    let saved: unknown;
+    await page.route('**/api/cases/fresh/default-group', async (route) => {
+      saved = route.request().postDataJSON();
+      await route.fulfill({ contentType: 'application/json', body: '{"success":true}' });
+    });
+    await page.evaluate(() => (window as any).__app.linkRemoteCase());
+    expect(saved).toEqual({ groupId: 'group-tcc' });
+  });
+
+  it('does not start a Docker session if case creation succeeds but saving the group fails', async () => {
+    await newCaseForm();
+    await page.locator('#newCaseDocker').check();
+    await page.evaluate(() => {
+      const app = (window as any).__app;
+      app._collectDockerQuickSettings = () => ({});
+      (window as any).__started = false;
+      app.runClaude = async () => {
+        (window as any).__started = true;
+      };
+    });
+    await page.route('**/api/cases/docker-quickcreate', (route) =>
+      route.fulfill({ contentType: 'application/json', body: '{"success":true,"data":{}}' })
+    );
+    await page.route('**/api/cases/fresh/default-group', (route) =>
+      route.fulfill({ status: 400, contentType: 'application/json', body: '{"success":false,"error":"Group removed"}' })
+    );
+    await page.evaluate(() => (window as any).__app.createCase());
+    expect(await page.evaluate(() => (window as any).__started)).toBe(false);
+    expect(await page.evaluate(() => (window as any).__toasts)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: 'error', message: expect.stringContaining('Case created, but') }),
+      ])
+    );
+  });
+
+  it('ignores a new-case group response after the dialog has switched to an existing case', async () => {
+    let release!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await page.route('**/api/tab-layout', async (route) => {
+      await waiting;
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({ success: true, data: { layout: { groups } } }),
+      });
+    });
+    const requested = page.waitForRequest('**/api/tab-layout');
+    await page.evaluate(() => {
+      const a = (window as any).__app;
+      a.caseEditOriginalName = null;
+      void a.loadCaseEditDefaultGroup(null);
+    });
+    await requested;
+    await page.evaluate(async () => {
+      const a = (window as any).__app;
+      a.caseEditOriginalName = 'sandbox';
+      await a.loadCaseEditDefaultGroup('sandbox');
+    });
+    release();
+    await page.waitForTimeout(150);
+    expect(await page.locator('#caseEditDefaultGroup').inputValue()).toBe('group-tcc');
+  });
+
   it('loads the saved default into the Edit Case control and exposes its selected ID for the case update', async () => {
     await page.evaluate(() => (window as any).__app.loadCaseEditDefaultGroup('nzbdav'));
 
