@@ -4215,6 +4215,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   resetCaseEditState() {
+    this._caseEditDefaultGroupLoadToken = (this._caseEditDefaultGroupLoadToken || 0) + 1;
     this.caseEditOriginalName = null;
     this.caseEditOriginalLocation = null;
     this.caseEditOriginalHostId = null;
@@ -4278,10 +4279,13 @@ Object.assign(CodemanApp.prototype, {
     void this.loadRemoteHostsForCaseModal();
     modal.classList.add('active');
     document.getElementById('newCaseName').focus();
+    void this.loadCaseEditDefaultGroup(null);
   },
 
   switchCaseModalTab(tabName) {
     this.caseModalTab = tabName;
+    const groupRow = document.getElementById('caseEditDefaultGroupRow');
+    if (groupRow) groupRow.style.display = tabName === 'case-manage' ? 'none' : '';
     const modal = document.getElementById('createCaseModal');
     const isEditing = Boolean(this.caseEditOriginalName);
     // Toggle active class on tab buttons
@@ -4347,6 +4351,10 @@ Object.assign(CodemanApp.prototype, {
   },
 
   async submitCaseModal() {
+    if (!this.caseEditOriginalName && document.getElementById('caseEditDefaultGroup')?.disabled) {
+      this.showToast('Default session groups are not loaded yet. Reopen Add Case to retry.', 'error');
+      return;
+    }
     // Both submit buttons move together: whichever one the user pressed, the
     // other must show the same pending state and be equally unclickable.
     const btns = ['caseModalSubmit', 'caseModalSubmitMobile'].map((id) => document.getElementById(id)).filter(Boolean);
@@ -4454,6 +4462,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   async createCase() {
+    const defaultGroupId = this._caseEditDefaultGroupId();
     const name = document.getElementById('newCaseName').value.trim();
     const description = document.getElementById('newCaseDescription').value.trim();
 
@@ -4492,12 +4501,14 @@ Object.assign(CodemanApp.prototype, {
 
       const data = await res.json();
       if (data.success) {
+        const groupSaved = await this._saveNewCaseDefaultGroup(name, defaultGroupId);
         this.closeCreateCaseModal();
         // Reload cases and select the new one
         await this.loadQuickStartCases(name);
         // Save as last used case
         await this.saveLastUsedCase(name);
         if (inDocker) {
+          if (!groupSaved) return;
           const caps = data.data?.capsEnforced === false ? ' (resource caps advisory on this engine)' : '';
           this.showToast(`Docker case "${name}" created${caps} — starting session…`, 'success');
           // Start a session INSIDE the container (routes through quick-start).
@@ -4558,6 +4569,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   async linkCase() {
+    const defaultGroupId = this._caseEditDefaultGroupId();
     const name = document.getElementById('linkCaseName').value.trim();
     const path = document.getElementById('linkCasePath').value.trim();
 
@@ -4585,6 +4597,7 @@ Object.assign(CodemanApp.prototype, {
 
       const data = await res.json();
       if (data.success) {
+        await this._saveNewCaseDefaultGroup(name, defaultGroupId);
         this.closeCreateCaseModal();
         this.showToast(`Case "${name}" linked to ${path}`, 'success');
         // Reload cases and select the new one
@@ -4768,6 +4781,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   async cloneCase() {
+    const defaultGroupId = this._caseEditDefaultGroupId();
     const url = document.getElementById('cloneRepoUrl').value.trim();
     const name = document.getElementById('cloneCaseName').value.trim();
     const ref = document.getElementById('cloneRepoRef').value.trim();
@@ -4813,12 +4827,13 @@ Object.assign(CodemanApp.prototype, {
       // Setting the brain before the tab closes means the Run button is already
       // pointing at the chosen CLI, whether or not a session starts now.
       if (brain) this.setRunMode(brain);
+      const groupSaved = await this._saveNewCaseDefaultGroup(name, defaultGroupId);
       this.closeCreateCaseModal();
       await this.loadQuickStartCases(name);
       await this.saveLastUsedCase(name);
       this.showToast(`Cloned into case "${name}"`, 'success');
       for (const warning of data.data?.warnings || []) this.showToast(warning, 'warning');
-      if (startSession) await this.run();
+      if (startSession && groupSaved) await this.run();
     } catch (err) {
       // A proxy/idle timeout can kill the request while git keeps going: the
       // case:created broadcast is what makes the case show up regardless.
@@ -4906,6 +4921,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   async linkRemoteCase() {
+    const defaultGroupId = this._caseEditDefaultGroupId();
     const name = document.getElementById('remoteCaseName').value.trim();
     const remotePath = document.getElementById('remoteCasePath').value.trim();
     const hostId = document.getElementById('remoteHostId').value.trim()
@@ -4978,6 +4994,7 @@ Object.assign(CodemanApp.prototype, {
       });
       const caseData = await caseRes.json();
       if (caseData.success) {
+        await this._saveNewCaseDefaultGroup(name, defaultGroupId);
         this.closeCreateCaseModal();
         this.showToast(`Remote case "${name}" linked`, 'success');
         await this.loadQuickStartCases(name);
@@ -5554,6 +5571,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   async linkDockerCase() {
+    const defaultGroupId = this._caseEditDefaultGroupId();
     const name = document.getElementById('dockerCaseName').value.trim();
     const hostWorkspacePath = document.getElementById('dockerWorkspacePath').value.trim();
     const hostId = document.getElementById('dockerHostId').value.trim() || 'local';
@@ -5646,6 +5664,7 @@ Object.assign(CodemanApp.prototype, {
       });
       const caseData = await caseRes.json();
       if (caseData.success) {
+        await this._saveNewCaseDefaultGroup(name, defaultGroupId);
         this.closeCreateCaseModal();
         const caps = caseData.data?.capsEnforced === false ? ' (resource caps are advisory on this engine)' : '';
         const modes = (caseData.data?.availableModes || []).filter((m) => m !== 'shell');
@@ -6200,6 +6219,23 @@ Object.assign(CodemanApp.prototype, {
     return select.value || null;
   },
 
+  async _saveNewCaseDefaultGroup(caseName, groupId) {
+    if (!groupId) return true; // New cases already default to Ungrouped.
+    try {
+      const res = await fetch(`/api/cases/${encodeURIComponent(caseName)}/default-group`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ groupId }),
+      });
+      const json = await res.json();
+      if (!res.ok || json.success === false) throw new Error(json.error || 'Save refused');
+      return true;
+    } catch {
+      // The case already exists: do not report creation failure or retry creation.
+      this.showToast('Case created, but its default group could not be saved. Set it in Case settings.', 'error');
+      return false;
+    }
+  },
+
   async loadCaseEditDefaultGroup(caseName) {
     const token = (this._caseEditDefaultGroupLoadToken || 0) + 1;
     this._caseEditDefaultGroupLoadToken = token;
@@ -6207,13 +6243,14 @@ Object.assign(CodemanApp.prototype, {
     const row = document.getElementById('caseEditDefaultGroupRow');
     if (row) row.classList.remove('hidden');
     try {
-      const res = await fetch(`/api/cases/${encodeURIComponent(caseName)}/default-group`);
+      const res = await fetch(caseName ? `/api/cases/${encodeURIComponent(caseName)}/default-group` : '/api/tab-layout');
       const json = await res.json();
       if (!res.ok || json.success === false) throw new Error(json.error || 'Failed to load default group');
       if (token !== this._caseEditDefaultGroupLoadToken || this.caseEditOriginalName !== caseName) return;
       const select = document.getElementById('caseEditDefaultGroup');
       if (!select) return;
-      const groups = Array.isArray(json.data?.groups) ? json.data.groups : [];
+      const availableGroups = caseName ? json.data?.groups : json.data?.layout?.groups;
+      const groups = Array.isArray(availableGroups) ? availableGroups : [];
       const selected = typeof json.data?.groupId === 'string' && groups.some((group) => group.id === json.data.groupId)
         ? json.data.groupId
         : '';
