@@ -14,7 +14,7 @@ import {
   observeOpenCode,
   type NativeCursor,
 } from './assistant-native.js';
-import { observeClaudeAssistantTurn, observeAssistantTurn } from './assistant-turn-observer.js';
+import { codexLifecycleReady, observeClaudeAssistantTurn, observeAssistantTurn } from './assistant-turn-observer.js';
 import type { AssistantDefinition, AssistantBinding } from './types/assistant.js';
 import type { AssistantRecovery } from './assistant-recovery.js';
 
@@ -70,7 +70,7 @@ export class AssistantRequestManager {
   conversationReady(path: string, binding?: AssistantBinding): Promise<boolean> {
     return binding && assistantBindingMode(binding) !== 'codex'
       ? otherNativeReady(binding, path)
-      : this.nativeReady(path);
+      : this.nativeReady(path, binding?.conversationId);
   }
   private handoffPending = new Set<string>();
   private takingControl = new Set<string>();
@@ -93,7 +93,7 @@ export class AssistantRequestManager {
         .map((r) => r.binding.sessionId)
     );
   }
-  private async nativeReady(path: string): Promise<boolean> {
+  private async nativeReady(path: string, conversationId?: string): Promise<boolean> {
     const file = await open(path, 'r');
     try {
       const info = await file.stat();
@@ -121,7 +121,13 @@ export class AssistantRequestManager {
               r.payload?.type ?? ''
             )
         );
-      return !malformed && (!events.length || events.at(-1)?.payload?.type === 'task_complete');
+      return (
+        !malformed &&
+        codexLifecycleReady(
+          events.map((event) => event!.payload!),
+          conversationId
+        )
+      );
     } finally {
       await file.close();
     }
