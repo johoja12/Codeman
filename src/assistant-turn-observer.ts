@@ -21,6 +21,28 @@ function isEarlierCodexTurn(candidate: unknown, current: string): boolean {
   );
 }
 
+/** A completed turn remains idle when only its background command results arrive later. */
+export function codexLifecycleReady(events: ReadonlyArray<Record<string, unknown>>, conversationId?: string): boolean {
+  if (!events.length) return true;
+  let completedIndex = events.length - 1;
+  while (completedIndex >= 0 && events[completedIndex].type !== 'task_complete') completedIndex--;
+  if (completedIndex < 0) return false;
+  const completed = events[completedIndex];
+  return events
+    .slice(completedIndex + 1)
+    .every(
+      (event) =>
+        event.type === 'item_completed' &&
+        (event.item as { type?: string } | undefined)?.type === 'CommandExecution' &&
+        typeof completed.turn_id === 'string' &&
+        completed.turn_id.length > 0 &&
+        typeof event.thread_id === 'string' &&
+        typeof conversationId === 'string' &&
+        event.thread_id === conversationId &&
+        (event.turn_id === completed.turn_id || isEarlierCodexTurn(event.turn_id, completed.turn_id))
+    );
+}
+
 export function observeAssistantTurn(
   jsonl: string,
   conversationId: string,

@@ -128,6 +128,48 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true });
 });
 describe('durable assistant requests', () => {
+  it.each(['01a1a0ff-0bd4-71b2-b26f-33504a365079', '01a1a070-9999-70a1-b838-7e4162d35c0f'])(
+    'hands off after a completed turn receives background result from %s',
+    async (backgroundTurn) => {
+      const id = '01a1a0ff-0bd4-71b2-b26f-33504a365079';
+      appendFileSync(
+        file,
+        turn('earlier prompt', 'finished', id) +
+          row({
+            type: 'item_completed',
+            thread_id: conversationId,
+            turn_id: backgroundTurn,
+            item: { type: 'CommandExecution' },
+          })
+      );
+      const a = await ready();
+      expect(manager.availability(a).requestExecution).toBe(true);
+      expect(writes).toEqual([]);
+    }
+  );
+
+  it.each(['task_started', 'UserMessage', 'foreign-thread', 'newer-turn', 'missing-turn'])(
+    'does not hand off after completion followed by %s',
+    async (kind) => {
+      const id = '01a1a0ff-0bd4-71b2-b26f-33504a365079';
+      const later =
+        kind === 'task_started'
+          ? row({ type: 'task_started', turn_id: 'new-turn' })
+          : row({
+              type: 'item_completed',
+              thread_id: kind === 'foreign-thread' ? randomUUID() : conversationId,
+              turn_id:
+                kind === 'missing-turn'
+                  ? undefined
+                  : kind === 'newer-turn'
+                    ? '01a1a1ff-0bd4-71b2-b26f-33504a365079'
+                    : id,
+              item: { type: kind === 'UserMessage' ? 'UserMessage' : 'CommandExecution' },
+            });
+      appendFileSync(file, turn('earlier prompt', 'finished', id) + later);
+      await expect(ready()).rejects.toThrow(/unfinished turn/);
+    }
+  );
   it('completes once when an older background command finishes during this request (#42)', async () => {
     const a = await ready();
     const request = manager.submit(a, 'hello', 'late-background-command-42');
