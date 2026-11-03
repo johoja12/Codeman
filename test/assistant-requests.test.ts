@@ -128,6 +128,49 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true });
 });
 describe('durable assistant requests', () => {
+  it('completes once when an older background command finishes during this request (#42)', async () => {
+    const a = await ready();
+    const request = manager.submit(a, 'hello', 'late-background-command-42');
+    await manager.tick();
+    const id = '01a1a0ff-0bd4-71b2-b26f-33504a365079';
+    const records = turn('hello', 'current answer', id).trimEnd().split('\n');
+    const old = row({
+      type: 'item_completed',
+      thread_id: conversationId,
+      turn_id: '01a1a070-9999-70a1-b838-7e4162d35c0f',
+      item: { type: 'CommandExecution' },
+    });
+    appendFileSync(file, records.slice(0, 2).join('\n') + '\n' + old);
+    await manager.tick();
+    expect(manager.store.get(request.id)?.status).toBe('running');
+    appendFileSync(file, records.slice(2).join('\n') + '\n');
+    await manager.tick();
+    expect(manager.store.get(request.id)).toMatchObject({ status: 'completed', result: { text: 'current answer' } });
+    await manager.tick();
+    expect(writes).toEqual(['hello\r']);
+  });
+
+  it.each([
+    ['future command', '01a1a1ff-0bd4-71b2-b26f-33504a365079', 'CommandExecution', false],
+    ['same-millisecond command', '01a1a0ff-0bd4-71b2-b26f-33504a365078', 'CommandExecution', false],
+    ['unversioned command', 'older-turn', 'CommandExecution', false],
+    ['missing turn', undefined, 'CommandExecution', false],
+    ['old foreign conversation', '01a1a070-9999-70a1-b838-7e4162d35c0f', 'CommandExecution', true],
+    ['old user message', '01a1a070-9999-70a1-b838-7e4162d35c0f', 'UserMessage', false],
+    ['old final answer', '01a1a070-9999-70a1-b838-7e4162d35c0f', 'AgentMessage', false],
+  ])('still fails closed for %s', (_label, otherId, type, foreign) => {
+    const id = '01a1a0ff-0bd4-71b2-b26f-33504a365079';
+    const data =
+      turn('hello', 'current answer', id) +
+      row({
+        type: 'item_completed',
+        turn_id: otherId,
+        thread_id: foreign ? randomUUID() : conversationId,
+        item: { type },
+      });
+    expect(observeAssistantTurn(data, conversationId, 'hello')).toMatchObject({ state: 'unknown' });
+  });
+
   it('treats an exact empty native final as a stopped response failure, never unknown or task success', async () => {
     const a = await ready();
     const r = manager.submit(a, 'silent task', 'empty-native-123456789');

@@ -7,6 +7,20 @@ export type TurnObservation =
   | { state: 'failed'; turnId: string; reason: string }
   | { state: 'unknown'; reason: string };
 
+/** Codex turn IDs encode their creation time as UUIDv7's first 48 bits.
+ * Only a strictly earlier timestamp proves a late background completion;
+ * unversioned IDs and IDs from the same millisecond remain ambiguous.
+ */
+function isEarlierCodexTurn(candidate: unknown, current: string): boolean {
+  const uuid7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  return (
+    typeof candidate === 'string' &&
+    uuid7.test(candidate) &&
+    uuid7.test(current) &&
+    candidate.slice(0, 13).toLowerCase() < current.slice(0, 13).toLowerCase()
+  );
+}
+
 export function observeAssistantTurn(
   jsonl: string,
   conversationId: string,
@@ -30,7 +44,19 @@ export function observeAssistantTurn(
       : { state: 'waiting' };
   const turnId = starts[0].turn_id;
   if (typeof turnId !== 'string' || !turnId) return { state: 'unknown', reason: 'Unsupported native turn identity' };
-  const items = events.filter((p) => p.type === 'item_completed');
+  const startIndex = events.indexOf(starts[0]);
+  const items = events.filter((p, index) => {
+    if (p.type !== 'item_completed') return false;
+    // Background commands can finish after their parent turn completed, even
+    // during the next request. They are neither current-turn results nor
+    // evidence that a different conversation took control (#42).
+    const lateBackgroundCommand =
+      p.thread_id === conversationId &&
+      (p.item as { type?: string } | undefined)?.type === 'CommandExecution' &&
+      index > startIndex &&
+      isEarlierCodexTurn(p.turn_id, turnId);
+    return !lateBackgroundCommand;
+  });
   if (items.some((p) => p.turn_id !== turnId || p.thread_id !== conversationId))
     return { state: 'unknown', reason: 'Transcript identity changed' };
   const item = (p: Record<string, unknown>) =>
