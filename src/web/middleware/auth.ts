@@ -831,7 +831,7 @@ export function registerSecurityHeaders(app: FastifyInstance, https: boolean, ba
   const workerSrc = "; worker-src 'self' blob:";
   const csp =
     `default-src 'self'; ${scriptSrc}; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; ` +
-    `img-src 'self' data: blob:; ${connectSrc}; font-src 'self' https://cdn.jsdelivr.net; frame-ancestors 'self'${workerSrc}`;
+    `img-src 'self' data: blob:; media-src 'self' blob: https: http:; ${connectSrc}; font-src 'self' https://cdn.jsdelivr.net; frame-ancestors 'self'${workerSrc}`;
 
   app.addHook('onRequest', (req, reply, done) => {
     reply.header('X-Content-Type-Options', 'nosniff');

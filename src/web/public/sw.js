@@ -100,6 +100,9 @@ self.addEventListener('fetch', (event) => {
   if (request.method !== 'GET') return;
   if (request.headers.get('upgrade') === 'websocket') return;
   if (request.headers.get('accept') === 'text/event-stream') return;
+  // Let the browser stream and seek media directly. Cloning/caching a video
+  // duplicates large downloads, and Cache.put cannot store partial (206) responses.
+  if (request.destination === 'video' || request.destination === 'audio' || request.headers.get('range')) return;
   if (request.url.includes('/api/')) return;
   // A rendered HTML page is served `no-store` behind a capability that logout
   // revokes; caching a popped-out page here would let the offline fallback

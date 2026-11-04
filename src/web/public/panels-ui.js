@@ -5262,6 +5262,70 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
+  /** Direct media loading stays in the browser; external URLs never become server fetches. */
+  openVideoUrlPreview(value, sessionId = this.activeSessionId) {
+    if (typeof value !== 'string' || !/^https?:\/\//i.test(value)) return false;
+    let url;
+    try {
+      url = new URL(value);
+      if (url.username || url.password || !/\.(mp4|webm|mov|m4v|ogv)$/i.test(url.pathname)) return false;
+    } catch { return false; }
+    const overlay = this.$('filePreviewOverlay');
+    const body = this.$('filePreviewBody');
+    if (!overlay || !body) return false;
+    if (this.filePreviewEdit?.dirty && !confirm('Discard unsaved changes?')) return true;
+
+    this._stopFilePreviewPolling();
+    this._filePreviewLoad = (this._filePreviewLoad || 0) + 1;
+    this._stopFilePreviewMedia();
+    this._resetFilePreviewEdit?.();
+    this._resetFilePreviewExternalAction?.();
+    this._resetFilePreviewOriginalDownloadAction?.();
+    this._teardownOfficePreviewResources?.();
+    this._teardownOutlineScrollSpy?.();
+    this._closeAnnotationPopover?.();
+    this._closeAnnotationTray?.();
+    this._hideFilePreviewNavigation();
+    this._updateFolderPreviewNav?.(null);
+    if (this.folderGrid) this.folderGrid.index = null;
+    this.filePreviewText = null;
+    this.filePreviewContent = '';
+    this.filePreviewPage = null;
+    this.filePreviewDetachUrl = '';
+    this._annotations = [];
+    this._updateFilePreviewToolbar?.('none');
+    const detach = this.$('filePreviewDetachBtn');
+    if (detach) detach.hidden = true;
+    const folder = this.$('filePreviewFolderBtn');
+    if (folder) folder.hidden = true;
+    const state = this.filePreviewState = { sessionId, filePath: url.href, previewKind: 'video', externalPreviewUrl: url.href };
+    this._recordFilePreviewHistory(url.href, sessionId, null, {});
+    this._bindFilePreviewChrome();
+    this._restorePreviewSize();
+    this._applyFilePreviewExpanded();
+    overlay.classList.add('visible');
+    let name = url.pathname.split('/').pop();
+    try { name = decodeURIComponent(name); } catch { /* Keep an undecodable file name readable. */ }
+    this.$('filePreviewTitle').textContent = name;
+    const footer = this.$('filePreviewFooter');
+    footer.textContent = `Video • ${url.host}`;
+    const external = this.$('filePreviewOpenNewTab');
+    if (external) external.disabled = false;
+    const video = document.createElement('video');
+    video.controls = true;
+    video.autoplay = true;
+    video.playsInline = true;
+    video.preload = 'metadata';
+    video.style.width = '100%';
+    video.setAttribute('aria-label', name);
+    video.addEventListener('error', () => {
+      if (this.filePreviewState === state) footer.textContent = 'Video could not play. Try “Open in new tab” in the toolbar.';
+    });
+    video.src = url.href;
+    body.replaceChildren(video);
+    return true;
+  },
+
   /**
    * @param {object} [options]
    * @param {{folderId: string, name: string}} [options.folderFile] A file of a
@@ -5269,6 +5333,7 @@ Object.assign(CodemanApp.prototype, {
    *   paging through 300 renders never touches the attachment registry.
    */
   async openFilePreview(filePath, sessionId = this.activeSessionId, attachmentId = null, options = {}) {
+    if (!attachmentId && this.openVideoUrlPreview?.(filePath, sessionId)) return;
     if (!sessionId || !filePath) return;
     const folderFile = options.folderFile || null;
     // Prev/next only while browsing a folder grid; a preview opened from anywhere

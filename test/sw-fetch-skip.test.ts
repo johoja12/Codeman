@@ -33,7 +33,11 @@ function loadFetchListener(): (event: unknown) => void {
 
 function fetchEvent(path: string) {
   return {
-    request: { method: 'GET', url: `http://localhost${path}`, headers: { get: () => null } },
+    request: {
+      method: 'GET',
+      url: `http://localhost${path}`,
+      headers: { get: (_name: string): string | null => null },
+    },
     respondWith: vi.fn(),
   };
 }
@@ -46,6 +50,22 @@ describe('service worker fetch skip list', () => {
       onFetch(event);
       expect(event.respondWith, path).not.toHaveBeenCalled();
     }
+  });
+
+  it.each(['video', 'audio'])('does not cache %s streams', (destination) => {
+    const onFetch = loadFetchListener();
+    const event = fetchEvent('/preview.mp4?token=private');
+    Object.assign(event.request, { destination });
+    onFetch(event);
+    expect(event.respondWith).not.toHaveBeenCalled();
+  });
+
+  it('leaves range requests to the native network path even without a media destination', () => {
+    const onFetch = loadFetchListener();
+    const event = fetchEvent('/download');
+    event.request.headers.get = (name: string) => (name === 'range' ? 'bytes=0-1023' : null);
+    onFetch(event);
+    expect(event.respondWith).not.toHaveBeenCalled();
   });
 
   it('still answers an app asset', () => {

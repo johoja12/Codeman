@@ -3679,9 +3679,10 @@ Object.assign(CodemanApp.prototype, {
   _openTerminalUrl(text) {
     // A `localhost` link tapped from another device can only work through the
     // server: route it into a proxied web tab (webview-tabs.js). Anything else
-    // opens as before. Lives here rather than in the link provider's activate()
+    // uses the video preview or opens normally. Lives here rather than in the link provider's activate()
     // so every caller of this one opener gets the same routing.
     if (this.openLinkThroughWebTabIfLoopback?.(text)) return;
+    if (this.openVideoUrlPreview?.(text)) return;
     window.open(text, '_blank', 'noopener,noreferrer');
   },
 

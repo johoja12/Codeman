@@ -3645,6 +3645,12 @@ class CodemanApp {
         return;
       }
 
+      if (urlLink && !ev.ctrlKey && !ev.metaKey && !ev.shiftKey && !ev.altKey && this.openVideoUrlPreview?.(urlLink.href, body.dataset.rvSessionId || this.activeSessionId)) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        return;
+      }
+
       // One-click copy: lift the raw source from the sibling <pre><code>, or —
       // COD-263 — the rendered text of the sibling <blockquote>.
       const copyBtn = ev.target.closest('.rv-copy-btn');
