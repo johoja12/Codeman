@@ -613,7 +613,7 @@ function _debugEchoLogOuter() {
   } catch {}
 }
 
-const TERMINAL_FILE_URI_PREVIEW_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'pdf', 'docx', 'pptx', 'xlsx', 'md', 'txt']);
+const TERMINAL_FILE_URI_PREVIEW_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'pdf', 'docx', 'pptx', 'xlsx', 'md', 'txt', 'mp4', 'webm', 'mov', 'm4v', 'ogv']);
 
 Object.assign(CodemanApp.prototype, {
 
@@ -2556,6 +2556,11 @@ Object.assign(CodemanApp.prototype, {
       'docx',
       'pptx',
       'xlsx',
+      'mp4',
+      'webm',
+      'mov',
+      'm4v',
+      'ogv',
       'json',
       'yaml',
       'yml',
@@ -2576,6 +2581,11 @@ Object.assign(CodemanApp.prototype, {
       'docx',
       'pptx',
       'xlsx',
+      'mp4',
+      'webm',
+      'mov',
+      'm4v',
+      'ogv',
       'md',
       'txt',
     ]);
@@ -3662,6 +3672,8 @@ Object.assign(CodemanApp.prototype, {
     return {
       activate: (_event, text) => {
         if (/^https?:\/\/[^\s\x00-\x1f]+$/i.test(text)) {
+          const proxied = window.CodemanWebviewLinks?.linkNeedsWebTabProxy?.(text, window.location?.hostname);
+          if (!proxied && this.openVideoUrlPreview?.(text, getSessionId())) return;
           if (window.confirm(`Open this link?\n\n${text}`)) this._openTerminalUrl(text);
           return;
         }
@@ -3679,9 +3691,10 @@ Object.assign(CodemanApp.prototype, {
   _openTerminalUrl(text) {
     // A `localhost` link tapped from another device can only work through the
     // server: route it into a proxied web tab (webview-tabs.js). Anything else
-    // opens as before. Lives here rather than in the link provider's activate()
+    // uses the video preview or opens normally. Lives here rather than in the link provider's activate()
     // so every caller of this one opener gets the same routing.
     if (this.openLinkThroughWebTabIfLoopback?.(text)) return;
+    if (this.openVideoUrlPreview?.(text)) return;
     window.open(text, '_blank', 'noopener,noreferrer');
   },
 
@@ -3792,18 +3805,25 @@ Object.assign(CodemanApp.prototype, {
 
     const bufferLineNumber = (buffer.viewportY || 0) + cell.row;
     let activated = false;
+    // xterm's native OSC 8 provider owns labelled links, whose visible text
+    // need not contain the URL. Its normal mouse path never runs on touch.
+    const nativeProvider = this.terminal?._core?._linkProviderService?.linkProviders?.[0];
+    const providers = nativeProvider && nativeProvider !== provider ? [nativeProvider, provider] : [provider];
     try {
-      provider.provideLinks(bufferLineNumber, (links) => {
-        const link = links?.find((candidate) => {
-          const { start, end } = candidate.range;
-          const afterStart = bufferLineNumber > start.y || (bufferLineNumber === start.y && cell.col >= start.x);
-          const beforeEnd = bufferLineNumber < end.y || (bufferLineNumber === end.y && cell.col <= end.x);
-          return afterStart && beforeEnd;
+      for (const candidateProvider of providers) {
+        if (activated) break;
+        candidateProvider.provideLinks(bufferLineNumber, (links) => {
+          const link = links?.find((candidate) => {
+            const { start, end } = candidate.range;
+            const afterStart = bufferLineNumber > start.y || (bufferLineNumber === start.y && cell.col >= start.x);
+            const beforeEnd = bufferLineNumber < end.y || (bufferLineNumber === end.y && cell.col <= end.x);
+            return afterStart && beforeEnd;
+          });
+          if (!link || typeof link.activate !== 'function') return;
+          link.activate(event, link.text);
+          activated = true;
         });
-        if (!link || typeof link.activate !== 'function') return;
-        link.activate(event, link.text);
-        activated = true;
-      });
+      }
     } catch (err) {
       console.warn('[LinkProvider] tap activation failed:', err);
       return false;
