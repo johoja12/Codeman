@@ -1263,3 +1263,15 @@ it('routes native Codex file hyperlinks through the guarded preview using the ow
   handler.activate(null, uri);
   expect(preview).toHaveBeenCalledTimes(1);
 });
+
+it.each(['mp4', 'webm', 'mov', 'm4v', 'ogv'])(
+  'routes generated %s file URI labels to the guarded video preview',
+  (extension) => {
+    const { proto } = loadTerminalUiPrototype();
+    const host = { sessions: new Map([['video-pane', { mode: 'codex' }]]), openFileUriPreview: vi.fn() };
+    const handler = proto._terminalOsc8LinkHandler.call(host, { getSessionId: () => 'video-pane' });
+    const uri = `file:///Users/example/output/preview.${extension}`;
+    handler.activate(null, uri);
+    expect(host.openFileUriPreview).toHaveBeenCalledExactlyOnceWith(uri, 'video-pane');
+  }
+);

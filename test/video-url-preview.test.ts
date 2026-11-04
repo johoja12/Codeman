@@ -51,6 +51,20 @@ describe('direct video link routing', () => {
     expect(external).not.toHaveBeenCalled();
   });
 
+  it('opens a labelled OSC 8 video directly with the originating session and no external-link prompt', () => {
+    const confirm = vi.fn();
+    const host = { openVideoUrlPreview: vi.fn(() => true), _openTerminalUrl: vi.fn() };
+    const factory = vm.runInNewContext(`({${method('terminal-ui.js', '_terminalOsc8LinkHandler')}})`, {
+      window: { confirm },
+    });
+    factory._terminalOsc8LinkHandler
+      .call(host, { getSessionId: () => 'source-session' })
+      .activate({}, 'https://example.test/movie.mp4');
+    expect(host.openVideoUrlPreview).toHaveBeenCalledWith('https://example.test/movie.mp4', 'source-session');
+    expect(confirm).not.toHaveBeenCalled();
+    expect(host._openTerminalUrl).not.toHaveBeenCalled();
+  });
+
   it('preserves the loopback proxy and ordinary external-link behavior', () => {
     const external = vi.fn();
     const host = { openLinkThroughWebTabIfLoopback: vi.fn(() => true), openVideoUrlPreview: vi.fn(() => false) };

@@ -143,6 +143,23 @@ describe('POST /api/sessions/:id/file-uri-preview', () => {
     });
   }
 
+  it('registers a generated MP4 and streams seekable video bytes through its guarded attachment route', async () => {
+    const filePath = join(workspaceDir, 'preview.mp4');
+    await fs.writeFile(filePath, 'video-bytes');
+    const registered = await postUri(pathToFileURL(filePath).href);
+    expect(registered.statusCode).toBe(200);
+    const id = registered.json().data.attachmentId;
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/sessions/${ctx._sessionId}/attachments/${id}/raw`,
+      headers: { range: 'bytes=0-3' },
+    });
+    expect(response.statusCode).toBe(206);
+    expect(response.headers['content-type']).toContain('video/mp4');
+    expect(response.headers['content-range']).toBe('bytes 0-3/11');
+    expect(response.body).toBe('vide');
+  });
+
   it('resolves a percent-encoded local artifact to sanitized opaque attachment metadata', async () => {
     const filePath = join(workspaceDir, 'mockup one.png');
     await fs.writeFile(filePath, 'image-bytes');

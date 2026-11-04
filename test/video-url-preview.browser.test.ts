@@ -63,13 +63,19 @@ describe('linked video previews', () => {
     await server?.stop();
   });
 
-  for (const mobile of [false, true]) {
-    it(`plays a signed video URL in the modal on ${mobile ? 'mobile' : 'desktop'} and unloads on close`, async () => {
+  for (const { mobile, labelled } of [
+    { mobile: false, labelled: false },
+    { mobile: true, labelled: false },
+    { mobile: false, labelled: true },
+    { mobile: true, labelled: true },
+  ]) {
+    it(`plays a signed ${labelled ? 'labelled' : 'plain'} video link on ${mobile ? 'mobile' : 'desktop'} and unloads on close`, async () => {
       const page = await openPage(mobile);
       const popups: Page[] = [];
       page.on('popup', (popup) => popups.push(popup));
       try {
         await page.evaluate('window.__videoTestApp = app');
+        const renderedLink = labelled ? `\x1b]8;;${videoUrl}\x07Watch preview\x1b]8;;\x07` : videoUrl;
         const point = await page.evaluate(async (url) => {
           // Exercise the terminal's real link provider and touch/click path.
           const app = (window as any).__videoTestApp;
@@ -79,7 +85,7 @@ describe('linked video previews', () => {
           const rect = app.terminal.element.querySelector('.xterm-screen').getBoundingClientRect();
           const cell = app.terminal._core._renderService.dimensions.css.cell;
           return { x: rect.left + cell.width * 8.5, y: rect.top + cell.height * 0.5 };
-        }, videoUrl);
+        }, renderedLink);
         if (mobile) await page.touchscreen.tap(point.x, point.y);
         else {
           await page.mouse.move(point.x, point.y);
