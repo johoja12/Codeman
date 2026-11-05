@@ -230,6 +230,75 @@ describe('Discord interface mode', () => {
     expect(answers()).toHaveLength(1);
     expect(sendInput).not.toHaveBeenCalled();
   });
+  it('binds component clicks to the prompt, message, channel and allowlisted user and consumes once', async () => {
+    const control = vi.fn(async (_id: string, command: string) =>
+      command === 'pending'
+        ? {
+            text: 'Choose one',
+            actions: [{ label: 'Allow once', command: 'answer current revision 1', validity: 'current' }],
+          }
+        : { text: 'Answered' }
+    );
+    const b = makeBridge(undefined, { control, controlCurrent: () => true });
+    await b.reload();
+    await b.syncSessions();
+    const map = await readFullMap(dir);
+    await b.onGatewayMessage({
+      id: '555555555555555555',
+      guild_id: cfg.guildId,
+      channel_id: map.s1,
+      author: { id: cfg.allowedUserIds[0] },
+      content: '!codeman pending',
+    });
+    const posted = posts.find((p) => p.body?.components?.length)!;
+    const custom_id = posted.body!.components[0].components[0].custom_id;
+    const click = {
+      id: '777777777777777777',
+      application_id: '888888888888888888',
+      token: 'test-interaction-token',
+      type: 3,
+      guild_id: cfg.guildId,
+      channel_id: map.s1,
+      member: { user: { id: cfg.allowedUserIds[0] } },
+      message: { id: '444444444444444444' },
+      data: { custom_id },
+    };
+    await b.onGatewayInteraction({ ...click, member: { user: { id: '999999999999999999' } } });
+    expect(control).toHaveBeenCalledTimes(1);
+    await b.onGatewayInteraction(click);
+    await b.onGatewayInteraction(click);
+    expect(control).toHaveBeenCalledTimes(2);
+    expect(control).toHaveBeenLastCalledWith('s1', 'answer current revision 1');
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+  it('shows prompt-bound buttons on a question alert and refuses an unbound digit in Full mode', async () => {
+    const control = async () => ({
+      text: 'Which option?',
+      actions: [{ label: 'One', command: 'answer prompt revision 1', validity: 'prompt' }],
+    });
+    const b = makeBridge(undefined, { control, controlCurrent: () => true, awaitingChoice: () => true });
+    await b.reload();
+    await b.syncSessions();
+    const map = await readFullMap(dir);
+    await b.notify({
+      sessionId: 's1',
+      sessionName: 'one',
+      event: 'question',
+      title: 'Question',
+      body: 'Choose',
+      urgency: 'critical',
+    });
+    expect(posts.some((p) => p.body?.components?.length && p.body?.content === 'Which option?')).toBe(true);
+    await b.onGatewayMessage({
+      id: '555555555555555555',
+      guild_id: cfg.guildId,
+      channel_id: map.s1,
+      author: { id: cfg.allowedUserIds[0] },
+      content: '1',
+    });
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(posts.some((p) => p.body?.content?.includes('prompt-bound answer'))).toBe(true);
+  });
   it('defaults legacy and unknown config values to notifications', async () => {
     for (const mode of [undefined, 'unknown', null]) {
       await writeFile(discordConfigPath(dir), JSON.stringify({ enabled: false, mode }));

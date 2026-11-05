@@ -1,3 +1,4 @@
+import { discordTaskControl, discordControlCurrent } from '../discord-task-controls.js';
 import { discordHistoryControl, readDiscordSessionHistory } from '../discord-history.js';
 import { readDiscordSessionFile, writeDiscordRemoteAttachment } from '../discord-file-transfers.js';
 /**
@@ -762,10 +763,14 @@ export class WebServer extends EventEmitter {
       if (!session) throw new Error('Session unavailable');
       return readDiscordSessionHistory(session, options);
     },
+    controlCurrent: (id, validity) => {
+      const session = this.sessions.get(id);
+      return !!session && discordControlCurrent(session, validity);
+    },
     control: async (id, command) => {
       const session = this.sessions.get(id);
       if (!session) throw new Error('Session unavailable');
-      return discordHistoryControl(session, command);
+      return (await discordTaskControl(session, command)) ?? discordHistoryControl(session, command);
     },
     getAttachment: async (id, path) => {
       const session = this.sessions.get(id);
