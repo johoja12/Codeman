@@ -1247,7 +1247,7 @@ export class DiscordBridge {
           '**Historical context**' +
           (history.partial ? ' (partial)' : '') +
           '\n' +
-          renderHistory([{ ...turn, text: clip(turn.text, 1000) }]) +
+          renderHistory([{ ...turn, text: clip(turn.text, 1000) }], { includeTimestamps: false }) +
           '\n`!codeman history` / `!codeman transcript` for more';
         await this.deliverPost(
           channel,
@@ -1309,7 +1309,11 @@ export class DiscordBridge {
   private async observeConversation(sessionId: string, channel: string): Promise<void> {
     await this.seedConversation(sessionId, channel);
     const key = this.conversationKey(sessionId, channel);
-    if (this.conversationRuns.has(key)) return;
+    const active = this.conversationRuns.get(key);
+    if (active) {
+      await active;
+      return;
+    }
     const run = (async () => {
       let progress = await this.conversationProgress.get(key);
       if (!progress?.seeded) return;
@@ -1330,9 +1334,7 @@ export class DiscordBridge {
           throw new BridgeProblem('Session changed');
         if (turn.role === 'assistant' || (turn.role === 'tool' && progress.verbose)) {
           const chunks = splitForDiscord(
-            tablesToCodeBlocks(
-              '**' + (turn.role === 'tool' ? 'Tool output' : 'Assistant') + '** ' + turn.timestamp + '\n' + turn.text
-            )
+            tablesToCodeBlocks((turn.role === 'tool' ? '**Tool output**\n' : '') + turn.text)
           );
           for (const [i, content] of chunks.entries())
             await this.deliverPost(
@@ -1355,11 +1357,21 @@ export class DiscordBridge {
         await this.conversationProgress.set(key, progress);
       }
       const latest = history.executions?.at(-1);
-      if (!latest) return;
-      const status = 'Latest native task: **' + latest.state.replaceAll('_', ' ') + '**';
-      const hash = createHash('sha256')
-        .update(latest.userCursor + status)
-        .digest('hex');
+      const stateLabels = {
+        submitted: '📨 Sent to the agent',
+        running: '⏳ Working…',
+        completed: '✅ Done',
+        interrupted: '⏸️ Interrupted',
+        execution_error: '⚠️ Task failed',
+      };
+      const status = this.deps.awaitingChoice?.(sessionId)
+        ? '❓ Needs your answer'
+        : latest
+          ? stateLabels[latest.state]
+          : this.deps.sessions?.().find((s) => s.id === sessionId)?.working
+            ? '⏳ Working…'
+            : '💬 Ready for your next message';
+      const hash = createHash('sha256').update(status).digest('hex');
       if (progress.statusHash !== hash) {
         if (
           this.stopped ||
@@ -1368,22 +1380,34 @@ export class DiscordBridge {
           !this.destinationMatches(sessionId, channel)
         )
           return;
-        let id = progress.statusMessageId;
-        if (id) {
+        try {
           await this.channels.assertOwned(this.cfg, sessionId, channel);
-          await this.api.editMessage(channel, id, { content: status, allowed_mentions: { parse: [], users: [] } });
-        } else
-          id = (
-            (await this.deliverPost(
-              channel,
-              { content: status, allowed_mentions: { parse: [], users: [] } },
-              undefined,
-              sessionId,
-              `native-status:${latest.userCursor}`
-            )) as { id?: string }
-          )?.id;
-        progress = { ...progress, statusMessageId: id, statusHash: hash };
-        await this.conversationProgress.set(key, progress);
+          let id = progress.statusMessageId;
+          if (id) {
+            try {
+              await this.api.editMessage(channel, id, { content: status, allowed_mentions: { parse: [], users: [] } });
+            } catch (err) {
+              if (!(err instanceof DiscordHttpError) || err.status !== 404) throw err;
+              id = undefined;
+            }
+          }
+          if (!id)
+            id = (
+              (await this.deliverPost(
+                channel,
+                { content: status, allowed_mentions: { parse: [], users: [] } },
+                undefined,
+                sessionId,
+                `native-status:${progress.conversationId}:${progress.statusMessageId ?? 'initial'}`
+              )) as { id?: string }
+            )?.id;
+          progress = { ...progress, statusMessageId: id, statusHash: hash };
+          await this.conversationProgress.set(key, progress);
+        } catch {
+          // Native cursor progress is already durable. A cosmetic status failure must not
+          // resend the response body through the idle-alert fallback; retry status next poll.
+          this.last = this.fail(new BridgeProblem('Response delivered; its status could not be updated yet'));
+        }
       }
     })().finally(() => {
       if (this.conversationRuns.get(key) === run) this.conversationRuns.delete(key);
@@ -1711,6 +1735,38 @@ export class DiscordBridge {
     if (this.lastSent.size > 256) {
       for (const [k, v] of this.lastSent) if (t - v > DEDUPE_WINDOW_MS) this.lastSent.delete(k);
     }
+    // Native conversation output owns routine responses in Full mode. Await the exact destination's
+    // observer before suppressing an alert, so a failed/off stream retains its fallback notification.
+    if (
+      this.cfg.mode === 'full' &&
+      this.deps.history &&
+      msg.sessionId &&
+      !opts.deliberate &&
+      !msg.file &&
+      ['hook:idle_prompt', 'hook:stop'].includes(msg.event) &&
+      !this.deps.awaitingChoice?.(msg.sessionId)
+    ) {
+      try {
+        const channel = await this.threadFor(msg.sessionId, msg.sessionName);
+        if (typeof channel === 'string') {
+          await this.observeConversation(msg.sessionId, channel);
+          const progress = await this.conversationProgress.get(this.conversationKey(msg.sessionId, channel));
+          if (
+            progress?.seeded &&
+            !!progress.cursor &&
+            !progress.streamOff &&
+            !this.deps.awaitingChoice?.(msg.sessionId) &&
+            this.cfg.mode === 'full' &&
+            this.cfg.enabled &&
+            !this.stopped &&
+            this.destinationMatches(msg.sessionId, channel)
+          )
+            return { ok: true, deduped: true, at: this.now() };
+        }
+      } catch {
+        /* preserve the ordinary alert when native delivery is unavailable */
+      }
+    }
     let chunks: string[] = [];
     // Remembered only once the first post is out: a failed post must leave the message to be sent again.
     let posted: string | undefined;
@@ -1731,17 +1787,6 @@ export class DiscordBridge {
       } catch {
         // no transcript to read: the screen tail stands in
       }
-    }
-    if (
-      this.cfg.mode === 'full' &&
-      this.deps.history &&
-      msg.sessionId &&
-      msg.urgency === 'info' &&
-      !opts.deliberate &&
-      !msg.file
-    ) {
-      await this.pollConversations();
-      return { ok: true, deduped: true, at: this.now() };
     }
     if (this.cfg.mode === 'full' && msg.sessionId && msg.urgency !== 'info' && this.deps.control) {
       try {
