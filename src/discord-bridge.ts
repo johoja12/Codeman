@@ -1690,7 +1690,8 @@ export class DiscordBridge {
               msg.sessionId,
               channel,
               prompt,
-              `pending:${msg.sessionId}:${createHash('sha256').update(prompt.text).digest('hex')}`
+              `pending:${msg.sessionId}:${createHash('sha256').update(prompt.text).digest('hex')}`,
+              shouldPing(this.cfg.pingMode, msg.urgency, explicitUrgent)
             );
             return { ok: true, at: this.now() };
           }
@@ -1904,7 +1905,8 @@ export class DiscordBridge {
     sessionId: string,
     channel: string,
     result: DiscordControlReply,
-    key: string
+    key: string,
+    notifyUsers = false
   ): Promise<void> {
     if (result.locateSessionId) {
       if (!this.deps.sessions?.().some((s) => s.id === result.locateSessionId))
@@ -1919,6 +1921,8 @@ export class DiscordBridge {
             : '\nDestination unavailable; retry synchronization.'),
       };
     }
+    const users = notifyUsers ? this.cfg.allowedUserIds.slice(0, 20) : [];
+    const mentions = users.length ? users.map((id) => `<@${id}>`).join(' ') + '\n' : '';
     const ids: string[] = [];
     for (const action of (result.actions ?? []).slice(0, 5)) {
       if (this.actions.size >= 256) break;
@@ -1944,10 +1948,14 @@ export class DiscordBridge {
           },
         ]
       : undefined;
-    for (const [i, content] of splitForDiscord(tablesToCodeBlocks(result.text)).entries()) {
+    for (const [i, content] of splitForDiscord(tablesToCodeBlocks(result.text), 1900 - mentions.length).entries()) {
       const posted = (await this.deliverPost(
         channel,
-        { content, allowed_mentions: { parse: [], users: [] }, components: i === 0 ? components : undefined },
+        {
+          content: (i === 0 ? mentions : '') + content,
+          allowed_mentions: { parse: [], users: i === 0 ? users : [] },
+          components: i === 0 ? components : undefined,
+        },
         i === 0 ? result.file : undefined,
         sessionId,
         key + ':' + i
@@ -1981,7 +1989,7 @@ export class DiscordBridge {
       !SNOWFLAKE.test(m.id) ||
       !SNOWFLAKE.test(m.application_id) ||
       typeof m.token !== 'string' ||
-      !/^[A-Za-z0-9._-]{1,256}$/.test(m.token)
+      !/^[\x21-\x7e]{1,2048}$/.test(m.token)
     )
       return;
     const reply = (text: string) =>
