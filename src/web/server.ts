@@ -27,30 +27,7 @@
  * @module web/server
  */
 
-import { findUser } from '../user-store.js';
-import { AssistantRequestManager } from '../assistant-request-manager.js';
-import {
-  AssistantRecovery,
-  assistantComposerEmpty,
-  assistantCodexRecoveryProfile,
-  assistantRecoveryGroup,
-  assistantRecoveryCandidateExited,
-} from '../assistant-recovery.js';
-import {
-  assistantBindingMode,
-  assistantSessionHome,
-  findAssistantConversation,
-  openCodeAssistantHome,
-  nativeAssistantProfile,
-} from '../assistant-native.js';
-import { resolveCodexRecoveryStrategy } from '../codex-command-profiles.js';
-import { canonicalizeCodexHome } from '../checkpoint-conversation-identity.js';
 import { _clampExternalCliBypassForOwner } from './routes/session-routes.js';
-import { clampEnvOverridesForOwner } from '../session-env-clamp.js';
-import { AssistantRequestStore } from '../assistant-request-store.js';
-import { AssistantStore } from '../assistant-store.js';
-import { AssistantRegistry } from '../assistant-registry.js';
-import { registerAssistantRoutes } from './routes/assistant-routes.js';
 import Fastify, { FastifyInstance } from 'fastify';
 import fastifyCompress from '@fastify/compress';
 import fastifyCookie from '@fastify/cookie';
@@ -64,7 +41,7 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, readFileSync, chmodSync, statSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { execFile, execSync } from 'node:child_process';
-import { hostname as getHostname, uptime as osUptime, homedir } from 'node:os';
+import { hostname as getHostname, uptime as osUptime } from 'node:os';
 import { normalizeSettingsObject } from '../config/settings.js';
 import { looksLikeHostReboot, newestPersistedActivity, planRebootRestore } from '../reboot-restore.js';
 import { rebootRestoreRegistry } from './reboot-restore-registry.js';
@@ -747,8 +724,6 @@ export class WebServer extends EventEmitter {
     removed: (data: { runId: string }) => void;
   } | null = null;
   private tunnelManager: TunnelManager = new TunnelManager();
-  private readonly assistantStore = new AssistantStore();
-  private assistantRequests: AssistantRequestManager | undefined;
   private authSessions: StaleExpirationMap<string, import('./ports/auth-port.js').AuthSessionRecord> | null = null;
   private authFailures: StaleExpirationMap<string, number> | null = null;
   private qrAuthFailures: StaleExpirationMap<string, number> | null = null;
@@ -1641,7 +1616,6 @@ export class WebServer extends EventEmitter {
 
   /** Register a live session only inside its owner layout queue, rolling activity state back on failure. */
   private async registerSessionWithLayout(session: Session, options: SessionCreationOptions = {}) {
-    this.assistantRequests?.attach(session);
     this.attachAgentActivity(session);
     let activityAttached = true;
     try {
@@ -1840,7 +1814,7 @@ export class WebServer extends EventEmitter {
     registerHostGuard(this.app, () => this.getHostPolicy(), this.basePath);
 
     // Auth middleware (Basic Auth + session cookies + rate limiting)
-    const authState = registerAuthMiddleware(this.app, this.https, this.basePath, this.assistantStore);
+    const authState = registerAuthMiddleware(this.app, this.https, this.basePath);
     if (authState) {
       this.authSessions = authState.authSessions;
       this.authFailures = authState.authFailures;
@@ -2166,227 +2140,6 @@ export class WebServer extends EventEmitter {
     registerStatusTelemetryRoutes(this.app, ctx);
     registerSystemRoutes(this.app, ctx);
     registerCaseRoutes(this.app, ctx);
-    this.assistantRequests = new AssistantRequestManager(
-      this.assistantStore,
-      new AssistantRequestStore(),
-      (id) => this.sessions.get(id),
-      (id) =>
-        Boolean(
-          this.respawnControllers.get(id)?.isRunning ||
-          this.sessions.get(id)?.ralphTracker.enabled ||
-          this.sessions.get(id)?.autoClearEnabled ||
-          this.sessions.get(id)?.autoCompactEnabled ||
-          this.sessions.get(id)?.checkpointEnabled
-        ),
-      async (r) => {
-        if (
-          r.tokenId &&
-          !this.assistantStore
-            .listTokens(r.assistantId)
-            .some((t) => t.id === r.tokenId && t.owner === r.owner && t.scopes.includes('submit'))
-        )
-          return false;
-        if (!isMultiUserMode()) return r.owner === undefined;
-        const user = r.owner ? await findUser(r.owner) : undefined;
-        return Boolean(user && !user.disabled && !user.mustChangePassword);
-      },
-      (r) =>
-        this.sse.broadcast(
-          'assistant-request:updated',
-          { id: r.id, assistantId: r.assistantId, status: r.status, revision: r.revision },
-          isMultiUserMode() ? { owner: r.owner, adminOnly: r.owner === undefined } : undefined
-        )
-    );
-    registerAssistantRoutes(
-      this.app,
-      new AssistantRegistry(this.assistantStore, (id) => this.assistantRequests!.outstanding(id)),
-      this.sessions,
-      this.assistantRequests
-    );
-    this.assistantRequests.setRecovery(
-      new AssistantRecovery(this.assistantStore, this.assistantRequests, (id) => this.sessions.get(id), {
-        placement: (live) => assistantRecoveryGroup(this.store.getTabLayout(live.owner ?? '@single'), live.id),
-        candidateExited: async (live) => {
-          const session = this.sessions.get(live.id);
-          return Boolean(session?.muxName && (await assistantRecoveryCandidateExited(session.muxName)));
-        },
-        snapshot: (live) => {
-          const session = this.sessions.get(live.id);
-          if (
-            !session ||
-            session.customModel ||
-            session.getCodexProviderIdentityForPersist()?.credentialSource === 'session-key'
-          )
-            throw new Error('Session-scoped credentials require manual recovery');
-          const tabGroupId = assistantRecoveryGroup(this.store.getTabLayout(session.owner ?? '@single'), session.id);
-          const assistantProfile = nativeAssistantProfile(session.mode);
-          if (assistantProfile === 'claude') {
-            const envOverrides = session.getEnvOverridesForPersist();
-            if (Object.keys(envOverrides ?? {}).some((k) => /TOKEN|KEY|AUTH|ENDPOINT|BASE_URL/i.test(k)))
-              throw new Error('Private provider configuration requires manual recovery');
-            const state = session.toState();
-            return {
-              name: session.name,
-              tabGroupId,
-              mode: 'claude' as const,
-              codexConfig: {},
-              envOverrides,
-              claudeConfig: {
-                claudeMode: session.claudeMode,
-                allowedTools: session.allowedTools,
-                model: state.model,
-                effort: state.effort,
-                advisorModel: state.advisorModel,
-              },
-            };
-          }
-          if (assistantProfile === 'opencode') {
-            if (
-              session.openCodeConfig?.configContent ||
-              Object.keys(session.getEnvOverridesForPersist() ?? {}).length ||
-              ['OPENCODE_CONFIG', 'OPENCODE_CONFIG_DIR', 'OPENCODE_CONFIG_CONTENT'].some((key) => process.env[key])
-            )
-              throw new Error('Custom provider configuration requires manual recovery');
-            return {
-              name: session.name,
-              tabGroupId,
-              mode: 'opencode' as const,
-              codexConfig: {},
-              openCodeConfig: {
-                model: session.openCodeConfig?.model,
-                autoAllowTools: session.openCodeConfig?.autoAllowTools,
-              },
-              openCodeConfigHome: canonicalizeCodexHome(process.env.XDG_CONFIG_HOME || join(homedir(), '.config')),
-            };
-          }
-          const { resumeSessionId: _resume, ...codexConfig } = session.codexConfig ?? {};
-          const resumeId = session.nativeResumeId || session.codexConfig?.resumeSessionId;
-          if (codexConfig.baseCommand && !resumeId) throw new Error('Custom launcher native identity unavailable');
-          return {
-            name: session.name,
-            tabGroupId,
-            ...assistantCodexRecoveryProfile(
-              codexConfig,
-              this.store.getCodexCommandProfiles(session.owner ?? '@single'),
-              resumeId || ''
-            ),
-          };
-        },
-        ownerAllowed: async (a) => {
-          if (!isMultiUserMode()) return a.owner === undefined;
-          const user = a.owner ? await findUser(a.owner) : undefined;
-          return Boolean(user && !user.disabled && !user.mustChangePassword);
-        },
-        composerEmpty: async (live) => {
-          const session = this.sessions.get(live.id);
-          return Boolean(
-            session?.muxName &&
-            assistantComposerEmpty(
-              (await this.mux.capturePaneTextAsync?.(session.muxName, { ansi: true })) ?? null,
-              session.mode as 'codex' | 'claude' | 'opencode'
-            )
-          );
-        },
-        create: async (id, assistant, profile) => {
-          const binding = assistant.binding!;
-          if (this.sessions.has(id)) throw new Error('Recovery session already exists');
-          const mode = assistantBindingMode(binding);
-          for (const live of this.sessions.values()) {
-            if (
-              live.mode !== mode ||
-              !live.pid ||
-              live.paneExit ||
-              live.remote ||
-              live.docker ||
-              assistantSessionHome(live) !== binding.codexHome
-            )
-              continue;
-            const native = await findAssistantConversation(binding, live);
-            if (native?.id === binding.conversationId) {
-              if (live.muxName && (await assistantRecoveryCandidateExited(live.muxName))) continue;
-              throw new Error('Original conversation already has another live session');
-            }
-          }
-          let envOverrides: Record<string, string> | undefined;
-          let codexConfig = profile.codexConfig;
-          const claudeConfig = profile.claudeConfig;
-          const assistantProfile = nativeAssistantProfile(mode);
-          if (assistantProfile === 'codex') {
-            const gated = await _clampExternalCliBypassForOwner(assistant.owner, profile.codexConfig);
-            envOverrides = await clampEnvOverridesForOwner(assistant.owner, { CODEX_HOME: binding.codexHome });
-            if (
-              envOverrides?.CODEX_HOME !== binding.codexHome ||
-              JSON.stringify(gated.codexConfig) !== JSON.stringify(profile.codexConfig)
-            )
-              throw new Error('Recovery permissions changed');
-            const checkedProfile = assistantCodexRecoveryProfile(
-              profile.codexConfig,
-              this.store.getCodexCommandProfiles(assistant.owner ?? '@single'),
-              binding.conversationId
-            );
-            if (checkedProfile.resumeCommandTemplate !== profile.resumeCommandTemplate)
-              throw new Error('Recovery launcher template changed');
-            const strategy = resolveCodexRecoveryStrategy(
-              { command: gated.codexConfig?.baseCommand, resumeCommandTemplate: profile.resumeCommandTemplate },
-              binding.conversationId
-            );
-            if (strategy.kind === 'manual_required') throw new Error('Custom launcher needs explicit resume template');
-            codexConfig =
-              strategy.kind === 'template'
-                ? { ...gated.codexConfig!, baseCommand: strategy.command }
-                : gated.codexConfig!;
-          } else if (assistantProfile === 'claude') {
-            if (
-              !claudeConfig ||
-              (await resolveClaudeModeForUsername(claudeConfig.claudeMode, assistant.owner)) !== claudeConfig.claudeMode
-            )
-              throw new Error('Recovery permissions changed');
-            const rawEnv = { ...profile.envOverrides };
-            envOverrides = await clampEnvOverridesForOwner(assistant.owner, rawEnv);
-            const defaultHome = canonicalizeCodexHome(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'));
-            if (
-              Object.entries(rawEnv).some(([key, value]) => envOverrides?.[key] !== value) ||
-              canonicalizeCodexHome(envOverrides?.CLAUDE_CONFIG_DIR || defaultHome, binding.workingDir) !==
-                binding.codexHome
-            )
-              throw new Error('Recovery account changed');
-          } else if (
-            openCodeAssistantHome() !== binding.codexHome ||
-            profile.openCodeConfigHome !==
-              canonicalizeCodexHome(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'))
-          )
-            throw new Error('Recovery account changed');
-          const session = new Session({
-            id,
-            workingDir: binding.workingDir,
-            name: profile.name,
-            mode,
-            owner: assistant.owner,
-            mux: this.mux,
-            useMux: true,
-            codexConfig:
-              assistantProfile === 'codex' ? { ...codexConfig, resumeSessionId: binding.conversationId } : undefined,
-            openCodeConfig:
-              assistantProfile === 'opencode'
-                ? { ...profile.openCodeConfig, continueSession: binding.conversationId, forkSession: false }
-                : undefined,
-            ...(assistantProfile === 'claude' ? { ...claudeConfig, resumeSessionId: binding.conversationId } : {}),
-            envOverrides,
-            checkpointEnabled: false,
-            truecolorEnabled: await this.getTruecolorEnabled(),
-          });
-          await this.registerSessionWithLayout(session, { tabGroupId: profile.tabGroupId ?? undefined });
-          this.store.incrementSessionsCreated();
-          this.persistSessionState(session);
-          await this.setupSessionListeners(session);
-          await session.startInteractive();
-          this.persistSessionState(session);
-          this.broadcast(SseEvent.SessionCreated, this.getSessionStateWithRespawn(session));
-          return session;
-        },
-      })
-    );
-    this.assistantRequests.start();
     registerCodexCommandProfileRoutes(this.app, ctx);
     registerWorktreeRoutes(this.app, ctx);
     // The registry's lifetime is the server's: it drops per-session wake state on every
@@ -2705,7 +2458,6 @@ export class WebServer extends EventEmitter {
     const pinned = session?.pinned === true || this.store.getSession(sessionId)?.pinned === true;
     if (coordinateLayout && session && killMux && !pinned) {
       return this.tabLayouts.runSessionDeletion([{ id: sessionId, owner: session.owner }], async () => {
-        this.assistantRequests?.captureRecoveryPlacement(sessionId);
         return this._doCleanupSession(sessionId, killMux, reason, false);
       });
     }
@@ -3238,7 +2990,6 @@ export class WebServer extends EventEmitter {
   }
 
   private async setupSessionListeners(session: Session): Promise<void> {
-    this.assistantRequests?.attach(session);
     // PTY exit detaches the coordinator together with the old listener set. A
     // later interactive restart reuses this Session object, so restore its
     // exact-identity gate before the replacement PTY becomes observable.
@@ -5887,7 +5638,6 @@ export class WebServer extends EventEmitter {
   }
 
   async stop(): Promise<void> {
-    await this.assistantRequests?.stop();
     getLifecycleLog().log({ event: 'server_stopped', sessionId: '*' });
     // Set stopping flag to prevent new timer creation during shutdown
     this.sse.setStopping();

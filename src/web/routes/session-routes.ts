@@ -2403,10 +2403,6 @@ export function registerSessionRoutes(
     const { id } = req.params as { id: string };
     const { input, useMux, seq, clientId, wait, waitTimeout } = parseBody(SessionInputWithLimitSchema, req.body);
     const session = findSessionOrFail(ctx, id, req);
-    if (session.assistantInputLocked)
-      return reply
-        .code(409)
-        .send(createErrorResponse(ApiErrorCode.CONFLICT, 'Assistant owns session input; take control in Assistants'));
 
     const inputStr = String(input);
     if (inputStr.length > MAX_INPUT_LENGTH) {
@@ -2876,8 +2872,6 @@ export function registerSessionRoutes(
     }
 
     const session = findSessionOrFail(ctx, id, req);
-    if (session.assistantInputLocked)
-      throw { statusCode: 409, body: createErrorResponse(ApiErrorCode.CONFLICT, 'Assistant owns session input') };
     session.cancelCheckpoint('manual-takeover');
     const muxName = session.muxName;
     if (!muxName) {

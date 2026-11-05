@@ -140,7 +140,7 @@ import { EXEC_TIMEOUT_MS } from './config/exec-timeout.js';
 import { DEFAULT_TMUX_HISTORY_LIMIT } from './config/terminal-history.js';
 import { getCli } from './config/cli-registry/registry.js';
 import { legacyResumeSlot } from './session-cli-registry-bridge.js';
-import { SubmitVerifier, exactPromptStillInComposer } from './session-submit-verifier.js';
+import { SubmitVerifier } from './session-submit-verifier.js';
 import {
   guardedComposerChrome,
   promptSha256,
@@ -1024,7 +1024,6 @@ export class Session extends EventEmitter {
   private _trustDialogTimer: NodeJS.Timeout | null = null; // Re-read after a keystroke (see below)
   /** Re-sends Enter while a programmatic prompt still sits in the composer (session-submit-verifier.ts). */
   private _submitVerifier: SubmitVerifier | null = null;
-  private _assistantSubmitVerifier: SubmitVerifier | null = null;
   private _interactiveStartedAt = 0; // When the interactive pane launched (bounds that scan)
   private _taskTracker: TaskTracker;
 
@@ -5512,7 +5511,6 @@ export class Session extends EventEmitter {
     prompt: string,
     options?: { model?: string; onProgress?: (info: { tokens?: number; status?: string }) => void }
   ): Promise<{ result: string; cost: number }> {
-    if (!this.assistantInputAllowed()) throw new Error('Assistant owns session input');
     if (this.guardedInputHeld) {
       this._guardedInputRevision++;
       throw new Error('Guarded submission in progress');
@@ -5860,7 +5858,6 @@ export class Session extends EventEmitter {
   private _clearAllTimers(): void {
     // Stop re-sending Enter for a prompt this session will never take now
     this._submitVerifier?.cancel();
-    this._assistantSubmitVerifier?.cancel();
     this._submitVerifier = null;
     // Clear the workspace-trust follow-up read
     if (this._trustDialogTimer) {
@@ -6374,7 +6371,6 @@ export class Session extends EventEmitter {
       this._closing ||
       this.paneLifecycleInFlight ||
       this._guardedPendingWrites ||
-      !this.assistantInputAllowed() ||
       (!allowLease && this.guardedInputHeld) ||
       this.remote ||
       this.docker ||
@@ -6450,19 +6446,14 @@ export class Session extends EventEmitter {
    * only a full hold queue refuses it, with {@link GuardedInputBusyError}.
    */
   async performAuxiliaryInput(operation: () => Promise<void>): Promise<void> {
-    if (!this.assistantInputAllowed()) throw new Error('Assistant owns session input');
     this._guardedInputRevision++;
     return this._inGuardedTurn(
       async () => {
-        if (!this.assistantInputAllowed()) throw new Error('Assistant owns session input');
         this._guardedPendingWrites++;
-        this._assistantPendingWrites++;
-        this._assistantLastInputAt = Date.now();
         try {
           await operation();
         } finally {
           this._guardedPendingWrites--;
-          this._assistantPendingWrites--;
         }
       },
       () => {
@@ -6488,60 +6479,12 @@ export class Session extends EventEmitter {
    * discards the data, but it used to do so with no signal at all — which is how
    * input could disappear while the caller believed it had been delivered.
    */
-  private _assistantInputGuard: ((permit?: string) => boolean) | undefined;
-  private _assistantPendingWrites = 0;
-  private _assistantLastInputAt = 0;
-  setAssistantInputGuard(guard: (permit?: string) => boolean): void {
-    this._assistantInputGuard = guard;
-  }
-  get assistantPendingWrites(): number {
-    return this._assistantPendingWrites;
-  }
-  get assistantLastInputAt(): number {
-    return this._assistantLastInputAt;
-  }
-  get assistantInputLocked(): boolean {
-    return !this.assistantInputAllowed();
-  }
-  assistantInputAllowed(permit?: string): boolean {
-    return this._assistantInputGuard?.(permit) ?? true;
-  }
-  cancelAssistantSubmitVerification(): void {
-    this._submitVerifier?.cancel();
-    this._assistantSubmitVerifier?.cancel();
-  }
-  /** Enter-only recovery for a new, owned Codex request; never retypes its text. */
-  verifyAssistantSubmission(text: string, permit: string, beforeEnter: () => Promise<boolean>): void {
-    this._assistantSubmitVerifier?.cancel();
-    if (
-      getCli(this.mode)?.capabilities.nativeAssistantProfile !== 'codex' ||
-      !this._mux?.capturePaneText ||
-      !this._muxSession
-    )
-      return;
-    this._assistantSubmitVerifier = new SubmitVerifier({
-      capture: () =>
-        this._isStopped || !this._muxSession ? null : this._mux?.capturePaneText?.(this._muxSession.muxName),
-      glyph: () => '›',
-      matches: exactPromptStillInComposer,
-      beforeEnter,
-      sendEnter: async () => {
-        if (this._isStopped || !this.assistantInputAllowed(permit)) return;
-        await this.writeViaMux('\r', { assistantPermit: permit });
-      },
-      log: (message) => console.log(`[Session ${this.id.slice(0, 8)}] assistant ${message}`),
-    });
-    this._assistantSubmitVerifier.arm(text);
-  }
-
   write(data: string, options: SessionWriteOptions = {}): boolean {
-    if (!this.assistantInputAllowed(options.assistantPermit)) return false;
     this._observeGuardedKeyboardInput(data);
     // The lease only, not the drain, which writes held input through here (see guardedInputHeld).
     if (this._guardedSubmitInFlight) return false;
     if (!this.ptyProcess) return false;
     this.ptyProcess.write(data);
-    this._assistantLastInputAt = Date.now();
     const submittedPrompt = this._trackSubmit(data, options);
     this._emitSubmittedPrompt(submittedPrompt);
     return true;
@@ -6711,7 +6654,6 @@ export class Session extends EventEmitter {
    * ```
    */
   async writeViaMux(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
-    if (!this.assistantInputAllowed(options.assistantPermit)) return false;
     this._observeGuardedKeyboardInput(data);
     return this._inGuardedTurn(
       () => this._writeViaMuxNow(data, options),
@@ -6720,31 +6662,25 @@ export class Session extends EventEmitter {
   }
 
   private async _writeViaMuxNow(data: string, options: SessionWriteOptions): Promise<boolean> {
-    // Ownership may have changed while this write waited for a guarded lease.
-    if (!this.assistantInputAllowed(options.assistantPermit)) return false;
     this._guardedPendingWrites++;
-    this._assistantPendingWrites++;
     try {
       if (this._mux && this._muxSession) {
         const sent = await this._mux.sendInput(this.id, data);
         if (sent) {
-          this._assistantLastInputAt = Date.now();
           const submittedPrompt = this._trackSubmit(data, options);
           this._emitSubmittedPrompt(submittedPrompt);
-          if (!options.assistantPermit) this._verifySubmitted(data);
+          this._verifySubmitted(data);
         }
         return sent;
       }
       if (this.ptyProcess) {
         this.ptyProcess.write(data);
-        this._assistantLastInputAt = Date.now();
         const submittedPrompt = this._trackSubmit(data, options);
         this._emitSubmittedPrompt(submittedPrompt);
         return true;
       }
       return false;
     } finally {
-      this._assistantPendingWrites--;
       this._guardedPendingWrites--;
     }
   }
@@ -6771,8 +6707,6 @@ export class Session extends EventEmitter {
   }
 
   private async _deliverCheckpointViaMux(data: string): Promise<CommandDeliveryResult> {
-    if (!this.assistantInputAllowed())
-      return { ok: false, stage: 'text', error: 'Assistant owns session input', attempt: 1 };
     const checkpointRunId = this._autoOps.activeCheckpointRunId;
     const checkpointCommand = data.replace(/[\r\n]/g, '').trim();
     const isClear = checkpointCommand === '/clear';
@@ -6870,7 +6804,6 @@ export class Session extends EventEmitter {
       sendEnter: () => {
         // A retry Enter is never held behind a guarded submit: once that submit's
         // Enter went out, a re-press would submit whatever is on the composer next.
-        if (!this.assistantInputAllowed()) return Promise.resolve(false);
         if (this.guardedInputHeld) {
           this._guardedInputRevision++;
           this._submitVerifier?.cancel();
@@ -7138,7 +7071,6 @@ export class Session extends EventEmitter {
 
   // Legacy method for sending input - wraps runPrompt
   async sendInput(input: string): Promise<void> {
-    if (!this.assistantInputAllowed()) throw new Error('Assistant owns session input');
     if (this.guardedInputHeld) {
       this._guardedInputRevision++;
       throw new Error('Guarded submission in progress');
