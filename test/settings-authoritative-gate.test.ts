@@ -82,6 +82,7 @@ describe('App Settings authoritative checkpoint gate', () => {
     const app = new (CodemanApp as unknown as new () => Record<string, any>)();
     app.$ = (id: string) => elements[id];
     app.loadWebhook = async () => {};
+    app.loadDiscord = async () => {};
     app._updatePushUI = () => {};
     app._refreshHeadroomStatus = () => {};
     app.renderShortcutSettingsList = () => {};

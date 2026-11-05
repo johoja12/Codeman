@@ -326,7 +326,7 @@ describe('COD-288 external terminal path preview UI', () => {
     expect(fetch).toHaveBeenCalledWith('/api/sessions/session-1/attachments', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: absolutePath }),
+      body: JSON.stringify({ path: absolutePath, notify: false }),
     });
     response.resolve({
       ok: true,
@@ -349,7 +349,7 @@ describe('COD-288 external terminal path preview UI', () => {
     expect(fetch).toHaveBeenCalledWith('/api/sessions/session%20%2F%20one/attachments', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: absolutePath }),
+      body: JSON.stringify({ path: absolutePath, notify: false }),
     });
 
     response.resolve({

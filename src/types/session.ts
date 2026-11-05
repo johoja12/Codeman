@@ -923,6 +923,8 @@ export interface SessionState {
    * landing outside the workspace goes through the attachment route's own guard.
    */
   cwd?: string;
+  /** Live directory from the pane-exit watcher, with workspace symlinks rebased. */
+  paneCwd?: string;
   /** Remote execution metadata, present when this session runs over SSH through local tmux */
   remote?: SessionRemote;
   /** Docker execution metadata, present when this session runs inside a container via local tmux + docker exec */

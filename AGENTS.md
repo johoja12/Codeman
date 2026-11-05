@@ -78,7 +78,7 @@ Never push, tag, publish, open releases or post announcements on `Ark0N/Codeman`
 
 GitHub CI runs `npm run check:lockfile`, so lockfile drift fails the build even if the `version-packages` script is bypassed.
 
-**Version**: 1.47.0 (must match `package.json`)
+**Version**: 1.48.0 (must match `package.json`)
 
 ## Fork Workflow: GitHub + gh (this checkout)
 
@@ -547,3 +547,10 @@ Other key scripts: `scripts/tmux-manager.sh` (safe tmux mgmt), `scripts/tunnel.s
 - Visible tmux frame and caret are captured together; full-history replay retains the fork's remote history and relative cursor handling. Keyboard row holds apply only to eligible local untracked sessions; viewer sizing ownership remains authoritative.
 - File links use the shared spaced/wrapped path grammar and cell mapping while retaining strict file URI resolution, originating-session preview ownership and the blocked-path one-file approval flow.
 - All settings.json read-modify-writes serialize through `mutateSettingsFile`. Tunnel exposure has its own acknowledgement, separate from the non-loopback bind flag.
+
+## Upstream 1.48 integration rules
+
+- Discord is opt-in. Preserve session ownership, allowlisted users and guilds, bounded files, printable-line input through `writeViaMux`, and lone-digit dialog replies without Enter. Keep its token file blocked by every file-serving surface.
+- Edit history reads on request only, uses the session transcript watcher or session-specific Claude config directory, preserves old-conversation reads across `/clear`, and deletes stores only when the session record is removed.
+- Relative links prefer the live pane directory, retain fork `cwd` compatibility, and never widen the workspace confinement root. Keep guarded file URI ownership, wrapped path cell mapping and attachment approval behavior.
+- Custom-folder cloning preserves owner-scoped Codex command profiles and Docker workspace refusal. Custom model configuration validates launch ids before eviction or writes, carries discovered context limits and guards supplied config homes before filesystem calls.

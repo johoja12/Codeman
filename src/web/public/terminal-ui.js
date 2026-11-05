@@ -2512,7 +2512,8 @@ Object.assign(CodemanApp.prototype, {
 
   /**
    * A clicked path as the preview needs it: relative paths resolved against the
-   * session's working directory, absolute and `~/` paths unchanged
+   * directory the session's pane is in now, else its working directory
+   * (`relativeResolutionBase`), absolute and `~/` paths unchanged
    * (`resolveLinkedFilePath`, constants.js). Shared by the terminal link
    * provider and the response viewer, so one path opens the same file in both.
    */
@@ -3372,7 +3373,7 @@ Object.assign(CodemanApp.prototype, {
         // Pattern 4: Bash() tool output
         const bashPattern = /Bash\([^)]*?(\/(?:home|tmp|var|etc|opt)[^\s"'<>|;&\)\n\x00-\x1f]+)/g;
 
-        const activateFilePath = (text) => {
+        const activateFilePath = (text, folder = false, verifiedSessionId = null) => {
           // Tailing a PNG in the log viewer shows binary noise; the file preview
           // already renders images, PDFs, documents and media inline. The
           // extension list is previewsInFileViewer() in constants.js — shared
@@ -3380,25 +3381,49 @@ Object.assign(CodemanApp.prototype, {
           // test/media-extension-parity.test.ts, so an in-workspace .m4a can no
           // longer route to the log viewer while the same file in /tmp plays.
           //
-          // Routing is by EXTENSION, not by workspace containment: text still
-          // goes to the log viewer even from outside the workspace, because it
-          // follows a file that is still being written and its allowlist covers
-          // /var/log and ~/logs (COD-232 pins those). A previewable path outside
-          // the workspace has to be registered as an attachment first — the
-          // workspace-confined routes can only 404 on it — which is what
-          // openExternalPathPreview does before previewing by id.
-          if (text.startsWith('~/') || previewsInFileViewer(text) || rendersAsPage(text) || self._isExternalPreviewPath?.(text, originatingSessionId)) {
-            if (self._isExternalPreviewPath?.(text, originatingSessionId)) {
-              const pending = self.openExternalPathPreview(text, originatingSessionId);
-              if (pending && typeof pending.catch === 'function') {
-                pending.catch((err) => console.error('Failed to open external path preview:', err));
+          // Text goes to the log viewer, which follows a file that is still
+          // being written — but ONLY where it can actually read: it spawns
+          // `tail -f` and allows the workspace, /var/log and ~/logs, so an
+          // out-of-workspace path there answered "Path must be within
+          // working directory or allowed log directories" while the SAME
+          // path clicked in the response viewer previewed fine. The preview
+          // reads those through the guarded attachment routes, so external
+          // paths route there and the two surfaces agree.
+          //
+          // A relative path is resolved against the session's working
+          // directory first, and a `~/` path always previews (only the
+          // server knows that host's home, and the log viewer cannot ask).
+          const sessionId = verifiedSessionId || originatingSessionId;
+          if (!sessionId) return;
+          const target = self._resolveLinkedFilePath(text, sessionId);
+          const alternative = !folder && logical.pathAlternatives?.find((candidate) => candidate.path === text);
+          if (alternative && !verifiedSessionId) {
+            return (async () => {
+              const original = await self._registerExternalPreview(target, sessionId);
+              // Attachment policy must not gate the workspace's normal opener.
+              if (original.status !== 404) return activateFilePath(target, false, sessionId);
+              const path = self._resolveLinkedFilePath(alternative.spacedPath, sessionId);
+              const registered = await self._registerExternalPreview(path, sessionId);
+              if (registered.status === 404) return activateFilePath(target, false, sessionId);
+              if (!registered.attachmentId) {
+                self.showToast(registered.error || 'Cannot open this file', 'error');
+                return;
               }
-              return;
-            }
-            self.openFilePreview(text, originatingSessionId);
+              // The normal opener rechecks its guards; attachment registration deduplicates the path.
+              return activateFilePath(path, false, sessionId);
+            })();
+          }
+          // A folder path opens the folder grid (which falls back to the
+          // preview if the server finds a file there after all).
+          if (folder) {
+            self.openFolderGrid(target, sessionId);
             return;
           }
-          self.openLogViewerWindow(text, originatingSessionId);
+          if (target.startsWith('~/') || previewsInFileViewer(target) || rendersAsPage(target) || self._isExternalPreviewPath?.(target, sessionId)) {
+            if (self._isExternalPreviewPath?.(target, sessionId)) return self.openExternalPathPreview(target, sessionId);
+            return self.openFilePreview(target, sessionId);
+          }
+          return self.openLogViewerWindow(target, sessionId);
         };
 
         const addLogLink = (filePath, matchIndex, displayPath = filePath) => {
@@ -3421,7 +3446,7 @@ Object.assign(CodemanApp.prototype, {
               range: { start: coordAt(from), end: coordAt(to - 1) },
               decorations: { pointerCursor: true, underline: true },
               activate() {
-                activateFilePath(filePath);
+                return activateFilePath(filePath);
               },
               hover() {
                 setHovered(true);
@@ -3502,7 +3527,18 @@ Object.assign(CodemanApp.prototype, {
           if (!reference.absolutePath) addPreviewLink(reference);
         }
 
-        for (const reference of findFilePathLinks(lineText)) {
+        const hasUnclaimedPath = () => {
+          for (let slash = lineText.indexOf('/'); slash !== -1; slash = lineText.indexOf('/', slash + 1)) {
+            if (!occupiedOffsets[slash]) return true;
+          }
+          return false;
+        };
+        // Preserve the fork's linear fast path when the document parser already
+        // claimed every path; the generic parser need not scan those again.
+        const hasBareTableFile = /(?:^| {2,}|[│┃║|])[ \t]*[^/\s│┃║|]+\.[A-Za-z0-9]{1,10}(?=\s|$)/.test(lineText);
+        const needsGenericPaths = hasUnclaimedPath() || hasBareTableFile || /(?:path|file|saved to):\s*\.\.\//i.test(lineText);
+        const genericPaths = findFilePathLinks(lineText, { foldersOnly: !needsGenericPaths });
+        for (const reference of genericPaths) {
           const startIndex = reference.index;
           const endIndex = startIndex + reference.path.length;
           const prefix = lineText.slice(0, startIndex);
@@ -3608,11 +3644,7 @@ Object.assign(CodemanApp.prototype, {
             links.map((l) => l.text)
           );
         }
-        let hasUnclaimedPath = false;
-        for (let slash = lineText.indexOf('/'); slash !== -1; slash = lineText.indexOf('/', slash + 1)) {
-          if (!occupiedOffsets[slash]) { hasUnclaimedPath = true; break; }
-        }
-        for (const found of hasUnclaimedPath ? findFilePathLinks(lineText) : []) {
+        for (const found of hasUnclaimedPath() ? findFilePathLinks(lineText) : []) {
           if (!found.folder && (found.path.startsWith('/') || (!found.path.includes('/') && !found.path.startsWith('~/')))) continue;
           if (/(^|\/)\.\.(\/|$)/.test(found.path) || found.path.includes('//')) continue;
           const startIndex = found.index;
@@ -3650,7 +3682,16 @@ Object.assign(CodemanApp.prototype, {
     // rather than growing a second, driftable copy of the patterns.
     // See _terminalLinkAtPoint.
     if (isPrimary) this._terminalLinkProvider = provider;
-    terminal.registerLinkProvider(provider);
+    // xterm prunes intersections in column space for the requested row. Passing
+    // another row's segment makes it occupy those columns here and can erase
+    // the actual link on this row. Touch inspection keeps the complete extent.
+    terminal.registerLinkProvider({
+      provideLinks(row, callback) {
+        provider.provideLinks(row, (links) => callback(links?.filter(
+          (link) => link.range.start.y <= row && link.range.end.y >= row
+        )));
+      },
+    });
 
     console.log('[LinkProvider] File path link provider registered');
     return provider;

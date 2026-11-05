@@ -75,6 +75,7 @@ export function createMockRouteContext(options?: {
     cleanupRecoveryReconnectWrapper: vi.fn(async (id: string) => {
       sessions.delete(id);
     }),
+    forgetEditHistory: vi.fn(),
     setupSessionListeners: vi.fn(async () => {}),
     persistSessionState: vi.fn(),
     persistSessionStateNow: vi.fn(),

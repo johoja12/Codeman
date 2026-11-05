@@ -17,6 +17,16 @@ export interface SessionPort {
   addSession(session: Session, options?: SessionCreationOptions): Promise<TabLayoutSnapshot>;
   cleanupSession(sessionId: string, killMux?: boolean, reason?: string): Promise<void>;
   cleanupRecoveryReconnectWrapper(sessionId: string): Promise<void>;
+  /**
+   * The last-response reader (the body of `GET /api/sessions/:id/last-response`), filled in when the
+   * session routes register, so other server code reads the same per-CLI transcript the viewer does.
+   */
+  lastResponseFor?: (session: Session, context?: string) => Promise<{ text: string; timestamp?: string }>;
+  /**
+   * Delete a session's stored edit history once its record is gone. `cleanupSession` does it
+   * itself; this is for removing a record without a live session (DELETE route).
+   */
+  forgetEditHistory(sessionId: string): void;
   setupSessionListeners(session: Session): Promise<void>;
   persistSessionState(session: Session): void;
   persistSessionStateNow(session: Session): void;

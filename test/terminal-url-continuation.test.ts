@@ -740,12 +740,12 @@ describe('terminal link provider with wrapped table URLs', () => {
     expect(path!.range.end.y).toBe(1);
     // The stitched URL keeps one link per row, and its first-row piece ends
     // before the path's column.
-    const urlPieces = links.filter((link) => /^https?:/.test(link.text));
+    const urlPieces = [...links, ...provide(2)].filter((link) => /^https?:/.test(link.text));
     expect(new Set(urlPieces.map((link) => link.text))).toEqual(new Set([WIKI_URL]));
     expect(urlPieces.map((link) => link.range.start.y)).toEqual([1, 2]);
     expect(urlPieces[0].range.end.x).toBeLessThan(pathStart + 1);
     // Nothing else is linked, so nothing glues the column onto the URL.
-    expect(links.map((link) => link.text).sort()).toEqual([WIKI_URL, WIKI_URL, '/home/me/proj/docs/design.md'].sort());
+    expect(links.map((link) => link.text).sort()).toEqual([WIKI_URL, '/home/me/proj/docs/design.md'].sort());
     path!.activate(null, path!.text);
     expect(app.openFilePreview).toHaveBeenCalledExactlyOnceWith('/home/me/proj/docs/design.md', 's1');
     // The URL's second row still opens the whole URL, and the next record keeps its path.
@@ -784,7 +784,7 @@ describe('terminal link provider with wrapped table URLs', () => {
 
   it('underlines only the URL cells on each row, never the indent between pieces', () => {
     const { provide } = harness(TABLE, COLS);
-    const segments = provide(3).filter((link) => link.text === URL);
+    const segments = [2, 3, 4].flatMap((row) => provide(row).filter((link) => link.text === URL));
     expect(segments.map((link) => link.range.start.y)).toEqual([2, 3, 4]);
     for (const link of segments) expect(link.range.start.y).toBe(link.range.end.y);
     expect(segments[0].range.start.x).toBe(TABLE[1].text.indexOf('https://') + 1);

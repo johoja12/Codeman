@@ -93,7 +93,10 @@ describe('registerFilePathLinkProvider with no target (the primary pane)', () =>
 
     const provider = app.registerFilePathLinkProvider();
 
-    expect(app.terminal.providers).toEqual([provider]);
+    expect(app.terminal.providers).toHaveLength(1);
+    expect(linksOn(app.terminal.providers[0], 1).map((link) => link.text)).toEqual(
+      linksOn(provider, 1).map((link) => link.text)
+    );
     expect(app._terminalLinkProvider).toBe(provider);
     const [link] = linksOn(provider, 1);
     link.activate({}, link.text);
@@ -117,8 +120,11 @@ describe('registerFilePathLinkProvider with a target (a second pane)', () => {
       setHovered,
     });
 
-    expect(paneTerminal.providers).toEqual([provider]);
-    expect(app.terminal.providers).toEqual([primaryProvider]);
+    expect(paneTerminal.providers).toHaveLength(1);
+    expect(app.terminal.providers).toHaveLength(1);
+    expect(linksOn(paneTerminal.providers[0], 1).map((link) => link.text)).toEqual(
+      linksOn(provider, 1).map((link) => link.text)
+    );
     // The tap path's provider is still the primary one.
     expect(app._terminalLinkProvider).toBe(primaryProvider);
 

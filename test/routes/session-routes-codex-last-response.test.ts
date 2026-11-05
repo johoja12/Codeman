@@ -132,6 +132,23 @@ describe('GET /api/sessions/:id/last-response (codex)', () => {
     return { res, body: JSON.parse(res.body) };
   }
 
+  it('exposes the same canonical Codex pane fallback to Discord and the HTTP viewer', async () => {
+    const session = createMockSession(UUID_A);
+    session.mode = 'codex';
+    session.workingDir = workdir;
+    const screen = '› Explain the integration\n\nThe integration preserves canonical output.\n\n› ';
+    Object.defineProperty(session, 'terminalBuffer', { value: screen, configurable: true });
+    harness.ctx.sessions.set(session.id, session);
+    const response = await harness.app.inject({ method: 'GET', url: `/api/sessions/${session.id}/last-response` });
+    expect(response.statusCode).toBe(200);
+    const wire = response.json().data;
+    const reader = (harness.ctx as unknown as { lastResponseFor: (s: typeof session) => Promise<{ text: string }> })
+      .lastResponseFor;
+    const shared = await reader(session);
+    expect(shared.text).toBe(wire.text);
+    expect(shared.text).toContain('preserves canonical output');
+  });
+
   beforeEach(async () => {
     codexHome = mkdtempSync(join(tmpdir(), 'codeman-codex-rv-'));
     prevCodexHome = process.env.CODEX_HOME;

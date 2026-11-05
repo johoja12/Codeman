@@ -5066,7 +5066,7 @@ Object.assign(CodemanApp.prototype, {
         response = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/attachments`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: absolutePath }),
+          body: JSON.stringify({ path: absolutePath, notify: false }),
         });
       } catch (err) {
         if (!ownsPreview()) return;
@@ -5224,7 +5224,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   /**
-   * Register an out-of-workspace path as a live external attachment and return
+   * Register a file path as a live external attachment and return
    * its id, so the preview can render it through the by-id attachment routes.
    *
    * `notify: false` keeps this quiet: the caller is already opening the file in
@@ -5233,7 +5233,7 @@ Object.assign(CodemanApp.prototype, {
    * full attachment guard (blocked secret trees, extension allowlist, symlinks
    * resolved), so a refusal here is a policy answer worth showing verbatim.
    *
-   * @returns {Promise<{attachmentId?: string, size?: number, error?: string}>}
+   * @returns {Promise<{attachmentId?: string, size?: number, error?: string, status?: number}>}
    */
   async _registerExternalPreview(filePath, sessionId) {
     try {
@@ -5249,14 +5249,18 @@ Object.assign(CodemanApp.prototype, {
       const reason = result?.error || `Cannot open this file (HTTP ${res.status})`;
       // The registry's type answer is a policy term, not an explanation, and the
       // user just clicked a file they can see on disk. Say what IS previewable
-      // from outside the workspace instead.
+      // through this lookup instead, using the path's actual workspace scope.
       if (/unsupported/i.test(reason)) {
         const ext = (filePath.split('.').pop() || '').toLowerCase();
+        const target = this._isExternalPreviewPath(filePath, sessionId)
+          ? `.${ext} from outside the session workspace`
+          : `"${filePath}" through the attachment lookup`;
         return {
-          error: `Cannot preview .${ext} from outside the session workspace (images, video, audio, PDF, Office documents and text files only).`,
+          status: res.status,
+          error: `Cannot preview ${target} (images, video, audio, PDF, Office documents and text files only).`,
         };
       }
-      return { error: reason };
+      return { error: reason, status: res.status };
     } catch (err) {
       return { error: err.message || 'Cannot open this file' };
     }

@@ -13,7 +13,7 @@ function captureHistoryLines(raw: string | undefined, historyLimit: number): num
 import { claudeProjectDirName } from '../../case-rename.js';
 import { FastifyInstance, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { join, dirname, extname, basename, resolve, posix as pathPosix } from 'node:path';
+import { join, dirname, extname, basename, isAbsolute, resolve, posix as pathPosix } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync, statSync, mkdirSync, writeFileSync, realpathSync } from 'node:fs';
 import { execFile } from 'node:child_process';
@@ -78,8 +78,9 @@ import {
   SessionWaitOutputQuerySchema,
   CustomModelSelectionSchema,
 } from '../schemas.js';
-import { readCustomModelHosts } from '../../custom-model-hosts.js';
+import { readCustomModelHosts, resolveCustomModelContextLength } from '../../custom-model-hosts.js';
 import { applyCustomModelInjection, removeConfigDir } from '../../custom-model-injection-apply.js';
+import { buildCustomModelInjection } from '../../custom-model-injection.js';
 import {
   getLlamaSwapStatus,
   triggerLlamaSwapLoad,
@@ -135,7 +136,7 @@ import { agentInbox } from '../agent-inbox.js';
 import { canUsernameRunPrivilegedCommands, resolveClaudeModeForUsername } from '../../user-store.js';
 import { clampEnvOverridesForOwner } from '../../session-env-clamp.js';
 import { enabledClis, getCli } from '../../config/cli-registry/registry.js';
-import type { AgentSkillDir, NewlineSequence } from '../../config/cli-registry/types.js';
+import type { AgentSkillDir, CliEntry, NewlineSequence } from '../../config/cli-registry/types.js';
 import { resolveCliLaunchError } from '../../utils/cli-launcher.js';
 import { applyLaunchDefaults } from '../launch-defaults.js';
 import { legacyConfigForMode } from '../../session-cli-registry-bridge.js';
@@ -277,6 +278,39 @@ function resolveRemoteCodexCommand(
       ...(selection.resumeCommandTemplate ? { codexResumeCommandTemplate: selection.resumeCommandTemplate } : {}),
     },
   };
+}
+
+/**
+ * Guard a session-supplied configDir home BEFORE `applyCustomModelInjection` runs.
+ *
+ * The apply resolves the CLI's real home from this session's env override and then runs
+ * synchronous `existsSync`/`mkdirSync` on it (deepseek `DSH_HOME`, and any future
+ * `linkFromRealHome` recipe). A path on an unreachable network mount makes a synchronous
+ * stat wait forever, and this runs INSIDE a request handler, so it would freeze the whole
+ * web server (CLAUDE.md, the #516 rule on user-chosen paths). A relative home is left to
+ * the apply, which already refuses to join non-absolute values.
+ *
+ * Probe the session's own home with `probePathKind(..., { pastCap: true })` first: on
+ * `'unknown'` (a dead mount that never answered) hand the apply a lookup that hides that
+ * one env var, so linking falls through to the server's own environment and the unresponsive
+ * path is never touched. Any other entry's lookup passes through untouched.
+ */
+export async function guardSessionConfigDirHome(
+  entry: Pick<CliEntry, 'capabilities'>,
+  baseLookup: (envVar: string) => string | undefined
+): Promise<(envVar: string) => string | undefined> {
+  const recipe = entry.capabilities.customModelInjection;
+  if (recipe?.kind !== 'configDir' || !recipe.linkFromRealHome?.length) return baseLookup;
+  const dirEnvVar = recipe.dirEnvVar;
+  const supplied = baseLookup(dirEnvVar)?.trim();
+  if (!supplied || !isAbsolute(supplied)) return baseLookup;
+  if ((await probePathKind(supplied, { pastCap: true })) === 'unknown') {
+    console.warn(
+      `[custom-model] ${dirEnvVar} (${supplied}) did not answer; linking from the server's own home instead`
+    );
+    return (envVar: string) => (envVar === dirEnvVar ? undefined : baseLookup(envVar));
+  }
+  return baseLookup;
 }
 
 /**
@@ -1794,8 +1828,35 @@ export function registerSessionRoutes(
     if (!endpoint) {
       return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Model endpoint not found');
     }
-    const contextLength = endpoint.modelContextLengths?.[body.modelId];
+    // Discovery's per-model figure wins; the endpoint's user-set default covers models
+    // whose size discovery could not determine (a gateway that states none, say). With
+    // neither, the existing "no override, CLI assumes its own default" behaviour stands.
+    const contextLength = resolveCustomModelContextLength(endpoint, body.modelId);
     const slotCount = endpoint.modelSlotCounts?.[body.modelId];
+
+    // A CLI whose config alone cannot select the model also gets its `model` launch param
+    // forced (pi/omp `custom/<id>`, grok's block name, and codex now carries its bare
+    // selected id too). The argv engine DROPS a token that
+    // fails its pattern rather than quoting it, which would silently launch the CLI on its
+    // own default provider again, so refuse an id the pattern cannot carry up front.
+    // The check runs on the PURE build result, before applyCustomModelInjection below:
+    // the forced launch id only comes out of that build, and writing first would mean a
+    // refused id already replaced the config dir a live codex session uses as CODEX_HOME.
+    // It also runs before the two confirmations, so nobody agrees to evict a model only
+    // to be told the id was never usable.
+    const modelSpec = entry.launch.params.model;
+    const injection = buildCustomModelInjection(entry, endpoint, body.modelId, contextLength);
+    const forcedLaunchModel = injection.kind === 'unsupported' ? undefined : injection.launchModel;
+    if (
+      forcedLaunchModel !== undefined &&
+      modelSpec?.type === 'token' &&
+      !matchesPattern(modelSpec.pattern, forcedLaunchModel)
+    ) {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        `Model id ${JSON.stringify(body.modelId)} cannot be passed to ${session.mode} on its command line`
+      );
+    }
 
     // Some CLIs (today: only claude) carry enough of their own fixed system-prompt/tool-
     // schema overhead that a small enough real context guarantees a first-message failure
@@ -1860,32 +1921,17 @@ export function registerSessionRoutes(
       }
     }
 
-    // A CLI whose config alone cannot select the model also gets its `model` launch param
-    // forced (pi/omp `custom/<id>`, grok's block name). The argv engine DROPS a token that
-    // fails its pattern rather than quoting it, which would silently launch the CLI on its
-    // own default provider again, so refuse an id the pattern cannot carry up front.
-    const modelSpec = entry.launch.params.model;
     const applied = applyCustomModelInjection(
       entry,
       endpoint,
       body.modelId,
       session.id,
       contextLength,
-      session.workingDir
+      session.workingDir,
+      await guardSessionConfigDirHome(entry, (envVar) => session.envOverrideValue(envVar))
     );
     if (!applied) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, `${session.mode} has no known custom-model mechanism`);
-    }
-    if (
-      applied.launchModel !== undefined &&
-      modelSpec?.type === 'token' &&
-      !matchesPattern(modelSpec.pattern, applied.launchModel)
-    ) {
-      removeConfigDir(applied.configDir);
-      return createErrorResponse(
-        ApiErrorCode.INVALID_INPUT,
-        `Model id ${JSON.stringify(body.modelId)} cannot be passed to ${session.mode} on its command line`
-      );
     }
 
     const { previousConfigDir } = session.setCustomModel(
@@ -1936,7 +1982,8 @@ export function registerSessionRoutes(
       // Called for its existence/ownership 404 side effect only — demoteOrRemoveSession
       // below re-looks-up the record by id, so the returned SessionState is unused here.
       findPersistedSessionOrFail(ctx.store, id, req);
-      ctx.store.demoteOrRemoveSession(id);
+      // The edit history goes with the record (same rule as `cleanupSession`).
+      if (ctx.store.demoteOrRemoveSession(id) === 'removed') ctx.forgetEditHistory(id);
       // A detached session kept its agent inbox (server.ts _doCleanupSession drops it
       // only on killMux); retiring the row is the delete, so the mail goes now.
       agentInbox.drop(id);
@@ -3267,16 +3314,14 @@ export function registerSessionRoutes(
     return candidates[0] ?? null;
   }
 
-  app.get('/api/sessions/:id/last-response', async (req) => {
-    const { id } = req.params as { id: string };
-    const session = findSessionOrFail(ctx, id, req);
-    const query = req.query as { context?: string };
-
+  // The body of GET /api/sessions/:id/last-response, so the Discord bridge reads the same transcript
+  // the response viewer does (per-CLI reader, pane fallback) without a second copy of this logic.
+  const lastResponseFor = async (session: Session, context?: string) => {
     // Codex has a structured rollout source. Prefer it when a rollout can be
     // attributed to this pane; fall back to the rendered terminal transcript
     // for live/legacy panes that do not yet have a matching rollout.
     if (getCli(session.mode)?.capabilities.transcript === 'codex-rollout') {
-      const full = query.context === 'full';
+      const full = context === 'full';
       const codexResponse = await readCodexLastResponse(session, full);
       if (codexResponse.text || (full && codexResponse.messages && codexResponse.messages.length > 0)) {
         return codexResponse;
@@ -3296,18 +3341,6 @@ export function registerSessionRoutes(
       return codexResponse;
     }
 
-    if (isExternalCliTranscriptMode(session.mode)) {
-      const transcriptBuffer = await getCanonicalTranscriptBuffer(session);
-      const blocks = parseExternalCliTranscript(transcriptBuffer, session.mode);
-      const transcriptText = getLastTranscriptResponse(blocks);
-      return {
-        text: transcriptText,
-        timestamp: '',
-        hasContext: blocks.length > 0,
-        messages: query.context === 'full' ? blocks : undefined,
-      };
-    }
-
     // DeepSeek Harness writes a real structured transcript under
     // `$DSH_HOME/sessions/**`, so read that rather than segmenting the pane.
     // ⚠️ For dsh the pane fallback is not merely coarse, it is WRONG: dsh-TUI
@@ -3324,8 +3357,7 @@ export function registerSessionRoutes(
     // would starve on an answer that exists. Those configurations keep the
     // pane segmenter below: coarse, but the real conversation.
     if (getCli(session.mode)?.capabilities.transcript === 'deepseek-zstd' && !session.docker && !session.remote) {
-      const deepSeekQuery = req.query as { context?: string };
-      const full = deepSeekQuery.context === 'full';
+      const full = context === 'full';
       const transcript = await readDeepSeekLastResponse(session, { blocks: full });
       if (transcript) {
         return {
@@ -3335,6 +3367,17 @@ export function registerSessionRoutes(
           messages: full ? transcript.blocks : undefined,
         };
       }
+    }
+
+    if (isExternalCliTranscriptMode(session.mode)) {
+      const transcriptBuffer = await getCanonicalTranscriptBuffer(session);
+      const blocks = parseExternalCliTranscript(transcriptBuffer, session.mode);
+      return {
+        text: getLastTranscriptResponse(blocks),
+        timestamp: '',
+        hasContext: blocks.length > 0,
+        messages: context === 'full' ? blocks : undefined,
+      };
     }
 
     // Scan ~/.claude/projects/*/ for the transcript file
@@ -3363,8 +3406,7 @@ export function registerSessionRoutes(
     // `turn` is the brief view's context: the last ANSWERED turn's assistant
     // messages, so a multi-row answer is not reduced to its final row. `text`
     // stays the last assistant row in every mode (agent pollers hash it).
-    // (`query` is already destructured at the top of this handler downstream.)
-    const wantsMessages = query.context === 'full' || query.context === 'turn';
+    const wantsMessages = context === 'full' || context === 'turn';
     const claudeSessionId = session.claudeSessionId || session.id;
     const transcript = await findClaudeTranscript(projectsDir, claudeSessionId, session.id);
     if (!transcript) {
@@ -3386,7 +3428,7 @@ export function registerSessionRoutes(
     try {
       const content = await fs.readFile(transcript.path, 'utf8');
       const parsed = parseClaudeResponseTranscript(content, wantsMessages);
-      if (query.context === 'turn') {
+      if (context === 'turn') {
         return {
           text: parsed.text,
           timestamp: parsed.timestamp,
@@ -3397,6 +3439,13 @@ export function registerSessionRoutes(
     } catch {
       return wantsMessages ? { text: '', timestamp: '', messages: [] } : { text: '', timestamp: '' };
     }
+  };
+  ctx.lastResponseFor = lastResponseFor;
+
+  app.get('/api/sessions/:id/last-response', async (req) => {
+    const { id } = req.params as { id: string };
+    const session = findSessionOrFail(ctx, id, req);
+    return lastResponseFor(session, (req.query as { context?: string }).context);
   });
 
   // ── Codex response-viewer support ───────────────────────────────────────────────────────
@@ -4906,8 +4955,27 @@ export function registerSessionRoutes(
       const cmHosts = await readCustomModelHosts(CODEMAN_CONFIG_DIR);
       const cmEndpoint = cmHosts.find((h) => h.id === customModel.endpointId);
       if (!cmEndpoint) return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Model endpoint not found');
-      const cmContextLength = cmEndpoint.modelContextLengths?.[customModel.modelId];
+      // Per-model discovery figure first, user-set endpoint default second, nothing third
+      // (see the dedicated route's own comment above).
+      const cmContextLength = resolveCustomModelContextLength(cmEndpoint, customModel.modelId);
       const cmSlotCount = cmEndpoint.modelSlotCounts?.[customModel.modelId];
+
+      // See the dedicated route: refused on the pure build, before either confirmation, so
+      // nobody agrees to evict a model for an id that could never launch, and before anything
+      // is written.
+      const cmModelSpec = cmEntry.launch.params.model;
+      const cmInjection = buildCustomModelInjection(cmEntry, cmEndpoint, customModel.modelId, cmContextLength);
+      const cmForcedLaunchModel = cmInjection.kind === 'unsupported' ? undefined : cmInjection.launchModel;
+      if (
+        cmForcedLaunchModel !== undefined &&
+        cmModelSpec?.type === 'token' &&
+        !matchesPattern(cmModelSpec.pattern, cmForcedLaunchModel)
+      ) {
+        return createErrorResponse(
+          ApiErrorCode.INVALID_INPUT,
+          `Model id ${JSON.stringify(customModel.modelId)} cannot be passed to ${mode} on its command line`
+        );
+      }
 
       // See the dedicated route's own comment for the full reasoning: some CLIs' own fixed
       // overhead can exceed a small enough real context on the very first message,
@@ -4973,24 +5041,12 @@ export function registerSessionRoutes(
         customModel.modelId,
         qsCustomModelSessionId,
         cmContextLength,
-        workspacePath
+        workspacePath,
+        await guardSessionConfigDirHome(cmEntry, (envVar) => qsGatedEnvOverrides?.[envVar])
       );
       if (!cmApplied) {
         return createErrorResponse(ApiErrorCode.OPERATION_FAILED, `${mode} has no known custom-model mechanism`);
       }
-      const cmModelSpec = cmEntry.launch.params.model;
-      if (
-        cmApplied.launchModel !== undefined &&
-        cmModelSpec?.type === 'token' &&
-        !matchesPattern(cmModelSpec.pattern, cmApplied.launchModel)
-      ) {
-        removeConfigDir(cmApplied.configDir);
-        return createErrorResponse(
-          ApiErrorCode.INVALID_INPUT,
-          `Model id ${JSON.stringify(customModel.modelId)} cannot be passed to ${mode} on its command line`
-        );
-      }
-
       qsCustomModelEnvOverrides = { ...qsGatedEnvOverrides, ...cmApplied.envOverrides };
       qsCustomModelAppliedEnvOverrides = cmApplied.envOverrides;
       qsCustomModelLaunchModel = cmApplied.launchModel;
