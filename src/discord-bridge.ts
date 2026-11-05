@@ -1,3 +1,4 @@
+import { DiscordCaseCategories } from './discord-case-categories.js';
 import { DiscordCaseThreads, type DiscordStarter } from './discord-case-threads.js';
 import type { DiscordCaseIdentity } from './discord-case-identity.js';
 import { hashDiscordPrompt } from './discord-native-execution.js';
@@ -129,7 +130,7 @@ export interface DiscordFile {
 // ---------------------------------------------------------------------------
 
 /** Why `cfg` cannot be saved as an enabled config, or null. */
-export function discordConfigProblem(cfg: DiscordConfig): string | null {
+export function discordConfigProblem(cfg: DiscordConfig, allowMissingCategory = false): string | null {
   if (cfg.token && (/\s/.test(cfg.token) || cfg.token.length > 200)) return 'The bot token looks wrong';
   if (cfg.guildId && !SNOWFLAKE.test(cfg.guildId)) return 'Guild ID must be a number (Copy ID in Discord)';
   if (cfg.parentChannelId && !SNOWFLAKE.test(cfg.parentChannelId)) return 'Channel ID must be a number';
@@ -139,7 +140,8 @@ export function discordConfigProblem(cfg: DiscordConfig): string | null {
   if (cfg.enabled) {
     if (!cfg.token) return 'Add the bot token before enabling';
     if (!cfg.guildId || !cfg.parentChannelId) return 'Add the guild ID and parent channel ID before enabling';
-    if (cfg.mode === 'full' && !cfg.categoryId) return 'Choose a case category before enabling Full interface mode';
+    if (cfg.mode === 'full' && !cfg.categoryId && !allowMissingCategory)
+      return 'Choose a case category before enabling Full interface mode';
     if (cfg.allowedUserIds.length === 0) return 'Add at least one allowed user ID: nobody could reply otherwise';
   }
   return null;
@@ -1032,6 +1034,7 @@ export class DiscordBridge {
   private readonly now: () => number;
   private readonly deliveries: DiscordDeliveryJournal;
   private readonly channels: DiscordCaseThreads;
+  private readonly categories: DiscordCaseCategories;
   private readonly conversationProgress: DiscordConversationProgressStore;
   private readonly conversationRuns = new Map<string, Promise<void>>();
 
@@ -1040,6 +1043,7 @@ export class DiscordBridge {
     this.conversationProgress = new DiscordConversationProgressStore(deps.configDir);
     this.deliveries = new DiscordDeliveryJournal(deps.configDir, this.now);
     this.api = new DiscordApi(() => this.cfg.token, deps.fetchImpl, deps.sleep);
+    this.categories = new DiscordCaseCategories(deps.configDir);
     this.channels = new DiscordCaseThreads(
       deps.configDir,
       {
@@ -1076,6 +1080,22 @@ export class DiscordBridge {
         this.cfg.categoryId === scope.categoryId &&
         (!this.deps.sessions || this.deps.sessions().some((s) => s.id === id))
     );
+  }
+
+  async provisionCategory(config: DiscordConfig): Promise<string> {
+    const api = new DiscordApi(() => config.token, this.deps.fetchImpl, this.deps.sleep);
+    return this.categories.forConfig(config, {
+      botId: async () => {
+        const me = await api.botUserId();
+        if (!me?.id) throw new DiscordChannelProblem('Bot identity unavailable');
+        return me.id;
+      },
+      get: (id) => api.getChannel(id),
+      list: (id) => api.guildChannels(id),
+      create: (guild, body) => api.createTextChannel(guild, body),
+      edit: (id, body) => api.editChannel(id, body),
+      remove: (id) => api.remove(id),
+    });
   }
 
   get acceptsControls(): boolean {

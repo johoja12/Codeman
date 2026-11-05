@@ -1842,7 +1842,7 @@ Object.assign(CodemanApp.prototype, {
   updateDiscordMode() {
     const full = document.getElementById('discordMode').value === 'full';
     document.getElementById('discordModeHint').textContent = full
-      ? 'One channel per case, one thread per session. Threads provide recent history, live native responses, local/SSH files and supported controls. Use !codeman help for session management. Some CLI dialogs and ambiguous recoveries still require the terminal.'
+      ? 'One channel per case, one thread per session. Save creates a private Codeman category when no category ID is set. Threads provide recent history, live native responses, local/SSH files and supported controls. Use !codeman help for session management. Some CLI dialogs and ambiguous recoveries still require the terminal.'
       : 'Notifications keeps the current alerts and thread replies. Threads appear on the first alert unless configured below.';
     document.getElementById('discordThreadCreation').disabled = full;
     document.getElementById('discordCategoryRow').style.display = full ? '' : 'none';
@@ -1908,8 +1908,6 @@ Object.assign(CodemanApp.prototype, {
     if (!res || !res.ok || !body || body.success === false) {
       const error = body?.error || 'Could not save the Discord settings.';
       this._discordSay(error, true);
-      const category = document.getElementById('discordCategoryId');
-      if (payload.enabled && payload.mode === 'full' && !payload.categoryId) category.setAttribute('aria-invalid', 'true');
       document.getElementById('discordResult')?.scrollIntoView({ block: 'center' });
       return error;
     }

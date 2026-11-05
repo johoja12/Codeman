@@ -174,8 +174,20 @@ describe('Discord interface mode Settings', () => {
     expect(extraWrites).toBe(0);
   });
 
-  it('keeps failed Full-mode saves open, shows the missing-category error and never puts tokens in general settings', async () => {
+  it('keeps failed Full-mode saves open, shows a permissions error and never puts tokens in general settings', async () => {
     await openSettings();
+    await page.route('**/api/discord', async (route) => {
+      if (route.request().method() === 'PUT')
+        return route.fulfill({
+          status: 403,
+          json: {
+            success: false,
+            error:
+              'Discord bot needs Manage Channels and Manage Threads. Update its server role permissions, then save again.',
+          },
+        });
+      return route.continue();
+    });
     await page.selectOption('#discordMode', 'full');
     await page.locator('label:has(#discordEnabled)').click();
     await page.fill('#discordToken', 'fake-private-test-token');
@@ -185,13 +197,12 @@ describe('Discord interface mode Settings', () => {
     await page.fill('#discordCategoryId', '');
     const writing = page.waitForResponse((r) => r.url().endsWith('/api/discord') && r.request().method() === 'PUT');
     await page.locator('.set-foot [onclick="app.saveAppSettings()"]').click();
-    expect((await writing).status()).toBe(400);
+    expect((await writing).status()).toBe(403);
     await page.waitForFunction(() =>
-      document.getElementById('discordResult')?.textContent?.includes('Choose a case category')
+      document.getElementById('discordResult')?.textContent?.includes('Manage Channels and Manage Threads')
     );
     expect(await page.isVisible('#appSettingsModal')).toBe(true);
     expect(await page.isVisible('#discordResult')).toBe(true);
-    expect(await page.getAttribute('#discordCategoryId', 'aria-invalid')).toBe('true');
     expect(await page.inputValue('#discordToken')).toBe('fake-private-test-token');
     const persisted = (await (await fetch(base + '/api/discord')).json()).data;
     expect(persisted.enabled).toBe(false);
@@ -199,6 +210,7 @@ describe('Discord interface mode Settings', () => {
     expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain('fake-private-test-token');
     expect(JSON.stringify(await (await fetch(base + '/api/settings')).json())).not.toContain('fake-private-test-token');
     await page.screenshot({ path: `${screenshots}/save-error-desktop.png` });
+    await page.unroute('**/api/discord');
     await page.evaluate(() => (window as any).app.closeAppSettings());
   });
 
@@ -218,6 +230,44 @@ describe('Discord interface mode Settings', () => {
     await mobile.waitForFunction(() => !document.getElementById('appSettingsModal')?.classList.contains('active'));
     expect((await (await fetch(base + '/api/discord')).json()).data.mode).toBe('notifications');
     await context.close();
+  });
+
+  it('saves an empty category and fills the category ID returned by automatic setup', async () => {
+    const current = (await (await fetch(base + '/api/discord')).json()).data;
+    let overlay = {
+      ...current,
+      enabled: true,
+      mode: 'notifications',
+      categoryId: '',
+      hasToken: true,
+      guildId: '111111111111111111',
+      parentChannelId: '222222222222222222',
+      allowedUserIds: ['333333333333333333'],
+    };
+    let writes = 0;
+    await page.route('**/api/discord', async (route) => {
+      if (route.request().method() === 'PUT') {
+        const body = route.request().postDataJSON();
+        expect(body.mode).toBe('full');
+        expect(body.categoryId).toBe('');
+        expect(body).not.toHaveProperty('token');
+        overlay = { ...overlay, ...body, categoryId: '666666666666666666' };
+        writes++;
+      }
+      return route.fulfill({ json: { success: true, data: overlay } });
+    });
+    await openSettings();
+    await page.selectOption('#discordMode', 'full');
+    expect(await page.inputValue('#discordCategoryId')).toBe('');
+    expect(await page.getAttribute('#discordCategoryId', 'placeholder')).toContain('automatically');
+    await page.locator('.set-foot [onclick="app.saveAppSettings()"]').click();
+    await page.waitForFunction(() => !document.getElementById('appSettingsModal')?.classList.contains('active'));
+    expect(writes).toBe(1);
+    await openSettings();
+    expect(await page.inputValue('#discordCategoryId')).toBe('666666666666666666');
+    await page.screenshot({ path: `${screenshots}/automatic-category.png` });
+    await page.unroute('**/api/discord');
+    await page.evaluate(() => (window as any).app.closeAppSettings());
   });
 
   it('has no browser runtime errors', () => {
