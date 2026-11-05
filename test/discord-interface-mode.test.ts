@@ -31,9 +31,13 @@ let sendInput: ReturnType<typeof vi.fn>;
 let sequence: number;
 let remoteChannels: Map<string, any>;
 
-function makeBridge(fetchOverride?: DiscordFetch) {
+function makeBridge(
+  fetchOverride?: DiscordFetch,
+  extra: Partial<import('../src/discord-bridge.js').DiscordBridgeDeps> = {}
+) {
   const bridge = new DiscordBridge({
     configDir: dir,
+    ...extra,
     sessions: () => sessions,
     sendInput,
     fetchImpl: async (url, init) => {
@@ -125,6 +129,26 @@ describe('Discord interface mode', () => {
     expect(await readFullMap(dir)).toEqual(original);
     expect(creations()).toHaveLength(2);
     expect(posts.some((p) => p.method === 'DELETE')).toBe(false);
+  });
+  it('serves a control without typing and deduplicates repeated/unauthorized gateway messages', async () => {
+    const control = vi.fn(async () => ({ text: 'Working' }));
+    const b = makeBridge(undefined, { control });
+    await b.reload();
+    await b.syncSessions();
+    const map = await readFullMap(dir);
+    const message = {
+      id: '555555555555555555',
+      guild_id: cfg.guildId,
+      channel_id: map.s1,
+      author: { id: cfg.allowedUserIds[0] },
+      content: '!codeman status',
+    };
+    await b.onGatewayMessage(message);
+    await b.onGatewayMessage(message);
+    await b.onGatewayMessage({ ...message, id: '555555555555555556', author: { id: '999999999999999999' } });
+    expect(control).toHaveBeenCalledExactlyOnceWith('s1', 'status');
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(posts.some((p) => p.body?.content === 'Working')).toBe(true);
   });
   it('defaults legacy and unknown config values to notifications', async () => {
     for (const mode of [undefined, 'unknown', null]) {

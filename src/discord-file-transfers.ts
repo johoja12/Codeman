@@ -62,15 +62,13 @@ export function discordRemoteReadCommand(root: string, path: string, maxBytes = 
     'python3 -c ' + shellescape(READ_SCRIPT) + ' ' + shellescape(JSON.stringify({ root, path, limit: maxBytes }))
   );
 }
-async function remoteBoundedRead(remote: SessionRemote, root: string, path: string): Promise<Buffer> {
+export async function runDiscordRemoteRead(remote: SessionRemote, command: string): Promise<Buffer> {
   return runWithRemoteSshLimit(
     () =>
       new Promise<Buffer>((resolve, reject) => {
-        const child = spawn(
-          'ssh',
-          [...buildSshConnectionArgv(remote), remoteSshTarget(remote), discordRemoteReadCommand(root, path)],
-          { stdio: ['ignore', 'pipe', 'pipe'] }
-        );
+        const child = spawn('ssh', [...buildSshConnectionArgv(remote), remoteSshTarget(remote), command], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
         const chunks: Buffer[] = [];
         let bytes = 0,
           stderr = 0,
@@ -124,7 +122,10 @@ export async function readDiscordSessionFile(scope: DiscordFileScope, path: stri
     if (isBlockedAttachmentPath(file.realPath, guard.blockedTrees))
       throw new DiscordFileProblem('That file cannot be sent: it can hold credentials');
     if (file.size > DISCORD_FILE_LIMIT) throw new DiscordFileProblem('The file is over 8 MB');
-    return { name: posix.basename(path), data: await remoteBoundedRead(scope.remote, root.realPath, file.realPath) };
+    return {
+      name: posix.basename(path),
+      data: await runDiscordRemoteRead(scope.remote, discordRemoteReadCommand(root.realPath, file.realPath)),
+    };
   }
   if ((await probePathKind(scope.workingDir, { pastCap: true })) !== 'directory')
     throw new DiscordFileProblem(describeUnknownPath('The session folder', scope.workingDir, { pastCap: true }));
