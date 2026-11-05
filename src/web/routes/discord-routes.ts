@@ -1,3 +1,4 @@
+import { DiscordCategoryProblem } from '../../discord-case-categories.js';
 /**
  * @fileoverview Discord bridge settings and the deliberate-post route (src/discord-bridge.ts).
  *
@@ -139,16 +140,27 @@ export function registerDiscordRoutes(app: FastifyInstance, deps: DiscordRouteDe
       ...patch,
       token: patch.token !== undefined ? patch.token.trim() : current.token,
     };
-    const problem = discordConfigProblem(next);
+    const automaticCategory = next.enabled && next.mode === 'full' && !next.categoryId;
+    const problem = discordConfigProblem(next, automaticCategory);
     if (problem) {
       reply.code(400);
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, problem);
     }
     try {
+      if (automaticCategory) {
+        next.categoryId = await deps.bridge.provisionCategory(next);
+        if (JSON.stringify(await readDiscordConfig(deps.configDir)) !== JSON.stringify(current)) {
+          reply.code(409);
+          return createErrorResponse(
+            ApiErrorCode.OPERATION_FAILED,
+            'Discord settings changed during category setup. Reload Settings and save again.'
+          );
+        }
+      }
       await writeDiscordConfig(deps.configDir, next);
       await deps.bridge.reload();
     } catch (err) {
-      reply.code(500);
+      reply.code(err instanceof DiscordCategoryProblem ? err.status : 500);
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
     }
     return { success: true, data: await status() };

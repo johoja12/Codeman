@@ -3511,7 +3511,7 @@
                   <div class="set-row" data-search="discord bot thread reply phone notification blocked">
                     <div class="set-row-text">
                       <span class="set-row-label">Talk to your sessions from Discord</span>
-                      <span class="set-row-desc">Notifications uses a thread per tab; Full interface creates a channel per case with a thread per session. Replies reach that session. Only the user IDs listed below can reply. Setup (bot, least-privilege permissions) is in docs/discord-bridge.md. This group has its own Save button.</span>
+                      <span class="set-row-desc">Notifications uses a thread per tab; Full interface creates a channel per case with a thread per session. Replies reach that session. Only the user IDs listed below can reply. Setup (bot, least-privilege permissions) is in docs/discord-bridge.md. Settings Save also saves this group.</span>
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="discordEnabled"><span class="slider"></span></label>
                   </div>
@@ -3552,8 +3552,8 @@
                     <button class="btn-toolbar btn-sm" id="discordSyncBtn" onclick="app.syncDiscordSessions()">Sync sessions</button>
                   </div>
                   <div class="set-row has-field" id="discordCategoryRow" style="display:none">
-                    <div class="set-row-text"><label class="set-row-label" for="discordCategoryId">Case category ID</label><span class="set-row-desc">Create a private Discord category and copy its ID. The bot needs Manage Channels and thread permissions. Each case gets a channel; sessions get threads. Empty case channels are kept.</span></div>
-                    <input id="discordCategoryId" class="set-input" type="text" inputmode="numeric" autocomplete="off">
+                    <div class="set-row-text"><label class="set-row-label" for="discordCategoryId">Case category ID (optional)</label><span class="set-row-desc">Leave blank to create a private Codeman category automatically when saving Full mode. Or enter an existing category ID. The bot needs Manage Channels and Manage Threads. Case channels contain session threads.</span></div>
+                    <input id="discordCategoryId" class="set-input" placeholder="Created automatically when you save" type="text" inputmode="numeric" autocomplete="off">
                   </div>
                   <div class="set-row has-field" id="discordChannelDeleteRow" style="display:none">
                     <div class="set-row-text"><label class="set-row-label" for="discordOnChannelDelete">When a session is deleted</label><span class="set-row-desc">Disconnects and crashes keep the channel. Making history read-only also needs Manage Roles on the channel.</span></div>
@@ -3614,7 +3614,7 @@
                   <div class="set-row">
                     <div class="set-row-text">
                       <span class="set-row-label">Save and test</span>
-                      <span class="set-row-desc">Send test saves first, then posts to the parent channel.</span>
+                      <span class="set-row-desc">Settings Save and Apply save this group too. Full interface creates a private category if the ID is blank. Send test saves first, then posts to the parent channel.</span>
                     </div>
                     <span>
                       <button class="btn-toolbar btn-sm btn-primary" id="discordSaveBtn" onclick="app.saveDiscord()">Save</button>
