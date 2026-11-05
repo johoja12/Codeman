@@ -1,3 +1,4 @@
+import { discordDisplayText } from './discord-display-text.js';
 import { DiscordCaseCategories } from './discord-case-categories.js';
 import { DiscordCaseThreads, type DiscordStarter } from './discord-case-threads.js';
 import type { DiscordCaseIdentity } from './discord-case-identity.js';
@@ -432,9 +433,10 @@ export function buildPost(msg: DiscordMessage, cfg: DiscordConfig, explicitUrgen
   } catch {
     tailText = undefined;
   }
+  tailText = tailText ? discordDisplayText(tailText) : undefined;
   const fence = tailText?.trim() ? `\n\`\`\`\n${tailText.trim().replace(/```/g, "'''")}\n\`\`\`` : '';
   const host = msg.host ? ` (${clip(msg.host, 60)})` : '';
-  const content = clip(`${head}${host}${msg.body ? `\n${msg.body}` : ''}${fence}`, MAX_CONTENT);
+  const content = clip(`${head}${host}${msg.body ? `\n${discordDisplayText(msg.body)}` : ''}${fence}`, MAX_CONTENT);
   // Agent output and session names must not be able to @everyone the server; only the allowlisted ids ping.
   return { content, allowed_mentions: { parse: [], users: ping } };
 }
@@ -1243,11 +1245,17 @@ export class DiscordBridge {
           throw new BridgeProblem('Session changed during history sync');
         const turn = history.turns.find((t) => t.cursor === progress!.seed[i]);
         if (!turn) throw new BridgeProblem('Historical boundary expired; use !codeman history for catch-up');
+        const visible = turn.role === 'assistant' ? discordDisplayText(turn.text) : turn.text;
+        if (!visible.trim()) {
+          progress = { ...progress, seedIndex: i + 1 };
+          await this.conversationProgress.set(key, progress);
+          continue;
+        }
         const text =
           '**Historical context**' +
           (history.partial ? ' (partial)' : '') +
           '\n' +
-          renderHistory([{ ...turn, text: clip(turn.text, 1000) }], { includeTimestamps: false }) +
+          renderHistory([{ ...turn, text: clip(visible, 1000) }], { includeTimestamps: false }) +
           '\n`!codeman history` / `!codeman transcript` for more';
         await this.deliverPost(
           channel,
@@ -1333,8 +1341,9 @@ export class DiscordBridge {
         )
           throw new BridgeProblem('Session changed');
         if (turn.role === 'assistant' || (turn.role === 'tool' && progress.verbose)) {
+          const visible = turn.role === 'assistant' ? discordDisplayText(turn.text) : turn.text;
           const chunks = splitForDiscord(
-            tablesToCodeBlocks((turn.role === 'tool' ? '**Tool output**\n' : '') + turn.text)
+            tablesToCodeBlocks((turn.role === 'tool' ? '**Tool output**\n' : '') + visible)
           );
           for (const [i, content] of chunks.entries())
             await this.deliverPost(
@@ -1344,11 +1353,11 @@ export class DiscordBridge {
               sessionId,
               `native:${turn.cursor}:${i}`
             );
-          if (turn.text.length > 12000)
+          if (visible.length > 12000)
             await this.deliverPost(
               channel,
               { content: 'Full user-visible response', allowed_mentions: { parse: [], users: [] } },
-              { name: 'response.txt', data: Buffer.from(turn.text) },
+              { name: 'response.txt', data: Buffer.from(visible) },
               sessionId,
               `native:${turn.cursor}:overflow`
             );
@@ -1773,8 +1782,9 @@ export class DiscordBridge {
     if (msg.fullText) {
       try {
         const got = await withTimeout(msg.fullText(), FULL_TEXT_TIMEOUT_MS);
-        const text = got?.text.trim();
+        const text = got?.text ? discordDisplayText(got.text).trim() : undefined;
         const sid = msg.sessionId;
+        if (got?.text && !text) msg = { ...msg, tail: undefined };
         if (text && sid) {
           // Keyed on the text and the turn it came from, so a later turn that ends on the same words is posted.
           const key = `${got?.version ?? ''}\u0000${text}`;
