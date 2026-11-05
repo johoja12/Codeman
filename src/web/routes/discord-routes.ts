@@ -136,6 +136,7 @@ export function registerDiscordRoutes(app: FastifyInstance, deps: DiscordRouteDe
       gateway: deps.bridge.gatewayState,
       gatewayError: deps.bridge.gatewayError,
       lastResult: deps.bridge.lastResult,
+      sessionSync: deps.bridge.sessionSync,
     };
   };
 
@@ -180,6 +181,18 @@ export function registerDiscordRoutes(app: FastifyInstance, deps: DiscordRouteDe
     }
     // 200 even when delivery failed: the request to Codeman worked, `data.ok` says whether Discord did.
     return { success: true, data: await deps.bridge.sendTest(cfg, deps.hostTitle()) };
+  });
+
+  app.post('/api/discord/sync', async (req, reply) => {
+    const no = denied(req, reply);
+    if (no) return no;
+    const cfg = await readDiscordConfig(deps.configDir);
+    if (!cfg.enabled || cfg.mode !== 'full') {
+      reply.code(409);
+      return createErrorResponse(ApiErrorCode.CONFLICT, 'Enable Full interface mode before syncing sessions');
+    }
+    // Join the background pass rather than creating duplicate threads.
+    return { success: true, data: await deps.bridge.syncSessions() };
   });
 
   app.post('/api/sessions/:id/discord-notify', async (req, reply): Promise<ApiResponse<DiscordResult | null>> => {

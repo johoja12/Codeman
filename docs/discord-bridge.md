@@ -89,8 +89,22 @@ In the Discord mobile app set the server to **All Messages**. Discord's own push
 
 ## Options
 
+### Notifications or Full interface
+
+Settings → Notifications → Discord has a **Discord mode** selector, independent of the enable switch:
+
+- **Notifications** (`mode: "notifications"`, the default) preserves the existing alerts and thread replies. Threads are created on the first alert, or for new tabs when **Create threads** is set to **For every new tab**.
+- **Full interface (preview)** (`mode: "full"`) creates a thread for every existing session when enabled, after restart/restoration, and for each new session immediately. This overrides lazy thread creation without changing the saved Notifications preference. It does not submit a prompt or start an agent.
+
+This first phase still uses threads. Per-session channels, historical transcript seeding, live streaming, SSH attachment transfers and expanded controls are tracked separately under fork issue #53. **Full interface does not yet replace the web UI.** Event selection and the current reply/file limitations below still apply.
+
+Use **Sync sessions** to check discovery and retry missing threads. The Settings API returns `sessionSync` with `state`, `total`, `ready` and `failed`; `POST /api/discord/sync` joins or starts a discovery pass (admin only in multi-user mode). Saves schedule discovery in the background so a slow Discord connection does not block Settings. Successful mappings are reused after retry and restart.
+
+Changing back to Notifications preserves existing threads and their history. Disable the bridge with its enable switch. Only explicit session deletion uses the existing deletion policy; a dead agent or disconnected SSH host is not deletion. Creating a session thread exposes future messages, **not its historical transcript**.
+
 | Option            | Values                      | Default     | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | ----------------- | --------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode` | `notifications`, `full` | `notifications` | Legacy notification behavior or proactive session discovery in the full-interface preview. |
 | `threadCreation`  | `lazy`, `onSessionStart`    | `lazy`      | `lazy` makes a thread on the first notification. `onSessionStart` makes one per new tab                                                                                                                                                                                                                                                                                                                                                           |
 | `onSessionDelete` | `keep`, `archive`, `delete` | `archive`   | What happens to the thread when its tab is deleted. `delete` needs Manage Threads                                                                                                                                                                                                                                                                                                                                                                 |
 | `staleThreads`    | `keep`, `archive`, `delete` | `keep`      | What happens to threads this bot made that no tab uses any more, checked after startup and then daily. A deleted tab's thread leaves the map, so this also archives or deletes threads that `onSessionDelete` kept or archived. Skips threads under an hour old, other people's threads and other channels, does nothing while the thread map is empty, and closes at most 25 per run. `delete` needs Manage Threads. Use one channel per Codeman |

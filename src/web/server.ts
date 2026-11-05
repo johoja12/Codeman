@@ -773,6 +773,7 @@ export class WebServer extends EventEmitter {
     },
     agentExited: (id) => !!this.sessions.get(id)?.paneExit,
     awaitingChoice: (id) => approvalInbox.listPending().some((item) => item.sessionId === id && item.kind !== 'idle'),
+    sessions: () => Array.from(this.sessions.values(), (session) => ({ id: session.id, name: session.name })),
     // Remote (ssh) sessions keep their folder on another host, so received files have nowhere local to go.
     sessionDir: (sessionId) => {
       const session = this.sessions.get(sessionId);

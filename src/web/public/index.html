@@ -3537,6 +3537,23 @@
                     <input type="text" id="discordAllowedUserIds" class="set-input" autocomplete="off" spellcheck="false">
                   </div>
                   <div class="set-row has-field">
+                    <div class="set-row-text">
+                      <label class="set-row-label" for="discordMode">Discord mode</label>
+                      <span class="set-row-desc" id="discordModeHint">Notifications keeps the current alerts and thread replies.</span>
+                    </div>
+                    <select id="discordMode" class="set-select" aria-describedby="discordModeHint" onchange="app.updateDiscordMode()">
+                      <option value="notifications">Notifications</option>
+                      <option value="full">Full interface (preview)</option>
+                    </select>
+                  </div>
+                  <div class="set-row" id="discordSyncRow" style="display:none">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Existing sessions</span>
+                      <span class="set-row-desc" id="discordSyncStatus" role="status" aria-live="polite">Save to sync existing sessions.</span>
+                    </div>
+                    <button class="btn-toolbar btn-sm" id="discordSyncBtn" onclick="app.syncDiscordSessions()">Sync sessions</button>
+                  </div>
+                  <div class="set-row has-field">
                     <div class="set-row-text"><span class="set-row-label">Create threads</span></div>
                     <select id="discordThreadCreation" class="set-select">
                       <option value="lazy">On the first alert</option>

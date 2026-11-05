@@ -52,7 +52,13 @@ describe('/api/discord', () => {
   it('starts disabled with no token', async () => {
     const { app } = await harness();
     const data = (await app.inject({ method: 'GET', url: '/api/discord' })).json().data;
-    expect(data).toMatchObject({ enabled: false, hasToken: false, tokenMasked: '', gateway: 'off' });
+    expect(data).toMatchObject({
+      enabled: false,
+      mode: 'notifications',
+      hasToken: false,
+      tokenMasked: '',
+      gateway: 'off',
+    });
     expect(data).not.toHaveProperty('token');
   });
 
@@ -97,6 +103,31 @@ describe('/api/discord', () => {
     bridge.stop();
   });
 
+  it('persists mode independently of enablement and rejects unsupported modes', async () => {
+    const { app, bridge } = await harness();
+    const put = await app.inject({ method: 'PUT', url: '/api/discord', payload: { mode: 'full' } });
+    expect(put.statusCode).toBe(200);
+    expect(put.json().data).toMatchObject({ mode: 'full', enabled: false });
+    expect((await readDiscordConfig(dir)).mode).toBe('full');
+    expect((await app.inject({ method: 'PUT', url: '/api/discord', payload: { mode: 'unknown' } })).statusCode).toBe(
+      400
+    );
+    const get = await app.inject({ method: 'GET', url: '/api/discord' });
+    expect(get.json().data.mode).toBe('full');
+    expect(get.json().data.sessionSync.state).toBe('idle');
+    bridge.stop();
+  });
+
+  it('sync is gated by full mode and remains admin-only', async () => {
+    const { app, bridge } = await harness();
+    expect((await app.inject({ method: 'POST', url: '/api/discord/sync' })).statusCode).toBe(409);
+    await app.inject({ method: 'PUT', url: '/api/discord', payload: { ...FULL, mode: 'full' } });
+    const sync = await app.inject({ method: 'POST', url: '/api/discord/sync' });
+    expect(sync.statusCode).toBe(200);
+    expect(sync.json().data).toMatchObject({ state: 'complete', total: 0 });
+    bridge.stop();
+  });
+
   it('refuses a bad id, an incomplete enable, and unknown fields', async () => {
     const { app } = await harness();
     const bad = await app.inject({ method: 'PUT', url: '/api/discord', payload: { guildId: 'not-a-number' } });
@@ -123,6 +154,7 @@ describe('/api/discord', () => {
     expect((await app.inject({ method: 'GET', url: '/api/discord' })).statusCode).toBe(403);
     expect((await app.inject({ method: 'PUT', url: '/api/discord', payload: FULL })).statusCode).toBe(403);
     expect((await app.inject({ method: 'POST', url: '/api/discord/test' })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'POST', url: '/api/discord/sync' })).statusCode).toBe(403);
   });
 });
 

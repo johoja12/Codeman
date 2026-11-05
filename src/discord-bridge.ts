@@ -29,6 +29,7 @@ import { DISCORD_RECEIVED_DIR } from './web/paste-image-gc.js';
 import WebSocket from 'ws';
 import { WEBHOOK_SCOPES, type WebhookUrgency } from './types/push.js';
 import {
+  DISCORD_MODES,
   DISCORD_ON_DELETE,
   DISCORD_PING_MODES,
   DISCORD_THREAD_CREATION,
@@ -36,6 +37,7 @@ import {
   type DiscordGatewayState,
   type DiscordPingMode,
   type DiscordResult,
+  type DiscordSessionSync,
 } from './types/discord.js';
 
 const CONFIG_FILE = 'discord.json';
@@ -74,6 +76,7 @@ const FULL_TEXT_TIMEOUT_MS = 4000;
 
 export const DEFAULT_DISCORD_CONFIG: DiscordConfig = {
   enabled: false,
+  mode: 'notifications',
   token: '',
   guildId: '',
   parentChannelId: '',
@@ -392,6 +395,7 @@ function coerce(raw: unknown): DiscordConfig {
   const d = DEFAULT_DISCORD_CONFIG;
   return {
     enabled: r.enabled === true,
+    mode: oneOf(DISCORD_MODES, r.mode, d.mode),
     token: typeof r.token === 'string' ? r.token : '',
     guildId: typeof r.guildId === 'string' ? r.guildId : '',
     parentChannelId: typeof r.parentChannelId === 'string' ? r.parentChannelId : '',
@@ -817,6 +821,8 @@ export interface DiscordBridgeDeps {
   awaitingChoice?: (sessionId: string) => boolean;
   /** A session's working folder, where received files are saved. Undefined when it is gone or remote. */
   sessionDir?: (sessionId: string) => string | undefined;
+  /** Snapshot only: never discovers or starts agents. Called after restoration is released. */
+  sessions?: () => Array<{ id: string; name?: string }>;
   socketFactory?: SocketFactory;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -852,6 +858,10 @@ export class DiscordBridge {
   /** The first full load (config, thread map, gateway), shared by every caller that arrives before it ends. */
   private firstLoad?: Promise<void>;
   private last: DiscordResult | null = null;
+  private syncRun?: Promise<DiscordSessionSync>;
+  private syncQueued = false;
+  private syncState: DiscordSessionSync = { state: 'idle', total: 0, ready: 0, failed: 0 };
+  private stopped = false;
   private readonly api: DiscordApi;
   private readonly now: () => number;
 
@@ -868,6 +878,61 @@ export class DiscordBridge {
   }
   get gatewayError(): string | null {
     return this.gateway?.lastError ?? null;
+  }
+  get sessionSync(): DiscordSessionSync {
+    return { ...this.syncState };
+  }
+
+  /** Full-mode discovery is bounded to the current session snapshot, without replaying any prompts. */
+  syncSessions(): Promise<DiscordSessionSync> {
+    if (this.syncRun) return this.syncRun;
+    const run = this.runSessionSync().finally(() => {
+      if (this.syncRun === run) {
+        this.syncRun = undefined;
+        if (this.syncQueued) {
+          this.syncQueued = false;
+          void this.syncSessions().catch(() => undefined);
+        }
+      }
+    });
+    this.syncRun = run;
+    return run;
+  }
+
+  private async runSessionSync(): Promise<DiscordSessionSync> {
+    await this.ensureLoaded();
+    if (this.stopped || this.held || !this.cfg.enabled || !this.cfg.token || this.cfg.mode !== 'full')
+      return this.sessionSync;
+    const parent = this.cfg.parentChannelId;
+    const sessions = this.deps.sessions?.() ?? [];
+    this.syncState = { state: 'syncing', total: sessions.length, ready: 0, failed: 0 };
+    try {
+      for (const session of sessions) {
+        if (
+          this.stopped ||
+          this.held ||
+          !this.cfg.enabled ||
+          this.cfg.mode !== 'full' ||
+          parent !== this.cfg.parentChannelId
+        ) {
+          this.syncState.state = 'idle';
+          return this.sessionSync;
+        }
+        // A tab may have been deleted while the previous Discord request was in flight.
+        if (!this.deps.sessions?.().some((current) => current.id === session.id)) continue;
+        const result = await this.threadFor(session.id, session.name);
+        if (typeof result === 'string') this.syncState.ready++;
+        else {
+          this.syncState.failed++;
+          this.last = result;
+        }
+      }
+      this.syncState.state = this.syncState.failed ? 'error' : 'complete';
+    } catch {
+      this.syncState.state = 'error';
+      this.syncState.failed++;
+    }
+    return this.sessionSync;
   }
 
   async ensureLoaded(): Promise<void> {
@@ -958,6 +1023,7 @@ export class DiscordBridge {
 
   /** (Re)read the config and start or stop the gateway to match. Call at boot and after a save. */
   async reload(): Promise<void> {
+    this.stopped = false;
     this.cfg = await readDiscordConfig(this.deps.configDir);
     // The thread map is read once, by whoever gets here first; everyone else waits for that read. A second
     // read finishing later would replace the map and drop threads made in between.
@@ -981,6 +1047,11 @@ export class DiscordBridge {
     // A save that changed neither the switch nor the token keeps the gateway session, so it can resume.
     // A gateway that gave up (a fatal close, such as a missing intent) is replaced, or a fix could never take.
     const want = this.cfg.enabled && this.cfg.token && !this.held ? this.cfg.token : '';
+    // Do not hold Settings saves behind a potentially large series of Discord requests.
+    if (want && this.cfg.mode === 'full') {
+      this.syncQueued ||= !!this.syncRun;
+      void this.syncSessions().catch(() => undefined);
+    }
     if (this.gateway && this.gateway.state !== 'error' && want && want === this.gatewayToken) return;
     this.gateway?.stop();
     this.gateway = null;
@@ -997,6 +1068,8 @@ export class DiscordBridge {
   }
 
   stop(): void {
+    this.stopped = true;
+    this.syncQueued = false;
     clearInterval(this.sweepTimer);
     this.sweepTimer = undefined;
     this.gateway?.stop();
@@ -1188,7 +1261,8 @@ export class DiscordBridge {
   /** Session tab created: make its thread now when `threadCreation` is `onSessionStart`. */
   async sessionCreated(sessionId: string, name: string | undefined): Promise<void> {
     await this.ensureLoaded();
-    if (!this.cfg.enabled || this.cfg.threadCreation !== 'onSessionStart') return;
+    if (!this.cfg.enabled || this.stopped) return;
+    if (this.cfg.mode === 'full' ? this.held : this.cfg.threadCreation !== 'onSessionStart') return;
     const made = await this.threadFor(sessionId, name);
     if (typeof made !== 'string') this.last = made;
   }

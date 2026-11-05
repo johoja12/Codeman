@@ -1810,6 +1810,14 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('discordGuildId').value = d.guildId || '';
     document.getElementById('discordParentChannelId').value = d.parentChannelId || '';
     document.getElementById('discordAllowedUserIds').value = (d.allowedUserIds || []).join(', ');
+    document.getElementById('discordMode').value = d.mode || 'notifications';
+    this.updateDiscordMode();
+    const sync = d.sessionSync;
+    document.getElementById('discordSyncStatus').textContent = sync?.state === 'syncing'
+      ? 'Syncing existing sessions…'
+      : sync?.state === 'complete' || sync?.state === 'error'
+        ? `${sync.ready} of ${sync.total} sessions ready.${sync.failed ? ` ${sync.failed} failed; try Sync sessions again.` : ''}`
+        : 'Save to sync existing sessions.';
     document.getElementById('discordThreadCreation').value = d.threadCreation;
     document.getElementById('discordOnSessionDelete').value = d.onSessionDelete;
     document.getElementById('discordStaleThreads').value = d.staleThreads || 'keep';
@@ -1827,11 +1835,40 @@ Object.assign(CodemanApp.prototype, {
     this._discordSay(line.trim(), d.gateway === 'error' || (d.lastResult && !d.lastResult.ok));
   },
 
+  updateDiscordMode() {
+    const full = document.getElementById('discordMode').value === 'full';
+    document.getElementById('discordModeHint').textContent = full
+      ? 'Preview: creates threads for existing and new sessions immediately. Per-session channels, historical messages, live streaming and remote files are coming in separate updates. This does not yet replace the web UI.'
+      : 'Notifications keeps the current alerts and thread replies. Threads appear on the first alert unless configured below.';
+    document.getElementById('discordThreadCreation').disabled = full;
+    document.getElementById('discordSyncRow').style.display = full ? '' : 'none';
+  },
+
+  async syncDiscordSessions() {
+    const btn = document.getElementById('discordSyncBtn');
+    btn.disabled = true;
+    try {
+      if (await this.saveDiscord()) return;
+      const res = await this._apiPost('/api/discord/sync', {});
+      const body = res ? await res.json() : null;
+      if (!res?.ok || !body?.success) {
+        this._discordSay(body?.error || 'Could not sync sessions.', true);
+        return;
+      }
+      await this.loadDiscord();
+    } catch {
+      this._discordSay('Could not sync sessions. Try again.', true);
+    } finally {
+      btn.disabled = false;
+    }
+  },
+
   /** PUT the group's state. Resolves to '' on success, else the error (also shown in the group). */
   async saveDiscord() {
     const ids = document.getElementById('discordAllowedUserIds').value.split(/[\s,]+/).filter(Boolean);
     const payload = {
       enabled: document.getElementById('discordEnabled').checked,
+      mode: document.getElementById('discordMode').value,
       guildId: document.getElementById('discordGuildId').value.trim(),
       parentChannelId: document.getElementById('discordParentChannelId').value.trim(),
       allowedUserIds: ids,
