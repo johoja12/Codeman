@@ -1,3 +1,4 @@
+import { probeRemoteDiscordConversation } from './discord-remote-conversation.js';
 import { getCli } from './config/cli-registry/registry.js';
 import { nativeExecutions, type DiscordNativeExecution } from './discord-native-execution.js';
 /** Read-only, exact-conversation history. No cwd guesses, model turns, tool results or reasoning. */
@@ -313,13 +314,24 @@ export async function readDiscordSessionHistory(
       )?.id ?? id;
   }
   if (session.docker) throw new Error('Container history is not available through this reader');
-  return readDiscordHistory({
+  const remote = session.remote;
+  const discovered =
+    format === 'codex-rollout' && remote && !id
+      ? await probeRemoteDiscordConversation(remote, session.id).catch(() => undefined)
+      : undefined;
+  id ??= discovered;
+  const history = await readDiscordHistory({
     mode: session.mode,
     conversationId: id,
     remote: session.remote,
     configHome,
     includeTools: options?.includeTools,
   });
+  // Publish only after the exact transcript header was verified, and never overwrite a concurrent adoption.
+  if (discovered && (session.remote !== remote || (session.nativeResumeId && session.nativeResumeId !== discovered)))
+    throw new Error('Native conversation changed during history discovery');
+  if (discovered && !session.nativeResumeId) session.setNativeResumeId(discovered);
+  return history;
 }
 export function renderHistory(turns: DiscordHistoryTurn[]): string {
   return turns
