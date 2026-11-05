@@ -183,9 +183,7 @@ export class MockSession extends EventEmitter {
    * which is the state in which input used to disappear silently.
    */
   failWrites = false;
-  assistantInputLocked = false;
   async performAuxiliaryInput(operation: () => Promise<void>): Promise<void> {
-    if (this.assistantInputLocked) throw new Error('Assistant owns session input');
     await operation();
   }
 

@@ -120,8 +120,6 @@ export interface SessionWriteOptions {
   fromUser?: boolean;
   /** Internal writeViaMux option: preserve structured-message whitespace and newline bytes. */
   preserveWhitespace?: boolean;
-  /** Internal assistant coordinator permit; never accepted from HTTP or WebSocket payloads. */
-  assistantPermit?: string;
 }
 
 export type RemoteCommandMode = Extract<
