@@ -130,7 +130,11 @@ describe('/api/discord', () => {
   it('sync is gated by full mode and remains admin-only', async () => {
     const { app, bridge } = await harness();
     expect((await app.inject({ method: 'POST', url: '/api/discord/sync' })).statusCode).toBe(409);
-    await app.inject({ method: 'PUT', url: '/api/discord', payload: { ...FULL, mode: 'full' } });
+    await app.inject({
+      method: 'PUT',
+      url: '/api/discord',
+      payload: { ...FULL, mode: 'full', categoryId: '666666666666666666' },
+    });
     const sync = await app.inject({ method: 'POST', url: '/api/discord/sync' });
     expect(sync.statusCode).toBe(200);
     expect(sync.json().data).toMatchObject({ state: 'complete', total: 0 });

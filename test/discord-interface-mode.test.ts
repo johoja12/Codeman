@@ -1,5 +1,5 @@
 /** Full-interface discovery uses fake Discord only; never attaches to or submits work to a session. */
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -8,7 +8,6 @@ import {
   DiscordBridge,
   discordConfigPath,
   readDiscordConfig,
-  readThreadMap,
   writeDiscordConfig,
   type DiscordFetch,
 } from '../src/discord-bridge.js';
@@ -17,6 +16,8 @@ const cfg = {
   ...DEFAULT_DISCORD_CONFIG,
   enabled: true,
   mode: 'full' as const,
+  categoryId: '666666666666666666',
+  onChannelDelete: 'delete' as const,
   token: 'fake-test-token',
   guildId: '111111111111111111',
   parentChannelId: '222222222222222222',
@@ -25,27 +26,56 @@ const cfg = {
 let dir: string;
 let sessions: Array<{ id: string; name?: string }>;
 let bridges: DiscordBridge[];
-let posts: Array<{ path: string; method: string }>;
+let posts: Array<{ path: string; method: string; body?: any }>;
 let sendInput: ReturnType<typeof vi.fn>;
 let sequence: number;
+let remoteChannels: Map<string, any>;
 
 function makeBridge(fetchOverride?: DiscordFetch) {
   const bridge = new DiscordBridge({
     configDir: dir,
     sessions: () => sessions,
     sendInput,
-    fetchImpl:
-      fetchOverride ??
-      (async (url, init) => {
-        posts.push({ path: url.pathname, method: String(init.method) });
-        return Response.json({ id: String(444444444444444440n + BigInt(sequence++)) });
-      }),
+    fetchImpl: async (url, init) => {
+      const method = String(init.method);
+      const path = url.pathname;
+      const body = init.body ? JSON.parse(String(init.body)) : undefined;
+      posts.push({ path, method, body } as any);
+      if (method === 'GET' && path.endsWith('/channels')) return Response.json([...remoteChannels.values()]);
+      if (method === 'GET')
+        return Response.json(
+          remoteChannels.get(path.split('/').pop()!) ?? { id: path.split('/').pop(), type: 4, guild_id: cfg.guildId }
+        );
+      if (method === 'POST' && path.endsWith('/channels')) {
+        const result = fetchOverride
+          ? await fetchOverride(url, init)
+          : Response.json({ id: String(444444444444444440n + BigInt(sequence++)) });
+        if (!result.ok) return result;
+        const got = await result.json();
+        const c = { ...body, id: got.id, guild_id: cfg.guildId };
+        remoteChannels.set(c.id, c);
+        return Response.json(c);
+      }
+      const id = path.split('/').pop()!;
+      if (method === 'PATCH') Object.assign(remoteChannels.get(id) ?? {}, body);
+      if (method === 'DELETE') remoteChannels.delete(id);
+      return Response.json({ id: '444444444444444444' });
+    },
     socketFactory: () => ({ send() {}, close() {}, on() {} }),
   });
   bridges.push(bridge);
   return bridge;
 }
-const creations = () => posts.filter((p) => p.path.endsWith('/threads'));
+const creations = () => posts.filter((p) => p.method === 'POST' && p.path.endsWith('/channels'));
+async function readFullMap(dir: string): Promise<Record<string, string>> {
+  const raw = JSON.parse(await readFile(join(dir, 'discord-channels.json'), 'utf8').catch(() => '{}'));
+  const current = await readDiscordConfig(dir);
+  return Object.fromEntries(
+    Object.values(raw.entries ?? {})
+      .filter((e: any) => e.state === 'active' && e.categoryId === current.categoryId)
+      .map((e: any) => [e.sessionId, e.channelId])
+  );
+}
 
 beforeEach(async () => {
   dir = await mkdtemp(join(tmpdir(), 'discord-mode-'));
@@ -56,6 +86,7 @@ beforeEach(async () => {
   bridges = [];
   posts = [];
   sequence = 0;
+  remoteChannels = new Map();
   sendInput = vi.fn(async () => true);
   await writeDiscordConfig(dir, cfg);
 });
@@ -65,6 +96,36 @@ afterEach(async () => {
 });
 
 describe('Discord interface mode', () => {
+  it('routes a full-mode channel reply to its exact session and preserves it across mode changes', async () => {
+    const b = makeBridge();
+    await b.reload();
+    await b.syncSessions();
+    const original = await readFullMap(dir);
+    await b.onGatewayMessage({
+      id: '555555555555555555',
+      guild_id: cfg.guildId,
+      channel_id: original.s1,
+      author: { id: cfg.allowedUserIds[0] },
+      content: 'hello',
+    });
+    expect(sendInput).toHaveBeenCalledExactlyOnceWith('s1', 'hello\r');
+    await writeDiscordConfig(dir, { ...cfg, mode: 'notifications' });
+    await b.reload();
+    await b.onGatewayMessage({
+      id: '555555555555555556',
+      guild_id: cfg.guildId,
+      channel_id: original.s1,
+      author: { id: cfg.allowedUserIds[0] },
+      content: 'old channel',
+    });
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    await writeDiscordConfig(dir, cfg);
+    await b.reload();
+    await b.syncSessions();
+    expect(await readFullMap(dir)).toEqual(original);
+    expect(creations()).toHaveLength(2);
+    expect(posts.some((p) => p.method === 'DELETE')).toBe(false);
+  });
   it('defaults legacy and unknown config values to notifications', async () => {
     for (const mode of [undefined, 'unknown', null]) {
       await writeFile(discordConfigPath(dir), JSON.stringify({ enabled: false, mode }));
@@ -89,7 +150,7 @@ describe('Discord interface mode', () => {
     expect(bridge.syncSessions()).toBe(first);
     expect(await first).toEqual({ state: 'complete', total: 2, ready: 2, failed: 0 });
     expect(creations()).toHaveLength(2);
-    expect(Object.keys(await readThreadMap(dir))).toEqual(['s1', 's2']);
+    expect(Object.keys(await readFullMap(dir))).toEqual(['s1', 's2']);
     expect(sendInput).not.toHaveBeenCalled();
   });
 
@@ -118,7 +179,7 @@ describe('Discord interface mode', () => {
     const bridge = makeBridge();
     await bridge.reload();
     await bridge.syncSessions();
-    const before = await readThreadMap(dir);
+    const before = await readFullMap(dir);
     bridge.stop();
     const restarted = makeBridge();
     await restarted.reload();
@@ -126,7 +187,7 @@ describe('Discord interface mode', () => {
     expect(creations()).toHaveLength(2);
     await writeDiscordConfig(dir, { ...cfg, mode: 'notifications' });
     await restarted.reload();
-    expect(await readThreadMap(dir)).toEqual(before);
+    expect(await readFullMap(dir)).toEqual(before);
     expect(posts.some((p) => p.method === 'DELETE')).toBe(false);
   });
 
@@ -142,7 +203,6 @@ describe('Discord interface mode', () => {
   it('reports failures and retries only missing destinations', async () => {
     let rejectSecond = true;
     const bridge = makeBridge(async (url, init) => {
-      posts.push({ path: url.pathname, method: String(init.method) });
       if (creations().length === 2 && rejectSecond) return Response.json({}, { status: 403 });
       return Response.json({ id: String(444444444444444440n + BigInt(sequence++)) });
     });
@@ -159,7 +219,6 @@ describe('Discord interface mode', () => {
       release = resolve;
     });
     const bridge = makeBridge(async (url, init) => {
-      posts.push({ path: url.pathname, method: String(init.method) });
       await pending;
       return Response.json({ id: '444444444444444444' });
     });
@@ -171,7 +230,7 @@ describe('Discord interface mode', () => {
     release();
     await sync;
     expect(creations()).toHaveLength(1);
-    expect(await readThreadMap(dir)).not.toHaveProperty('s2');
+    expect(await readFullMap(dir)).not.toHaveProperty('s2');
   });
 
   it('does not recreate a tab deleted while its own destination is pending', async () => {
@@ -181,8 +240,7 @@ describe('Discord interface mode', () => {
     });
     sessions = sessions.slice(0, 1);
     const bridge = makeBridge(async (url, init) => {
-      posts.push({ path: url.pathname, method: String(init.method) });
-      if (url.pathname.endsWith('/threads')) await pending;
+      if (url.pathname.endsWith('/channels')) await pending;
       return Response.json({ id: '444444444444444444' });
     });
     await bridge.reload();
@@ -192,8 +250,8 @@ describe('Discord interface mode', () => {
     await bridge.sessionDeleted('s1');
     release();
     await sync;
-    expect(await readThreadMap(dir)).toEqual({});
-    expect(posts.some((p) => p.method === 'PATCH')).toBe(true);
+    expect(await readFullMap(dir)).toEqual({});
+    expect(posts.some((p) => p.method === 'DELETE')).toBe(true);
   });
 
   it('stops discovery after switching back to Notifications during a request', async () => {
@@ -202,7 +260,6 @@ describe('Discord interface mode', () => {
       release = resolve;
     });
     const bridge = makeBridge(async (url, init) => {
-      posts.push({ path: url.pathname, method: String(init.method) });
       await pending;
       return Response.json({ id: '444444444444444444' });
     });
@@ -223,20 +280,19 @@ describe('Discord interface mode', () => {
       release = resolve;
     });
     const bridge = makeBridge(async (url, init) => {
-      posts.push({ path: url.pathname, method: String(init.method) });
-      if (url.pathname.includes(cfg.parentChannelId)) await pending;
+      if (JSON.parse(String(init.body)).parent_id === cfg.categoryId) await pending;
       return Response.json({ id: String(444444444444444440n + BigInt(sequence++)) });
     });
     await bridge.reload();
     const first = bridge.syncSessions();
     await vi.waitFor(() => expect(creations()).toHaveLength(1));
     const newParent = '777777777777777777';
-    await writeDiscordConfig(dir, { ...cfg, parentChannelId: newParent });
+    await writeDiscordConfig(dir, { ...cfg, categoryId: newParent });
     await bridge.reload();
     release();
     await first;
     await vi.waitFor(() => expect(bridge.sessionSync).toMatchObject({ state: 'complete', ready: 2 }));
-    expect(creations().filter((p) => p.path.includes(newParent))).toHaveLength(2);
-    expect(Object.keys(await readThreadMap(dir))).toEqual(['s1', 's2']);
+    expect(creations().filter((p) => p.body?.parent_id === newParent)).toHaveLength(2);
+    expect(Object.keys(await readFullMap(dir))).toEqual(['s1', 's2']);
   });
 });

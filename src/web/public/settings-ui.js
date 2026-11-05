@@ -1811,6 +1811,8 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('discordParentChannelId').value = d.parentChannelId || '';
     document.getElementById('discordAllowedUserIds').value = (d.allowedUserIds || []).join(', ');
     document.getElementById('discordMode').value = d.mode || 'notifications';
+    document.getElementById('discordCategoryId').value = d.categoryId || '';
+    document.getElementById('discordOnChannelDelete').value = d.onChannelDelete || 'keep';
     this.updateDiscordMode();
     const sync = d.sessionSync;
     document.getElementById('discordSyncStatus').textContent = sync?.state === 'syncing'
@@ -1838,9 +1840,11 @@ Object.assign(CodemanApp.prototype, {
   updateDiscordMode() {
     const full = document.getElementById('discordMode').value === 'full';
     document.getElementById('discordModeHint').textContent = full
-      ? 'Preview: creates threads for existing and new sessions immediately. Per-session channels, historical messages, live streaming and remote files are coming in separate updates. This does not yet replace the web UI.'
+      ? 'Preview: creates a channel for each existing and new session in your category. Historical messages, live streaming and remote files are coming in separate updates. This does not yet replace the web UI.'
       : 'Notifications keeps the current alerts and thread replies. Threads appear on the first alert unless configured below.';
     document.getElementById('discordThreadCreation').disabled = full;
+    for (const id of ['discordCategoryRow', 'discordChannelDeleteRow']) document.getElementById(id).style.display = full ? '' : 'none';
+    document.getElementById('discordThreadCreationRow').style.display = full ? 'none' : '';
     document.getElementById('discordSyncRow').style.display = full ? '' : 'none';
   },
 
@@ -1869,6 +1873,8 @@ Object.assign(CodemanApp.prototype, {
     const payload = {
       enabled: document.getElementById('discordEnabled').checked,
       mode: document.getElementById('discordMode').value,
+      categoryId: document.getElementById('discordCategoryId').value.trim(),
+      onChannelDelete: document.getElementById('discordOnChannelDelete').value,
       guildId: document.getElementById('discordGuildId').value.trim(),
       parentChannelId: document.getElementById('discordParentChannelId').value.trim(),
       allowedUserIds: ids,
