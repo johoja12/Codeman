@@ -229,7 +229,7 @@ export class DiscordSessionManagement {
       };
     }
     return {
-      text: 'Commands: sessions [offset] · open <session-id> · cases · groups · create <case> <host-id|local> <CLI> <group-id|default> · recoveries · recover <record-id> <reconnect|resume> · reconnect <session-id> · status · history · transcript · pending · interrupt. Prefix commands with !codeman.',
+      text: 'Commands: sessions [offset] · open <session-id> · cases · groups · create <case> <host-id|local> <CLI> <group-id|default> · recoveries · recover <record-id> <reconnect|resume> · reconnect <session-id> · model [model-id] · effort [level] · status · history · transcript · pending · interrupt. Prefix commands with !codeman.',
     };
   }
 }

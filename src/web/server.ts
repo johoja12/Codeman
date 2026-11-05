@@ -1,4 +1,6 @@
 import { resolveDiscordCase } from '../discord-case-identity.js';
+import { DiscordModelControls } from '../discord-model-controls.js';
+import { readDiscordModelCatalog } from '../discord-model-catalog.js';
 import { DiscordSessionManagement } from '../discord-session-management.js';
 import { activeSessionRecoveryActions } from './session-recovery-service.js';
 import { isRecoveryDismissed } from '../session-recovery-fence.js';
@@ -790,6 +792,24 @@ export class WebServer extends EventEmitter {
       return !(await this.mux.isPaneDead(session.muxName));
     },
   });
+  private discordModelControls: DiscordModelControls = new DiscordModelControls({
+    scope: () => (isMultiUserMode() ? undefined : this.discordBridge.controlScope),
+    target: (id) => {
+      const session = this.sessions.get(id);
+      return session
+        ? {
+            mode: session.mode,
+            generation: session.nativeModelSettingsRevision,
+            working: session.isWorking,
+            pending: approvalInbox.listPending().some((item) => item.sessionId === id && item.kind !== 'idle'),
+            exited: !!session.paneExit,
+            reportedModel: session.displayModel?.model,
+            operate: (operation, allowed) => session.withNativeModelSettings(operation, allowed),
+            catalog: () => readDiscordModelCatalog(session),
+          }
+        : undefined;
+    },
+  });
   private discordBridge: DiscordBridge = new DiscordBridge({
     configDir: getDataDir(),
     fetchImpl: webviewFetch,
@@ -827,10 +847,14 @@ export class WebServer extends EventEmitter {
     controlCurrent: (id, validity) => {
       const session = this.sessions.get(id);
       return (
-        this.discordSessionManager.current(id, validity) || (!!session && discordControlCurrent(session, validity))
+        this.discordModelControls.current(id, validity) ||
+        this.discordSessionManager.current(id, validity) ||
+        (!!session && discordControlCurrent(session, validity))
       );
     },
     control: async (id, command) => {
+      const settings = await this.discordModelControls.control(id, command);
+      if (settings) return settings;
       const managed = await this.discordSessionManager.control(id, command);
       if (managed) return managed;
       const session = this.sessions.get(id);
@@ -5841,6 +5865,7 @@ export class WebServer extends EventEmitter {
 
     // Close the Discord gateway socket and its heartbeat, and clear the bridge's per-tab maps.
     this.discordBridge.stop();
+    this.discordModelControls.stop();
 
     // Dispose all managed timers (intervals + resettable timeouts)
     this.cleanup.dispose();

@@ -1100,6 +1100,22 @@ export class DiscordBridge {
   get acceptsControls(): boolean {
     return !this.stopped && this.cfg.enabled && this.cfg.mode === 'full' && !!this.cfg.token;
   }
+  /** Opaque revision for an in-flight native setting operation; never expose the token itself. */
+  get controlScope(): string | undefined {
+    return this.acceptsControls
+      ? createHash('sha256')
+          .update(
+            JSON.stringify([
+              this.cfg.token,
+              this.cfg.guildId,
+              this.cfg.parentChannelId,
+              this.cfg.categoryId,
+              this.cfg.allowedUserIds,
+            ])
+          )
+          .digest('hex')
+      : undefined;
+  }
   get lastResult(): DiscordResult | null {
     return this.last;
   }

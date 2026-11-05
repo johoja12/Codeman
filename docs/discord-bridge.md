@@ -140,6 +140,24 @@ Case channels and thread IDs are saved privately in instance-scoped `discord-cas
 
 The old `onChannelDelete` setting is retained for configuration compatibility and does not delete shared case channels. Switching back to Notifications resumes its original maps/preferences. The Notifications stale-thread sweep never runs in Full mode.
 
+## Change an existing session's model or effort
+
+In Full mode, send these commands inside that session's thread:
+
+| Command | Result |
+| --- | --- |
+| `!codeman model` | Inspect the native model and available choices, with selection buttons where canonical IDs are known. |
+| `!codeman model gpt-6-luna` | Select a Codex model by ID for this session. |
+| `!codeman model sonnet` | Select an alias offered by the current Claude picker for this session. |
+| `!codeman effort` | Inspect the current effort and the model's available levels. |
+| `!codeman effort high` | Apply and verify the effort for this session. |
+
+These controls work with an idle Claude or Codex session, including SSH sessions, while keeping the existing conversation and thread. An unfinished composer draft, a pending dialog, a stopped agent or a session which is working is refused. Incoming Codeman keyboard input is held during a native settings transaction and replayed in order afterward; if new input arrives before a setting is applied, the operation cancels and dismisses its own picker. Buttons expire and bind to the session/input revision. Unsupported CLIs, Docker sessions, unknown menu layouts and unverifiable results require the web terminal. In multi-user mode these controls remain disabled until Discord identities can be mapped to Codeman users.
+
+The bridge verifies the CLI's resulting setting before reporting success. It neither restarts the agent nor edits configuration files. Codex uses its session-only inline `/model` commands and rereads `/status`, including the conversation ID. Claude uses its verified native model picker and the **s — use this session only** action for both model and effort, then rereads that picker. It never sends Claude's inline `/model <alias>` or `/effort <level>` commands: those save defaults for future sessions in current Claude builds. Older builds without the explicit session-only picker action are refused. If a change cannot be confirmed, inspect the terminal before retrying; it is not automatically replayed.
+
+Model availability and effort levels come from the running CLI's picker and public catalog metadata. If a Codex catalog cannot supply canonical IDs or supported efforts, the bridge still shows the native model labels and refuses to invent IDs or reasoning choices. CLI-reported selection does not override provider access or organization restrictions.
+
 ## Telling the CLIs
 
 A CLI only posts deliberately if it knows it can. While the bridge is on:

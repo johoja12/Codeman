@@ -199,6 +199,7 @@ import {
 } from './perf/mobile-input-trace.js';
 import type { DisplayModel } from './types/session.js';
 import { resolveConfigModel } from './model-config-resolvers.js';
+import { isNativeModelSettingsInput, type NativeModelSettingsLease } from './native-model-settings.js';
 import { caseSessionSettled, isCasePathLocked, noteCaseSessionStarting } from './case-rename.js';
 import { legacyConfigForMode } from './session-cli-registry-bridge.js';
 import {
@@ -6269,6 +6270,9 @@ export class Session extends EventEmitter {
   get guardedInputGeneration(): string {
     return `${this.inspectionGeneration}:${this._guardedGeometryRevision}`;
   }
+  get nativeModelSettingsRevision(): string {
+    return `${this.guardedInputGeneration}:${this._guardedInputRevision}`;
+  }
   get guardedInputPendingWrites(): number {
     return this._guardedPendingWrites;
   }
@@ -6364,6 +6368,73 @@ export class Session extends EventEmitter {
   }
   guardedInputSnapshot(): GuardedInputSnapshot | null {
     return this._readGuardedInputSnapshot(false);
+  }
+  /**
+   * Keep incoming Codeman keyboard writes queued while a native settings menu is inspected.
+   * Only model commands/menu keys are accepted; no agent prompts, restarts or configuration writes.
+   */
+  async withNativeModelSettings<T>(
+    operation: (lease: NativeModelSettingsLease) => Promise<T>,
+    allowed: () => boolean
+  ): Promise<T> {
+    if (
+      (this.mode !== 'codex' && this.mode !== 'claude') ||
+      this.docker ||
+      this.guardedInputHeld ||
+      this._guardedPendingWrites ||
+      this.isWorking ||
+      this.paneExit ||
+      this._isStopped ||
+      this._closing ||
+      this.paneLifecycleInFlight ||
+      !this._muxSession ||
+      !allowed()
+    )
+      throw new Error('The session must be idle with an available native terminal. Nothing was changed.');
+    const generation = this.guardedInputGeneration;
+    const paneGeneration = this.inspectionGeneration;
+    const revision = this._guardedInputRevision;
+    const samePane = () =>
+      this.inspectionGeneration === paneGeneration &&
+      !this._isStopped &&
+      !this._closing &&
+      !this.paneExit &&
+      !this.paneLifecycleInFlight;
+    const current = () =>
+      samePane() && this.guardedInputGeneration === generation && this._guardedInputRevision === revision && allowed();
+    this._guardedSubmitInFlight = true;
+    this._submitVerifier?.cancel();
+    try {
+      return await operation({
+        current,
+        capture: async () => {
+          if (!current()) throw new Error('The session or input changed. Nothing further was sent.');
+          const text = await this._mux?.capturePaneTextAsync?.(this._muxSession!.muxName, { ansi: true });
+          if (!current() || !text || Buffer.byteLength(text) > 128 * 1024)
+            throw new Error('The native terminal could not be verified. Use the web terminal.');
+          return text;
+        },
+        write: async (input) => {
+          if (!isNativeModelSettingsInput(input) || !current()) return false;
+          this._submitVerifier?.cancel();
+          const sent = await this._writeViaMuxNow(input, { preserveWhitespace: true, nativeModelSettings: true });
+          this._submitVerifier?.cancel();
+          return sent;
+        },
+        cancelMenu: async () => {
+          // Held keys have not reached this pane. Dismiss our own menu even if their arrival
+          // invalidated the operation, so they are not replayed into its highlighted choice.
+          if (samePane()) {
+            this._submitVerifier?.cancel();
+            await this._writeViaMuxNow('\x1b', { preserveWhitespace: true, nativeModelSettings: true });
+          }
+        },
+      });
+    } finally {
+      this._submitVerifier?.cancel();
+      this._guardedSubmitInFlight = false;
+      this._drainGuardedHeld();
+    }
   }
   private _readGuardedInputSnapshot(allowLease: boolean): GuardedInputSnapshot | null {
     if (
@@ -6668,7 +6739,7 @@ export class Session extends EventEmitter {
         const sent = options.preserveWhitespace
           ? await this._mux.sendInput(this.id, data, { preserveWhitespace: true })
           : await this._mux.sendInput(this.id, data);
-        if (sent) {
+        if (sent && !options.nativeModelSettings) {
           const submittedPrompt = this._trackSubmit(data, options);
           this._emitSubmittedPrompt(submittedPrompt);
           this._verifySubmitted(data);
@@ -6679,8 +6750,10 @@ export class Session extends EventEmitter {
         // Structured multiline messages require the bracketed-paste/Enter transport above.
         if (options.preserveWhitespace && data.includes('\n')) return false;
         this.ptyProcess.write(data);
-        const submittedPrompt = this._trackSubmit(data, options);
-        this._emitSubmittedPrompt(submittedPrompt);
+        if (!options.nativeModelSettings) {
+          const submittedPrompt = this._trackSubmit(data, options);
+          this._emitSubmittedPrompt(submittedPrompt);
+        }
         return true;
       }
       return false;
