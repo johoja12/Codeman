@@ -10,15 +10,21 @@ import type { SessionDocker, SessionRemote } from '../types.js';
 import type { SessionRecoveryRecord } from '../types/session-recovery.js';
 import type { StateStore } from '../state-store.js';
 import type { SessionPort } from './ports/session-port.js';
+import type { EventPort } from './ports/event-port.js';
+import { SseEvent } from './sse-events.js';
 import { probeRemoteRecoveryTarget } from '../remote-hosts.js';
+
+/** Shared fence for API and connector recovery, including refresh races. */
+export const activeSessionRecoveryActions = new Set<string>();
 
 export type SessionRecoveryAction = 'reconnect' | 'resume';
 export type RecoveryTransport = { remote?: SessionRemote; docker?: SessionDocker };
 
-export type RecoveryExecutionContext = SessionPort & {
-  store: StateStore;
-  mux: ConstructorParameters<typeof Session>[0]['mux'];
-};
+export type RecoveryExecutionContext = SessionPort &
+  Pick<EventPort, 'broadcast'> & {
+    store: StateStore;
+    mux: ConstructorParameters<typeof Session>[0]['mux'];
+  };
 
 export interface RecoveryExecutionSeams {
   resolveTransport?: (record: SessionRecoveryRecord) => Promise<RecoveryTransport>;
@@ -173,7 +179,10 @@ export async function executeSessionRecovery(
       recoveredSessionId: session.id,
     };
     ctx.store.upsertSessionRecovery(next);
-    return { recovery: next, session: ctx.getSessionStateWithRespawn(session) };
+    const state = ctx.getSessionStateWithRespawn(session);
+    // Creation must reach every interface: the browser state cache and Discord lifecycle both observe this event.
+    ctx.broadcast(SseEvent.SessionCreated, state);
+    return { recovery: next, session: state };
   } catch (error) {
     if (ctx.sessions.has(session.id) && !(error instanceof SessionRecoveryConflictError && cancelled(seams))) {
       await ctx.cleanupSession(session.id, false, 'recovery failed');

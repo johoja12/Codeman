@@ -386,6 +386,7 @@ export function isDiscordCdnUrl(raw: string): boolean {
 
 export interface DiscordControlReply {
   text: string;
+  locateSessionId?: string;
   file?: DiscordFile;
   actions?: Array<{ label: string; command: string; validity: string; style?: number }>;
 }
@@ -1015,7 +1016,7 @@ export class DiscordBridge {
   private syncState: DiscordSessionSync = { state: 'idle', total: 0, ready: 0, failed: 0 };
   private stopped = false;
   private outputTimer?: ReturnType<typeof setInterval>;
-  private outputRun?: Promise<void>;
+  private outputReads = new Map<string, { remote: boolean; run: Promise<void> }>();
   private outputIndex = 0;
   private actions = new Map<string, DiscordBoundAction>();
   private outputDue = new Map<string, number>();
@@ -1040,6 +1041,9 @@ export class DiscordBridge {
     });
   }
 
+  get acceptsControls(): boolean {
+    return !this.stopped && this.cfg.enabled && this.cfg.mode === 'full' && !!this.cfg.token;
+  }
   get lastResult(): DiscordResult | null {
     return this.last;
   }
@@ -1059,6 +1063,8 @@ export class DiscordBridge {
     return JSON.stringify([this.cfg.mode, this.cfg.guildId, this.cfg.parentChannelId, this.cfg.categoryId]);
   }
   private destinationMatches(id: string, channel: string): boolean {
+    if (id === '__management__')
+      return this.cfg.mode === 'full' && !!this.cfg.parentChannelId && this.cfg.parentChannelId === channel;
     return this.cfg.mode === 'full'
       ? this.channels.channelForSession(this.cfg, id) === channel
       : this.threads[id] === channel;
@@ -1204,41 +1210,42 @@ export class DiscordBridge {
   }
 
   /** Bounded round-robin polling: only native text, never redraw/scrollback snapshots. */
-  pollConversations(): Promise<void> {
-    if (this.outputRun) return this.outputRun;
-    const run = (async () => {
-      if (this.stopped || this.held || !this.cfg.enabled || this.cfg.mode !== 'full' || !this.deps.history) return;
-      await this.refreshControls();
-      const sessions = this.deps.sessions?.() ?? [];
-      if (!sessions.length) return;
-      const batch = Array.from(
-        { length: Math.min(8, sessions.length) },
-        (_, i) => sessions[(this.outputIndex + i) % sessions.length]
+  async pollConversations(): Promise<void> {
+    if (this.stopped || this.held || !this.cfg.enabled || this.cfg.mode !== 'full' || !this.deps.history) return;
+    await this.refreshControls();
+    const sessions = this.deps.sessions?.() ?? [];
+    if (!sessions.length) return;
+    const batch = Array.from(
+      { length: Math.min(8, sessions.length) },
+      (_, i) => sessions[(this.outputIndex + i) % sessions.length]
+    );
+    this.outputIndex = (this.outputIndex + batch.length) % sessions.length;
+    const reads: Promise<void>[] = [];
+    for (const session of batch) {
+      if (this.outputReads.has(session.id) || (this.outputDue.get(session.id) ?? 0) > this.now()) continue;
+      const remote = !!session.remote;
+      if ([...this.outputReads.values()].filter((r) => r.remote === remote).length >= (remote ? 2 : 4)) continue;
+      const channel = this.channels.channelForSession(this.cfg, session.id);
+      if (!channel) continue;
+      this.outputDue.set(
+        session.id,
+        this.now() + (remote ? (session.working ? 10000 : 60000) : session.working ? 3000 : 15000)
       );
-      this.outputIndex = (this.outputIndex + batch.length) % sessions.length;
-      for (const session of batch) {
-        if ((this.outputDue.get(session.id) ?? 0) > this.now()) continue;
-        this.outputDue.set(
-          session.id,
-          this.now() + (session.remote ? (session.working ? 10000 : 60000) : session.working ? 3000 : 15000)
-        );
-        const channel = this.channels.channelForSession(this.cfg, session.id);
-        if (!channel) continue;
-        try {
-          await this.observeConversation(session.id, channel);
-        } catch {
+      const run = this.observeConversation(session.id, channel)
+        .catch(() => {
           this.last = this.fail(
             new BridgeProblem(
               'Live output paused: transcript/delivery boundary unavailable; use status/history or retry synchronization'
             )
           );
-        }
-      }
-    })().finally(() => {
-      if (this.outputRun === run) this.outputRun = undefined;
-    });
-    this.outputRun = run;
-    return run;
+        })
+        .finally(() => {
+          if (this.outputReads.get(session.id)?.run === run) this.outputReads.delete(session.id);
+        });
+      this.outputReads.set(session.id, { remote, run });
+      reads.push(run);
+    }
+    await Promise.all(reads);
   }
   private async observeConversation(sessionId: string, channel: string): Promise<void> {
     await this.seedConversation(sessionId, channel);
@@ -1901,6 +1908,19 @@ export class DiscordBridge {
     key: string,
     notifyUsers = false
   ): Promise<void> {
+    if (result.locateSessionId) {
+      if (!this.deps.sessions?.().some((s) => s.id === result.locateSessionId))
+        throw new BridgeProblem('Session no longer exists');
+      const destination = await this.threadFor(result.locateSessionId, undefined);
+      result = {
+        ...result,
+        text:
+          result.text +
+          (typeof destination === 'string'
+            ? '\n<#' + destination + '>'
+            : '\nDestination unavailable; retry synchronization.'),
+      };
+    }
     const users = notifyUsers ? this.cfg.allowedUserIds.slice(0, 20) : [];
     const mentions = users.length ? users.map((id) => `<@${id}>`).join(' ') + '\n' : '';
     const ids: string[] = [];
@@ -2035,6 +2055,8 @@ export class DiscordBridge {
         )
           throw new BridgeProblem('Control changed');
         const result = await this.deps.control!(action.sessionId, action.command);
+        if (result.locateSessionId)
+          await this.postControlReply(action.sessionId, key, result, `interaction-result:${m.id}`);
         await this.deliveries.update(id, 'delivered');
         await this.api.finishInteraction(m.application_id, m.token, clip(result.text, 1800));
         if (action.messageId)
@@ -2125,10 +2147,17 @@ export class DiscordBridge {
     if (!this.cfg.enabled || this.stopped || m.author?.bot) return;
     if (m.guild_id !== this.cfg.guildId) return;
     if (!this.cfg.allowedUserIds.includes(m.author?.id)) return;
-    const sessionId =
+    const mappedSessionId =
       this.cfg.mode === 'full'
         ? this.channels.sessionForChannel(this.cfg, m.channel_id)
         : Object.keys(this.threads).find((k) => this.threads[k] === m.channel_id);
+    const sessionId =
+      mappedSessionId ??
+      (this.cfg.mode === 'full' &&
+      this.cfg.parentChannelId === m.channel_id &&
+      /^!codeman(?:\s|$)/i.test(m.content ?? '')
+        ? '__management__'
+        : undefined);
     if (!sessionId || typeof m.id !== 'string' || !m.id || m.id.length > 100) return;
     if (!m.content?.trim() && !m.attachments?.length) return;
     const id = `in:${m.guild_id}:${m.id}`;

@@ -1250,7 +1250,10 @@ export function registerSessionRoutes(
     TabLayoutPort &
     KeepWarmPort,
   /** Test seam: inject a registry with fake IO instead of the real TCP/WoL probes. */
-  options: { remoteWake?: RemoteWakeRegistry } = {}
+  options: {
+    remoteWake?: RemoteWakeRegistry;
+    onCreateReady?: (create: (request: FastifyRequest) => Promise<unknown>) => void;
+  } = {}
 ): RemoteWakeRegistry {
   // Wake-on-LAN for sleeping remote hosts (see remote-wake.ts). One registry per
   // route registration (= one web server) — the same shape as the process-wide
@@ -1341,7 +1344,7 @@ export function registerSessionRoutes(
 
   // ========== Session Creation ==========
 
-  app.post('/api/sessions', async (req) => {
+  const createSessionForRequest = async (req: FastifyRequest) => {
     const owner = ownerFor(req);
     // Global + per-user session cap.
     const capMsg = sessionCapacityMessage(ctx.sessions, owner);
@@ -1737,7 +1740,9 @@ export function registerSessionRoutes(
         ? { tabLayout: tabLayoutSnapshot.layout, tabPlacements: tabLayoutSnapshot.placements }
         : {}),
     };
-  });
+  };
+  app.post('/api/sessions', createSessionForRequest);
+  options.onCreateReady?.(createSessionForRequest);
 
   // ========== Rename Session ==========
 
