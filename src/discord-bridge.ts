@@ -911,6 +911,8 @@ export interface DiscordBridgeDeps {
   awaitingChoice?: (sessionId: string) => boolean;
   /** A session's working folder, where received files are saved. Undefined when it is gone or remote. */
   sessionDir?: (sessionId: string) => string | undefined;
+  control?: (sessionId: string, command: string) => Promise<{ text: string; file?: DiscordFile }>;
+  history?: (sessionId: string) => Promise<import('./discord-history.js').DiscordHistory>;
   saveRemoteAttachment?: (sessionId: string, name: string, bytes: Uint8Array) => Promise<string>;
   getAttachment?: (sessionId: string, path: string) => Promise<DiscordFile>;
   /** Snapshot only: never discovers or starts agents. Called after restoration is released. */
@@ -1687,6 +1689,23 @@ export class DiscordBridge {
         return;
       }
       if (/^!codeman(?:\s|$)/i.test(m.content ?? '')) {
+        const command = (m.content ?? '').replace(/^!codeman\s*/i, '');
+        if (!/^file(?:\s|$)/i.test(command) && this.deps.control && this.cfg.mode === 'full') {
+          const result = await this.deps.control(sessionId, command);
+          if (!this.destinationMatches(sessionId, m.channel_id)) throw new BridgeProblem('Session changed');
+          for (const [i, content] of splitForDiscord(result.text).entries()) {
+            await this.deliverPost(
+              m.channel_id,
+              { content, allowed_mentions: { parse: [], users: [] } },
+              i === 0 ? result.file : undefined,
+              sessionId,
+              `control:${m.id}:${i}`
+            );
+          }
+          await this.deliveries.update(id, 'delivered');
+          await this.api.react(m.channel_id, m.id, '✅').catch(() => undefined);
+          return;
+        }
         const match = /^!codeman file ([^\r\n]+)$/i.exec(m.content ?? '');
         if (!match || !this.deps.getAttachment) {
           await this.say(m.channel_id, 'Usage: !codeman file /absolute/path');

@@ -173,3 +173,10 @@ Admins can inspect the latest 50 records through `GET /api/discord/deliveries`. 
 | Posts arrive but replies do nothing | Message Content Intent is off, or your user ID is not in the allowlist   |
 | Thread is not deleted               | The bot lacks Manage Threads on the parent channel                       |
 | Nothing arrives on the phone        | Check the Discord app's notification setting for the server              |
+
+
+## Read-only conversation commands (Full mode)
+
+Send `!codeman status` for the exact mapped session status. `!codeman history` shows recent role-separated, timestamped turns, with a cursor command to load older turns. `!codeman transcript` downloads the bounded user-visible transcript. These commands never type a prompt or consume a model turn.
+
+Claude and Codex readers use an exact native UUID, including SSH sessions. Python 3 must be installed on the host containing the transcript. Custom CLAUDE_CONFIG_DIR/CODEX_HOME overrides are honored. Missing or ambiguous identity/transcripts, unsupported CLIs and containers report history unavailable, without guessing from a shared working directory or terminal redraws. At most the last 2 MB of complete JSONL rows are read; truncated history is explicitly labeled. Only user/assistant text is exported: reasoning, tool calls/results, synthetic/system context and sidechains are excluded. Cursors are bound to conversation and row identity; after conversation replacement, request history again.
