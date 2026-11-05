@@ -2251,7 +2251,9 @@ export class WebServer extends EventEmitter {
           const session = result.session?.id ? this.sessions.get(result.session.id) : undefined;
           if (!session) throw new Error('Session creation refused');
           if (!this.discordBridge.acceptsControls) throw new Error('Bridge disabled before agent launch');
-          await session.startInteractive();
+          if (getCli(session.mode)?.capabilities.startMode === 'shell') await session.startShell();
+          else await session.startInteractive();
+          ctx.persistSessionStateNow(session);
           return session.id;
         };
       },

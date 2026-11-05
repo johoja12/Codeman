@@ -1,3 +1,4 @@
+import { getCli } from './config/cli-registry/registry.js';
 import { nativeExecutions, type DiscordNativeExecution } from './discord-native-execution.js';
 /** Read-only, exact-conversation history. No cwd guesses, model turns, tool results or reasoning. */
 import { execFile } from 'node:child_process';
@@ -85,9 +86,9 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Bounded inventory and bounded tail. Exact UUID only; ambiguous copies are unavailable. */
 const HISTORY_SCRIPT = String.raw`
 import os,sys,json,stat,base64
-s=json.loads(sys.argv[1]);mode=s['mode'];ident=s['id'];limit=2*1024*1024
-root=os.path.expanduser(s.get('home') or os.environ.get('CLAUDE_CONFIG_DIR' if mode=='claude' else 'CODEX_HOME') or ('~/.claude' if mode=='claude' else '~/.codex'))
-root=os.path.join(root,'projects' if mode=='claude' else 'sessions');found=[];count=0
+s=json.loads(sys.argv[1]);mode=s['format'];ident=s['id'];limit=2*1024*1024
+root=os.path.expanduser(s.get('home') or os.environ.get('CLAUDE_CONFIG_DIR' if mode=='claude-jsonl' else 'CODEX_HOME') or ('~/.claude' if mode=='claude-jsonl' else '~/.codex'))
+root=os.path.join(root,'projects' if mode=='claude-jsonl' else 'sessions');found=[];count=0
 for parent,dirs,files in os.walk(root,followlinks=False):
  dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(parent,d))]
  depth=os.path.relpath(parent,root).count(os.sep)
@@ -95,7 +96,7 @@ for parent,dirs,files in os.walk(root,followlinks=False):
  for name in files:
   count+=1
   if count>16384: raise Exception('inventory limit')
-  match=(name==ident+'.jsonl') if mode=='claude' else name.endswith('-'+ident+'.jsonl')
+  match=(name==ident+'.jsonl') if mode=='claude-jsonl' else name.endswith('-'+ident+'.jsonl')
   if not match: continue
   path=os.path.join(parent,name)
   if os.path.islink(path) or not stat.S_ISREG(os.lstat(path).st_mode): continue
@@ -106,7 +107,7 @@ try:
  info=os.fstat(f)
  if not stat.S_ISREG(info.st_mode): raise Exception('not regular')
  head=os.read(f,65536).split(b'\n')[0]
- if mode=='codex':
+ if mode=='codex-rollout':
   meta=json.loads(head)
   if meta.get('type')!='session_meta' or meta.get('payload',{}).get('id')!=ident: raise Exception('identity mismatch')
  offset=max(0,info.st_size-limit);os.lseek(f,offset,0);data=os.read(f,limit)
@@ -120,16 +121,22 @@ try:
 finally: os.close(f)
 `;
 export function discordHistoryCommand(source: DiscordHistorySource): string {
-  if (!source.conversationId || !UUID.test(source.conversationId) || !['claude', 'codex'].includes(source.mode))
+  const format = getCli(source.mode)?.capabilities.transcript;
+  if (
+    !source.conversationId ||
+    !UUID.test(source.conversationId) ||
+    !['claude-jsonl', 'codex-rollout'].includes(format ?? '')
+  )
     throw new Error('Exact Claude/Codex conversation identity is unavailable');
   return withRemotePathBootstrap(
     'python3 -c ' +
       shellescape(HISTORY_SCRIPT) +
       ' ' +
-      shellescape(JSON.stringify({ mode: source.mode, id: source.conversationId, home: source.configHome }))
+      shellescape(JSON.stringify({ format, id: source.conversationId, home: source.configHome }))
   );
 }
 export function parseDiscordHistory(source: DiscordHistorySource, raw: string): DiscordHistory {
+  const format = getCli(source.mode)?.capabilities.transcript;
   const packet = JSON.parse(raw) as { offset: number; data: string; partial: boolean };
   if (
     !Number.isSafeInteger(packet.offset) ||
@@ -161,14 +168,14 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
     if (source.includeTools) {
       let output = '';
       if (
-        source.mode === 'codex' &&
+        format === 'codex-rollout' &&
         e.type === 'response_item' &&
         e.payload?.type === 'function_call_output' &&
         typeof e.payload.output === 'string'
       )
         output = e.payload.output;
       if (
-        source.mode === 'claude' &&
+        format === 'claude-jsonl' &&
         e.type === 'user' &&
         !e.isSidechain &&
         (!e.sessionId || e.sessionId === source.conversationId) &&
@@ -198,7 +205,7 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
           cursor: `${source.conversationId}:${offset}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`,
         });
     }
-    if (source.mode === 'codex') {
+    if (format === 'codex-rollout') {
       const msg = codexMessageFromLine(codexVisibleRow(e));
       if (!msg || (msg.injectionProne && isCodexInjectedContext(msg.text))) continue;
       role = msg.role;
@@ -246,7 +253,7 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
     });
   }
   const executions = nativeExecutions(
-    source.mode,
+    format ?? 'none',
     source.conversationId!,
     rows.map((r) => ({
       value: r.value,
@@ -279,11 +286,12 @@ export async function readDiscordSessionHistory(
   session: import('./session.js').Session,
   options?: { includeTools?: boolean }
 ): Promise<DiscordHistory> {
+  const format = getCli(session.mode)?.capabilities.transcript;
   let id =
-    session.mode === 'claude'
+    format === 'claude-jsonl'
       ? session.claudeSessionId
       : (session.nativeResumeId ?? session.codexConfig?.resumeSessionId);
-  const key = session.mode === 'claude' ? 'CLAUDE_CONFIG_DIR' : 'CODEX_HOME';
+  const key = format === 'claude-jsonl' ? 'CLAUDE_CONFIG_DIR' : 'CODEX_HOME';
   let configHome = session.envOverrideValue(key) ?? (!session.remote ? process.env[key] : undefined);
   if (configHome && !configHome.startsWith('~/'))
     configHome = session.remote
@@ -291,7 +299,7 @@ export async function readDiscordSessionHistory(
         ? configHome
         : posix.resolve(session.remote.remotePath, configHome)
       : resolve(session.workingDir, configHome);
-  if (session.mode === 'codex' && !session.remote) {
+  if (format === 'codex-rollout' && !session.remote) {
     const { findOwnedCodexConversation, resolveEffectiveCodexHome } =
       await import('./checkpoint-conversation-identity.js');
     id =
