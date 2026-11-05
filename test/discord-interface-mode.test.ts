@@ -18,6 +18,7 @@ const cfg = {
   mode: 'full' as const,
   categoryId: '666666666666666666',
   onChannelDelete: 'delete' as const,
+  onSessionDelete: 'delete' as const,
   token: 'fake-test-token',
   guildId: '111111111111111111',
   parentChannelId: '222222222222222222',
@@ -30,6 +31,8 @@ let posts: Array<{ path: string; method: string; body?: any }>;
 let sendInput: ReturnType<typeof vi.fn>;
 let sequence: number;
 let remoteChannels: Map<string, any>;
+let remoteMessages: Map<string, any>;
+const BOT = '888888888888888888';
 
 function makeBridge(
   fetchOverride?: DiscordFetch,
@@ -45,11 +48,23 @@ function makeBridge(
       const path = url.pathname;
       const body = init.body ? JSON.parse(String(init.body)) : undefined;
       posts.push({ path, method, body } as any);
-      if (method === 'GET' && path.endsWith('/channels')) return Response.json([...remoteChannels.values()]);
-      if (method === 'GET')
-        return Response.json(
-          remoteChannels.get(path.split('/').pop()!) ?? { id: path.split('/').pop(), type: 4, guild_id: cfg.guildId }
-        );
+      if (method === 'GET' && path.endsWith('/users/@me')) return Response.json({ id: BOT });
+      if (method === 'GET' && path.endsWith('/channels'))
+        return Response.json([...remoteChannels.values()].filter((c) => c.type === 0));
+      const messageMatch = /\/channels\/(\d+)\/messages(?:\/(\d+))?$/.exec(path);
+      if (method === 'GET' && messageMatch) {
+        if (!messageMatch[2])
+          return Response.json([...remoteMessages.values()].filter((m) => m.channel_id === messageMatch[1]));
+        const m = remoteMessages.get(messageMatch[2]);
+        return m ? Response.json(m) : Response.json({}, { status: 404 });
+      }
+      if (method === 'GET') {
+        const id = path.split('/').pop()!;
+        const c = remoteChannels.get(id);
+        if (c) return Response.json(c);
+        if (remoteMessages.has(id)) return Response.json({}, { status: 404 });
+        return Response.json({ id, type: 4, guild_id: cfg.guildId });
+      }
       if (method === 'POST' && path.endsWith('/channels')) {
         const result = fetchOverride
           ? await fetchOverride(url, init)
@@ -60,8 +75,42 @@ function makeBridge(
         remoteChannels.set(c.id, c);
         return Response.json(c);
       }
+      if (method === 'POST' && messageMatch && !messageMatch[2]) {
+        const existing = body.nonce
+          ? [...remoteMessages.values()].find((m) => m.nonce === body.nonce && m.channel_id === messageMatch[1])
+          : undefined;
+        if (existing) return Response.json(existing);
+        const m = {
+          ...body,
+          id: String(555555555555555440n + BigInt(sequence++)),
+          channel_id: messageMatch[1],
+          author: { id: BOT },
+        };
+        remoteMessages.set(m.id, m);
+        return Response.json(m);
+      }
+      const thread = /\/channels\/(\d+)\/messages\/(\d+)\/threads$/.exec(path);
+      if (method === 'POST' && thread) {
+        const c = {
+          ...body,
+          id: thread[2],
+          parent_id: thread[1],
+          guild_id: cfg.guildId,
+          type: 11,
+          owner_id: BOT,
+          thread_metadata: { archived: false, locked: false },
+        };
+        remoteChannels.set(c.id, c);
+        return Response.json(c);
+      }
       const id = path.split('/').pop()!;
-      if (method === 'PATCH') Object.assign(remoteChannels.get(id) ?? {}, body);
+      if (method === 'PATCH') {
+        const c = remoteChannels.get(id);
+        if (c) {
+          Object.assign(c, body);
+          if (c.thread_metadata && typeof body.archived === 'boolean') c.thread_metadata.archived = body.archived;
+        }
+      }
       if (method === 'DELETE') remoteChannels.delete(id);
       return Response.json({ id: '444444444444444444' });
     },
@@ -72,12 +121,12 @@ function makeBridge(
 }
 const creations = () => posts.filter((p) => p.method === 'POST' && p.path.endsWith('/channels'));
 async function readFullMap(dir: string): Promise<Record<string, string>> {
-  const raw = JSON.parse(await readFile(join(dir, 'discord-channels.json'), 'utf8').catch(() => '{}'));
+  const raw = JSON.parse(await readFile(join(dir, 'discord-case-threads.json'), 'utf8').catch(() => '{}'));
   const current = await readDiscordConfig(dir);
   return Object.fromEntries(
     Object.values(raw.entries ?? {})
-      .filter((e: any) => e.state === 'active' && e.categoryId === current.categoryId)
-      .map((e: any) => [e.sessionId, e.channelId])
+      .filter((e: any) => e.phase === 'active' && e.categoryId === current.categoryId)
+      .map((e: any) => [e.sessionId, e.starterId])
   );
 }
 
@@ -91,6 +140,7 @@ beforeEach(async () => {
   posts = [];
   sequence = 0;
   remoteChannels = new Map();
+  remoteMessages = new Map();
   sendInput = vi.fn(async () => true);
   await writeDiscordConfig(dir, cfg);
 });
@@ -100,6 +150,105 @@ afterEach(async () => {
 });
 
 describe('Discord interface mode', () => {
+  it('groups a case into one parent with exact session-thread input and safe parent selection', async () => {
+    const caseKey = 'a'.repeat(64);
+    const control = vi.fn(async () => ({ text: 'Management ready' }));
+    const b = makeBridge(undefined, { caseForSession: async () => ({ key: caseKey, name: 'saif' }), control });
+    await b.reload();
+    await b.syncSessions();
+    const map = await readFullMap(dir);
+    const parent = [...remoteChannels.values()].find((c) => c.type === 0)!;
+    expect(creations()).toHaveLength(1);
+    expect([...remoteChannels.values()].filter((c) => c.type === 11)).toHaveLength(2);
+    expect(remoteChannels.get(map.s1).parent_id).toBe(parent.id);
+    expect(remoteChannels.get(map.s2).parent_id).toBe(parent.id);
+    const m = {
+      id: '900000000000000001',
+      guild_id: cfg.guildId,
+      channel_id: parent.id,
+      author: { id: cfg.allowedUserIds[0] },
+      content: 'do this',
+    };
+    await b.onGatewayMessage(m);
+    expect(sendInput).not.toHaveBeenCalled();
+    const selection = posts.find((p) => p.body?.content?.includes('Nothing was submitted'))!;
+    expect(selection.path).toContain(parent.id);
+    expect(selection.body.content).toContain('<#' + map.s1 + '>');
+    expect(selection.body.content).toContain('<#' + map.s2 + '>');
+    await b.onGatewayMessage({ ...m, id: '900000000000000002', content: '!codeman sessions' });
+    expect(control).toHaveBeenCalledExactlyOnceWith('__case__:' + caseKey, 'sessions');
+    await b.onGatewayMessage({ ...m, id: '900000000000000005', content: '!codeman stream verbose' });
+    await b.onGatewayMessage({ ...m, id: '900000000000000006', content: '!codeman file /work/file.txt' });
+    expect(control).toHaveBeenCalledTimes(1);
+    expect(posts.some((p) => p.body?.content?.includes('Open a session thread for task'))).toBe(true);
+
+    await b.onGatewayMessage({ ...m, id: '900000000000000003', channel_id: map.s1, content: 'first' });
+    await b.onGatewayMessage({ ...m, id: '900000000000000004', channel_id: map.s2, content: 'second' });
+    expect(sendInput.mock.calls).toEqual([
+      ['s1', 'first\r'],
+      ['s2', 'second\r'],
+    ]);
+    sessions = sessions.filter((s) => s.id !== 's1');
+    await b.sessionDeleted('s1');
+    expect(remoteChannels.has(parent.id)).toBe(true);
+    expect(remoteChannels.has(map.s2)).toBe(true);
+    expect(remoteChannels.has(map.s1)).toBe(false);
+  });
+  it('keeps historical and live sibling output in their own threads within one case', async () => {
+    let fresh = false;
+    const history = async (id: string) => ({
+      conversationId: 'native-' + id,
+      partial: false,
+      turns: [
+        { cursor: id + ':1', role: 'assistant' as const, text: 'historical-' + id, timestamp: '' },
+        ...(fresh ? [{ cursor: id + ':2', role: 'assistant' as const, text: 'live-' + id, timestamp: '' }] : []),
+      ],
+    });
+    const b = makeBridge(undefined, { caseForSession: async () => ({ key: 'a'.repeat(64), name: 'saif' }), history });
+    await b.reload();
+    await b.syncSessions();
+    const map = await readFullMap(dir);
+    fresh = true;
+    await b.pollConversations();
+    for (const id of ['s1', 's2']) {
+      const historyPost = posts.find((p) => p.body?.content?.includes('historical-' + id));
+      const livePost = posts.find((p) => p.body?.content?.includes('live-' + id));
+      expect(historyPost?.path).toContain('/' + map[id] + '/messages');
+      expect(livePost?.path).toContain('/' + map[id] + '/messages');
+    }
+    expect(creations()).toHaveLength(1);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+  it('preserves old per-session channels and notification maps without accepting their input or sweeping them', async () => {
+    const legacyScope = JSON.stringify([cfg.guildId, cfg.parentChannelId]);
+    const legacyThreads = { s1: '777777777777777777' };
+    const legacy = JSON.stringify({
+      parentChannelId: cfg.parentChannelId,
+      threads: legacyThreads,
+      scope: legacyScope,
+      scopes: { [legacyScope]: legacyThreads },
+    });
+    await writeFile(join(dir, 'discord-bridge.json'), legacy);
+    await writeFile(join(dir, 'discord-channels.json'), '{"legacy":"preserve"}');
+    await writeDiscordConfig(dir, { ...cfg, staleThreads: 'delete' });
+    const b = makeBridge();
+    await b.reload();
+    await b.syncSessions();
+    await b.onGatewayMessage({
+      id: '900000000000000001',
+      guild_id: cfg.guildId,
+      channel_id: '777777777777777777',
+      author: { id: cfg.allowedUserIds[0] },
+      content: 'old destination',
+    });
+    await b.sweepStaleThreads();
+    sessions = sessions.filter((s) => s.id !== 's1');
+    await b.sessionDeleted('s1');
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(await readFile(join(dir, 'discord-bridge.json'), 'utf8')).toBe(legacy);
+    expect(await readFile(join(dir, 'discord-channels.json'), 'utf8')).toBe('{"legacy":"preserve"}');
+    expect(posts.some((p) => p.method === 'DELETE' && p.path.endsWith('/777777777777777777'))).toBe(false);
+  });
   it('routes a full-mode channel reply to its exact session and preserves it across mode changes', async () => {
     const b = makeBridge();
     await b.reload();
@@ -260,7 +409,7 @@ describe('Discord interface mode', () => {
       guild_id: cfg.guildId,
       channel_id: map.s1,
       member: { user: { id: cfg.allowedUserIds[0] } },
-      message: { id: '444444444444444444' },
+      message: { id: [...remoteMessages.values()].findLast((m) => m.components?.length)?.id },
       data: { custom_id },
     };
     await b.onGatewayInteraction({ ...click, member: { user: { id: '999999999999999999' } } });
@@ -490,7 +639,8 @@ describe('Discord interface mode', () => {
     release();
     await sync;
     expect(await readFullMap(dir)).toEqual({});
-    expect(posts.some((p) => p.method === 'DELETE')).toBe(true);
+    expect(posts.some((p) => p.method === 'DELETE')).toBe(false);
+    expect([...remoteChannels.values()].filter((c) => c.type === 11)).toHaveLength(0);
   });
 
   it('stops discovery after switching back to Notifications during a request', async () => {
