@@ -234,10 +234,6 @@ export function registerWsRoutes(
         msg: { d: string; seq?: unknown; cid?: unknown },
         receivedAt?: ReturnType<typeof mobileInputTraceTimestamp>
       ) => {
-        if (session.assistantInputLocked) {
-          if (socket.readyState === 1) socket.send(JSON.stringify({ t: 'ia', seq: msg.seq, err: 'assistant_locked' }));
-          return;
-        }
         // Reliable delivery: when the frame carries a clientId + seq, apply it
         // exactly once (skip a duplicate redelivery) but ACK it regardless so
         // the client can drop it from its durable queue. Frames without seq
@@ -333,11 +329,6 @@ export function registerWsRoutes(
         try {
           const msg = JSON.parse(String(raw));
           if (msg.t === 'i' && typeof msg.d === 'string') {
-            if (session.assistantInputLocked) {
-              if (socket.readyState === 1)
-                socket.send(JSON.stringify({ t: 'ia', seq: msg.seq, err: 'assistant_locked' }));
-              return;
-            }
             if (inputStalled) return;
             if (msg.d.length > MAX_INPUT_LENGTH) {
               // Refused for good, so say so: a silent return left the frame

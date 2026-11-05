@@ -186,10 +186,6 @@ const ALLOWED_BRANCHES: Record<string, Allowance> = {
   "web/routes/session-routes.ts::mode !== 'pi'": allow(1, 'scaffolded-case hooks (see the opencode entry)'),
   "web/routes/session-routes.ts::mode !== 'grok'": allow(1, 'scaffolded-case hooks (see the opencode entry)'),
   // ── Downstream-only entries (local fork) ──
-  "assistant-registry.ts::mode !== 'codex'": allow(
-    1,
-    'Assistant binding validates Codex session_meta UUID, workspace and originator; no cross-provider fallback'
-  ),
   "reboot-restore.ts::mode === 'codex'": allow(
     2,
     'Codex rollout UUID evidence versus the Claude conversation chain in boot reconciliation'
