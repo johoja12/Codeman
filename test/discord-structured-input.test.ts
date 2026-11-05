@@ -17,7 +17,7 @@ describe('structured input transport', () => {
       expect(await session.writeViaMux(text, { fromUser: true, preserveWhitespace: true })).toBe(true);
       expect(sendInput).toHaveBeenCalledWith(session.id, text, { preserveWhitespace: true });
     } finally {
-      session.cancelAssistantSubmitVerification();
+      internals._submitVerifier?.cancel();
       internals._mux = undefined;
       internals._muxSession = undefined;
     }
