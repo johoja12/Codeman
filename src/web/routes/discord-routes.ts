@@ -146,6 +146,12 @@ export function registerDiscordRoutes(app: FastifyInstance, deps: DiscordRouteDe
     return { success: true, data: await status() };
   });
 
+  app.get('/api/discord/deliveries', async (req, reply) => {
+    const no = denied(req, reply);
+    if (no) return no;
+    return { success: true, data: await deps.bridge.recentDeliveries() };
+  });
+
   app.put('/api/discord', async (req, reply): Promise<ApiResponse<DiscordStatus>> => {
     const no = denied(req, reply);
     if (no) return no;

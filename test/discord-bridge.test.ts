@@ -474,7 +474,7 @@ describe('DiscordBridge', () => {
     it('turns a multi-line reply into one line and rate limits a burst', async () => {
       const b = await ready();
       await b.onGatewayMessage(reply({ content: 'a\nb' }));
-      await b.onGatewayMessage(reply({ content: 'again' }));
+      await b.onGatewayMessage(reply({ id: 'm2', content: 'again' }));
       expect(sendInput).toHaveBeenCalledTimes(1);
       expect(sendInput).toHaveBeenCalledWith('s1', 'a b\r');
       // The second reply was not typed, and the person is told so instead of it vanishing.
@@ -625,7 +625,7 @@ describe('DiscordBridge', () => {
         const path = new URL(String(url)).pathname.replace('/api/v10', '');
         posts.push({ path, method: String(init.method), body: init.body ? JSON.parse(String(init.body)) : undefined });
         if (path.endsWith('/threads')) return jsonRes({ id: THREAD });
-        if (fail && path.endsWith('/messages')) return new Response('{}', { status: 500 });
+        if (fail && path.endsWith('/messages')) return new Response('{}', { status: 403 });
         return jsonRes({ id: 'msg' });
       });
       const first = await b.notify({ ...MSG, event: 'hook:stop', fullText: async () => ({ text: 'The answer.' }) });
@@ -641,9 +641,11 @@ describe('DiscordBridge', () => {
     it('converts only what can be posted, so one very wide table cell cannot stall the server', async () => {
       const b = bridge();
       const wide = ['| a |', '|---|', `| ${'x'.repeat(1024 * 1024)} |`, ...Array(190).fill('| y |')].join('\n');
-      const t0 = Date.now();
+      const cpuBefore = process.cpuUsage();
       await b.notify({ ...MSG, event: 'hook:idle_prompt', fullText: async () => ({ text: wide, version: 'turn-1' }) });
-      expect(Date.now() - t0).toBeLessThan(500);
+      // Bound conversion CPU, not the journal's awaited durable disk I/O on a busy host.
+      const cpu = process.cpuUsage(cpuBefore);
+      expect((cpu.user + cpu.system) / 1000).toBeLessThan(500);
       const said = posts.filter((p) => p.path.endsWith('/messages')).map((p) => String(p.body?.content));
       expect(said.length).toBeLessThanOrEqual(9); // the title post plus at most 8 parts
       expect(said.at(-1)).toContain('continues in the tab');
@@ -1143,7 +1145,7 @@ describe('DiscordBridge files and startup hint', () => {
   it('types a reply that waits on a download before a later text reply', async () => {
     const b = await make();
     const slow = b.onGatewayMessage(reply({ content: 'first' }));
-    await new Promise((r) => setTimeout(r, 0)); // the first reply is under way (gate passed) before the clock moves
+    await vi.waitFor(() => expect(downloads).toHaveLength(1)); // durable claim and the first input gate have completed
     t += 5_000;
     const fast = b.onGatewayMessage(reply({ id: '555555555555555556', content: 'second', attachments: [] }));
     await Promise.all([slow, fast]);
@@ -1157,11 +1159,11 @@ describe('DiscordBridge files and startup hint', () => {
     await b.onGatewayMessage(reply({ content: '2', attachments: [] }));
     expect(sent.at(-1)?.[1]).toBe('2');
     t += 5_000;
-    await b.onGatewayMessage(reply({ content: 'yes', attachments: [] }));
+    await b.onGatewayMessage(reply({ id: '555555555555555556', content: 'yes', attachments: [] }));
     expect(sent.at(-1)?.[1]).toBe('yes\r');
     t += 5_000;
     waiting = false;
-    await b.onGatewayMessage(reply({ content: '2', attachments: [] }));
+    await b.onGatewayMessage(reply({ id: '555555555555555557', content: '2', attachments: [] }));
     expect(sent.at(-1)?.[1]).toBe('2\r');
     b.stop();
   });

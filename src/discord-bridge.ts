@@ -22,11 +22,12 @@
 
 import { existsSync, mkdirSync } from 'node:fs';
 import fs from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { probePathKind } from './utils/bounded-path-probe.js';
 import { DISCORD_RECEIVED_DIR } from './web/paste-image-gc.js';
 import WebSocket from 'ws';
+import { DiscordDeliveryError, DiscordDeliveryJournal, type DiscordDelivery } from './discord-delivery.js';
 import { WEBHOOK_SCOPES, type WebhookUrgency } from './types/push.js';
 import {
   DISCORD_MODES,
@@ -359,6 +360,8 @@ export function isDiscordCdnUrl(raw: string): boolean {
 export interface DiscordPost {
   content: string;
   allowed_mentions: { parse: string[]; users: string[] };
+  nonce?: string;
+  enforce_nonce?: boolean;
 }
 
 export function buildPost(msg: DiscordMessage, cfg: DiscordConfig, explicitUrgent = false): DiscordPost {
@@ -508,24 +511,41 @@ export class DiscordApi {
     private readonly sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms))
   ) {}
 
-  async request<T = unknown>(method: string, path: string, body?: unknown, retried = false): Promise<T | null> {
+  async request<T = unknown>(method: string, path: string, body?: unknown, attempt = 0): Promise<T | null> {
     const isForm = typeof FormData !== 'undefined' && body instanceof FormData;
-    const res = await this.fetchImpl(new URL(`${API}${path}`), {
-      method,
-      headers: {
-        Authorization: `Bot ${this.token()}`,
-        // A form body sets its own multipart Content-Type (with the boundary).
-        ...(isForm ? {} : { 'Content-Type': 'application/json' }),
-        'User-Agent': 'DiscordBot (https://github.com/Ark0N/Codeman, 1)',
-      },
-      body: body === undefined ? undefined : isForm ? (body as FormData) : JSON.stringify(body),
-      redirect: 'manual',
-      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
-    });
-    if (res.status === 429 && !retried) {
+    const payload = isForm ? JSON.parse(String((body as FormData).get('payload_json') ?? '{}')) : body;
+    const retrySafe = method !== 'POST' || !!(payload as DiscordPost | undefined)?.enforce_nonce;
+    let res: Response;
+    try {
+      res = await this.fetchImpl(new URL(`${API}${path}`), {
+        method,
+        headers: {
+          Authorization: `Bot ${this.token()}`,
+          // A form body sets its own multipart Content-Type (with the boundary).
+          ...(isForm ? {} : { 'Content-Type': 'application/json' }),
+          'User-Agent': 'DiscordBot (https://github.com/Ark0N/Codeman, 1)',
+        },
+        body: body === undefined ? undefined : isForm ? (body as FormData) : JSON.stringify(body),
+        redirect: 'manual',
+        signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+      });
+    } catch (err) {
+      // Creating a thread/channel has no idempotency key: a lost response must not create a duplicate.
+      if (!retrySafe || attempt >= 2) throw err;
+      await this.sleep(500 * 2 ** attempt);
+      return this.request<T>(method, path, body, attempt + 1);
+    }
+    if (res.status === 429 && attempt < 2) {
       const j = (await res.json().catch(() => ({}))) as { retry_after?: number };
-      await this.sleep(Math.min(Math.max((j.retry_after ?? 1) * 1000, 100), 10_000));
-      return this.request<T>(method, path, body, true);
+      const delay = Number.isFinite(j.retry_after) ? Math.max((j.retry_after ?? 1) * 1000, 100) : 1000;
+      // Never retry earlier than Discord permits. A longer wait is surfaced instead of blocking a session chain.
+      if (delay > 30_000) throw new DiscordHttpError(429);
+      await this.sleep(delay);
+      return this.request<T>(method, path, body, attempt + 1);
+    }
+    if (res.status >= 500 && retrySafe && attempt < 2) {
+      await this.sleep(500 * 2 ** attempt);
+      return this.request<T>(method, path, body, attempt + 1);
     }
     if (!res.ok) {
       const j = (await res.json().catch(() => ({}))) as { code?: number };
@@ -540,11 +560,22 @@ export class DiscordApi {
     return this.request('POST', `/channels/${parentId}/threads`, { name, type: 11, auto_archive_duration: 10080 });
   }
   post(channelId: string, p: DiscordPost): Promise<{ id: string } | null> {
-    return this.request('POST', `/channels/${channelId}/messages`, p);
+    return this.request('POST', `/channels/${channelId}/messages`, {
+      ...p,
+      nonce: p.nonce ?? randomUUID().replaceAll('-', '').slice(0, 24),
+      enforce_nonce: true,
+    });
   }
   postWithFile(channelId: string, p: DiscordPost, file: DiscordFile): Promise<{ id: string } | null> {
     const form = new FormData();
-    form.append('payload_json', JSON.stringify(p));
+    form.append(
+      'payload_json',
+      JSON.stringify({
+        ...p,
+        nonce: p.nonce ?? randomUUID().replaceAll('-', '').slice(0, 24),
+        enforce_nonce: true,
+      })
+    );
     form.append('files[0]', new Blob([Buffer.from(file.data)]), safeAttachmentName(file.name));
     return this.request('POST', `/channels/${channelId}/messages`, form);
   }
@@ -851,8 +882,12 @@ export class DiscordBridge {
   private held = false;
   /** Thread-map writes run one after another: concurrent creations must not interleave on the tmp file. */
   private persistChain: Promise<void> = Promise.resolve();
+  private mapRevision = 0;
+  private persistedMapRevision = 0;
   /** Per-thread chain of inbound messages (see onGatewayMessage). */
   private inbound = new Map<string, Promise<void>>();
+  private outbound = new Map<string, Promise<DiscordResult | null>>();
+  private pendingNotifications = 0;
   private mapLoad?: Promise<void>;
   private sweepTimer?: ReturnType<typeof setInterval>;
   /** The first full load (config, thread map, gateway), shared by every caller that arrives before it ends. */
@@ -864,9 +899,11 @@ export class DiscordBridge {
   private stopped = false;
   private readonly api: DiscordApi;
   private readonly now: () => number;
+  private readonly deliveries: DiscordDeliveryJournal;
 
   constructor(private readonly deps: DiscordBridgeDeps) {
     this.now = deps.now ?? Date.now;
+    this.deliveries = new DiscordDeliveryJournal(deps.configDir, this.now);
     this.api = new DiscordApi(() => this.cfg.token, deps.fetchImpl, deps.sleep);
   }
 
@@ -881,6 +918,9 @@ export class DiscordBridge {
   }
   get sessionSync(): DiscordSessionSync {
     return { ...this.syncState };
+  }
+  recentDeliveries(): Promise<DiscordDelivery[]> {
+    return this.deliveries.recent();
   }
 
   /** Full-mode discovery is bounded to the current session snapshot, without replaying any prompts. */
@@ -1033,6 +1073,15 @@ export class DiscordBridge {
       this.loaded = true;
     });
     await this.mapLoad;
+    try {
+      await this.deliveries.load();
+    } catch (err) {
+      this.last = this.fail(err);
+      this.gateway?.stop();
+      this.gateway = null;
+      this.gatewayToken = '';
+      throw err;
+    }
     // Threads belong to the channel they were made under: a new parent channel (or guild) starts afresh,
     // or every tab would keep posting into the old one.
     const parent = this.cfg.parentChannelId;
@@ -1095,7 +1144,7 @@ export class DiscordBridge {
             ? 'Channel not found (check the IDs)'
             : status
               ? `HTTP ${status}`
-              : err instanceof BridgeProblem
+              : err instanceof BridgeProblem || err instanceof DiscordDeliveryError
                 ? err.message
                 : (err as { name?: string })?.name === 'TimeoutError'
                   ? 'Timed out'
@@ -1104,16 +1153,34 @@ export class DiscordBridge {
   }
 
   private persistThreads(): Promise<void> {
-    this.persistChain = this.persistChain
-      .then(() => writeThreadMap(this.deps.configDir, this.threadsParent, { ...this.threads }))
-      .catch(() => undefined);
-    return this.persistChain;
+    const revision = ++this.mapRevision;
+    const parent = this.threadsParent;
+    const threads = { ...this.threads };
+    const run = this.persistChain
+      .catch(() => undefined)
+      .then(() => writeThreadMap(this.deps.configDir, parent, threads))
+      .then(() => {
+        this.persistedMapRevision = revision;
+      })
+      .catch(() => {
+        const error = new BridgeProblem('Discord session mapping could not be saved; retry after checking storage');
+        this.last = this.fail(error);
+        throw error;
+      });
+    this.persistChain = run;
+    return run;
   }
 
   /** The thread for a session, creating it when absent. Concurrent callers share one creation. */
   private threadFor(sessionId: string, name: string | undefined): Promise<string | DiscordResult> {
     const existing = this.threads[sessionId];
-    if (existing) return Promise.resolve(existing);
+    if (existing)
+      return this.persistedMapRevision < this.mapRevision
+        ? this.persistThreads().then(
+            () => existing,
+            (err) => this.fail(err)
+          )
+        : Promise.resolve(existing);
     const inflight = this.pending.get(sessionId);
     if (inflight) return inflight;
     const parent = this.cfg.parentChannelId;
@@ -1149,9 +1216,24 @@ export class DiscordBridge {
   }
 
   /** Post an alert. Session-less messages go to the parent channel. Never throws. */
-  async notify(
+  notify(msg: DiscordMessage, opts: { urgent?: boolean; deliberate?: boolean } = {}): Promise<DiscordResult | null> {
+    if (this.pendingNotifications >= 128)
+      return Promise.resolve(this.fail(new BridgeProblem('Discord delivery queue is full')));
+    this.pendingNotifications++;
+    const key = msg.sessionId ?? '@general';
+    const run = (this.outbound.get(key) ?? Promise.resolve())
+      .then(() => this.notifyNow(msg, opts))
+      .catch((err) => (this.last = this.fail(err)));
+    this.outbound.set(key, run);
+    return run.finally(() => {
+      this.pendingNotifications--;
+      if (this.outbound.get(key) === run) this.outbound.delete(key);
+    });
+  }
+
+  private async notifyNow(
     msg: DiscordMessage,
-    opts: { urgent?: boolean; deliberate?: boolean } = {}
+    opts: { urgent?: boolean; deliberate?: boolean }
   ): Promise<DiscordResult | null> {
     const explicitUrgent = opts.urgent === true;
     await this.ensureLoaded();
@@ -1181,7 +1263,7 @@ export class DiscordBridge {
           const key = `${got?.version ?? ''}\u0000${text}`;
           msg = { ...msg, tail: undefined };
           if (this.lastFull.get(sid) !== key) {
-            chunks = splitForDiscord(tablesToCodeBlocks(text.slice(0, MAX_CONVERTED_TEXT)));
+            chunks = splitForDiscord(tablesToCodeBlocks(text.slice(0, MAX_CONVERTED_TEXT)), 1450);
             posted = key;
           } // else: said already, so only the header goes
         }
@@ -1191,7 +1273,8 @@ export class DiscordBridge {
     }
     const post = buildPost(msg, this.cfg, explicitUrgent);
     // One post when the head and the first part fit together, the rest follow without a ping.
-    if (chunks.length > 0 && post.content.length + 1 + chunks[0].length <= MAX_CONTENT) {
+    if (chunks.length > 0) {
+      post.content = clip(post.content, 350);
       post.content += `\n${chunks.shift()}`;
     }
     // Claimed just before the first post and given back if it fails, so an alert for the same tab that
@@ -1201,10 +1284,14 @@ export class DiscordBridge {
       let target = this.cfg.parentChannelId;
       if (msg.sessionId) {
         const thread = await this.threadFor(msg.sessionId, msg.sessionName);
-        if (typeof thread !== 'string') return (this.last = thread);
+        if (typeof thread !== 'string') {
+          this.lastSent.delete(key);
+          return (this.last = thread);
+        }
         target = thread;
       }
-      const send = (to: string) => (msg.file ? this.api.postWithFile(to, post, msg.file) : this.api.post(to, post));
+      const deliveryKey = !opts.deliberate && posted ? `${msg.sessionId}:${posted}` : randomUUID();
+      const send = (to: string) => this.deliverPost(to, post, msg.file, msg.sessionId, `${deliveryKey}:0`);
       if (posted && msg.sessionId) {
         claimed = { sid: msg.sessionId, before: this.lastFull.get(msg.sessionId) };
         this.lastFull.set(msg.sessionId, posted);
@@ -1216,16 +1303,25 @@ export class DiscordBridge {
         if (msg.sessionId && err instanceof DiscordHttpError && err.status === 404) {
           delete this.threads[msg.sessionId];
           const fresh = await this.threadFor(msg.sessionId, msg.sessionName);
-          if (typeof fresh !== 'string') return (this.last = fresh);
+          if (typeof fresh !== 'string')
+            throw new BridgeProblem(fresh.error ?? 'Could not recreate the session thread');
           await send(fresh);
         } else {
           throw err;
         }
       }
-      // Parts 2 to 8 are best effort on purpose: the first post, which carries the title, is what is reported.
-      for (const part of chunks) await this.say(this.threads[msg.sessionId ?? ''] ?? target, part);
+      // Every part must be delivered; a missing tail must never be reported as a successful response.
+      for (const [i, part] of chunks.entries())
+        await this.deliverPost(
+          this.threads[msg.sessionId ?? ''] ?? target,
+          { content: part, allowed_mentions: { parse: [], users: [] } },
+          undefined,
+          msg.sessionId,
+          `${deliveryKey}:${i + 1}`
+        );
       return (this.last = { ok: true, at: this.now() });
     } catch (err) {
+      this.lastSent.delete(key);
       if (claimed) {
         if (claimed.before === undefined) this.lastFull.delete(claimed.sid);
         else this.lastFull.set(claimed.sid, claimed.before);
@@ -1307,6 +1403,45 @@ export class DiscordBridge {
     else if (this.cfg.onSessionDelete === 'archive') await this.api.archive(thread).catch(() => undefined);
   }
 
+  private async deliverPost(
+    channelId: string,
+    post: DiscordPost,
+    file: DiscordFile | undefined,
+    sessionId: string | undefined,
+    key: string
+  ): Promise<unknown> {
+    const id = createHash('sha256').update(`${this.cfg.guildId}:${channelId}:${key}`).digest('hex');
+    const claim = await this.deliveries.claim({
+      id,
+      direction: 'outbound',
+      sessionId,
+      channelId,
+      guildId: this.cfg.guildId,
+    });
+    if (!claim.fresh && claim.record.state === 'delivered') return;
+    if (!claim.fresh && ['uncertain', 'submitting'].includes(claim.record.state)) {
+      throw new BridgeProblem('Previous Discord delivery is uncertain; it will not be replayed automatically');
+    }
+    await this.deliveries.update(id, 'submitting');
+    const payload = { ...post, nonce: id.slice(0, 24), enforce_nonce: true };
+    try {
+      const result = file
+        ? await this.api.postWithFile(channelId, payload, file)
+        : await this.api.post(channelId, payload);
+      if (!result?.id) throw new BridgeProblem('Discord did not confirm delivery');
+      await this.deliveries.update(id, 'delivered');
+      return result;
+    } catch (err) {
+      const refused = err instanceof DiscordHttpError && err.status < 500;
+      await this.deliveries.update(
+        id,
+        refused ? 'failed' : 'uncertain',
+        refused ? 'discord_refused' : 'delivery_uncertain'
+      );
+      throw err;
+    }
+  }
+
   private say(channelId: string, content: string): Promise<unknown> {
     return this.api.post(channelId, { content, allowed_mentions: { parse: [], users: [] } }).catch(() => undefined);
   }
@@ -1370,39 +1505,98 @@ export class DiscordBridge {
 
   /** Every gate here drops silently: a stranger learns nothing. */
   private async handleMessage(m: GatewayMessage): Promise<void> {
-    if (!this.cfg.enabled || m.author?.bot) return;
+    if (!this.cfg.enabled || this.stopped || m.author?.bot) return;
     if (m.guild_id !== this.cfg.guildId) return;
     if (!this.cfg.allowedUserIds.includes(m.author?.id)) return;
     const sessionId = Object.keys(this.threads).find((k) => this.threads[k] === m.channel_id);
-    if (!sessionId) return;
-    const t = this.now();
-    const prev = this.lastReply.get(sessionId);
-    if (prev !== undefined && t - prev < REPLY_MIN_INTERVAL_MS) {
-      // Too soon after the last reply: say it was not typed, instead of dropping it silently.
-      await this.api.react(m.channel_id, m.id, '⏳').catch(() => undefined);
+    if (!sessionId || typeof m.id !== 'string' || !m.id || m.id.length > 100) return;
+    if (!m.content?.trim() && !m.attachments?.length) return;
+    const id = `in:${m.guild_id}:${m.id}`;
+    let claim;
+    try {
+      claim = await this.deliveries.claim({
+        id,
+        direction: 'inbound',
+        sessionId,
+        channelId: m.channel_id,
+        guildId: m.guild_id!,
+      });
+    } catch {
+      await this.say(m.channel_id, 'Input is paused because delivery tracking is unavailable. Nothing was typed.');
       return;
     }
-    if (this.deps.agentExited?.(sessionId)) {
-      await this.say(m.channel_id, 'The agent in that tab has exited, so nothing was typed.');
+    if (!claim.fresh) {
+      // Redelivery must never submit the same task twice, even after a process restart.
+      await this.api
+        .react(m.channel_id, m.id, claim.record.state === 'input_accepted' ? '✅' : '⏳')
+        .catch(() => undefined);
       return;
     }
-    this.lastReply.set(sessionId, t);
-    const saved = await this.saveAttachments(sessionId, m);
-    const text = sanitiseReply(m.content ?? '', saved.paths);
-    if (!text) {
+    try {
+      const t = this.now();
+      const prev = this.lastReply.get(sessionId);
+      if (prev !== undefined && t - prev < REPLY_MIN_INTERVAL_MS) {
+        await this.deliveries.update(id, 'failed', 'rate_limited');
+        await this.api.react(m.channel_id, m.id, '⏳').catch(() => undefined);
+        await this.say(
+          m.channel_id,
+          'That reply arrived too quickly and was not typed. Please send it again as a new message.'
+        );
+        return;
+      }
+      if (this.deps.agentExited?.(sessionId)) {
+        await this.deliveries.update(id, 'failed', 'session_unavailable');
+        await this.say(
+          m.channel_id,
+          'The agent in that tab has exited, so nothing was typed. Reconnect or recover it first.'
+        );
+        return;
+      }
+      this.lastReply.set(sessionId, t);
+      const saved = await this.saveAttachments(sessionId, m);
+      const text = sanitiseReply(m.content ?? '', saved.paths);
       if (saved.refused) await this.say(m.channel_id, saved.refused);
-      return;
+      if (!text || saved.refused) {
+        await this.deliveries.update(id, 'failed', saved.refused ? 'transfer_failed' : 'empty');
+        if (text && saved.refused)
+          await this.say(
+            m.channel_id,
+            'Nothing was typed because an attachment failed. Send a new message after fixing the transfer.'
+          );
+        return;
+      }
+      await this.deliveries.update(id, 'files_transferred');
+      // Persist the submission boundary before the final live routing check.
+      await this.deliveries.update(id, 'submitting');
+      // Downloads can wait: recheck routing and permission immediately before any terminal write.
+      if (
+        !this.cfg.enabled ||
+        this.stopped ||
+        this.cfg.guildId !== m.guild_id ||
+        !this.cfg.allowedUserIds.includes(m.author.id) ||
+        this.threads[sessionId] !== m.channel_id ||
+        this.deps.agentExited?.(sessionId)
+      ) {
+        await this.deliveries.update(id, 'failed', 'scope_changed');
+        await this.say(m.channel_id, 'The session or Discord configuration changed. Nothing was typed.');
+        return;
+      }
+      const keys = /^\d\r$/.test(text) && this.deps.awaitingChoice?.(sessionId) ? text.slice(0, -1) : text;
+      // A crash beyond the durable boundary is ambiguous; never retry the whole input.
+      const ok = await this.deps.sendInput(sessionId, keys);
+      await this.deliveries.update(id, ok ? 'input_accepted' : 'uncertain', ok ? undefined : 'input_uncertain');
+      if (ok) await this.api.react(m.channel_id, m.id, '✅').catch(() => undefined);
+      else
+        await this.say(
+          m.channel_id,
+          'Delivery is uncertain: the tab may be gone or disconnected. Check the terminal before sending again; this message will not be replayed automatically.'
+        );
+    } catch {
+      await this.deliveries.update(id, 'uncertain', 'input_uncertain').catch(() => undefined);
+      await this.say(
+        m.channel_id,
+        'Delivery could not be confirmed. Check the session before sending again; this message will not be replayed automatically.'
+      );
     }
-    if (saved.refused) await this.say(m.channel_id, saved.refused);
-    // A lone digit answers a dialog by itself: an Enter after it would land on whatever comes next.
-    const keys = /^\d\r$/.test(text) && this.deps.awaitingChoice?.(sessionId) ? text.slice(0, -1) : text;
-    const ok = await this.deps.sendInput(sessionId, keys).catch(() => false);
-    const reply = ok
-      ? this.api.react(m.channel_id, m.id, '✅')
-      : this.api.post(m.channel_id, {
-          content: 'That tab is gone, so nothing was typed.',
-          allowed_mentions: { parse: [], users: [] },
-        });
-    await reply.catch(() => undefined);
   }
 }

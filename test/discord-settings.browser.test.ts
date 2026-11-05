@@ -43,6 +43,8 @@ describe('Discord interface mode Settings', () => {
   it('round-trips mode through curl without enabling or exposing a token', async () => {
     const get = JSON.parse((await exec('curl', ['-fsS', `${base}/api/discord`])).stdout);
     expect(get.data).toMatchObject({ enabled: false, mode: 'notifications', sessionSync: { state: 'idle' } });
+    const deliveries = JSON.parse((await exec('curl', ['-fsS', `${base}/api/discord/deliveries`])).stdout);
+    expect(deliveries).toEqual({ success: true, data: [] });
     const put = JSON.parse(
       (
         await exec('curl', [
