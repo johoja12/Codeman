@@ -8,7 +8,7 @@ it('requires native Codex turn IDs, and does not let queued input steal prior co
     { value: { type: 'event_msg', payload: { type: 'user_message' } }, cursor: '2' },
     { value: { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn1' } }, cursor: '3' },
   ];
-  expect(nativeExecutions('codex', 'native', rows, [turn('1'), turn('2')]).map((x) => x.state)).toEqual([
+  expect(nativeExecutions('codex-rollout', 'native', rows, [turn('1'), turn('2')]).map((x) => x.state)).toEqual([
     'completed',
     'submitted',
   ]);
@@ -23,7 +23,7 @@ it('requires Claude parent ancestry and excludes foreign/sidechain completion', 
     },
     { value: { type: 'assistant', parentUuid: 'elsewhere', message: { stop_reason: 'end_turn' } }, cursor: '4' },
   ];
-  expect(nativeExecutions('claude', 'native', rows, [turn('1')])[0].state).toBe('running');
+  expect(nativeExecutions('claude-jsonl', 'native', rows, [turn('1')])[0].state).toBe('running');
   rows.push({ value: { type: 'assistant', parentUuid: 'a', message: { stop_reason: 'end_turn' } }, cursor: '5' });
-  expect(nativeExecutions('claude', 'native', rows, [turn('1')])[0].state).toBe('completed');
+  expect(nativeExecutions('claude-jsonl', 'native', rows, [turn('1')])[0].state).toBe('completed');
 });
