@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DiscordConfig } from '../src/types/discord.js';
 import {
   buildPost,
+  MAX_REPLY_CHARS,
   DISCORD_STARTUP_HINT,
   ensureReceivedDir,
   isDiscordCdnUrl,
@@ -79,12 +80,13 @@ describe('pure rules', () => {
     expect(DISCORD_STARTUP_HINT).toContain('codeman notify');
   });
 
-  it('sanitiseReply makes one printable line plus Enter', () => {
+  it('sanitiseReply preserves line breaks and strips terminal controls', () => {
     expect(sanitiseReply('yes')).toBe('yes\r');
-    expect(sanitiseReply('line one\nline two\r\nthree')).toBe('line one line two three\r');
-    expect(sanitiseReply('a\u001b[31mb\u0000c')).toBe('a[31mbc\r');
+    expect(sanitiseReply('line one\nline two\r\nthree')).toBe('line one\nline two\nthree\r');
+    expect(sanitiseReply('a\u001b[31mb\u0000c')).toBe('abc\r');
     expect(sanitiseReply('   \n\t ')).toBeNull();
-    expect(sanitiseReply('x'.repeat(5000))!.length).toBe(1001);
+    expect(sanitiseReply('x'.repeat(5000))!.length).toBe(5001);
+    expect(sanitiseReply('x'.repeat(MAX_REPLY_CHARS + 1))).toBeNull();
   });
 
   it('threadNameFor falls back to the id and clips to 100 characters', () => {
@@ -471,12 +473,12 @@ describe('DiscordBridge', () => {
       b.stop();
     });
 
-    it('turns a multi-line reply into one line and rate limits a burst', async () => {
+    it('preserves a multi-line reply and rate limits a burst', async () => {
       const b = await ready();
       await b.onGatewayMessage(reply({ content: 'a\nb' }));
       await b.onGatewayMessage(reply({ id: 'm2', content: 'again' }));
       expect(sendInput).toHaveBeenCalledTimes(1);
-      expect(sendInput).toHaveBeenCalledWith('s1', 'a b\r');
+      expect(sendInput).toHaveBeenCalledWith('s1', 'a\nb\r');
       // The second reply was not typed, and the person is told so instead of it vanishing.
       expect(posts.some((p) => p.method === 'PUT' && p.path.includes(encodeURIComponent('⏳')))).toBe(true);
       b.stop();

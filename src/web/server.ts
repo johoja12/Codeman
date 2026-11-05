@@ -744,7 +744,7 @@ export class WebServer extends EventEmitter {
       if (!session) return false;
       // A Discord reply is a person's own input, so it names the tab like any other prompt.
       // writeViaMux already handles PTY fallback. Retrying the entire write can duplicate a partial paste.
-      return session.writeViaMux(text, { fromUser: true });
+      return session.writeViaMux(text, { fromUser: true, preserveWhitespace: true });
     },
     agentExited: (id) => !!this.sessions.get(id)?.paneExit,
     awaitingChoice: (id) => approvalInbox.listPending().some((item) => item.sessionId === id && item.kind !== 'idle'),

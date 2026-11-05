@@ -10,7 +10,7 @@ Codeman can post to a private Discord server when a session needs you, give ever
 - Posts when a session asks for permission, asks a question, goes idle or errors. Which of these a CLI can raise depends on the hooks it has: Claude Code sends a turn end (`stop`, an `info` event that posts only when **Which events** is set to Everything, and `idle_prompt`, which posts by default after the turn has waited a minute). DeepSeek Harness sends only `stop`. Codex, OMP, OpenCode, Gemini, Antigravity, Pi, Grok and Copilot send no turn end, so they reach Discord through an error, a blocked respawn, a stopped crash loop or their own `codeman notify`; Codex's permission and question dialogs are also read off its screen.
 - Posts a finished turn, and an error or blocked alert, as the CLI's whole last message, with its bold, lists and numbered questions kept (a Markdown table, which Discord cannot draw, becomes an aligned code block), split over several posts if it is long. It reads the CLI's transcript where it keeps one (Claude Code, Codex, DeepSeek Harness, OMP) and otherwise splits the screen into turns (OpenCode, Gemini, Antigravity, Pi, Grok, Copilot), which can start mid-message when a long answer has scrolled off. A shell, and a permission or question dialog, show the last lines of the screen instead, without the prompt row and status lines under them.
 - Creates one thread per tab in a single parent channel, so a reply always reaches exactly one session.
-- Types your reply into that session as a single line followed by Enter. A single digit sent while a permission or question is waiting goes as the key alone, without Enter, because the dialog acts on the keypress.
+- Pastes your reply into that session as one prompt, preserving Markdown, indentation and line breaks, then sends Enter separately. A single digit sent while a permission or question is waiting goes as the key alone, without Enter, because the dialog acts on the keypress.
 - Lets a CLI post a deliberate message (for example "press the reset button on the case") with the `codeman notify` command, which calls `POST /api/sessions/:id/discord-notify`. Each tab may post 6 a minute; past that the command says "too many messages", so a looping agent cannot ping your phone without end.
 - Saves files you attach in a thread into that tab's working folder and tells the CLI the path. A CLI can send a file back with `codeman notify "message" --file <path>`.
 - Tells each CLI about `codeman notify` (see [Telling the CLIs](#telling-the-clis)).
@@ -123,13 +123,17 @@ The text explains `codeman notify "message" --urgent`. `codeman` is on the PATH 
 
 ## Files
 
-- **Received:** files you attach to a reply from an allowed user are saved as `<working folder>/.codeman-discord/<message id>-<name>` (mode 0600) and the one-line reply the CLI sees ends with `[attached: <paths>]`. At most 5 files of 8 MB each; names are reduced to letters, digits, `.`, `_` and `-`; only Discord's own HTTPS addresses are fetched. Anything skipped is named in the thread. The folder ignores itself (it holds a `.gitignore` of `*`), so nothing in it is committed. Remote (ssh) tabs have no local folder, so no file is saved for them.
+- **Received:** files you attach to a reply from an allowed user are saved as `<working folder>/.codeman-discord/<message id>-<name>` (mode 0600) and the formatted reply the CLI sees ends with `[attached: <paths>]`. At most 5 files of 8 MB each; names are reduced to letters, digits, `.`, `_` and `-`; only Discord's own HTTPS addresses are fetched. Anything skipped is named in the thread. The folder ignores itself (it holds a `.gitignore` of `*`), so nothing in it is committed. Remote (ssh) tabs have no local folder, so no file is saved for them.
 - **Sent:** `codeman notify "message" --file <path>` uploads a regular file of at most 8 MB. The real path (symlinks followed) must be inside the tab's working folder, and a file on the attachment blocklist (`.env`, keys under `.ssh`, Codeman's own state) is refused even there, which stops an upload of something sensitive by mistake. The agent runs as your user, so this is a guard against accidents, not a sandbox. Remote tabs cannot send files.
 - A downloaded file is untrusted content: only allowed users can send one, but a CLI that opens it is exposed to anything written inside it.
 
 ## Security model
 
 ### Delivery and retries
+
+Formatted replies preserve logical line breaks, tabs and leading/trailing blank lines in one bracketed paste, followed by one Enter. An internal whitespace-preservation option uses tmux's raw-newline paste mode instead of changing ordinary keyboard input. A direct PTY without the bracketed-paste transport refuses structured multiline input instead of submitting separate lines. Terminal control sequences are removed; Markdown remains literal text for the agent.
+
+Response chunks retain code-block language hints, close/reopen code fences and avoid splitting Unicode surrogate pairs. An outbound payload fingerprint prevents automatic multipart retries from skipping changed content after a formatter upgrade. If an existing pending response has different or legacy formatting metadata, review it before resending; the bridge refuses to guess.
 
 Inbound message IDs are durably claimed before any terminal write, including file-only replies. Duplicate gateway events reuse that claim across restart and never type the same message again. An interrupted transfer or attachment refusal prevents the prompt from being typed. A reply rejected by the one-second rate limit is explicitly reported; send a new message to retry it.
 
@@ -142,7 +146,7 @@ Delivery metadata lives in instance-scoped `discord-delivery.json`, mode 0600, w
 Admins can inspect the latest 50 records through `GET /api/discord/deliveries`. States distinguish received input, transferred files, submission in progress, transport acceptance, delivered Discord posts, failure and uncertainty. This metadata is not a durable message-body outbox: uncertain output after a long outage requires review rather than a guaranteed automatic resend. Discord's nonce deduplication only covers recent messages.
 
 - Only messages from IDs in `allowedUserIds`, in the configured guild, inside a thread Codeman created, are acted on. Everything else is dropped.
-- A reply is reduced to one line, stripped of control characters and capped in length before it is typed.
+- Replies retain line breaks and indentation; terminal escape/control sequences are removed. Replies over 20,000 characters are refused explicitly instead of being silently truncated.
 - Replies are rate limited per session.
 - A Discord outage or a bad token never affects sessions. The bridge backs off, and the last error shows in Settings.
 

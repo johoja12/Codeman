@@ -12,7 +12,7 @@
  *   - The bot token lives only in `discord.json`; it is never returned, logged, or put in an error.
  *   - Only messages from `allowedUserIds`, in `guildId`, inside a thread this bridge created, are
  *     acted on. Everything else is dropped without being read further.
- *   - A reply becomes one printable line plus Enter. Embedded newlines would submit early. A lone digit
+ *   - A reply retains Markdown and line breaks in one bracketed paste plus Enter. A lone digit
  *     while a permission or question is pending goes as the key alone (see onGatewayMessage).
  *   - Posts never ping unless `pingMode` says so, and then only the allowlisted user ids.
  *   - A Discord outage or a bad token never reaches a session: every IO path catches and backs off.
@@ -27,6 +27,7 @@ import { join } from 'node:path';
 import { probePathKind } from './utils/bounded-path-probe.js';
 import { DISCORD_RECEIVED_DIR } from './web/paste-image-gc.js';
 import WebSocket from 'ws';
+import { stripVTControlCharacters } from 'node:util';
 import { DiscordDeliveryError, DiscordDeliveryJournal, type DiscordDelivery } from './discord-delivery.js';
 import { WEBHOOK_SCOPES, type WebhookUrgency } from './types/push.js';
 import {
@@ -48,8 +49,8 @@ const GATEWAY_URL = 'wss://gateway.discord.gg/?v=10&encoding=json';
 const SEND_TIMEOUT_MS = 8000;
 const MAX_CONTENT = 1900;
 const MAX_THREAD_NAME = 100;
-/** Longest reply typed into a session; Discord allows 2000, a CLI prompt rarely needs more than this. */
-export const MAX_REPLY_CHARS = 1000;
+/** Bound structured prompts without silently truncating user instructions. */
+export const MAX_REPLY_CHARS = 20_000;
 const REPLY_MIN_INTERVAL_MS = 1000;
 const DEDUPE_WINDOW_MS = 3000;
 /** GUILDS | GUILD_MESSAGES | MESSAGE_CONTENT (privileged, switched on in the Developer Portal). */
@@ -141,18 +142,18 @@ export function maskToken(token: string): string {
 const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
 /**
- * A Discord reply as one printable line plus Enter, or null when nothing printable is left. The caller
+ * A Discord reply preserving Markdown/whitespace plus Enter, or null when empty or oversized. The caller
  * drops the Enter for a lone digit answering a pending dialog.
  */
 export function sanitiseReply(raw: string, files: string[] = []): string | null {
-  // eslint-disable-next-line no-control-regex
-  const line = raw.replace(/[\r\n\t]+/g, ' ').replace(/[\u0000-\u001f\u007f-\u009f]/g, '');
-  const trimmed = clip(line.trim(), MAX_REPLY_CHARS);
-  // Paths are ours (a working folder plus a sanitised name), appended after the cap so they are never cut.
-  const attached = files.length ? `${trimmed ? ' ' : ''}[attached: ${files.join(', ')}]` : '';
-  // eslint-disable-next-line no-control-regex
-  const out = `${trimmed}${attached}`.replace(/[\u0000-\u001f\u007f-\u009f]/g, '');
-  return out ? `${out}\r` : null;
+  // Preserve Markdown, indentation and line breaks. Never pass terminal control sequences through.
+  const text = stripVTControlCharacters(raw)
+    .replace(/\r\n?/g, '\n')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, '');
+  if (text.length > MAX_REPLY_CHARS) return null;
+  const attached = files.length ? `${text ? ' ' : ''}[attached: ${files.join(', ')}]` : '';
+  return text.trim() || attached ? `${text}${attached}\r` : null;
 }
 
 export function threadNameFor(sessionName: string | undefined, sessionId: string): string {
@@ -186,8 +187,8 @@ export const DISCORD_STARTUP_HINT =
   'Codeman note: if you are blocked on something only the user can do (a physical step such as ' +
   'pressing a button, an answer you cannot work out, or a wait that timed out), run: ' +
   'codeman notify "message that leads with the action" --urgent (lead with the action). The user reads a Discord thread for ' +
-  'this tab and their reply is typed to you as one line; a file they attach is saved and its path is ' +
-  'given in that line. Add --file <path> to send a file from your working folder. Not for routine progress.';
+  'this tab and their reply is pasted with its formatting and line breaks; a file they attach is saved and its path is ' +
+  'given in that reply. Add --file <path> to send a file from your working folder. Not for routine progress.';
 
 let activeStartupHint: string | undefined;
 /** The hint to launch Claude with, or undefined while the bridge or the setting is off. */
@@ -307,24 +308,34 @@ export function tablesToCodeBlocks(text: string): string {
  * renders on its own. At most `maxPosts`; the last carries a note when text is left over.
  */
 export function splitForDiscord(text: string, max = 1900, maxPosts = 8): string[] {
+  if (!Number.isInteger(max) || max < 128 || max > 1900 || !Number.isInteger(maxPosts) || maxPosts < 1 || maxPosts > 64)
+    throw new RangeError('Invalid Discord message chunk limits');
   const posts: string[] = [];
   let cur = '';
-  let fence = false;
+  let fence: string | null = null;
   let cut = false;
+  const budget = max - 64; // Reserve a closing fence and the explicit overflow note.
+  const opening = () => (fence === null ? '' : '```' + fence + '\n');
   const flush = () => {
-    if (cur.trim()) posts.push(fence ? `${cur.trimEnd()}\n\`\`\`` : cur.trimEnd());
-    cur = fence ? '```\n' : '';
+    if (cur.trim() && cur !== opening()) posts.push(cur.trimEnd() + (fence !== null ? '\n```' : ''));
+    cur = opening();
   };
-  const lines = text.replace(/\r\n/g, '\n').split('\n');
-  for (let line of lines) {
+  for (let line of text.replace(/\r\n?/g, '\n').split('\n')) {
     if (posts.length >= maxPosts) {
       cut = true;
       break;
     }
-    while (line.length > max - 8) {
-      if (cur.trim()) flush();
-      cur += line.slice(0, max - 8) + '\n';
-      line = line.slice(max - 8);
+    const fenceLine = /^\s*`{3}([^`]*)$/.exec(line);
+    // Carry language hints across chunks, bounded so a hostile hint cannot fill a post.
+    const nextFence: string | null = fenceLine && fence === null ? fenceLine[1].trim().slice(0, 32) : null;
+    if (fenceLine && fence === null) line = '```' + nextFence;
+    if (cur.length + line.length + 1 > budget && cur.trim() && cur !== opening()) flush();
+    while (line.length > budget - cur.length) {
+      let end = budget - cur.length;
+      // Do not split a UTF-16 surrogate pair (emoji and non-BMP characters).
+      if (end > 0 && /[\uD800-\uDBFF]/.test(line[end - 1]) && /[\uDC00-\uDFFF]/.test(line[end] ?? '')) end--;
+      cur += line.slice(0, end) + '\n';
+      line = line.slice(end);
       flush();
       if (posts.length >= maxPosts) {
         cut = true;
@@ -332,11 +343,14 @@ export function splitForDiscord(text: string, max = 1900, maxPosts = 8): string[
       }
     }
     if (cut) break;
-    if (cur.length + line.length + 1 > max - 8) flush();
-    cur += `${line}\n`;
-    if (/^\s*```/.test(line)) fence = !fence;
+    if (cur.length + line.length + 1 > budget) flush();
+    cur += line + '\n';
+    if (fenceLine) {
+      if (fence === null) fence = nextFence ?? '';
+      else if (!fenceLine[1].trim()) fence = null;
+    }
   }
-  if (!cut && cur.trim()) posts.push(cur.trimEnd());
+  if (!cut) flush();
   if (cut && posts.length > 0) posts[posts.length - 1] += '\n*(The message continues in the tab.)*';
   return posts.slice(0, maxPosts);
 }
@@ -1263,7 +1277,7 @@ export class DiscordBridge {
           const key = `${got?.version ?? ''}\u0000${text}`;
           msg = { ...msg, tail: undefined };
           if (this.lastFull.get(sid) !== key) {
-            chunks = splitForDiscord(tablesToCodeBlocks(text.slice(0, MAX_CONVERTED_TEXT)), 1450);
+            chunks = splitForDiscord(tablesToCodeBlocks(text.slice(0, MAX_CONVERTED_TEXT)), 1520);
             posted = key;
           } // else: said already, so only the header goes
         }
@@ -1411,13 +1425,19 @@ export class DiscordBridge {
     key: string
   ): Promise<unknown> {
     const id = createHash('sha256').update(`${this.cfg.guildId}:${channelId}:${key}`).digest('hex');
+    const hash = createHash('sha256').update(JSON.stringify({ content: post.content, file: file?.name }));
+    if (file) hash.update(file.data);
+    const payloadHash = hash.digest('hex');
     const claim = await this.deliveries.claim({
       id,
       direction: 'outbound',
       sessionId,
       channelId,
       guildId: this.cfg.guildId,
+      payloadHash,
     });
+    if (!claim.fresh && claim.record.payloadHash !== payloadHash)
+      throw new BridgeProblem('Response formatting changed since the previous delivery; review it before resending');
     if (!claim.fresh && claim.record.state === 'delivered') return;
     if (!claim.fresh && ['uncertain', 'submitting'].includes(claim.record.state)) {
       throw new BridgeProblem('Previous Discord delivery is uncertain; it will not be replayed automatically');
@@ -1533,6 +1553,14 @@ export class DiscordBridge {
       return;
     }
     try {
+      if ((m.content ?? '').length > MAX_REPLY_CHARS) {
+        await this.deliveries.update(id, 'failed', 'input_too_large');
+        await this.say(
+          m.channel_id,
+          `That reply exceeds ${MAX_REPLY_CHARS.toLocaleString('en-US')} characters. Nothing was typed; shorten it or attach a file.`
+        );
+        return;
+      }
       const t = this.now();
       const prev = this.lastReply.get(sessionId);
       if (prev !== undefined && t - prev < REPLY_MIN_INTERVAL_MS) {
