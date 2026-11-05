@@ -89,6 +89,23 @@ describe('Discord native history', () => {
         await rm(root, { recursive: true, force: true });
       }
     });
+  it('exports bounded tool result text only when explicitly requested, never tool arguments or reasoning', () => {
+    const data = packet([
+      { type: 'user', message: { content: [{ type: 'tool_result', content: 'visible tool output' }] } },
+      {
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'tool_use', input: { password: 'SECRET' } },
+            { type: 'thinking', thinking: 'SECRET' },
+          ],
+        },
+      },
+    ]);
+    expect(parseDiscordHistory({ mode: 'claude', conversationId: id }, data).turns).toEqual([]);
+    const verbose = parseDiscordHistory({ mode: 'claude', conversationId: id, includeTools: true }, data);
+    expect(verbose.turns.map((t) => [t.role, t.text])).toEqual([['tool', 'visible tool output']]);
+  });
   it('refuses unsupported providers and non-UUID identities before starting subprocesses', () => {
     expect(() => discordHistoryCommand({ mode: 'shell', conversationId: id })).toThrow();
     expect(() => discordHistoryCommand({ mode: 'claude', conversationId: '../../etc/passwd' })).toThrow();

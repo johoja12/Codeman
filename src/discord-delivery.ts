@@ -15,6 +15,10 @@ const STATES = [
   'files_transferred',
   'submitting',
   'input_accepted',
+  'running',
+  'completed',
+  'interrupted',
+  'execution_error',
   'delivered',
   'failed',
   'uncertain',
@@ -29,6 +33,8 @@ export interface DiscordDelivery {
   state: DiscordDeliveryState;
   /** Outbound formatting fingerprint; guards multipart retries after a formatter upgrade. */
   payloadHash?: string;
+  messageId?: string;
+  native?: { conversationId: string; promptHash: string; afterCursor?: string; userCursor?: string };
   createdAt: number;
   updatedAt: number;
   /** Fixed codes only. Never store external exception messages or prompt text here. */
@@ -117,6 +123,30 @@ export class DiscordDeliveryJournal {
           throw new DiscordDeliveryError('Invalid Discord delivery fingerprint');
         record.payloadHash = r.payloadHash;
       }
+      if (r.messageId !== undefined) {
+        if (typeof r.messageId !== 'string' || r.messageId.length > 100)
+          throw new DiscordDeliveryError('Invalid Discord message id');
+        record.messageId = r.messageId;
+      }
+      if (r.native !== undefined) {
+        if (
+          !r.native ||
+          typeof r.native.conversationId !== 'string' ||
+          r.native.conversationId.length > 100 ||
+          typeof r.native.promptHash !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(r.native.promptHash) ||
+          [r.native.afterCursor, r.native.userCursor].some(
+            (c) => c !== undefined && (typeof c !== 'string' || c.length > 200)
+          )
+        )
+          throw new DiscordDeliveryError('Invalid native execution metadata');
+        record.native = {
+          conversationId: r.native.conversationId,
+          promptHash: r.native.promptHash,
+          afterCursor: r.native.afterCursor,
+          userCursor: r.native.userCursor,
+        };
+      }
       if (['received', 'files_transferred', 'submitting'].includes(record.state)) {
         record.reason = record.state === 'submitting' ? 'restart_during_submit' : 'restart_before_submit';
         record.state = record.reason === 'restart_during_submit' ? 'uncertain' : 'failed';
@@ -189,6 +219,51 @@ export class DiscordDeliveryJournal {
     });
   }
 
+  annotate(id: string, metadata: Pick<DiscordDelivery, 'native' | 'messageId'>): Promise<void> {
+    return this.serial(async () => {
+      await this.load();
+      const before = this.records.get(id);
+      if (!before) throw new DiscordDeliveryError('Unknown delivery');
+      this.records.set(id, { ...before, ...metadata, updatedAt: this.now() });
+      try {
+        await this.persist();
+      } catch (err) {
+        this.records.set(id, before);
+        throw err;
+      }
+    });
+  }
+  async reconcileNative(sessionId: string, history: import('./discord-history.js').DiscordHistory): Promise<void> {
+    await this.load();
+    const records = [...this.records.values()]
+      .filter(
+        (r) =>
+          r.direction === 'inbound' &&
+          r.sessionId === sessionId &&
+          r.native?.conversationId === history.conversationId &&
+          ['input_accepted', 'uncertain', 'running'].includes(r.state)
+      )
+      .sort((a, b) => a.createdAt - b.createdAt);
+    const claimed = new Set(
+      [...this.records.values()].flatMap((r) => (r.native?.userCursor ? [r.native.userCursor] : []))
+    );
+    for (const record of records) {
+      const meta = record.native!;
+      const baseline = meta.afterCursor ? history.turns.findIndex((t) => t.cursor === meta.afterCursor) : -1;
+      if (meta.afterCursor && baseline < 0) continue;
+      const execution = history.executions?.find((e) =>
+        meta.userCursor
+          ? e.userCursor === meta.userCursor
+          : e.promptHash === meta.promptHash &&
+            !claimed.has(e.userCursor) &&
+            history.turns.findIndex((t) => t.cursor === e.userCursor) > baseline
+      );
+      if (!execution) continue;
+      claimed.add(execution.userCursor);
+      await this.annotate(record.id, { native: { ...meta, userCursor: execution.userCursor } });
+      if (execution.state !== 'submitted') await this.update(record.id, execution.state);
+    }
+  }
   async recent(): Promise<DiscordDelivery[]> {
     await this.load();
     await this.chain;

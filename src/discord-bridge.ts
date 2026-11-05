@@ -1,3 +1,4 @@
+import { hashDiscordPrompt } from './discord-native-execution.js';
 import { DiscordConversationProgressStore } from './discord-conversation-progress.js';
 import { renderHistory } from './discord-history.js';
 /**
@@ -640,6 +641,9 @@ export class DiscordApi {
     form.append('files[0]', new Blob([Buffer.from(file.data)]), safeAttachmentName(file.name));
     return this.request('POST', `/channels/${channelId}/messages`, form);
   }
+  editMessage(channelId: string, id: string, post: DiscordPost): Promise<unknown> {
+    return this.request('PATCH', `/channels/${channelId}/messages/${id}`, post);
+  }
   rename(threadId: string, name: string): Promise<unknown> {
     return this.request('PATCH', `/channels/${threadId}`, { name });
   }
@@ -914,11 +918,14 @@ export interface DiscordBridgeDeps {
   /** A session's working folder, where received files are saved. Undefined when it is gone or remote. */
   sessionDir?: (sessionId: string) => string | undefined;
   control?: (sessionId: string, command: string) => Promise<{ text: string; file?: DiscordFile }>;
-  history?: (sessionId: string) => Promise<import('./discord-history.js').DiscordHistory>;
+  history?: (
+    sessionId: string,
+    options?: { includeTools?: boolean }
+  ) => Promise<import('./discord-history.js').DiscordHistory>;
   saveRemoteAttachment?: (sessionId: string, name: string, bytes: Uint8Array) => Promise<string>;
   getAttachment?: (sessionId: string, path: string) => Promise<DiscordFile>;
   /** Snapshot only: never discovers or starts agents. Called after restoration is released. */
-  sessions?: () => Array<{ id: string; name?: string }>;
+  sessions?: () => Array<{ id: string; name?: string; remote?: boolean; working?: boolean }>;
   socketFactory?: SocketFactory;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -964,6 +971,10 @@ export class DiscordBridge {
   private syncQueued = false;
   private syncState: DiscordSessionSync = { state: 'idle', total: 0, ready: 0, failed: 0 };
   private stopped = false;
+  private outputTimer?: ReturnType<typeof setInterval>;
+  private outputRun?: Promise<void>;
+  private outputIndex = 0;
+  private outputDue = new Map<string, number>();
   private readonly api: DiscordApi;
   private readonly now: () => number;
   private readonly deliveries: DiscordDeliveryJournal;
@@ -1148,6 +1159,127 @@ export class DiscordBridge {
     return run;
   }
 
+  /** Bounded round-robin polling: only native text, never redraw/scrollback snapshots. */
+  pollConversations(): Promise<void> {
+    if (this.outputRun) return this.outputRun;
+    const run = (async () => {
+      if (this.stopped || this.held || !this.cfg.enabled || this.cfg.mode !== 'full' || !this.deps.history) return;
+      const sessions = this.deps.sessions?.() ?? [];
+      if (!sessions.length) return;
+      const batch = Array.from(
+        { length: Math.min(8, sessions.length) },
+        (_, i) => sessions[(this.outputIndex + i) % sessions.length]
+      );
+      this.outputIndex = (this.outputIndex + batch.length) % sessions.length;
+      for (const session of batch) {
+        if ((this.outputDue.get(session.id) ?? 0) > this.now()) continue;
+        this.outputDue.set(
+          session.id,
+          this.now() + (session.remote ? (session.working ? 10000 : 60000) : session.working ? 3000 : 15000)
+        );
+        const channel = this.channels.channelForSession(this.cfg, session.id);
+        if (!channel) continue;
+        try {
+          await this.observeConversation(session.id, channel);
+        } catch {
+          this.last = this.fail(
+            new BridgeProblem(
+              'Live output paused: transcript/delivery boundary unavailable; use status/history or retry synchronization'
+            )
+          );
+        }
+      }
+    })().finally(() => {
+      if (this.outputRun === run) this.outputRun = undefined;
+    });
+    this.outputRun = run;
+    return run;
+  }
+  private async observeConversation(sessionId: string, channel: string): Promise<void> {
+    await this.seedConversation(sessionId, channel);
+    const key = this.conversationKey(sessionId, channel);
+    if (this.conversationRuns.has(key)) return;
+    const run = (async () => {
+      let progress = await this.conversationProgress.get(key);
+      if (!progress?.seeded) return;
+      if (progress.streamOff) return;
+      const history = await this.deps.history!(sessionId, { includeTools: progress.verbose });
+      if (history.conversationId !== progress.conversationId)
+        throw new BridgeProblem('Conversation changed; synchronize history first');
+      await this.deliveries.reconcileNative(sessionId, history);
+      const at = progress.cursor ? history.turns.findIndex((t) => t.cursor === progress!.cursor) : -1;
+      if (progress.cursor && at < 0) throw new BridgeProblem('Live boundary expired; request history');
+      for (const turn of history.turns.slice(at + 1, at + 21)) {
+        if (
+          this.stopped ||
+          !this.cfg.enabled ||
+          this.cfg.mode !== 'full' ||
+          !this.destinationMatches(sessionId, channel)
+        )
+          throw new BridgeProblem('Session changed');
+        if (turn.role === 'assistant' || (turn.role === 'tool' && progress.verbose)) {
+          const chunks = splitForDiscord(
+            tablesToCodeBlocks(
+              '**' + (turn.role === 'tool' ? 'Tool output' : 'Assistant') + '** ' + turn.timestamp + '\n' + turn.text
+            )
+          );
+          for (const [i, content] of chunks.entries())
+            await this.deliverPost(
+              channel,
+              { content, allowed_mentions: { parse: [], users: [] } },
+              undefined,
+              sessionId,
+              `native:${turn.cursor}:${i}`
+            );
+          if (turn.text.length > 12000)
+            await this.deliverPost(
+              channel,
+              { content: 'Full user-visible response', allowed_mentions: { parse: [], users: [] } },
+              { name: 'response.txt', data: Buffer.from(turn.text) },
+              sessionId,
+              `native:${turn.cursor}:overflow`
+            );
+        }
+        progress = { ...progress, cursor: turn.cursor };
+        await this.conversationProgress.set(key, progress);
+      }
+      const latest = history.executions?.at(-1);
+      if (!latest) return;
+      const status = 'Latest native task: **' + latest.state.replaceAll('_', ' ') + '**';
+      const hash = createHash('sha256')
+        .update(latest.userCursor + status)
+        .digest('hex');
+      if (progress.statusHash !== hash) {
+        if (
+          this.stopped ||
+          !this.cfg.enabled ||
+          this.cfg.mode !== 'full' ||
+          !this.destinationMatches(sessionId, channel)
+        )
+          return;
+        let id = progress.statusMessageId;
+        if (id)
+          await this.api.editMessage(channel, id, { content: status, allowed_mentions: { parse: [], users: [] } });
+        else
+          id = (
+            (await this.deliverPost(
+              channel,
+              { content: status, allowed_mentions: { parse: [], users: [] } },
+              undefined,
+              sessionId,
+              `native-status:${latest.userCursor}`
+            )) as { id?: string }
+          )?.id;
+        progress = { ...progress, statusMessageId: id, statusHash: hash };
+        await this.conversationProgress.set(key, progress);
+      }
+    })().finally(() => {
+      if (this.conversationRuns.get(key) === run) this.conversationRuns.delete(key);
+    });
+    this.conversationRuns.set(key, run);
+    await run;
+  }
+
   async ensureLoaded(): Promise<void> {
     if (this.loaded) return;
     this.firstLoad ??= this.reload();
@@ -1286,6 +1418,13 @@ export class DiscordBridge {
       this.syncQueued ||= !!this.syncRun;
       void this.syncSessions().catch(() => undefined);
     }
+    if (want && this.cfg.mode === 'full' && this.deps.history && !this.outputTimer) {
+      this.outputTimer = setInterval(() => void this.pollConversations().catch(() => undefined), 5000);
+      this.outputTimer.unref();
+    } else if (!want || this.cfg.mode !== 'full') {
+      clearInterval(this.outputTimer);
+      this.outputTimer = undefined;
+    }
     if (this.gateway && this.gateway.state !== 'error' && want && want === this.gatewayToken) return;
     this.gateway?.stop();
     this.gateway = null;
@@ -1304,6 +1443,8 @@ export class DiscordBridge {
   stop(): void {
     this.stopped = true;
     this.syncQueued = false;
+    clearInterval(this.outputTimer);
+    this.outputTimer = undefined;
     clearInterval(this.sweepTimer);
     this.sweepTimer = undefined;
     this.gateway?.stop();
@@ -1474,6 +1615,17 @@ export class DiscordBridge {
         // no transcript to read: the screen tail stands in
       }
     }
+    if (
+      this.cfg.mode === 'full' &&
+      this.deps.history &&
+      msg.sessionId &&
+      msg.urgency === 'info' &&
+      !opts.deliberate &&
+      !msg.file
+    ) {
+      await this.pollConversations();
+      return { ok: true, deduped: true, at: this.now() };
+    }
     const post = buildPost(msg, this.cfg, explicitUrgent);
     // One post when the head and the first part fit together, the rest follow without a ping.
     if (chunks.length > 0) {
@@ -1593,6 +1745,7 @@ export class DiscordBridge {
    * Per-tab state goes whether or not the tab ever had a thread, so these maps cannot grow for the life of the server.
    */
   forgetTab(sessionId: string): void {
+    this.outputDue.delete(sessionId);
     this.lastReply.delete(sessionId);
     this.names.delete(sessionId);
     this.lastFull.delete(sessionId);
@@ -1643,7 +1796,7 @@ export class DiscordBridge {
     });
     if (!claim.fresh && claim.record.payloadHash !== payloadHash)
       throw new BridgeProblem('Response formatting changed since the previous delivery; review it before resending');
-    if (!claim.fresh && claim.record.state === 'delivered') return;
+    if (!claim.fresh && claim.record.state === 'delivered') return { id: claim.record.messageId };
     if (!claim.fresh && ['uncertain', 'submitting'].includes(claim.record.state)) {
       throw new BridgeProblem('Previous Discord delivery is uncertain; it will not be replayed automatically');
     }
@@ -1654,6 +1807,7 @@ export class DiscordBridge {
         ? await this.api.postWithFile(channelId, payload, file)
         : await this.api.post(channelId, payload);
       if (!result?.id) throw new BridgeProblem('Discord did not confirm delivery');
+      await this.deliveries.annotate(id, { messageId: result.id });
       await this.deliveries.update(id, 'delivered');
       return result;
     } catch (err) {
@@ -1765,7 +1919,11 @@ export class DiscordBridge {
     if (!claim.fresh) {
       // Redelivery must never submit the same task twice, even after a process restart.
       await this.api
-        .react(m.channel_id, m.id, ['input_accepted', 'delivered'].includes(claim.record.state) ? '✅' : '⏳')
+        .react(
+          m.channel_id,
+          m.id,
+          ['input_accepted', 'running', 'completed', 'delivered'].includes(claim.record.state) ? '✅' : '⏳'
+        )
         .catch(() => undefined);
       return;
     }
@@ -1780,10 +1938,31 @@ export class DiscordBridge {
       }
       if (/^!codeman(?:\s|$)/i.test(m.content ?? '')) {
         const command = (m.content ?? '').replace(/^!codeman\s*/i, '');
+        const stream = /^stream (responses|verbose|off)$/.exec(command);
+        if (stream && this.cfg.mode === 'full') {
+          await this.seedConversation(sessionId, m.channel_id);
+          const key = this.conversationKey(sessionId, m.channel_id);
+          const progress = await this.conversationProgress.get(key);
+          if (!progress) throw new BridgeProblem('History unavailable');
+          await this.conversationProgress.set(key, {
+            ...progress,
+            verbose: stream[1] === 'verbose',
+            streamOff: stream[1] === 'off',
+          });
+          await this.deliverPost(
+            m.channel_id,
+            { content: 'Live output: ' + stream[1], allowed_mentions: { parse: [], users: [] } },
+            undefined,
+            sessionId,
+            `stream-command:${m.id}`
+          );
+          await this.deliveries.update(id, 'delivered');
+          return;
+        }
         if (!/^file(?:\s|$)/i.test(command) && this.deps.control && this.cfg.mode === 'full') {
           const result = await this.deps.control(sessionId, command);
           if (!this.destinationMatches(sessionId, m.channel_id)) throw new BridgeProblem('Session changed');
-          for (const [i, content] of splitForDiscord(result.text).entries()) {
+          for (const [i, content] of splitForDiscord(tablesToCodeBlocks(result.text)).entries()) {
             await this.deliverPost(
               m.channel_id,
               { content, allowed_mentions: { parse: [], users: [] } },
@@ -1858,6 +2037,20 @@ export class DiscordBridge {
             'Nothing was typed because an attachment failed. Send a new message after fixing the transfer.'
           );
         return;
+      }
+      if (this.cfg.mode === 'full' && this.deps.history) {
+        try {
+          const baseline = await this.deps.history(sessionId);
+          await this.deliveries.annotate(id, {
+            native: {
+              conversationId: baseline.conversationId,
+              afterCursor: baseline.turns.at(-1)?.cursor,
+              promptHash: hashDiscordPrompt(text),
+            },
+          });
+        } catch {
+          /* no native proof; transport acceptance must remain unconfirmed */
+        }
       }
       await this.deliveries.update(id, 'files_transferred');
       // Persist the submission boundary before the final live routing check.

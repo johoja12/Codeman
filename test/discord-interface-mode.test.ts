@@ -193,6 +193,43 @@ describe('Discord interface mode', () => {
     expect(creations()).toHaveLength(2);
     expect(b.sessionSync.state).toBe('complete');
   });
+  it('streams new native responses once, edits task status and retains the boundary across restart', async () => {
+    let now = 100000;
+    let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+    let state: 'running' | 'completed' = 'running';
+    const history = async () => ({
+      conversationId: 'native1',
+      partial: false,
+      turns,
+      executions: turns.length ? [{ userCursor: turns[0].cursor, promptHash: 'a'.repeat(64), state }] : [],
+    });
+    sessions = [{ id: 's1', name: 'one' }];
+    const b = makeBridge(undefined, { history, now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    turns = [
+      { cursor: 'native1:1:abc', role: 'user', text: 'question', timestamp: 't' },
+      { cursor: 'native1:2:abc', role: 'assistant', text: 'fresh answer', timestamp: 't' },
+    ];
+    await b.pollConversations();
+    const answers = () => posts.filter((p) => p.body?.content?.includes('fresh answer'));
+    expect(answers()).toHaveLength(1);
+    expect(posts.some((p) => p.body?.content === 'Latest native task: **running**')).toBe(true);
+    now += 60001;
+    state = 'completed';
+    await b.pollConversations();
+    expect(answers()).toHaveLength(1);
+    expect(posts.some((p) => p.method === 'PATCH' && p.body?.content === 'Latest native task: **completed**')).toBe(
+      true
+    );
+    b.stop();
+    const again = makeBridge(undefined, { history, now: () => now });
+    await again.reload();
+    await again.syncSessions();
+    await again.pollConversations();
+    expect(answers()).toHaveLength(1);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
   it('defaults legacy and unknown config values to notifications', async () => {
     for (const mode of [undefined, 'unknown', null]) {
       await writeFile(discordConfigPath(dir), JSON.stringify({ enabled: false, mode }));
