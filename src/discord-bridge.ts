@@ -24,6 +24,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { boundedDiscordDownload } from './discord-file-transfers.js';
 import { probePathKind } from './utils/bounded-path-probe.js';
 import { DISCORD_RECEIVED_DIR } from './web/paste-image-gc.js';
 import WebSocket from 'ws';
@@ -910,6 +911,8 @@ export interface DiscordBridgeDeps {
   awaitingChoice?: (sessionId: string) => boolean;
   /** A session's working folder, where received files are saved. Undefined when it is gone or remote. */
   sessionDir?: (sessionId: string) => string | undefined;
+  saveRemoteAttachment?: (sessionId: string, name: string, bytes: Uint8Array) => Promise<string>;
+  getAttachment?: (sessionId: string, path: string) => Promise<DiscordFile>;
   /** Snapshot only: never discovers or starts agents. Called after restoration is released. */
   sessions?: () => Array<{ id: string; name?: string }>;
   socketFactory?: SocketFactory;
@@ -1585,16 +1588,21 @@ export class DiscordBridge {
     const list = m.attachments ?? [];
     if (list.length === 0) return { paths: [] };
     const dir = this.deps.sessionDir?.(sessionId);
-    if (!dir) return { paths: [], refused: 'That tab has no local folder to save files in, so no file was saved.' };
+    if (!dir && !this.deps.saveRemoteAttachment)
+      return { paths: [], refused: 'That tab has no available folder to save files in.' };
     // The message id goes into a file name, so it must be a snowflake and nothing else.
     if (!SNOWFLAKE.test(m.id)) return { paths: [], refused: 'That message could not be saved.' };
-    const target = await ensureReceivedDir(dir);
-    if (!target) return { paths: [], refused: 'The tab folder is not safe to write to, so no file was saved.' };
+    const target = dir ? await ensureReceivedDir(dir) : undefined;
+    if (dir && !target) return { paths: [], refused: 'The tab folder is not safe to write to, so no file was saved.' };
     const paths: string[] = [];
     const skipped: string[] = [];
     for (const [i, a] of list.entries()) {
       const name = safeAttachmentName(a.filename ?? 'file');
-      if (i >= MAX_FILES_PER_REPLY || !isDiscordCdnUrl(a.url) || !(a.size <= MAX_FILE_BYTES)) {
+      if (
+        i >= MAX_FILES_PER_REPLY ||
+        !isDiscordCdnUrl(a.url) ||
+        !(Number.isFinite(a.size) && a.size >= 0 && a.size <= MAX_FILE_BYTES)
+      ) {
         skipped.push(name);
         continue;
       }
@@ -1603,9 +1611,13 @@ export class DiscordBridge {
           redirect: 'manual',
           signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
         });
-        const buf = res.ok ? new Uint8Array(await res.arrayBuffer()) : null;
+        const buf = await boundedDiscordDownload(res);
         if (!buf || buf.byteLength > MAX_FILE_BYTES) {
           skipped.push(name);
+          continue;
+        }
+        if (!target) {
+          paths.push(await this.deps.saveRemoteAttachment!(sessionId, name, buf));
           continue;
         }
         const dest = join(target, `${m.id}-${name}`);
@@ -1661,7 +1673,7 @@ export class DiscordBridge {
     if (!claim.fresh) {
       // Redelivery must never submit the same task twice, even after a process restart.
       await this.api
-        .react(m.channel_id, m.id, claim.record.state === 'input_accepted' ? '✅' : '⏳')
+        .react(m.channel_id, m.id, ['input_accepted', 'delivered'].includes(claim.record.state) ? '✅' : '⏳')
         .catch(() => undefined);
       return;
     }
@@ -1672,6 +1684,36 @@ export class DiscordBridge {
           m.channel_id,
           `That reply exceeds ${MAX_REPLY_CHARS.toLocaleString('en-US')} characters. Nothing was typed; shorten it or attach a file.`
         );
+        return;
+      }
+      if (/^!codeman(?:\s|$)/i.test(m.content ?? '')) {
+        const match = /^!codeman file ([^\r\n]+)$/i.exec(m.content ?? '');
+        if (!match || !this.deps.getAttachment) {
+          await this.say(m.channel_id, 'Usage: !codeman file /absolute/path');
+          await this.deliveries.update(id, 'failed', 'invalid_command');
+          return;
+        }
+        try {
+          await this.api.react(m.channel_id, m.id, '📤').catch(() => undefined);
+          const path = match[1].replace(/^("|')(.*)\1$/, '$2');
+          const file = await this.deps.getAttachment(sessionId, path);
+          if (!this.destinationMatches(sessionId, m.channel_id)) throw new BridgeProblem('Session changed');
+          await this.deliverPost(
+            m.channel_id,
+            { content: 'Session file', allowed_mentions: { parse: [], users: [] } },
+            file,
+            sessionId,
+            `file:${m.id}`
+          );
+          await this.deliveries.update(id, 'delivered');
+          await this.api.react(m.channel_id, m.id, '✅').catch(() => undefined);
+        } catch {
+          await this.deliveries.update(id, 'failed', 'transfer_failed');
+          await this.say(
+            m.channel_id,
+            'File transfer failed. Use an existing regular file inside this session workspace, up to 8 MB; sensitive paths are blocked.'
+          );
+        }
         return;
       }
       const t = this.now();
@@ -1694,7 +1736,9 @@ export class DiscordBridge {
         return;
       }
       this.lastReply.set(sessionId, t);
+      if (m.attachments?.length) await this.api.react(m.channel_id, m.id, '📥').catch(() => undefined);
       const saved = await this.saveAttachments(sessionId, m);
+      if (saved.paths.length && !saved.refused) await this.api.react(m.channel_id, m.id, '📎').catch(() => undefined);
       const text = sanitiseReply(m.content ?? '', saved.paths);
       if (saved.refused) await this.say(m.channel_id, saved.refused);
       if (!text || saved.refused) {

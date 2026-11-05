@@ -33,6 +33,9 @@ export interface RemoteFileWriteScriptOptions {
   tmpPath: string;
   /** stderr message (exit 73) when `dir` exists but is a symlink / not a directory. */
   notADirectoryMessage: string;
+  /** Opt-in private upload directories and strict staged-file cleanup. */
+  privateDirectory?: boolean;
+  strict?: boolean;
 }
 
 /**
@@ -42,14 +45,17 @@ export interface RemoteFileWriteScriptOptions {
 export function buildRemoteFileWriteScript(opts: RemoteFileWriteScriptOptions): string {
   return withRemotePathBootstrap(
     [
+      ...(opts.strict ? ['set -eu'] : []),
       `dir=${shellescape(opts.dir)}`,
       `file=${shellescape(opts.filePath)}`,
       `tmp=${shellescape(opts.tmpPath)}`,
       `if [ -L "$dir" ] || { [ -e "$dir" ] && [ ! -d "$dir" ]; }; then echo ${shellescape(
         opts.notADirectoryMessage
       )} >&2; exit 73; fi`,
-      'if [ ! -e "$dir" ]; then mkdir "$dir"; fi',
       'umask 077',
+      'if [ ! -e "$dir" ]; then mkdir "$dir"; fi',
+      ...(opts.privateDirectory ? ['chmod 700 "$dir"'] : []),
+      ...(opts.strict ? [`trap 'rm -f "$tmp"' EXIT HUP INT TERM`] : []),
       'cat > "$tmp"',
       'mv -n "$tmp" "$file"',
       'rm -f "$tmp"',
@@ -80,6 +86,8 @@ export async function writeRemoteFileBytes(remote: SessionRemote, opts: WriteRem
     filePath: opts.filePath,
     tmpPath,
     notADirectoryMessage: opts.notADirectoryMessage,
+    privateDirectory: opts.privateDirectory,
+    strict: opts.strict,
   });
   const args = [...buildSshConnectionArgv(remote), '-o', 'ConnectTimeout=10', remoteSshTarget(remote), script];
   await new Promise<void>((resolve, reject) => {
