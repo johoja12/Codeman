@@ -1,3 +1,4 @@
+import { registerDiscordLaunchCommands } from './discord-launch-commands.js';
 import { formatDiscordTables } from './discord-tables.js';
 export { formatDiscordTables } from './discord-tables.js';
 import { discordDisplayText } from './discord-display-text.js';
@@ -322,7 +323,7 @@ export interface DiscordInteraction {
   guild_id?: string;
   channel_id?: string;
   type: number;
-  data?: { custom_id?: string };
+  data?: { custom_id?: string; id?: string; name?: string; options?: unknown[] };
   member?: { user?: { id: string } };
   user?: { id: string };
   message?: { id: string };
@@ -901,6 +902,8 @@ export interface DiscordBridgeDeps {
   caseForSession?: (sessionId: string) => Promise<DiscordCaseIdentity | undefined>;
   control?: (sessionId: string, command: string) => Promise<DiscordControlReply>;
   controlCurrent?: (sessionId: string, validity: string) => boolean;
+  launchModes?: () => string[];
+  launch?: (scope: string, caseKey: string, mode: string) => Promise<DiscordControlReply>;
   history?: (
     sessionId: string,
     options?: { includeTools?: boolean }
@@ -921,6 +924,9 @@ export class DiscordBridge {
   private loaded = false;
   private gateway: DiscordGateway | null = null;
   /** The token the running gateway was started with ('' when none). */
+  private launchCommands = new Map<string, string>();
+  private launchScope = '';
+  private launchRegistration?: Promise<void>;
   private gatewayToken = '';
   private lastSent = new Map<string, number>();
   private lastReply = new Map<string, number>();
@@ -1499,6 +1505,14 @@ export class DiscordBridge {
       clearInterval(this.outputTimer);
       this.outputTimer = undefined;
     }
+    if (want && this.cfg.mode === 'full' && this.deps.launch && this.deps.launchModes)
+      void this.syncLaunchCommands().catch((err) => {
+        this.last = this.fail(err);
+      });
+    else {
+      this.launchCommands.clear();
+      this.launchScope = '';
+    }
     if (this.gateway && this.gateway.state !== 'error' && want && want === this.gatewayToken) return;
     this.gateway?.stop();
     this.gateway = null;
@@ -1515,7 +1529,46 @@ export class DiscordBridge {
     }
   }
 
+  /** Read back guild registration before accepting a command ID from the gateway. */
+  async syncLaunchCommands(): Promise<void> {
+    if (this.launchRegistration) {
+      await this.launchRegistration.catch(() => undefined);
+      return this.syncLaunchCommands();
+    }
+    const scope = JSON.stringify([this.cfg.guildId, this.cfg.token, this.deps.launchModes?.()]);
+    if (this.launchScope === scope) return;
+    const current = () =>
+      !this.stopped &&
+      this.cfg.enabled &&
+      this.cfg.mode === 'full' &&
+      scope === JSON.stringify([this.cfg.guildId, this.cfg.token, this.deps.launchModes?.()]);
+    this.launchRegistration = (async () => {
+      this.launchCommands.clear();
+      if (!current() || !this.deps.launch) return;
+      const me = await this.api.botUserId();
+      if (!me || !current()) return;
+      const registered = await registerDiscordLaunchCommands(
+        this.api,
+        me.id,
+        this.cfg.guildId,
+        this.deps.launchModes?.() ?? [],
+        current
+      );
+      if (current()) {
+        this.launchCommands = registered;
+        this.launchScope = scope;
+      }
+    })();
+    try {
+      await this.launchRegistration;
+    } finally {
+      this.launchRegistration = undefined;
+    }
+  }
+
   stop(): void {
+    this.launchCommands.clear();
+    this.launchScope = '';
     this.stopped = true;
     this.actions.clear();
     this.syncQueued = false;
@@ -2036,6 +2089,81 @@ export class DiscordBridge {
     }
   }
   /** Gateway interactions need no slash-command registration or public callback server. */
+  private async onLaunchInteraction(m: DiscordInteraction): Promise<void> {
+    // Acknowledge before channel verification/network work (Discord's three-second deadline).
+    try {
+      await this.api.respondInteraction(m.id, m.token, { type: 5, data: { flags: 64 } });
+    } catch {
+      return;
+    }
+    const finish = (text: string) => this.api.finishInteraction(m.application_id, m.token, clip(text, 1800));
+    const channel = m.channel_id,
+      mode = m.data?.name;
+    if (
+      !channel ||
+      !mode ||
+      !m.data?.id ||
+      this.launchCommands.get(mode) !== m.data.id ||
+      !this.deps.launchModes?.().includes(mode) ||
+      m.data.options?.length ||
+      !this.deps.launch
+    ) {
+      await finish('This launch command is unavailable. No session was created.');
+      return;
+    }
+    const caseKey = this.channels.caseForChannel(this.cfg, channel);
+    const sessionId = this.channels.sessionForChannel(this.cfg, channel);
+    const scope = caseKey ? '__case__:' + caseKey : sessionId;
+    if (!scope) {
+      await finish('Use this command in a Codeman case channel or session thread.');
+      return;
+    }
+    const snapshot = this.destinationScope();
+    const user = m.member?.user?.id ?? m.user?.id;
+    try {
+      const claim = await this.deliveries.claim({
+        id: `launch:${m.guild_id}:${m.id}`,
+        direction: 'inbound',
+        sessionId: scope,
+        channelId: channel,
+        guildId: m.guild_id!,
+      });
+      if (!claim.fresh) {
+        await finish('This launch request was already received. Check the confirmation below.');
+        return;
+      }
+      if (caseKey) await this.channels.assertCaseOwned(this.cfg, caseKey, channel);
+      else await this.channels.assertOwned(this.cfg, sessionId!, channel);
+      const root = caseKey ?? (await this.deps.caseForSession?.(sessionId!))?.key;
+      if (
+        !root ||
+        this.stopped ||
+        !this.cfg.enabled ||
+        this.cfg.mode !== 'full' ||
+        snapshot !== this.destinationScope() ||
+        !user ||
+        !this.cfg.allowedUserIds.includes(user) ||
+        !this.destinationMatches(scope, channel)
+      )
+        throw new BridgeProblem('Launch context changed');
+      const result = await this.deps.launch(scope, root, mode);
+      if (
+        snapshot !== this.destinationScope() ||
+        !this.destinationMatches(scope, channel) ||
+        this.stopped ||
+        !this.cfg.enabled ||
+        this.cfg.mode !== 'full' ||
+        !this.cfg.allowedUserIds.includes(user)
+      )
+        throw new BridgeProblem('Launch context changed');
+      await this.postControlReply(scope, channel, result, `launch:${m.id}`);
+      await this.deliveries.update(`launch:${m.guild_id}:${m.id}`, 'delivered');
+      await finish(result.actions?.length ? 'Review the launch and press Confirm below.' : result.text);
+    } catch {
+      await finish('Launch could not be prepared. Check the case in the web UI and try again. No session was created.');
+    }
+  }
+
   async onGatewayInteraction(m: DiscordInteraction): Promise<void> {
     if (
       !SNOWFLAKE.test(m.id) ||
@@ -2061,6 +2189,10 @@ export class DiscordBridge {
       !this.cfg.allowedUserIds.includes(user)
     ) {
       await reply('This control is not available to this user.');
+      return;
+    }
+    if (m.type === 2) {
+      await this.onLaunchInteraction(m);
       return;
     }
     const action = m.data?.custom_id ? this.actions.get(m.data.custom_id) : undefined;

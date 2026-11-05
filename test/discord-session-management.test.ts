@@ -109,3 +109,34 @@ it('lists and locates existing sessions without model work and refuses lifecycle
   disallow();
   expect((await manager.control('scope', 'sessions'))?.text).toContain('single-user');
 });
+
+it.each(['localcase', 'remote'])(
+  'launches from exact configured %s channel identity with default placement',
+  async (name) => {
+    const { configuredDiscordCaseKey } = await import('../src/discord-case-identity.js');
+    const { manager, deps } = setup();
+    const c = (await deps.cases()).find((c) => c.name === name)!;
+    const review = await manager.launch('owned-channel', configuredDiscordCaseKey(c)!, 'codex');
+    expect(review.text).toContain(c.remote?.hostId || 'local');
+    expect(deps.create).not.toHaveBeenCalled();
+    await manager.control('owned-channel', review.actions![0].command);
+    expect(deps.create).toHaveBeenCalledExactlyOnceWith({ caseName: name, mode: 'codex', tabGroupId: undefined });
+    await manager.control('owned-channel', review.actions![0].command);
+    expect(deps.create).toHaveBeenCalledTimes(1);
+  }
+);
+it('rejects unmapped roots, duplicate case names and disabled CLIs at confirmation', async () => {
+  const { configuredDiscordCaseKey } = await import('../src/discord-case-identity.js');
+  const { manager, deps } = setup();
+  const cases = await deps.cases();
+  expect((await manager.launch('scope', 'unknown', 'codex')).actions).toBeUndefined();
+  const root = configuredDiscordCaseKey(cases[0])!;
+  const review = await manager.launch('scope', root, 'codex');
+  deps.modes = () => ['claude'];
+  await manager.control('scope', review.actions![0].command);
+  expect(deps.create).not.toHaveBeenCalled();
+  deps.modes = () => ['codex'];
+  cases.push({ name: cases[0].name, path: '/other' });
+  expect((await manager.launch('scope', root, 'codex')).actions).toBeUndefined();
+  expect(deps.create).not.toHaveBeenCalled();
+});
