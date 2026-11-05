@@ -543,60 +543,6 @@ it('stages through a real session whose first post-write capture is the torn fra
   }
 });
 
-it('preserves assistant ownership when guarded input drains after an ownership handoff', async () => {
-  let release!: () => void;
-  let locked = false;
-  const writes: string[] = [];
-  const mux = {
-    isAvailable: () => true,
-    capturePaneBuffer: (_name: string, _pane: unknown, opts: { capturedGeometry?: { cols: number; rows: number } }) => {
-      opts.capturedGeometry = { cols: 100, rows: 20 };
-      return formatPaneSnapshot(['› hello', '  GPT-6-Luna default · ~/case'], {
-        cols: 100,
-        rows: 20,
-        cursorX: 7,
-        cursorY: 0,
-      });
-    },
-    sendInput: async (_id: string, text: string, options?: { beforeDispatch?: () => boolean }) => {
-      if (options)
-        await new Promise<void>((resolve) => {
-          release = resolve;
-        });
-      if (options?.beforeDispatch && !options.beforeDispatch()) return false;
-      writes.push(text);
-      return true;
-    },
-  };
-  const session = new Session({
-    workingDir: '/tmp',
-    mode: 'codex',
-    mux,
-    muxSession: { muxName: 'codeman-test', sessionId: 'test', createdAt: 1, pid: 1 },
-  } as unknown as ConstructorParameters<typeof Session>[0]);
-  session.setAssistantInputGuard((permit) => !locked || permit === 'owner');
-  try {
-    const sending = session.submitGuardedInput(session.guardedInputSnapshot()!);
-    const queued = session.writeViaMux('human prompt');
-    const key = session.performAuxiliaryInput(async () => {
-      writes.push('key');
-    });
-    const keyResult = key.catch((error: Error) => error.message);
-    locked = true;
-    release();
-    expect(await sending).toBe(false);
-    expect(await queued).toBe(false);
-    expect(await keyResult).toBe('Assistant owns session input');
-    expect(writes).toEqual([]);
-    expect(session.guardedInputSnapshot()).toBeNull();
-    expect(await session.stageGuardedInput('human prompt')).toBe(false);
-    expect(await session.writeViaMux('delegated prompt', { assistantPermit: 'owner' })).toBe(true);
-    expect(writes).toEqual(['delegated prompt']);
-  } finally {
-    await session.stop(false);
-  }
-});
-
 it('prevents guarded Enter while a checkpoint command is in flight', async () => {
   let release!: () => void;
   const session = new Session({

@@ -184,7 +184,7 @@ always target `johoja12/Codeman`. `npm test` runs the root CI test config;
 ## Upstream 1.45 integration rules
 
 - **Agent inbox** (`web/agent-inbox.ts`, `routes/inbox-routes.ts`): posts store messages and never type into a pane. Only the receiver marks seen or acknowledges; peeks do neither. Inbox long-polls share the existing signal/output waiter budgets and hangup handling. Delete drops mail; detach keeps it. Persistence is opt-in and defaults off.
-- **Case rename** (`case-rename.ts`): hold old/new path locks, refuse pending session creation, require explicit `stopSessions` before closing live sessions, and reject an occupied destination before stopping anything. Settle the creation marker when a session enters the live map or stops. Preserve the fork's activity/assistant registration and rollback in the same path.
+- **Case rename** (`case-rename.ts`): hold old/new path locks, refuse pending session creation, require explicit `stopSessions` before closing live sessions, and reject an occupied destination before stopping anything. Settle the creation marker when a session enters the live map or stops. Preserve the fork's activity registration and rollback in the same path.
 - **Remote tmux PATH**: use `withRemoteTmuxPath()` for every remote tmux operation, including fork recovery and worker probes; shell-escape the complete script afterwards. Preserve ownership-selected sockets, resume behavior, history limits and startup mouse handling. Nested prefix reduction must precede the final `remain-on-exit failed` command.
 - **Header controls**: `header-divider.js` owns toolbar width/density; host GPU/clock readers are opt-in, bounded and cached. Keep the fork's mobile utility controls and automatic wrapped-header cap; an explicit divider width overrides that cap, and reset restores it.
 - **Palette and swipe**: palette choices follow the registry and case/container availability; launch with the fork's explicit `run({ mode })` so the toolbar mode stays unchanged. Swipes use drawn session order; keyboard shortcuts keep canonical order. Preserve grouped rail accessibility helpers.
@@ -543,7 +543,7 @@ Other key scripts: `scripts/tmux-manager.sh` (safe tmux mgmt), `scripts/tunnel.s
 
 ## Upstream 1.46 integration rules
 
-- Agent inspect/stage/submit are experimental and opt-in (`agentCoordinationEnabled`, default OFF). Guarded submits hold arriving input in order; tagged POST input retries on 409, WebSocket input ACKs only after delivery, and a full hold queue closes with 1013. Preserve assistant input ownership and checkpoint delivery through these boundaries.
+- Agent inspect/stage/submit are experimental and opt-in (`agentCoordinationEnabled`, default OFF). Guarded submits hold arriving input in order; tagged POST input retries on 409, WebSocket input ACKs only after delivery, and a full hold queue closes with 1013. Preserve checkpoint delivery through these boundaries.
 - Visible tmux frame and caret are captured together; full-history replay retains the fork's remote history and relative cursor handling. Keyboard row holds apply only to eligible local untracked sessions; viewer sizing ownership remains authoritative.
 - File links use the shared spaced/wrapped path grammar and cell mapping while retaining strict file URI resolution, originating-session preview ownership and the blocked-path one-file approval flow.
 - All settings.json read-modify-writes serialize through `mutateSettingsFile`. Tunnel exposure has its own acknowledgement, separate from the non-loopback bind flag.
