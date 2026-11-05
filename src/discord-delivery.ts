@@ -43,7 +43,8 @@ export interface DiscordDelivery {
     | 'discord_refused'
     | 'delivery_uncertain'
     | 'rate_limited'
-    | 'input_too_large';
+    | 'input_too_large'
+    | 'invalid_command';
 }
 
 export class DiscordDeliveryJournal {

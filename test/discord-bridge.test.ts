@@ -1051,7 +1051,8 @@ describe('DiscordBridge files and startup hint', () => {
     cfg: Partial<DiscordConfig> = {},
     dirFor: (id: string) => string | undefined = () => work,
     awaitingChoice?: (id: string) => boolean,
-    agentExited?: (id: string) => boolean
+    agentExited?: (id: string) => boolean,
+    transfers: Partial<import('../src/discord-bridge.js').DiscordBridgeDeps> = {}
   ) {
     const b = new DiscordBridge({
       configDir: dir,
@@ -1066,6 +1067,7 @@ describe('DiscordBridge files and startup hint', () => {
         return path.endsWith('/threads') ? jsonRes({ id: THREAD }) : jsonRes({ id: 'msg' });
       },
       sendInput: async (id, text) => (sent.push([id, text]), true),
+      ...transfers,
       sessionDir: dirFor,
       awaitingChoice,
       agentExited,
@@ -1090,6 +1092,38 @@ describe('DiscordBridge files and startup hint', () => {
   });
   afterEach(() => rmSync(work, { recursive: true, force: true }));
 
+  it('uploads to SSH before submitting only the verified remote path', async () => {
+    const upload = vi.fn(async () => '/workspace/.codeman-discord/verified.png');
+    const b = await make({}, () => undefined, undefined, undefined, { saveRemoteAttachment: upload });
+    await b.onGatewayMessage(reply());
+    expect(upload).toHaveBeenCalledWith('s1', 'shot_one.png', Buffer.from([7, 8, 9]));
+    expect(sent).toEqual([['s1', '[attached: /workspace/.codeman-discord/verified.png]\r']]);
+    b.stop();
+  });
+  it('does not submit any prompt when SSH upload fails', async () => {
+    const b = await make({}, () => undefined, undefined, undefined, {
+      saveRemoteAttachment: async () => {
+        throw new Error('offline');
+      },
+    });
+    await b.onGatewayMessage(reply({ content: 'read this' }));
+    expect(sent).toEqual([]);
+    b.stop();
+  });
+  it('routes file commands as controls even when the native agent has exited', async () => {
+    const get = vi.fn(async () => ({ name: 'answer.txt', data: new Uint8Array([1]) }));
+    const b = await make(
+      {},
+      () => work,
+      undefined,
+      () => true,
+      { getAttachment: get }
+    );
+    await b.onGatewayMessage(reply({ content: '!codeman file /workspace/a b.txt', attachments: [] }));
+    expect(get).toHaveBeenCalledWith('s1', '/workspace/a b.txt');
+    expect(sent).toEqual([]);
+    b.stop();
+  });
   it('saves an attachment under .codeman-discord and types its path, even with no text', async () => {
     const b = await make();
     await b.onGatewayMessage(reply());
@@ -1131,7 +1165,7 @@ describe('DiscordBridge files and startup hint', () => {
     const b = await make({}, () => undefined);
     await b.onGatewayMessage(reply());
     expect(sent).toHaveLength(0);
-    expect(String(posted.at(-1)?.body?.content)).toMatch(/no local folder/);
+    expect(String(posted.at(-1)?.body?.content)).toMatch(/no available folder/);
     b.stop();
   });
 

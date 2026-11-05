@@ -1,3 +1,4 @@
+import { readDiscordSessionFile, writeDiscordRemoteAttachment } from '../discord-file-transfers.js';
 /**
  * @fileoverview Codeman web server — central hub coordinating all subsystems.
  *
@@ -749,7 +750,16 @@ export class WebServer extends EventEmitter {
     agentExited: (id) => !!this.sessions.get(id)?.paneExit,
     awaitingChoice: (id) => approvalInbox.listPending().some((item) => item.sessionId === id && item.kind !== 'idle'),
     sessions: () => Array.from(this.sessions.values(), (session) => ({ id: session.id, name: session.name })),
-    // Remote (ssh) sessions keep their folder on another host, so received files have nowhere local to go.
+    getAttachment: async (id, path) => {
+      const session = this.sessions.get(id);
+      if (!session) throw new Error('Session unavailable');
+      return readDiscordSessionFile({ workingDir: session.workingDir, remote: session.remote }, path);
+    },
+    saveRemoteAttachment: async (id, name, bytes) => {
+      const remote = this.sessions.get(id)?.remote;
+      if (!remote) throw new Error('Remote session unavailable');
+      return writeDiscordRemoteAttachment(remote, name, bytes);
+    },
     sessionDir: (sessionId) => {
       const session = this.sessions.get(sessionId);
       return session && !session.remote ? session.workingDir : undefined;
