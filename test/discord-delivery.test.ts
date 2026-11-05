@@ -83,6 +83,33 @@ describe('delivery journal', () => {
     expect((await restored.recent())[0].state).toBe('input_accepted');
   });
 
+  it('reconciles an accepted prompt only with exact native identity, prompt hash and a new user cursor', async () => {
+    const journal = new DiscordDeliveryJournal(dir, () => now);
+    await journal.claim(meta);
+    await journal.update(meta.id, 'input_accepted');
+    const baseline = 'native:1:abc',
+      user = 'native:2:def';
+    await journal.annotate(meta.id, {
+      native: { conversationId: 'native', promptHash: 'a'.repeat(64), afterCursor: baseline },
+    });
+    const history = {
+      conversationId: 'native',
+      partial: false,
+      turns: [
+        { cursor: baseline, role: 'assistant' as const, text: 'old', timestamp: '' },
+        { cursor: user, role: 'user' as const, text: 'new', timestamp: '' },
+      ],
+      executions: [{ userCursor: user, promptHash: 'a'.repeat(64), state: 'completed' as const }],
+    };
+    await journal.reconcileNative('other', history);
+    expect((await journal.recent())[0].state).toBe('input_accepted');
+    await journal.reconcileNative(meta.sessionId!, { ...history, conversationId: 'other' });
+    expect((await journal.recent())[0].state).toBe('input_accepted');
+    await journal.reconcileNative(meta.sessionId!, history);
+    expect((await journal.recent())[0].state).toBe('completed');
+    const restored = new DiscordDeliveryJournal(dir, () => now);
+    expect((await restored.recent())[0].native?.userCursor).toBe(user);
+  });
   it('fails closed on corruption, oversized metadata and symlinks', async () => {
     const path = join(dir, 'discord-delivery.json');
     for (const contents of ['not JSON', '{}', 'x'.repeat(2 * 1024 * 1024 + 1)]) {

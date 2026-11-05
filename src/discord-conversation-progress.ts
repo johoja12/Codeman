@@ -8,6 +8,10 @@ export interface DiscordConversationProgress {
   seedIndex: number;
   seeded: boolean;
   cursor?: string;
+  statusMessageId?: string;
+  statusHash?: string;
+  verbose?: boolean;
+  streamOff?: boolean;
 }
 const validCursor = (v: unknown) => typeof v === 'string' && v.length <= 200 && /^[A-Za-z0-9:-]+$/.test(v);
 export class DiscordConversationProgressStore {
@@ -40,10 +44,26 @@ export class DiscordConversationProgressStore {
             p.seedIndex < 0 ||
             p.seedIndex > p.seed.length ||
             typeof p.seeded !== 'boolean' ||
-            (p.cursor !== undefined && !validCursor(p.cursor))
+            (p.cursor !== undefined && !validCursor(p.cursor)) ||
+            (p.statusMessageId !== undefined &&
+              (typeof p.statusMessageId !== 'string' || !/^\d{15,25}$/.test(p.statusMessageId))) ||
+            (p.statusHash !== undefined &&
+              (typeof p.statusHash !== 'string' || !/^[a-f0-9]{64}$/.test(p.statusHash))) ||
+            (p.verbose !== undefined && typeof p.verbose !== 'boolean') ||
+            (p.streamOff !== undefined && typeof p.streamOff !== 'boolean')
           )
             throw new Error('Invalid conversation boundary');
-          this.entries.set(key, p);
+          this.entries.set(key, {
+            conversationId: p.conversationId,
+            seed: p.seed,
+            seedIndex: p.seedIndex,
+            seeded: p.seeded,
+            cursor: p.cursor,
+            statusMessageId: p.statusMessageId,
+            statusHash: p.statusHash,
+            verbose: p.verbose,
+            streamOff: p.streamOff,
+          });
         }
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT')

@@ -750,11 +750,17 @@ export class WebServer extends EventEmitter {
     },
     agentExited: (id) => !!this.sessions.get(id)?.paneExit,
     awaitingChoice: (id) => approvalInbox.listPending().some((item) => item.sessionId === id && item.kind !== 'idle'),
-    sessions: () => Array.from(this.sessions.values(), (session) => ({ id: session.id, name: session.name })),
-    history: async (id) => {
+    sessions: () =>
+      Array.from(this.sessions.values(), (session) => ({
+        id: session.id,
+        name: session.name,
+        remote: !!session.remote,
+        working: session.isWorking,
+      })),
+    history: async (id, options) => {
       const session = this.sessions.get(id);
       if (!session) throw new Error('Session unavailable');
-      return readDiscordSessionHistory(session);
+      return readDiscordSessionHistory(session, options);
     },
     control: async (id, command) => {
       const session = this.sessions.get(id);
