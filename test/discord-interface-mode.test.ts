@@ -32,6 +32,7 @@ let sendInput: ReturnType<typeof vi.fn>;
 let sequence: number;
 let remoteChannels: Map<string, any>;
 let remoteMessages: Map<string, any>;
+let statusEditRefused: boolean;
 const BOT = '888888888888888888';
 
 function makeBridge(
@@ -52,6 +53,13 @@ function makeBridge(
       if (method === 'GET' && path.endsWith('/channels'))
         return Response.json([...remoteChannels.values()].filter((c) => c.type === 0));
       const messageMatch = /\/channels\/(\d+)\/messages(?:\/(\d+))?$/.exec(path);
+      if (method === 'PATCH' && messageMatch?.[2]) {
+        if (statusEditRefused && body?.content) return Response.json({}, { status: 403 });
+        const m = remoteMessages.get(messageMatch[2]);
+        if (!m) return Response.json({}, { status: 404 });
+        Object.assign(m, body);
+        return Response.json(m);
+      }
       if (method === 'GET' && messageMatch) {
         if (!messageMatch[2])
           return Response.json([...remoteMessages.values()].filter((m) => m.channel_id === messageMatch[1]));
@@ -141,6 +149,7 @@ beforeEach(async () => {
   sequence = 0;
   remoteChannels = new Map();
   remoteMessages = new Map();
+  statusEditRefused = false;
   sendInput = vi.fn(async () => true);
   await writeDiscordConfig(dir, cfg);
 });
@@ -363,14 +372,12 @@ describe('Discord interface mode', () => {
     await b.pollConversations();
     const answers = () => posts.filter((p) => p.body?.content?.includes('fresh answer'));
     expect(answers()).toHaveLength(1);
-    expect(posts.some((p) => p.body?.content === 'Latest native task: **running**')).toBe(true);
+    expect(posts.some((p) => p.body?.content === '⏳ Working…')).toBe(true);
     now += 60001;
     state = 'completed';
     await b.pollConversations();
     expect(answers()).toHaveLength(1);
-    expect(posts.some((p) => p.method === 'PATCH' && p.body?.content === 'Latest native task: **completed**')).toBe(
-      true
-    );
+    expect(posts.some((p) => p.method === 'PATCH' && p.body?.content === '✅ Done')).toBe(true);
     b.stop();
     const again = makeBridge(undefined, { history, now: () => now });
     await again.reload();
@@ -379,6 +386,187 @@ describe('Discord interface mode', () => {
     expect(answers()).toHaveLength(1);
     expect(sendInput).not.toHaveBeenCalled();
   });
+  it('posts clean live Markdown once across idle/stop events, polling and restart', async () => {
+    let now = 100000;
+    let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+    sessions = [{ id: 's1', name: 'one' }];
+    const history = async () => ({ conversationId: 'native1', partial: false, turns });
+    const fullText = vi.fn(async () => ({ text: '**Answer**\n- One\n- Two' }));
+    const b = makeBridge(undefined, { history, now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    turns = [
+      { cursor: 'native1:1', role: 'assistant', text: '**Answer**\n- One\n- Two', timestamp: '2026-11-06T00:00:00Z' },
+    ];
+    const msg = {
+      sessionId: 's1',
+      sessionName: 'one',
+      host: 'codeman:host',
+      event: 'hook:idle_prompt',
+      title: 'Waiting for Input',
+      body: '[one]',
+      urgency: 'warning' as const,
+      fullText,
+    };
+    await Promise.all([b.notify(msg), b.pollConversations()]);
+    now += 60001;
+    await b.notify({ ...msg, event: 'hook:stop', urgency: 'info' });
+    expect(posts.filter((p) => p.body?.content?.includes('**Answer**'))).toHaveLength(1);
+    expect(posts.find((p) => p.body?.content?.includes('**Answer**'))?.body.content).toBe('**Answer**\n- One\n- Two');
+    expect(
+      posts.some((p) => p.body?.content?.includes('Waiting for Input') || p.body?.content?.includes('2026-11-06T'))
+    ).toBe(false);
+    expect(fullText).not.toHaveBeenCalled();
+    b.stop();
+    const again = makeBridge(undefined, { history, now: () => now });
+    await again.reload();
+    await again.syncSessions();
+    await again.notify(msg);
+    expect(posts.filter((p) => p.body?.content?.includes('**Answer**'))).toHaveLength(1);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it.each(['unavailable', 'off'] as const)(
+    'retains automatic alert fallback when the native stream is %s',
+    async (state) => {
+      let offline = false;
+      const history = async () => {
+        if (offline) throw new Error('offline');
+        return {
+          conversationId: 'native1',
+          partial: false,
+          turns: [{ cursor: 'native1:1', role: 'assistant' as const, text: 'old', timestamp: '' }],
+        };
+      };
+      sessions = [{ id: 's1', name: 'one' }];
+      const b = makeBridge(undefined, { history });
+      await b.reload();
+      await b.syncSessions();
+      if (state === 'off')
+        await b.onGatewayMessage({
+          id: '900000000000000001',
+          guild_id: cfg.guildId,
+          channel_id: (await readFullMap(dir)).s1,
+          author: { id: cfg.allowedUserIds[0] },
+          content: '!codeman stream off',
+        });
+      else offline = true;
+      const r = await b.notify({
+        sessionId: 's1',
+        event: 'hook:idle_prompt',
+        title: 'Waiting for Input',
+        body: 'fallback',
+        urgency: 'warning',
+        fullText: async () => ({ text: 'fallback answer' }),
+      });
+      expect(r?.ok).toBe(true);
+      expect(
+        posts.some(
+          (p) => p.body?.content?.includes('Waiting for Input') && p.body?.content?.includes('fallback answer')
+        )
+      ).toBe(true);
+    }
+  );
+
+  it('preserves actual questions, errors and deliberate posts even when their text is in the native stream', async () => {
+    sessions = [{ id: 's1', name: 'one' }];
+    const history = async () => ({ conversationId: 'native1', partial: false, turns: [] });
+    const b = makeBridge(undefined, { history, awaitingChoice: () => true });
+    await b.reload();
+    await b.syncSessions();
+    for (const event of ['hook:elicitation_dialog', 'hook:permission_prompt', 'session:error'])
+      await b.notify({ sessionId: 's1', event, title: event, body: 'Needs attention', urgency: 'critical' });
+    await b.notify(
+      {
+        sessionId: 's1',
+        event: 'hook:idle_prompt',
+        title: 'Explicit message',
+        body: 'agent asked to send this',
+        urgency: 'warning',
+      },
+      { deliberate: true }
+    );
+    for (const label of ['hook:elicitation_dialog', 'hook:permission_prompt', 'session:error', 'Explicit message'])
+      expect(posts.some((p) => p.body?.content?.includes(label))).toBe(true);
+  });
+
+  it('reuses one editable status across tasks and recreates only a deleted status message', async () => {
+    let now = 100000;
+    let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+    let state: 'running' | 'completed' = 'running';
+    const history = async () => ({
+      conversationId: 'native1',
+      partial: false,
+      turns,
+      executions: turns.length ? [{ userCursor: turns.at(-1)!.cursor, promptHash: 'a'.repeat(64), state }] : [],
+    });
+    sessions = [{ id: 's1', name: 'one' }];
+    const b = makeBridge(undefined, { history, now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    turns = [{ cursor: 'native1:1', role: 'user', text: 'first', timestamp: '' }];
+    await b.pollConversations();
+    const statusPost = posts.find((p) => p.method === 'POST' && p.body?.content === '⏳ Working…')!;
+    const message = [...remoteMessages.values()].find((m) => m.content === '⏳ Working…')!;
+    now += 60001;
+    state = 'completed';
+    await b.pollConversations();
+    expect(
+      posts.filter((p) => p.method === 'POST' && ['⏳ Working…', '✅ Done'].includes(p.body?.content))
+    ).toHaveLength(1);
+    expect(
+      posts.some((p) => p.method === 'PATCH' && p.path.endsWith('/' + message.id) && p.body?.content === '✅ Done')
+    ).toBe(true);
+    now += 60001;
+    state = 'running';
+    turns.push({ cursor: 'native1:2', role: 'user', text: 'second', timestamp: '' });
+    await b.pollConversations();
+    expect(posts.filter((p) => p.method === 'POST' && p.body?.content === '⏳ Working…')).toHaveLength(1);
+    remoteMessages.delete(message.id);
+    now += 60001;
+    state = 'completed';
+    await b.pollConversations();
+    expect(posts.filter((p) => p.method === 'POST' && p.body?.content === '✅ Done')).toHaveLength(1);
+    expect(statusPost.path).toContain('/messages');
+  });
+
+  it('never replays a delivered response because a cosmetic status edit failed', async () => {
+    let now = 100000;
+    let state: 'running' | 'completed' = 'running';
+    let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+    const history = async () => ({
+      conversationId: 'native1',
+      partial: false,
+      turns,
+      executions: turns.length ? [{ userCursor: turns[0].cursor, promptHash: 'a'.repeat(64), state }] : [],
+    });
+    sessions = [{ id: 's1', name: 'one' }];
+    const b = makeBridge(undefined, { history, now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    turns = [{ cursor: 'native1:1', role: 'user', text: 'question', timestamp: '' }];
+    await b.pollConversations();
+    now += 60001;
+    state = 'completed';
+    statusEditRefused = true;
+    turns.push({ cursor: 'native1:2', role: 'assistant', text: 'Delivered once', timestamp: '' });
+    await b.notify({
+      sessionId: 's1',
+      event: 'hook:idle_prompt',
+      title: 'Waiting for Input',
+      body: 'one',
+      urgency: 'warning',
+      fullText: async () => ({ text: 'Delivered once' }),
+    });
+    expect(posts.filter((p) => p.method === 'POST' && p.body?.content?.includes('Delivered once'))).toHaveLength(1);
+    expect(posts.some((p) => p.body?.content?.includes('Waiting for Input'))).toBe(false);
+    statusEditRefused = false;
+    now += 60001;
+    await b.pollConversations();
+    expect(posts.some((p) => p.method === 'PATCH' && p.body?.content === '✅ Done')).toBe(true);
+    expect(posts.filter((p) => p.method === 'POST' && p.body?.content?.includes('Delivered once'))).toHaveLength(1);
+  });
+
   it('binds component clicks to the prompt, message, channel and allowlisted user and consumes once', async () => {
     const control = vi.fn(async (_id: string, command: string) =>
       command === 'pending'

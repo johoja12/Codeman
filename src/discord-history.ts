@@ -333,11 +333,11 @@ export async function readDiscordSessionHistory(
   if (discovered && !session.nativeResumeId) session.setNativeResumeId(discovered);
   return history;
 }
-export function renderHistory(turns: DiscordHistoryTurn[]): string {
+export function renderHistory(turns: DiscordHistoryTurn[], options: { includeTimestamps?: boolean } = {}): string {
   return turns
     .map(
       (t) =>
-        `**${t.role === 'user' ? 'You' : t.role === 'tool' ? 'Tool output' : 'Assistant'}** ${t.timestamp || '(time unavailable)'}\n${t.text}`
+        `**${t.role === 'user' ? 'You' : t.role === 'tool' ? 'Tool output' : 'Assistant'}**${options.includeTimestamps === false ? '' : ' ' + (t.timestamp || '(time unavailable)')}\n${t.text}`
     )
     .join('\n\n');
 }
