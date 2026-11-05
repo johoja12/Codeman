@@ -147,6 +147,79 @@ describe('Discord interface mode Settings', () => {
     await context.close();
   });
 
+  it('persists Discord through the main Save and Apply, and leaves untouched groups alone', async () => {
+    await openSettings();
+    await page.selectOption('#discordMode', 'notifications');
+    const saving = page.waitForResponse((r) => r.url().endsWith('/api/discord') && r.request().method() === 'PUT');
+    await page.locator('.set-foot [onclick="app.saveAppSettings()"]').click();
+    expect((await saving).status()).toBe(200);
+    await page.waitForFunction(() => !document.getElementById('appSettingsModal')?.classList.contains('active'));
+    expect((await (await fetch(base + '/api/discord')).json()).data.mode).toBe('notifications');
+    await openSettings();
+    await page.selectOption('#discordMode', 'full');
+    const applying = page.waitForResponse((r) => r.url().endsWith('/api/discord') && r.request().method() === 'PUT');
+    await page.locator('.set-foot [onclick="app.applyAppSettings()"]').click();
+    expect((await applying).status()).toBe(200);
+    await page.waitForFunction(() => (window as any).app._applyInFlight === false);
+    expect(await page.isVisible('#appSettingsModal')).toBe(true);
+    expect((await (await fetch(base + '/api/discord')).json()).data.mode).toBe('full');
+    let extraWrites = 0;
+    const listener = (r: import('playwright').Request) => {
+      if (r.url().endsWith('/api/discord') && r.method() === 'PUT') extraWrites++;
+    };
+    page.on('request', listener);
+    await page.locator('.set-foot [onclick="app.saveAppSettings()"]').click();
+    await page.waitForFunction(() => !document.getElementById('appSettingsModal')?.classList.contains('active'));
+    page.off('request', listener);
+    expect(extraWrites).toBe(0);
+  });
+
+  it('keeps failed Full-mode saves open, shows the missing-category error and never puts tokens in general settings', async () => {
+    await openSettings();
+    await page.selectOption('#discordMode', 'full');
+    await page.locator('label:has(#discordEnabled)').click();
+    await page.fill('#discordToken', 'fake-private-test-token');
+    await page.fill('#discordGuildId', '111111111111111111');
+    await page.fill('#discordParentChannelId', '222222222222222222');
+    await page.fill('#discordAllowedUserIds', '333333333333333333');
+    await page.fill('#discordCategoryId', '');
+    const writing = page.waitForResponse((r) => r.url().endsWith('/api/discord') && r.request().method() === 'PUT');
+    await page.locator('.set-foot [onclick="app.saveAppSettings()"]').click();
+    expect((await writing).status()).toBe(400);
+    await page.waitForFunction(() =>
+      document.getElementById('discordResult')?.textContent?.includes('Choose a case category')
+    );
+    expect(await page.isVisible('#appSettingsModal')).toBe(true);
+    expect(await page.isVisible('#discordResult')).toBe(true);
+    expect(await page.getAttribute('#discordCategoryId', 'aria-invalid')).toBe('true');
+    expect(await page.inputValue('#discordToken')).toBe('fake-private-test-token');
+    const persisted = (await (await fetch(base + '/api/discord')).json()).data;
+    expect(persisted.enabled).toBe(false);
+    expect(persisted.hasToken).toBe(false);
+    expect(await page.evaluate(() => JSON.stringify(localStorage))).not.toContain('fake-private-test-token');
+    expect(JSON.stringify(await (await fetch(base + '/api/settings')).json())).not.toContain('fake-private-test-token');
+    await page.screenshot({ path: `${screenshots}/save-error-desktop.png` });
+    await page.evaluate(() => (window as any).app.closeAppSettings());
+  });
+
+  it('saves Discord using the mobile header Save button', async () => {
+    const context = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    const mobile = await context.newPage();
+    mobile.on('pageerror', (e) => errors.push(e.message));
+    await mobile.goto(base, { waitUntil: 'domcontentloaded' });
+    await mobile.waitForFunction(() => (window as any).app?.terminal);
+    await mobile.evaluate(() => (window as any).app.openAppSettings());
+    await mobile.waitForTimeout(3500);
+    await mobile.locator('#discordMode').scrollIntoViewIfNeeded();
+    await mobile.selectOption('#discordMode', 'notifications');
+    const response = mobile.waitForResponse((r) => r.url().endsWith('/api/discord') && r.request().method() === 'PUT');
+    await mobile.locator('#appSettingsModal .set-head-save:not(.set-head-apply)').tap();
+    expect((await response).status()).toBe(200);
+    await mobile.waitForFunction(() => !document.getElementById('appSettingsModal')?.classList.contains('active'));
+    expect((await (await fetch(base + '/api/discord')).json()).data.mode).toBe('notifications');
+    await context.close();
+  });
+
   it('has no browser runtime errors', () => {
     expect(errors).toEqual([]);
   });

@@ -93,6 +93,8 @@ In the Discord mobile app set the server to **All Messages**. Discord's own push
 
 Settings → Notifications → Discord has a **Discord mode** selector, independent of the enable switch:
 
+The modal’s main **Save** and **Apply** buttons save edited Discord settings too. The group’s own **Save** remains available. Full mode requires a **Case category ID**; a rejected save keeps Settings open and brings the error into view. The bot needs **Manage Channels** and **Manage Threads**, as well as the message/thread permissions listed below.
+
 - **Notifications** (`mode: "notifications"`, the default) preserves the existing alerts and thread replies. Threads are created on the first alert, or for new tabs when **Create threads** is set to **For every new tab**.
 - **Full interface (preview)** (`mode: "full"`) creates a case channel and one thread per session for every existing session when enabled, after restart/restoration, and for each new session immediately, inside the configured case category. This overrides lazy thread creation without changing the saved Notifications preference. It does not submit a prompt or start an agent.
 

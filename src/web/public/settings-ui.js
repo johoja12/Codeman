@@ -1799,7 +1799,7 @@ Object.assign(CodemanApp.prototype, {
     const res = await this._api('/api/discord');
     let body = null;
     try { body = res && res.ok ? await res.json() : null; } catch { /* leave hidden */ }
-    if (!body || body.success === false) { group.style.display = 'none'; return; } // not an admin, or an older server
+    if (!body || body.success === false) { this._discordLoaded = null; group.style.display = 'none'; return; } // not an admin, or an older server
     const d = body.data;
     group.style.display = '';
     document.getElementById('discordEnabled').checked = d.enabled === true;
@@ -1834,6 +1834,8 @@ Object.assign(CodemanApp.prototype, {
       const when = new Date(d.lastResult.at).toLocaleString();
       line += d.lastResult.ok ? ` Last post succeeded (${when}).` : ` Last post failed (${when}): ${d.lastResult.error}`;
     }
+    this._discordLoaded = JSON.stringify(this._discordPayload());
+    document.getElementById('discordCategoryId').removeAttribute('aria-invalid');
     this._discordSay(line.trim(), d.gateway === 'error' || (d.lastResult && !d.lastResult.ok));
   },
 
@@ -1869,8 +1871,13 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
-  /** PUT the group's state. Resolves to '' on success, else the error (also shown in the group). */
-  async saveDiscord() {
+  _discordPending() {
+    const group = document.getElementById('discordGroup');
+    return !!group && group.style.display !== 'none' && typeof this._discordLoaded === 'string' &&
+      JSON.stringify(this._discordPayload()) !== this._discordLoaded;
+  },
+
+  _discordPayload() {
     const ids = document.getElementById('discordAllowedUserIds').value.split(/[\s,]+/).filter(Boolean);
     const payload = {
       enabled: document.getElementById('discordEnabled').checked,
@@ -1889,12 +1896,21 @@ Object.assign(CodemanApp.prototype, {
     };
     const token = document.getElementById('discordToken').value.trim();
     if (token) payload.token = token; // blank = keep the saved one (Remove token is the way to clear it)
+    return payload;
+  },
+
+  /** Save beside the main settings PUT; tokens never enter settings.json or localStorage. */
+  async saveDiscord() {
+    const payload = this._discordPayload();
     const res = await this._api('/api/discord', { method: 'PUT', body: payload });
     let body = null;
     try { body = res ? await res.json() : null; } catch { /* fall through */ }
     if (!res || !res.ok || !body || body.success === false) {
       const error = body?.error || 'Could not save the Discord settings.';
       this._discordSay(error, true);
+      const category = document.getElementById('discordCategoryId');
+      if (payload.enabled && payload.mode === 'full' && !payload.categoryId) category.setAttribute('aria-invalid', 'true');
+      document.getElementById('discordResult')?.scrollIntoView({ block: 'center' });
       return error;
     }
     await this.loadDiscord();
@@ -3727,6 +3743,7 @@ Object.assign(CodemanApp.prototype, {
       ...serverSettings
     } = settings;
     let webhookError = '';
+    let discordError = '';
     let saveError = '';
     let serverSaved = false;
     try {
@@ -3793,8 +3810,11 @@ Object.assign(CodemanApp.prototype, {
       // it. Only when the group was edited: an untouched group must not re-PUT. A refusal (bad URL,
       // enabled with no URL) keeps the modal open below, with the pasted URL still in the box.
       webhookError = this._webhookPending() ? await this.saveWebhook() : '';
+      discordError = this._discordPending?.() ? await this.saveDiscord() : '';
       if (saveError) {
         this.showToast(`Saved on this device, not on the server: ${saveError}`, 'warning', { duration: 0 });
+      } else if (discordError) {
+        this.showToast(`Settings saved, but not Discord: ${discordError}`, 'warning', { duration: 0 });
       } else if (webhookError) {
         this.showToast(`Settings saved, but not the webhook: ${webhookError}`, 'warning');
       } else if (syncedChangeRefused || modelConfigRefused || refusedAsNonAdmin) {
@@ -3821,7 +3841,9 @@ Object.assign(CodemanApp.prototype, {
     if (keepOpen && serverSaved) this._refreshSettingsAfterApply(settings);
 
     // A failed settings PUT keeps the modal open too, with the form as the user left it.
-    if (webhookError) {
+    if (discordError) {
+      document.getElementById('discordResult')?.scrollIntoView({ block: 'center' });
+    } else if (webhookError) {
       document.getElementById('webhookGroup')?.scrollIntoView({ block: 'center' });
     } else if (!keepOpen && !saveError) {
       this.closeAppSettings();
