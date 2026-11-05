@@ -29,6 +29,11 @@ import { DISCORD_RECEIVED_DIR } from './web/paste-image-gc.js';
 import WebSocket from 'ws';
 import { stripVTControlCharacters } from 'node:util';
 import { DiscordDeliveryError, DiscordDeliveryJournal, type DiscordDelivery } from './discord-delivery.js';
+import {
+  DiscordChannelProblem,
+  DiscordSessionChannels,
+  type DiscordManagedChannel,
+} from './discord-session-channels.js';
 import { WEBHOOK_SCOPES, type WebhookUrgency } from './types/push.js';
 import {
   DISCORD_MODES,
@@ -79,6 +84,8 @@ const FULL_TEXT_TIMEOUT_MS = 4000;
 export const DEFAULT_DISCORD_CONFIG: DiscordConfig = {
   enabled: false,
   mode: 'notifications',
+  categoryId: '',
+  onChannelDelete: 'keep',
   token: '',
   guildId: '',
   parentChannelId: '',
@@ -124,11 +131,13 @@ export function discordConfigProblem(cfg: DiscordConfig): string | null {
   if (cfg.token && (/\s/.test(cfg.token) || cfg.token.length > 200)) return 'The bot token looks wrong';
   if (cfg.guildId && !SNOWFLAKE.test(cfg.guildId)) return 'Guild ID must be a number (Copy ID in Discord)';
   if (cfg.parentChannelId && !SNOWFLAKE.test(cfg.parentChannelId)) return 'Channel ID must be a number';
+  if (cfg.categoryId && !SNOWFLAKE.test(cfg.categoryId)) return 'Session category ID must be a number';
   if (cfg.allowedUserIds.some((id) => !SNOWFLAKE.test(id))) return 'Each allowed user ID must be a number';
   if (cfg.allowedUserIds.length > 20) return 'At most 20 allowed user IDs';
   if (cfg.enabled) {
     if (!cfg.token) return 'Add the bot token before enabling';
     if (!cfg.guildId || !cfg.parentChannelId) return 'Add the guild ID and parent channel ID before enabling';
+    if (cfg.mode === 'full' && !cfg.categoryId) return 'Choose a session category before enabling Full interface mode';
     if (cfg.allowedUserIds.length === 0) return 'Add at least one allowed user ID: nobody could reply otherwise';
   }
   return null;
@@ -413,6 +422,8 @@ function coerce(raw: unknown): DiscordConfig {
   return {
     enabled: r.enabled === true,
     mode: oneOf(DISCORD_MODES, r.mode, d.mode),
+    categoryId: typeof r.categoryId === 'string' ? r.categoryId : '',
+    onChannelDelete: oneOf(['keep', 'retain', 'delete'] as const, r.onChannelDelete, d.onChannelDelete),
     token: typeof r.token === 'string' ? r.token : '',
     guildId: typeof r.guildId === 'string' ? r.guildId : '',
     parentChannelId: typeof r.parentChannelId === 'string' ? r.parentChannelId : '',
@@ -469,15 +480,34 @@ export async function writeDiscordConfig(configDir: string, cfg: DiscordConfig):
 }
 
 /** The thread map plus the parent channel it was built under. */
-async function readThreadFile(configDir: string): Promise<{ parent: string; threads: Record<string, string> }> {
+interface ThreadFile {
+  parent: string;
+  threads: Record<string, string>;
+  scope: string;
+  scopes: Record<string, Record<string, string>>;
+}
+async function readThreadFile(configDir: string): Promise<ThreadFile> {
   try {
     const raw = JSON.parse(await fs.readFile(join(configDir, THREADS_FILE), 'utf-8')) as Record<string, unknown>;
-    const threads: Record<string, string> = {};
-    const saved = typeof raw.threads === 'object' && raw.threads !== null ? raw.threads : {};
-    for (const [k, v] of Object.entries(saved)) if (typeof v === 'string' && SNOWFLAKE.test(v)) threads[k] = v;
-    return { parent: typeof raw.parentChannelId === 'string' ? raw.parentChannelId : '', threads };
-  } catch {
-    return { parent: '', threads: {} };
+    const clean = (value: unknown): Record<string, string> => {
+      const out: Record<string, string> = {};
+      if (value && typeof value === 'object')
+        for (const [k, v] of Object.entries(value)) if (typeof v === 'string' && SNOWFLAKE.test(v)) out[k] = v;
+      return out;
+    };
+    const scopes: Record<string, Record<string, string>> = {};
+    if (raw.scopes && typeof raw.scopes === 'object')
+      for (const [key, map] of Object.entries(raw.scopes)) scopes[key] = clean(map);
+    return {
+      parent: typeof raw.parentChannelId === 'string' ? raw.parentChannelId : '',
+      threads: clean(raw.threads),
+      scope: typeof raw.scope === 'string' ? raw.scope : '',
+      scopes,
+    };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
+      throw new BridgeProblem('Discord session mapping cannot be read; sync is paused');
+    return { parent: '', threads: {}, scope: '', scopes: {} };
   }
 }
 
@@ -488,10 +518,12 @@ export async function readThreadMap(configDir: string): Promise<Record<string, s
 async function writeThreadMap(
   configDir: string,
   parentChannelId: string,
-  threads: Record<string, string>
+  threads: Record<string, string>,
+  scope: string,
+  scopes: Record<string, Record<string, string>>
 ): Promise<void> {
   if (!existsSync(configDir)) mkdirSync(configDir, { recursive: true });
-  await writePrivate(join(configDir, THREADS_FILE), { parentChannelId, threads }, 0o600);
+  await writePrivate(join(configDir, THREADS_FILE), { parentChannelId, threads, scope, scopes }, 0o600);
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +604,18 @@ export class DiscordApi {
   createThread(parentId: string, name: string): Promise<{ id: string } | null> {
     // type 11 = public thread. A week of inactivity before Discord archives it.
     return this.request('POST', `/channels/${parentId}/threads`, { name, type: 11, auto_archive_duration: 10080 });
+  }
+  getChannel(id: string): Promise<DiscordManagedChannel | null> {
+    return this.request('GET', `/channels/${id}`);
+  }
+  guildChannels(id: string): Promise<DiscordManagedChannel[] | null> {
+    return this.request('GET', `/guilds/${id}/channels`);
+  }
+  createTextChannel(id: string, body: Record<string, unknown>): Promise<DiscordManagedChannel | null> {
+    return this.request('POST', `/guilds/${id}/channels`, body);
+  }
+  editChannel(id: string, body: Record<string, unknown>): Promise<unknown> {
+    return this.request('PATCH', `/channels/${id}`, body);
   }
   post(channelId: string, p: DiscordPost): Promise<{ id: string } | null> {
     return this.request('POST', `/channels/${channelId}/messages`, {
@@ -892,6 +936,8 @@ export class DiscordBridge {
   private lastFull = new Map<string, string>();
   /** The parent channel the thread map was built under. */
   private threadsParent = '';
+  private threadsScope = '';
+  private threadScopes: Record<string, Record<string, string>> = {};
   /** True from boot until the restored tabs exist (see hold). */
   private held = false;
   /** Thread-map writes run one after another: concurrent creations must not interleave on the tmp file. */
@@ -914,11 +960,19 @@ export class DiscordBridge {
   private readonly api: DiscordApi;
   private readonly now: () => number;
   private readonly deliveries: DiscordDeliveryJournal;
+  private readonly channels: DiscordSessionChannels;
 
   constructor(private readonly deps: DiscordBridgeDeps) {
     this.now = deps.now ?? Date.now;
     this.deliveries = new DiscordDeliveryJournal(deps.configDir, this.now);
     this.api = new DiscordApi(() => this.cfg.token, deps.fetchImpl, deps.sleep);
+    this.channels = new DiscordSessionChannels(deps.configDir, {
+      get: (id) => this.api.getChannel(id),
+      list: (id) => this.api.guildChannels(id),
+      create: (id, body) => this.api.createTextChannel(id, body),
+      edit: (id, body) => this.api.editChannel(id, body),
+      remove: (id) => this.api.remove(id),
+    });
   }
 
   get lastResult(): DiscordResult | null {
@@ -935,6 +989,14 @@ export class DiscordBridge {
   }
   recentDeliveries(): Promise<DiscordDelivery[]> {
     return this.deliveries.recent();
+  }
+  private destinationScope(): string {
+    return JSON.stringify([this.cfg.mode, this.cfg.guildId, this.cfg.parentChannelId, this.cfg.categoryId]);
+  }
+  private destinationMatches(id: string, channel: string): boolean {
+    return this.cfg.mode === 'full'
+      ? this.channels.channelForSession(this.cfg, id) === channel
+      : this.threads[id] === channel;
   }
 
   /** Full-mode discovery is bounded to the current session snapshot, without replaying any prompts. */
@@ -957,17 +1019,23 @@ export class DiscordBridge {
     await this.ensureLoaded();
     if (this.stopped || this.held || !this.cfg.enabled || !this.cfg.token || this.cfg.mode !== 'full')
       return this.sessionSync;
-    const parent = this.cfg.parentChannelId;
+    const parent = this.destinationScope();
     const sessions = this.deps.sessions?.() ?? [];
     this.syncState = { state: 'syncing', total: sessions.length, ready: 0, failed: 0 };
     try {
+      try {
+        await this.channels.flushRetirements(this.cfg.guildId);
+      } catch (err) {
+        this.last = this.fail(err);
+        this.syncState.failed++;
+      }
       for (const session of sessions) {
         if (
           this.stopped ||
           this.held ||
           !this.cfg.enabled ||
           this.cfg.mode !== 'full' ||
-          parent !== this.cfg.parentChannelId
+          parent !== this.destinationScope()
         ) {
           this.syncState.state = 'idle';
           return this.sessionSync;
@@ -1084,10 +1152,14 @@ export class DiscordBridge {
     this.mapLoad ??= readThreadFile(this.deps.configDir).then((saved) => {
       this.threads = { ...saved.threads, ...this.threads };
       this.threadsParent ||= saved.parent;
+      this.threadScopes = saved.scopes;
+      this.threadsScope = saved.scope || (saved.parent ? JSON.stringify([this.cfg.guildId, saved.parent]) : '');
+      if (this.threadsScope) this.threadScopes[this.threadsScope] = this.threads;
       this.loaded = true;
     });
     await this.mapLoad;
     try {
+      await this.channels.load();
       await this.deliveries.load();
     } catch (err) {
       this.last = this.fail(err);
@@ -1099,8 +1171,12 @@ export class DiscordBridge {
     // Threads belong to the channel they were made under: a new parent channel (or guild) starts afresh,
     // or every tab would keep posting into the old one.
     const parent = this.cfg.parentChannelId;
-    if (parent && parent !== this.threadsParent) {
-      this.threads = {};
+    const scope = JSON.stringify([this.cfg.guildId, parent]);
+    if (parent && scope !== this.threadsScope) {
+      if (this.threadsScope) this.threadScopes[this.threadsScope] = this.threads;
+      this.threads = this.threadScopes[scope] ?? {};
+      this.threadScopes[scope] = this.threads;
+      this.threadsScope = scope;
       this.pending.clear();
       this.closedWhilePending.clear();
       this.threadsParent = parent;
@@ -1110,6 +1186,10 @@ export class DiscordBridge {
     // A save that changed neither the switch nor the token keeps the gateway session, so it can resume.
     // A gateway that gave up (a fatal close, such as a missing intent) is replaced, or a fix could never take.
     const want = this.cfg.enabled && this.cfg.token && !this.held ? this.cfg.token : '';
+    if (want)
+      void this.channels.flushRetirements(this.cfg.guildId).catch((err) => {
+        this.last = this.fail(err);
+      });
     // Do not hold Settings saves behind a potentially large series of Discord requests.
     if (want && this.cfg.mode === 'full') {
       this.syncQueued ||= !!this.syncRun;
@@ -1150,19 +1230,23 @@ export class DiscordBridge {
     const status = err instanceof DiscordHttpError ? err.status : undefined;
     const code = err instanceof DiscordHttpError ? err.code : undefined;
     const error =
-      status === 401
-        ? 'The bot token was refused'
-        : status === 403 || code === 50001
-          ? 'The bot cannot see the parent channel (check its role and the channel ID)'
-          : status === 404
-            ? 'Channel not found (check the IDs)'
-            : status
-              ? `HTTP ${status}`
-              : err instanceof BridgeProblem || err instanceof DiscordDeliveryError
-                ? err.message
-                : (err as { name?: string })?.name === 'TimeoutError'
-                  ? 'Timed out'
-                  : 'Network error';
+      code === 30013 || code === 30030
+        ? 'Discord channel capacity reached; choose another session category or free unused channels'
+        : status === 401
+          ? 'The bot token was refused'
+          : status === 403 || code === 50001
+            ? 'The bot cannot see the parent channel (check its role and the channel ID)'
+            : status === 404
+              ? 'Channel not found (check the IDs)'
+              : status
+                ? `HTTP ${status}`
+                : err instanceof BridgeProblem ||
+                    err instanceof DiscordDeliveryError ||
+                    err instanceof DiscordChannelProblem
+                  ? err.message
+                  : (err as { name?: string })?.name === 'TimeoutError'
+                    ? 'Timed out'
+                    : 'Network error';
     return { ok: false, status, error, at: this.now() };
   }
 
@@ -1170,9 +1254,12 @@ export class DiscordBridge {
     const revision = ++this.mapRevision;
     const parent = this.threadsParent;
     const threads = { ...this.threads };
+    const scope = this.threadsScope;
+    this.threadScopes[scope] = this.threads;
+    const scopes = Object.fromEntries(Object.entries(this.threadScopes).map(([key, map]) => [key, { ...map }]));
     const run = this.persistChain
       .catch(() => undefined)
-      .then(() => writeThreadMap(this.deps.configDir, parent, threads))
+      .then(() => writeThreadMap(this.deps.configDir, parent, threads, scope, scopes))
       .then(() => {
         this.persistedMapRevision = revision;
       })
@@ -1187,6 +1274,17 @@ export class DiscordBridge {
 
   /** The thread for a session, creating it when absent. Concurrent callers share one creation. */
   private threadFor(sessionId: string, name: string | undefined): Promise<string | DiscordResult> {
+    if (this.cfg.mode === 'full') {
+      const scope = this.destinationScope();
+      return this.channels
+        .forSession(this.cfg, sessionId, name)
+        .then((id) =>
+          scope === this.destinationScope()
+            ? id
+            : this.fail(new BridgeProblem('Discord destination configuration changed'))
+        )
+        .catch((err) => this.fail(err));
+    }
     const existing = this.threads[sessionId];
     if (existing)
       return this.persistedMapRevision < this.mapRevision
@@ -1315,10 +1413,11 @@ export class DiscordBridge {
       } catch (err) {
         // The thread was deleted by hand: forget it, make a new one, once.
         if (msg.sessionId && err instanceof DiscordHttpError && err.status === 404) {
-          delete this.threads[msg.sessionId];
+          if (this.cfg.mode !== 'full') delete this.threads[msg.sessionId];
           const fresh = await this.threadFor(msg.sessionId, msg.sessionName);
           if (typeof fresh !== 'string')
             throw new BridgeProblem(fresh.error ?? 'Could not recreate the session thread');
+          target = fresh;
           await send(fresh);
         } else {
           throw err;
@@ -1327,7 +1426,7 @@ export class DiscordBridge {
       // Every part must be delivered; a missing tail must never be reported as a successful response.
       for (const [i, part] of chunks.entries())
         await this.deliverPost(
-          this.threads[msg.sessionId ?? ''] ?? target,
+          this.cfg.mode === 'full' ? target : (this.threads[msg.sessionId ?? ''] ?? target),
           { content: part, allowed_mentions: { parse: [], users: [] } },
           undefined,
           msg.sessionId,
@@ -1382,6 +1481,12 @@ export class DiscordBridge {
     this.names.set(sessionId, name ?? '');
     // First sight only records the name: the thread was made with it, so a PATCH would spend a rename for nothing.
     if (seen === undefined || seen === (name ?? '')) return;
+    if (this.cfg.enabled && this.cfg.mode === 'full') {
+      await this.channels.rename(this.cfg, sessionId, name).catch((err) => {
+        this.last = this.fail(err);
+      });
+      return;
+    }
     const thread = this.threads[sessionId];
     if (!thread || !this.cfg.enabled) return;
     await this.api.rename(thread, threadNameFor(name, sessionId)).catch(() => undefined);
@@ -1401,6 +1506,11 @@ export class DiscordBridge {
   /** Session tab deleted: apply `onSessionDelete` and forget the mapping. */
   async sessionDeleted(sessionId: string): Promise<void> {
     this.forgetTab(sessionId);
+    await this.channels
+      .deleted(sessionId, this.cfg.onChannelDelete, this.cfg.enabled ? this.cfg.guildId : undefined)
+      .catch((err) => {
+        this.last = this.fail(err);
+      });
     // A thread still being created is closed by its creation, which finds no entry to remove here.
     if (this.pending.has(sessionId)) this.closedWhilePending.add(sessionId);
     const thread = this.threads[sessionId];
@@ -1528,7 +1638,10 @@ export class DiscordBridge {
     if (!this.cfg.enabled || this.stopped || m.author?.bot) return;
     if (m.guild_id !== this.cfg.guildId) return;
     if (!this.cfg.allowedUserIds.includes(m.author?.id)) return;
-    const sessionId = Object.keys(this.threads).find((k) => this.threads[k] === m.channel_id);
+    const sessionId =
+      this.cfg.mode === 'full'
+        ? this.channels.sessionForChannel(this.cfg, m.channel_id)
+        : Object.keys(this.threads).find((k) => this.threads[k] === m.channel_id);
     if (!sessionId || typeof m.id !== 'string' || !m.id || m.id.length > 100) return;
     if (!m.content?.trim() && !m.attachments?.length) return;
     const id = `in:${m.guild_id}:${m.id}`;
@@ -1602,7 +1715,7 @@ export class DiscordBridge {
         this.stopped ||
         this.cfg.guildId !== m.guild_id ||
         !this.cfg.allowedUserIds.includes(m.author.id) ||
-        this.threads[sessionId] !== m.channel_id ||
+        !this.destinationMatches(sessionId, m.channel_id) ||
         this.deps.agentExited?.(sessionId)
       ) {
         await this.deliveries.update(id, 'failed', 'scope_changed');

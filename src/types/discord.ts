@@ -28,6 +28,8 @@ export interface DiscordConfig {
   enabled: boolean;
   /** Full is an opt-in conversation-interface preview; notifications preserves legacy behavior. */
   mode: DiscordMode;
+  categoryId: string;
+  onChannelDelete: 'keep' | 'retain' | 'delete';
   token: string;
   guildId: string;
   parentChannelId: string;

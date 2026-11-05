@@ -3506,12 +3506,12 @@
                 </div>
               </div>
               <div class="set-group" id="discordGroup" style="display:none">
-                <div class="set-group-head"><h4>Discord (two-way, one thread per tab)</h4><span class="set-scope">server</span></div>
+                <div class="set-group-head"><h4>Discord sessions</h4><span class="set-scope">server</span></div>
                 <div class="set-group-body">
                   <div class="set-row" data-search="discord bot thread reply phone notification blocked">
                     <div class="set-row-text">
                       <span class="set-row-label">Talk to your sessions from Discord</span>
-                      <span class="set-row-desc">Posts alerts into a thread per tab and types your reply in that thread into the tab. Only the user IDs listed below can reply. Setup (bot, least-privilege permissions) is in docs/discord-bridge.md. This group has its own Save button.</span>
+                      <span class="set-row-desc">Notifications uses a thread per tab; Full interface creates a channel per session. Replies reach that session. Only the user IDs listed below can reply. Setup (bot, least-privilege permissions) is in docs/discord-bridge.md. This group has its own Save button.</span>
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="discordEnabled"><span class="slider"></span></label>
                   </div>
@@ -3551,7 +3551,19 @@
                     </div>
                     <button class="btn-toolbar btn-sm" id="discordSyncBtn" onclick="app.syncDiscordSessions()">Sync sessions</button>
                   </div>
-                  <div class="set-row has-field">
+                  <div class="set-row has-field" id="discordCategoryRow" style="display:none">
+                    <div class="set-row-text"><label class="set-row-label" for="discordCategoryId">Session category ID</label><span class="set-row-desc">Create a private Discord category and copy its ID. The bot needs Manage Channels. Each session gets its own text channel.</span></div>
+                    <input id="discordCategoryId" class="set-input" type="text" inputmode="numeric" autocomplete="off">
+                  </div>
+                  <div class="set-row has-field" id="discordChannelDeleteRow" style="display:none">
+                    <div class="set-row-text"><label class="set-row-label" for="discordOnChannelDelete">When a session is deleted</label><span class="set-row-desc">Disconnects and crashes keep the channel. Making history read-only also needs Manage Roles on the channel.</span></div>
+                    <select id="discordOnChannelDelete" class="set-select">
+                      <option value="keep">Keep channel; stop routing</option>
+                      <option value="retain">Keep read-only history</option>
+                      <option value="delete">Delete channel and its history</option>
+                    </select>
+                  </div>
+                  <div class="set-row has-field" id="discordThreadCreationRow">
                     <div class="set-row-text"><span class="set-row-label">Create threads</span></div>
                     <select id="discordThreadCreation" class="set-select">
                       <option value="lazy">On the first alert</option>
@@ -3559,7 +3571,7 @@
                     </select>
                   </div>
                   <div class="set-row has-field">
-                    <div class="set-row-text"><span class="set-row-label">When a tab is deleted</span><span class="set-row-desc">Deleting a thread needs the Manage Threads permission on the channel.</span></div>
+                    <div class="set-row-text"><span class="set-row-label">When a notification tab is deleted</span><span class="set-row-desc">Deleting a thread needs the Manage Threads permission on the channel.</span></div>
                     <select id="discordOnSessionDelete" class="set-select">
                       <option value="keep">Keep the thread</option>
                       <option value="archive">Archive the thread</option>

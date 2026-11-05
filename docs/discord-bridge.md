@@ -1,6 +1,6 @@
 # Discord bridge
 
-Codeman can post to a private Discord server when a session needs you, give every tab its own thread, and type your thread reply into that tab. It only makes outbound connections, so Codeman is not exposed to the internet and it works when you are away from your network.
+Codeman can post to a private Discord server when a session needs you, give every session its own thread or channel, and paste your reply into that session. It only makes outbound connections, so Codeman is not exposed to the internet and it works when you are away from your network.
 
 > [!WARNING]
 > A reply from an allowed Discord account is typed into agents that can run shell commands. Treat that Discord account like a login to the machine: turn on 2FA and use a strong, unique password.
@@ -9,7 +9,7 @@ Codeman can post to a private Discord server when a session needs you, give ever
 
 - Posts when a session asks for permission, asks a question, goes idle or errors. Which of these a CLI can raise depends on the hooks it has: Claude Code sends a turn end (`stop`, an `info` event that posts only when **Which events** is set to Everything, and `idle_prompt`, which posts by default after the turn has waited a minute). DeepSeek Harness sends only `stop`. Codex, OMP, OpenCode, Gemini, Antigravity, Pi, Grok and Copilot send no turn end, so they reach Discord through an error, a blocked respawn, a stopped crash loop or their own `codeman notify`; Codex's permission and question dialogs are also read off its screen.
 - Posts a finished turn, and an error or blocked alert, as the CLI's whole last message, with its bold, lists and numbered questions kept (a Markdown table, which Discord cannot draw, becomes an aligned code block), split over several posts if it is long. It reads the CLI's transcript where it keeps one (Claude Code, Codex, DeepSeek Harness, OMP) and otherwise splits the screen into turns (OpenCode, Gemini, Antigravity, Pi, Grok, Copilot), which can start mid-message when a long answer has scrolled off. A shell, and a permission or question dialog, show the last lines of the screen instead, without the prompt row and status lines under them.
-- Creates one thread per tab in a single parent channel, so a reply always reaches exactly one session.
+- Notifications mode creates one thread per tab in a parent channel. Full interface mode creates one text channel per session in your configured category. Replies reach that exact session.
 - Pastes your reply into that session as one prompt, preserving Markdown, indentation and line breaks, then sends Enter separately. A single digit sent while a permission or question is waiting goes as the key alone, without Enter, because the dialog acts on the keypress.
 - Lets a CLI post a deliberate message (for example "press the reset button on the case") with the `codeman notify` command, which calls `POST /api/sessions/:id/discord-notify`. Each tab may post 6 a minute; past that the command says "too many messages", so a looping agent cannot ping your phone without end.
 - Saves files you attach in a thread into that tab's working folder and tells the CLI the path. A CLI can send a file back with `codeman notify "message" --file <path>`.
@@ -73,7 +73,7 @@ Only needed for `onSessionDelete: delete`. Give the bot role **Manage Threads** 
 
 ### 7. Never grant
 
-Administrator, Manage Channels, Manage Roles, Manage Messages, Mention Everyone, or any voice permission.
+Administrator, server-wide Manage Roles, Manage Messages, Mention Everyone, or voice permissions. Full interface mode additionally needs Manage Channels; optional read-only retention needs Manage Roles on the managed channels only.
 
 ### 8. Configure Codeman
 
@@ -94,13 +94,13 @@ In the Discord mobile app set the server to **All Messages**. Discord's own push
 Settings → Notifications → Discord has a **Discord mode** selector, independent of the enable switch:
 
 - **Notifications** (`mode: "notifications"`, the default) preserves the existing alerts and thread replies. Threads are created on the first alert, or for new tabs when **Create threads** is set to **For every new tab**.
-- **Full interface (preview)** (`mode: "full"`) creates a thread for every existing session when enabled, after restart/restoration, and for each new session immediately. This overrides lazy thread creation without changing the saved Notifications preference. It does not submit a prompt or start an agent.
+- **Full interface (preview)** (`mode: "full"`) creates a text channel for every existing session when enabled, after restart/restoration, and for each new session immediately, inside the configured session category. This overrides lazy thread creation without changing the saved Notifications preference. It does not submit a prompt or start an agent.
 
-This first phase still uses threads. Per-session channels, historical transcript seeding, live streaming, SSH attachment transfers and expanded controls are tracked separately under fork issue #53. **Full interface does not yet replace the web UI.** Event selection and the current reply/file limitations below still apply.
+Channels are available in Full interface mode. Historical transcript seeding, live streaming, SSH attachment transfers and expanded controls are tracked separately under fork issue #53. **Full interface does not yet replace the web UI.** Event selection and the current reply/file limitations below still apply.
 
-Use **Sync sessions** to check discovery and retry missing threads. The Settings API returns `sessionSync` with `state`, `total`, `ready` and `failed`; `POST /api/discord/sync` joins or starts a discovery pass (admin only in multi-user mode). Saves schedule discovery in the background so a slow Discord connection does not block Settings. Successful mappings are reused after retry and restart.
+Use **Sync sessions** to check discovery, retry failed cleanup and provision missing session destinations. The Settings API returns `sessionSync` with `state`, `total`, `ready` and `failed`; `POST /api/discord/sync` joins or starts a discovery pass (admin only in multi-user mode). Saves schedule discovery in the background so a slow Discord connection does not block Settings. Successful mappings are reused after retry and restart.
 
-Changing back to Notifications preserves existing threads and their history. Disable the bridge with its enable switch. Only explicit session deletion uses the existing deletion policy; a dead agent or disconnected SSH host is not deletion. Creating a session thread exposes future messages, **not its historical transcript**.
+Changing back to Notifications preserves existing threads and their history. Disable the bridge with its enable switch. Only explicit session deletion uses the existing deletion policy; a dead agent or disconnected SSH host is not deletion. Creating a session destination exposes future messages, **not its historical transcript**.
 
 | Option            | Values                      | Default     | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | ----------------- | --------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -111,6 +111,14 @@ Changing back to Notifications preserves existing threads and their history. Dis
 | `pingMode`        | `off`, `critical`, `all`    | `critical`  | `critical` pings you for permission prompts, questions, errors and urgent posts                                                                                                                                                                                                                                                                                                                                                                   |
 | `scope`           | `attention`, `all`          | `attention` | `attention` skips the quiet "response complete" event. `all` sends it too                                                                                                                                                                                                                                                                                                                                                                         |
 | `startupHint`     | on, off                     | on          | Tell Claude about `codeman notify` in its system prompt at launch                                                                                                                                                                                                                                                                                                                                                                                 |
+
+### Per-session channels
+
+For Full interface mode, create a private category in your configured Discord server and paste its ID into **Session category ID**. Grant the bot **Manage Channels** in that category, as well as the message permissions above. Keep the parent text channel configured for tests/general alerts. New channels copy the category permission overwrites.
+
+**When a session is deleted** chooses one of: keep the channel but stop routing (default), retain read-only history, or delete the channel and its Discord history. Read-only retention also needs channel-scoped **Manage Roles**. Discord administrators can still bypass read-only permissions. Cleanup failures remain pending for retry; retention never falls back to deletion. A crash, disconnected SSH host, missing restored session or recovery attempt is not deletion.
+
+Ownership intents and channel IDs are saved privately in instance-scoped discord-channels.json. Creation/rename/deletion checks the server, category and per-intent topic marker. A lost create response is reconciled against that unique intent before another create can happen. Names alone never authorize adoption or cleanup. Changing category/server/mode preserves old destinations and uses a separate mapping. Do not delete ownership files to retry provisioning.
 
 ## Telling the CLIs
 

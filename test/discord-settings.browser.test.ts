@@ -79,6 +79,8 @@ describe('Discord interface mode Settings', () => {
     expect(await page.isVisible('#discordSyncRow')).toBe(false);
     await page.selectOption('#discordThreadCreation', 'lazy');
     await page.selectOption('#discordMode', 'full');
+    expect(await page.isVisible('#discordCategoryRow')).toBe(true);
+    await page.fill('#discordCategoryId', '666666666666666666');
     expect(await page.isDisabled('#discordThreadCreation')).toBe(true);
     expect(await page.isVisible('#discordSyncRow')).toBe(true);
     expect(await page.textContent('#discordModeHint')).toContain('does not yet replace the web UI');
@@ -87,7 +89,13 @@ describe('Discord interface mode Settings', () => {
     await page.locator('#discordMode').scrollIntoViewIfNeeded();
     await page.screenshot({ path: `${screenshots}/desktop.png` });
     const data = await page.evaluate(async () => (await (await fetch('/api/discord')).json()).data);
-    expect(data).toMatchObject({ enabled: false, mode: 'full', threadCreation: 'lazy' });
+    expect(data).toMatchObject({
+      enabled: false,
+      mode: 'full',
+      threadCreation: 'lazy',
+      categoryId: '666666666666666666',
+      onChannelDelete: 'keep',
+    });
     await page.reload({ waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => (window as any).app?.terminal);
     await page.evaluate(() => (window as any).app.openAppSettings());
