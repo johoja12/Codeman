@@ -2212,6 +2212,10 @@ export class DiscordBridge {
       const root = caseKey ?? (await this.deps.caseForSession?.(sessionId!))?.key;
       if (
         !root ||
+        (!caseKey &&
+          !this.channels
+            .sessionsForCase(this.cfg, root)
+            .some((s) => s.sessionId === sessionId && s.threadId === channel)) ||
         this.stopped ||
         !this.cfg.enabled ||
         this.cfg.mode !== 'full' ||

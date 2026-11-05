@@ -1102,6 +1102,7 @@ describe('Discord interface mode', () => {
 
 it('launches from owned case channels and threads with a confirmation, never terminal input', async () => {
   const root = 'a'.repeat(64);
+  let currentRoot = root;
   const launch = vi.fn(async () => ({
     text: 'Create codex in brain on host1?',
     actions: [{ label: 'Confirm', command: 'confirm launch', validity: 'launch' }],
@@ -1111,7 +1112,7 @@ it('launches from owned case channels and threads with a confirmation, never ter
     return { text: 'Session created', locateSessionId: 'new-session' };
   });
   const b = makeBridge(undefined, {
-    caseForSession: async () => ({ key: root, name: 'brain' }),
+    caseForSession: async () => ({ key: currentRoot, name: 'brain' }),
     launchModes: () => ['codex', 'claude'],
     launch,
     control,
@@ -1150,6 +1151,8 @@ it('launches from owned case channels and threads with a confirmation, never ter
   await b.onGatewayInteraction({ ...interaction, id: '900000000000000084', channel_id: cfg.parentChannelId });
   await b.onGatewayInteraction({ ...interaction, id: '900000000000000085', member: { user: { id: 'unauthorized' } } });
   await b.onGatewayInteraction({ ...interaction, id: '900000000000000086', data: { name: 'codex', id: 'foreign' } });
+  currentRoot = 'b'.repeat(64);
+  await b.onGatewayInteraction({ ...interaction, id: '900000000000000087', channel_id: map.s1 });
   expect(launch).toHaveBeenCalledTimes(2);
   expect(sendInput).not.toHaveBeenCalled();
 });
