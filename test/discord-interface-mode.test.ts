@@ -150,6 +150,49 @@ describe('Discord interface mode', () => {
     expect(sendInput).not.toHaveBeenCalled();
     expect(posts.some((p) => p.body?.content === 'Working')).toBe(true);
   });
+  it('backfills bounded historical turns once across synchronization and process restart', async () => {
+    const history = vi.fn(async () => ({
+      conversationId: 'native1',
+      partial: false,
+      turns: Array.from({ length: 20 }, (_, i) => ({
+        cursor: `native1:${i}:abc`,
+        role: i % 2 ? ('assistant' as const) : ('user' as const),
+        text: 'historic ' + i,
+        timestamp: '2026-01-01',
+      })),
+    }));
+    const b = makeBridge(undefined, { history });
+    await b.reload();
+    await b.syncSessions();
+    const historical = () => posts.filter((p) => p.body?.content?.startsWith('**Historical context**'));
+    expect(historical()).toHaveLength(12);
+    expect(historical()[0].body?.content).toContain('historic 14');
+    expect(historical().every((p) => p.body?.allowed_mentions?.parse.length === 0)).toBe(true);
+    await b.syncSessions();
+    expect(historical()).toHaveLength(12);
+    b.stop();
+    const again = makeBridge(undefined, { history });
+    await again.reload();
+    await again.syncSessions();
+    expect(historical()).toHaveLength(12);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+  it('keeps other session channels available when one transcript is unavailable and retries without recreating destinations', async () => {
+    let offline = true;
+    const history = vi.fn(async (id: string) => {
+      if (id === 's1' && offline) throw new Error('offline');
+      return { conversationId: 'native1', partial: false, turns: [] };
+    });
+    const b = makeBridge(undefined, { history });
+    await b.reload();
+    await b.syncSessions();
+    expect(creations()).toHaveLength(2);
+    expect(b.sessionSync.failed).toBeGreaterThan(0);
+    offline = false;
+    await b.syncSessions();
+    expect(creations()).toHaveLength(2);
+    expect(b.sessionSync.state).toBe('complete');
+  });
   it('defaults legacy and unknown config values to notifications', async () => {
     for (const mode of [undefined, 'unknown', null]) {
       await writeFile(discordConfigPath(dir), JSON.stringify({ enabled: false, mode }));

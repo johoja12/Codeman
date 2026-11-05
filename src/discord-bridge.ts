@@ -1,3 +1,5 @@
+import { DiscordConversationProgressStore } from './discord-conversation-progress.js';
+import { renderHistory } from './discord-history.js';
 /**
  * @fileoverview Two-way Discord bridge: one thread per tab, alerts out, replies typed back in.
  *
@@ -966,9 +968,12 @@ export class DiscordBridge {
   private readonly now: () => number;
   private readonly deliveries: DiscordDeliveryJournal;
   private readonly channels: DiscordSessionChannels;
+  private readonly conversationProgress: DiscordConversationProgressStore;
+  private readonly conversationRuns = new Map<string, Promise<void>>();
 
   constructor(private readonly deps: DiscordBridgeDeps) {
     this.now = deps.now ?? Date.now;
+    this.conversationProgress = new DiscordConversationProgressStore(deps.configDir);
     this.deliveries = new DiscordDeliveryJournal(deps.configDir, this.now);
     this.api = new DiscordApi(() => this.cfg.token, deps.fetchImpl, deps.sleep);
     this.channels = new DiscordSessionChannels(deps.configDir, {
@@ -1048,8 +1053,29 @@ export class DiscordBridge {
         // A tab may have been deleted while the previous Discord request was in flight.
         if (!this.deps.sessions?.().some((current) => current.id === session.id)) continue;
         const result = await this.threadFor(session.id, session.name);
-        if (typeof result === 'string') this.syncState.ready++;
-        else {
+        if (typeof result === 'string') {
+          this.syncState.ready++;
+          try {
+            await this.seedConversation(session.id, result);
+          } catch {
+            this.syncState.failed++;
+            this.last = this.fail(
+              new BridgeProblem('History unavailable; retry synchronization or use !codeman history')
+            );
+            if (this.destinationMatches(session.id, result))
+              await this.deliverPost(
+                result,
+                {
+                  content:
+                    'History is unavailable or partial. Use !codeman history to retry; this session channel remains available.',
+                  allowed_mentions: { parse: [], users: [] },
+                },
+                undefined,
+                session.id,
+                'history-unavailable'
+              ).catch(() => undefined);
+          }
+        } else {
           this.syncState.failed++;
           this.last = result;
         }
@@ -1060,6 +1086,66 @@ export class DiscordBridge {
       this.syncState.failed++;
     }
     return this.sessionSync;
+  }
+
+  private conversationKey(sessionId: string, channel: string): string {
+    return createHash('sha256')
+      .update(JSON.stringify([this.cfg.guildId, channel, sessionId]))
+      .digest('hex');
+  }
+  /** No body is persisted: only exact native cursors and per-turn confirmed delivery progress. */
+  private seedConversation(sessionId: string, channel: string): Promise<void> {
+    if (!this.deps.history || this.cfg.mode !== 'full') return Promise.resolve();
+    const key = this.conversationKey(sessionId, channel);
+    const pending = this.conversationRuns.get(key);
+    if (pending) return pending;
+    const run = (async () => {
+      const history = await this.deps.history!(sessionId);
+      let progress = await this.conversationProgress.get(key);
+      if (!progress || progress.conversationId !== history.conversationId) {
+        progress = {
+          conversationId: history.conversationId,
+          seed: history.turns.slice(-6).map((t) => t.cursor),
+          seedIndex: 0,
+          seeded: false,
+          cursor: history.turns.at(-1)?.cursor,
+        };
+        await this.conversationProgress.set(key, progress);
+      }
+      if (progress.seeded) return;
+      for (let i = progress.seedIndex; i < progress.seed.length; i++) {
+        if (
+          this.stopped ||
+          !this.cfg.enabled ||
+          this.cfg.mode !== 'full' ||
+          !this.destinationMatches(sessionId, channel)
+        )
+          throw new BridgeProblem('Session changed during history sync');
+        const turn = history.turns.find((t) => t.cursor === progress!.seed[i]);
+        if (!turn) throw new BridgeProblem('Historical boundary expired; use !codeman history for catch-up');
+        const text =
+          '**Historical context**' +
+          (history.partial ? ' (partial)' : '') +
+          '\n' +
+          renderHistory([{ ...turn, text: clip(turn.text, 1000) }]) +
+          '\n`!codeman history` / `!codeman transcript` for more';
+        await this.deliverPost(
+          channel,
+          { content: text, allowed_mentions: { parse: [], users: [] } },
+          undefined,
+          sessionId,
+          `history:${turn.cursor}`
+        );
+        progress = { ...progress, seedIndex: i + 1 };
+        await this.conversationProgress.set(key, progress);
+      }
+      progress = { ...progress, seeded: true };
+      await this.conversationProgress.set(key, progress);
+    })().finally(() => {
+      if (this.conversationRuns.get(key) === run) this.conversationRuns.delete(key);
+    });
+    this.conversationRuns.set(key, run);
+    return run;
   }
 
   async ensureLoaded(): Promise<void> {
@@ -1479,6 +1565,10 @@ export class DiscordBridge {
     if (this.cfg.mode === 'full' ? this.held : this.cfg.threadCreation !== 'onSessionStart') return;
     const made = await this.threadFor(sessionId, name);
     if (typeof made !== 'string') this.last = made;
+    else if (this.cfg.mode === 'full')
+      await this.seedConversation(sessionId, made).catch(() => {
+        this.last = this.fail(new BridgeProblem('History unavailable; retry synchronization to seed it'));
+      });
   }
 
   async sessionRenamed(sessionId: string, name: string | undefined): Promise<void> {
