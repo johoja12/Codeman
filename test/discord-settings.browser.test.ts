@@ -7,7 +7,7 @@ import { chromium, type Browser, type Page } from 'playwright';
 import { WebServer } from '../src/web/server.js';
 
 const exec = promisify(execFile);
-const screenshots = '/tmp/codeman-discord-interface-screenshots';
+const screenshots = '/tmp/codeman-discord-case-thread-screenshots';
 
 describe('Discord interface mode Settings', () => {
   let server: WebServer;
@@ -80,6 +80,11 @@ describe('Discord interface mode Settings', () => {
     await page.selectOption('#discordThreadCreation', 'lazy');
     await page.selectOption('#discordMode', 'full');
     expect(await page.isVisible('#discordCategoryRow')).toBe(true);
+    expect(await page.textContent('#discordModeHint')).toContain('One channel per case, one thread per session');
+    expect(await page.isVisible('#discordChannelDeleteRow')).toBe(false);
+    expect(await page.isVisible('#discordStaleThreadsRow')).toBe(false);
+    expect(await page.isVisible('#discordOnSessionDelete')).toBe(true);
+    await page.selectOption('#discordOnSessionDelete', 'archive');
     await page.fill('#discordCategoryId', '666666666666666666');
     expect(await page.isDisabled('#discordThreadCreation')).toBe(true);
     expect(await page.isVisible('#discordSyncRow')).toBe(true);
@@ -105,6 +110,7 @@ describe('Discord interface mode Settings', () => {
     await page.locator('#discordMode').scrollIntoViewIfNeeded();
     await page.selectOption('#discordMode', 'notifications');
     expect(await page.isDisabled('#discordThreadCreation')).toBe(false);
+    expect(await page.isVisible('#discordStaleThreadsRow')).toBe(true);
     expect(await page.inputValue('#discordThreadCreation')).toBe('lazy');
     expect(await page.isVisible('#discordSyncRow')).toBe(false);
     await page.click('#discordSaveBtn');

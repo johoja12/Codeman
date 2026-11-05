@@ -1840,10 +1840,12 @@ Object.assign(CodemanApp.prototype, {
   updateDiscordMode() {
     const full = document.getElementById('discordMode').value === 'full';
     document.getElementById('discordModeHint').textContent = full
-      ? 'Session channels provide recent history, live native responses, local/SSH files and supported controls. Use !codeman help for session management. Some CLI dialogs and ambiguous recoveries still require the terminal.'
+      ? 'One channel per case, one thread per session. Threads provide recent history, live native responses, local/SSH files and supported controls. Use !codeman help for session management. Some CLI dialogs and ambiguous recoveries still require the terminal.'
       : 'Notifications keeps the current alerts and thread replies. Threads appear on the first alert unless configured below.';
     document.getElementById('discordThreadCreation').disabled = full;
-    for (const id of ['discordCategoryRow', 'discordChannelDeleteRow']) document.getElementById(id).style.display = full ? '' : 'none';
+    document.getElementById('discordCategoryRow').style.display = full ? '' : 'none';
+    document.getElementById('discordChannelDeleteRow').style.display = 'none';
+    document.getElementById('discordStaleThreadsRow').style.display = full ? 'none' : '';
     document.getElementById('discordThreadCreationRow').style.display = full ? 'none' : '';
     document.getElementById('discordSyncRow').style.display = full ? '' : 'none';
   },

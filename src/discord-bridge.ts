@@ -1,3 +1,5 @@
+import { DiscordCaseThreads, type DiscordStarter } from './discord-case-threads.js';
+import type { DiscordCaseIdentity } from './discord-case-identity.js';
 import { hashDiscordPrompt } from './discord-native-execution.js';
 import { DiscordConversationProgressStore } from './discord-conversation-progress.js';
 import { renderHistory } from './discord-history.js';
@@ -33,11 +35,7 @@ import { DISCORD_RECEIVED_DIR } from './web/paste-image-gc.js';
 import WebSocket from 'ws';
 import { stripVTControlCharacters } from 'node:util';
 import { DiscordDeliveryError, DiscordDeliveryJournal, type DiscordDelivery } from './discord-delivery.js';
-import {
-  DiscordChannelProblem,
-  DiscordSessionChannels,
-  type DiscordManagedChannel,
-} from './discord-session-channels.js';
+import { DiscordChannelProblem, type DiscordManagedChannel } from './discord-session-channels.js';
 import { WEBHOOK_SCOPES, type WebhookUrgency } from './types/push.js';
 import {
   DISCORD_MODES,
@@ -135,13 +133,13 @@ export function discordConfigProblem(cfg: DiscordConfig): string | null {
   if (cfg.token && (/\s/.test(cfg.token) || cfg.token.length > 200)) return 'The bot token looks wrong';
   if (cfg.guildId && !SNOWFLAKE.test(cfg.guildId)) return 'Guild ID must be a number (Copy ID in Discord)';
   if (cfg.parentChannelId && !SNOWFLAKE.test(cfg.parentChannelId)) return 'Channel ID must be a number';
-  if (cfg.categoryId && !SNOWFLAKE.test(cfg.categoryId)) return 'Session category ID must be a number';
+  if (cfg.categoryId && !SNOWFLAKE.test(cfg.categoryId)) return 'Case category ID must be a number';
   if (cfg.allowedUserIds.some((id) => !SNOWFLAKE.test(id))) return 'Each allowed user ID must be a number';
   if (cfg.allowedUserIds.length > 20) return 'At most 20 allowed user IDs';
   if (cfg.enabled) {
     if (!cfg.token) return 'Add the bot token before enabling';
     if (!cfg.guildId || !cfg.parentChannelId) return 'Add the guild ID and parent channel ID before enabling';
-    if (cfg.mode === 'full' && !cfg.categoryId) return 'Choose a session category before enabling Full interface mode';
+    if (cfg.mode === 'full' && !cfg.categoryId) return 'Choose a case category before enabling Full interface mode';
     if (cfg.allowedUserIds.length === 0) return 'Add at least one allowed user ID: nobody could reply otherwise';
   }
   return null;
@@ -639,6 +637,15 @@ export class DiscordApi {
     // type 11 = public thread. A week of inactivity before Discord archives it.
     return this.request('POST', `/channels/${parentId}/threads`, { name, type: 11, auto_archive_duration: 10080 });
   }
+  getMessage(parent: string, id: string): Promise<DiscordStarter | null> {
+    return this.request('GET', `/channels/${parent}/messages/${id}`);
+  }
+  channelMessages(parent: string): Promise<DiscordStarter[] | null> {
+    return this.request('GET', `/channels/${parent}/messages?limit=100`);
+  }
+  createThreadFromMessage(parent: string, id: string, name: string): Promise<DiscordManagedChannel | null> {
+    return this.request('POST', `/channels/${parent}/messages/${id}/threads`, { name, auto_archive_duration: 10080 });
+  }
   getChannel(id: string): Promise<DiscordManagedChannel | null> {
     return this.request('GET', `/channels/${id}`);
   }
@@ -960,6 +967,7 @@ export interface DiscordBridgeDeps {
   awaitingChoice?: (sessionId: string) => boolean;
   /** A session's working folder, where received files are saved. Undefined when it is gone or remote. */
   sessionDir?: (sessionId: string) => string | undefined;
+  caseForSession?: (sessionId: string) => Promise<DiscordCaseIdentity | undefined>;
   control?: (sessionId: string, command: string) => Promise<DiscordControlReply>;
   controlCurrent?: (sessionId: string, validity: string) => boolean;
   history?: (
@@ -1023,7 +1031,7 @@ export class DiscordBridge {
   private readonly api: DiscordApi;
   private readonly now: () => number;
   private readonly deliveries: DiscordDeliveryJournal;
-  private readonly channels: DiscordSessionChannels;
+  private readonly channels: DiscordCaseThreads;
   private readonly conversationProgress: DiscordConversationProgressStore;
   private readonly conversationRuns = new Map<string, Promise<void>>();
 
@@ -1032,13 +1040,42 @@ export class DiscordBridge {
     this.conversationProgress = new DiscordConversationProgressStore(deps.configDir);
     this.deliveries = new DiscordDeliveryJournal(deps.configDir, this.now);
     this.api = new DiscordApi(() => this.cfg.token, deps.fetchImpl, deps.sleep);
-    this.channels = new DiscordSessionChannels(deps.configDir, {
-      get: (id) => this.api.getChannel(id),
-      list: (id) => this.api.guildChannels(id),
-      create: (id, body) => this.api.createTextChannel(id, body),
-      edit: (id, body) => this.api.editChannel(id, body),
-      remove: (id) => this.api.remove(id),
-    });
+    this.channels = new DiscordCaseThreads(
+      deps.configDir,
+      {
+        get: (id) => this.api.getChannel(id),
+        list: (id) => this.api.guildChannels(id),
+        create: (id, body) => this.api.createTextChannel(id, body),
+        edit: (id, body) => this.api.editChannel(id, body),
+        remove: (id) => this.api.remove(id),
+        botId: async () => {
+          const me = await this.api.botUserId();
+          if (!me?.id) throw new DiscordChannelProblem('Discord bot identity unavailable');
+          return me.id;
+        },
+        postStarter: (id, body) => this.api.post(id, body),
+        getStarter: (parent, id) => this.api.getMessage(parent, id),
+        listStarters: (parent) => this.api.channelMessages(parent),
+        createThread: (parent, starter, name) => this.api.createThreadFromMessage(parent, starter, name),
+      },
+      async (id) =>
+        deps.caseForSession
+          ? deps.caseForSession(id)
+          : {
+              key: createHash('sha256')
+                .update('unlinked:' + id)
+                .digest('hex'),
+              name: 'unlinked-' + id.slice(0, 8),
+            },
+      this.now,
+      (scope, id) =>
+        !this.stopped &&
+        this.cfg.enabled &&
+        this.cfg.mode === 'full' &&
+        this.cfg.guildId === scope.guildId &&
+        this.cfg.categoryId === scope.categoryId &&
+        (!this.deps.sessions || this.deps.sessions().some((s) => s.id === id))
+    );
   }
 
   get acceptsControls(): boolean {
@@ -1063,6 +1100,8 @@ export class DiscordBridge {
     return JSON.stringify([this.cfg.mode, this.cfg.guildId, this.cfg.parentChannelId, this.cfg.categoryId]);
   }
   private destinationMatches(id: string, channel: string): boolean {
+    if (id.startsWith('__case__:'))
+      return this.cfg.mode === 'full' && this.channels.caseForChannel(this.cfg, channel) === id.slice(9);
     if (id === '__management__')
       return this.cfg.mode === 'full' && !!this.cfg.parentChannelId && this.cfg.parentChannelId === channel;
     return this.cfg.mode === 'full'
@@ -1310,9 +1349,10 @@ export class DiscordBridge {
         )
           return;
         let id = progress.statusMessageId;
-        if (id)
+        if (id) {
+          await this.channels.assertOwned(this.cfg, sessionId, channel);
           await this.api.editMessage(channel, id, { content: status, allowed_mentions: { parse: [], users: [] } });
-        else
+        } else
           id = (
             (await this.deliverPost(
               channel,
@@ -1342,6 +1382,7 @@ export class DiscordBridge {
   async prune(liveIds: Iterable<string>): Promise<void> {
     await this.ensureLoaded();
     const live = new Set(liveIds);
+    if (this.cfg.mode === 'full') return;
     if (live.size === 0) return; // nothing restored: more likely a failed restore than an empty server
     const stale = Object.keys(this.threads).filter((id) => !live.has(id));
     if (stale.length === 0) return;
@@ -1359,6 +1400,7 @@ export class DiscordBridge {
     try {
       await this.ensureLoaded();
       const c = this.cfg;
+      if (c.mode === 'full') return 0;
       if (c.staleThreads === 'keep' || !c.enabled || !c.token || !c.guildId || !c.parentChannelId) return 0;
       if (Object.keys(this.threads).length === 0 || this.pending.size > 0) return 0;
       const me = (await this.api.botUserId())?.id;
@@ -1435,6 +1477,7 @@ export class DiscordBridge {
     await this.mapLoad;
     try {
       await this.channels.load();
+      this.channels.resetBotIdentity();
       await this.deliveries.load();
     } catch (err) {
       this.last = this.fail(err);
@@ -1517,7 +1560,7 @@ export class DiscordBridge {
     const code = err instanceof DiscordHttpError ? err.code : undefined;
     const error =
       code === 30013 || code === 30030
-        ? 'Discord channel capacity reached; choose another session category or free unused channels'
+        ? 'Discord channel capacity reached; choose another case category or free unused channels'
         : status === 401
           ? 'The bot token was refused'
           : status === 403 || code === 50001
@@ -1829,10 +1872,12 @@ export class DiscordBridge {
   async sessionDeleted(sessionId: string): Promise<void> {
     this.forgetTab(sessionId);
     await this.channels
-      .deleted(sessionId, this.cfg.onChannelDelete, this.cfg.enabled ? this.cfg.guildId : undefined)
+      .deleted(sessionId, this.cfg.onSessionDelete, this.cfg.enabled ? this.cfg.guildId : undefined)
       .catch((err) => {
         this.last = this.fail(err);
       });
+    // Full mode preserves legacy notification resources after switching layouts.
+    if (this.cfg.mode === 'full') return;
     // A thread still being created is closed by its creation, which finds no entry to remove here.
     if (this.pending.has(sessionId)) this.closedWhilePending.add(sessionId);
     const thread = this.threads[sessionId];
@@ -1856,6 +1901,12 @@ export class DiscordBridge {
     sessionId: string | undefined,
     key: string
   ): Promise<unknown> {
+    if (this.cfg.mode === 'full' && sessionId) {
+      if (!this.destinationMatches(sessionId, channelId)) throw new BridgeProblem('Discord destination changed');
+      if (sessionId.startsWith('__case__:'))
+        await this.channels.assertCaseOwned(this.cfg, sessionId.slice(9), channelId);
+      else if (sessionId !== '__management__') await this.channels.assertOwned(this.cfg, sessionId, channelId);
+    }
     const id = createHash('sha256').update(`${this.cfg.guildId}:${channelId}:${key}`).digest('hex');
     const hash = createHash('sha256').update(
       JSON.stringify({ content: post.content, components: post.components, file: file?.name })
@@ -2054,6 +2105,10 @@ export class DiscordBridge {
           !this.deps.controlCurrent?.(action.sessionId, action.validity)
         )
           throw new BridgeProblem('Control changed');
+        if (action.sessionId.startsWith('__case__:'))
+          await this.channels.assertCaseOwned(this.cfg, action.sessionId.slice(9), key);
+        else if (action.sessionId !== '__management__')
+          await this.channels.assertOwned(this.cfg, action.sessionId, key);
         const result = await this.deps.control!(action.sessionId, action.command);
         if (result.locateSessionId)
           await this.postControlReply(action.sessionId, key, result, `interaction-result:${m.id}`);
@@ -2151,8 +2206,10 @@ export class DiscordBridge {
       this.cfg.mode === 'full'
         ? this.channels.sessionForChannel(this.cfg, m.channel_id)
         : Object.keys(this.threads).find((k) => this.threads[k] === m.channel_id);
+    const caseKey = this.cfg.mode === 'full' ? this.channels.caseForChannel(this.cfg, m.channel_id) : undefined;
     const sessionId =
       mappedSessionId ??
+      (caseKey ? '__case__:' + caseKey : undefined) ??
       (this.cfg.mode === 'full' &&
       this.cfg.parentChannelId === m.channel_id &&
       /^!codeman(?:\s|$)/i.test(m.content ?? '')
@@ -2186,6 +2243,29 @@ export class DiscordBridge {
       return;
     }
     try {
+      if (caseKey && !/^!codeman(?:\s|$)/i.test(m.content ?? '')) {
+        const live = this.deps.sessions?.() ?? [];
+        const threads = this.channels
+          .sessionsForCase(this.cfg, caseKey)
+          .filter((t) => live.some((s) => s.id === t.sessionId));
+        const links = threads
+          .slice(0, 10)
+          .map((t) => `<#${t.threadId}> — ${threadNameFor(live.find((s) => s.id === t.sessionId)?.name, t.sessionId)}`)
+          .join('\n');
+        await this.postControlReply(
+          sessionId,
+          m.channel_id,
+          {
+            text:
+              'Choose a session thread below. Nothing was submitted. Send messages and attachments inside that thread.\n' +
+              (links || 'No active sessions. Use !codeman cases and !codeman help to create one.') +
+              (threads.length > 10 ? '\nMore sessions: !codeman sessions' : ''),
+          },
+          `case-selection:${m.id}`
+        );
+        await this.deliveries.update(id, 'delivered');
+        return;
+      }
       if ((m.content ?? '').length > MAX_REPLY_CHARS) {
         await this.deliveries.update(id, 'failed', 'input_too_large');
         await this.say(
@@ -2204,7 +2284,26 @@ export class DiscordBridge {
           !this.destinationMatches(sessionId, m.channel_id)
         )
           throw new BridgeProblem('Discord configuration changed');
+        if (this.cfg.mode === 'full' && sessionId !== '__management__') {
+          if (caseKey) await this.channels.assertCaseOwned(this.cfg, caseKey, m.channel_id);
+          else await this.channels.assertOwned(this.cfg, sessionId, m.channel_id);
+        }
         const command = (m.content ?? '').replace(/^!codeman\s*/i, '');
+        if (
+          (caseKey || sessionId === '__management__') &&
+          !/^(sessions|open|cases|groups|recoveries|create|recover|reconnect|confirm|help)(?:\s|$)/i.test(command)
+        ) {
+          await this.postControlReply(
+            sessionId,
+            m.channel_id,
+            {
+              text: 'Open a session thread for task, history, stream and file commands. Use !codeman sessions to find it. Nothing was submitted.',
+            },
+            `choose-thread:${m.id}`
+          );
+          await this.deliveries.update(id, 'delivered');
+          return;
+        }
         const stream = /^stream (responses|verbose|off)$/.exec(command);
         if (stream && this.cfg.mode === 'full') {
           await this.seedConversation(sessionId, m.channel_id);
@@ -2337,6 +2436,7 @@ export class DiscordBridge {
       }
       const keys = /^\d\r$/.test(text) && this.deps.awaitingChoice?.(sessionId) ? text.slice(0, -1) : text;
       // A crash beyond the durable boundary is ambiguous; never retry the whole input.
+      if (this.cfg.mode === 'full') await this.channels.assertOwned(this.cfg, sessionId, m.channel_id);
       const ok = await this.deps.sendInput(sessionId, keys);
       await this.deliveries.update(id, ok ? 'input_accepted' : 'uncertain', ok ? undefined : 'input_uncertain');
       if (ok) await this.api.react(m.channel_id, m.id, '✅').catch(() => undefined);

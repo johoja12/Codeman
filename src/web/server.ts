@@ -1,3 +1,4 @@
+import { resolveDiscordCase } from '../discord-case-identity.js';
 import { DiscordSessionManagement } from '../discord-session-management.js';
 import { activeSessionRecoveryActions } from './session-recovery-service.js';
 import { isRecoveryDismissed } from '../session-recovery-fence.js';
@@ -801,6 +802,16 @@ export class WebServer extends EventEmitter {
     },
     agentExited: (id) => !!this.sessions.get(id)?.paneExit,
     awaitingChoice: (id) => approvalInbox.listPending().some((item) => item.sessionId === id && item.kind !== 'idle'),
+    caseForSession: async (id) => {
+      const session = this.sessions.get(id);
+      if (!session) return undefined;
+      const cases = isMultiUserMode() ? [] : ((await this.discordCases?.()) ?? []);
+      if (this.sessions.get(id) !== session) return undefined;
+      return resolveDiscordCase(
+        { id, workingDir: session.workingDir, owner: session.owner, remote: session.remote, docker: session.docker },
+        cases
+      );
+    },
     sessions: () =>
       Array.from(this.sessions.values(), (session) => ({
         id: session.id,
@@ -825,7 +836,7 @@ export class WebServer extends EventEmitter {
       const session = this.sessions.get(id);
       if (!session)
         return {
-          text: 'Use a mapped session channel for task/history commands; !codeman help lists management commands.',
+          text: 'Use a session thread for task/history commands; !codeman help lists management commands.',
         };
       return (await discordTaskControl(session, command)) ?? discordHistoryControl(session, command);
     },

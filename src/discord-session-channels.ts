@@ -11,6 +11,8 @@ export interface DiscordManagedChannel {
   parent_id?: string | null;
   topic?: string | null;
   name?: string;
+  owner_id?: string;
+  thread_metadata?: { archived: boolean; locked?: boolean };
   permission_overwrites?: Array<{ id: string; type: number; allow: string; deny: string }>;
 }
 export interface DiscordChannelApi {
@@ -56,15 +58,29 @@ export class DiscordSessionChannels {
   private retireRun?: Promise<void>;
   constructor(
     private readonly dir: string,
-    private readonly api: DiscordChannelApi
+    private readonly api: DiscordChannelApi,
+    private readonly options: {
+      fileName?: string;
+      kind?: 'case';
+      name?: (name: string | undefined, id: string) => string;
+    } = {}
   ) {}
   private marker(e: Entry): string {
-    return 'Codeman ' + this.state.instanceId + ' session ' + e.sessionId + ' intent ' + e.intentId;
+    return (
+      'Codeman ' +
+      this.state.instanceId +
+      ' ' +
+      (this.options.kind ?? 'session') +
+      ' ' +
+      e.sessionId +
+      ' intent ' +
+      e.intentId
+    );
   }
   load(): Promise<void> {
     this.loadRun ??= (async () => {
       try {
-        const path = join(this.dir, 'discord-channels.json');
+        const path = join(this.dir, this.options.fileName ?? 'discord-channels.json');
         const info = await fs.lstat(path);
         if (!info.isFile() || info.isSymbolicLink() || info.size > 4 * 1024 * 1024) throw new Error();
         const raw = JSON.parse(await fs.readFile(path, 'utf8')) as State;
@@ -109,7 +125,7 @@ export class DiscordSessionChannels {
       .catch(() => undefined)
       .then(async () => {
         await fs.mkdir(this.dir, { recursive: true });
-        const path = join(this.dir, 'discord-channels.json'),
+        const path = join(this.dir, this.options.fileName ?? 'discord-channels.json'),
           tmp = path + '.' + randomUUID() + '.tmp';
         try {
           const file = await fs.open(tmp, 'wx', 0o600);
@@ -141,6 +157,18 @@ export class DiscordSessionChannels {
     const e = this.state.entries[keyOf(scope, id)];
     return e?.state === 'active' && !this.state.deleted[id] ? e.channelId : undefined;
   }
+  async assertOwned(scope: DiscordChannelScope, id: string): Promise<string> {
+    await this.load();
+    const entry = this.state.entries[keyOf(scope, id)];
+    if (
+      !entry?.channelId ||
+      entry.state !== 'active' ||
+      this.state.deleted[id] ||
+      !this.owned(entry, await this.api.get(entry.channelId))
+    )
+      throw new DiscordChannelProblem('Case channel ownership changed; routing is paused');
+    return entry.channelId;
+  }
   private owned(e: Entry, c: DiscordManagedChannel | null): c is DiscordManagedChannel {
     return (
       !!c && c.type === 0 && c.guild_id === e.guildId && c.parent_id === e.categoryId && c.topic === this.marker(e)
@@ -168,7 +196,7 @@ export class DiscordSessionChannels {
         const channel = await this.api.get(e.channelId);
         if (!this.owned(e, channel))
           throw new DiscordChannelProblem('Session channel ownership changed; refusing to reuse it');
-        const desired = discordSessionChannelName(name, id);
+        const desired = (this.options.name ?? discordSessionChannelName)(name, id);
         if (channel.name !== desired) await this.api.edit(e.channelId, { name: desired });
         return e.channelId;
       } catch (err) {
@@ -213,7 +241,7 @@ export class DiscordSessionChannels {
       channel = await this.api.create(scope.guildId, {
         type: 0,
         parent_id: scope.categoryId,
-        name: discordSessionChannelName(name, id),
+        name: (this.options.name ?? discordSessionChannelName)(name, id),
         topic: this.marker(e),
         permission_overwrites: category.permission_overwrites ?? [],
       });
@@ -245,7 +273,7 @@ export class DiscordSessionChannels {
     if (!e?.channelId || e.state !== 'active' || this.state.deleted[id]) return;
     if (!this.owned(e, await this.api.get(e.channelId)))
       throw new DiscordChannelProblem('Session channel ownership changed; refusing to rename it');
-    await this.api.edit(e.channelId, { name: discordSessionChannelName(name, id) });
+    await this.api.edit(e.channelId, { name: (this.options.name ?? discordSessionChannelName)(name, id) });
   }
   async deleted(id: string, policy: DiscordChannelDelete, activeGuild?: string): Promise<void> {
     await this.load();
