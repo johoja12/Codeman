@@ -16,7 +16,7 @@ interface Row {
   message?: { stop_reason?: string };
 }
 export function nativeExecutions(
-  mode: string,
+  format: string,
   conversationId: string,
   rows: Array<{ value: unknown; cursor: string }>,
   turns: DiscordHistoryTurn[]
@@ -30,7 +30,7 @@ export function nativeExecutions(
     const e = row.value as Row;
     if (!e || typeof e !== 'object' || e.isSidechain || (e.sessionId && e.sessionId !== conversationId)) continue;
     const user = users.get(row.cursor);
-    if (mode === 'codex') {
+    if (format === 'codex-rollout') {
       if (e.type === 'event_msg' && e.payload?.type === 'task_started') {
         activeTurn = e.payload.turn_id;
       }
@@ -54,7 +54,7 @@ export function nativeExecutions(
         if (e.payload.type === 'turn_aborted') execution.state = 'interrupted';
         if (e.payload.type === 'task_failed') execution.state = 'execution_error';
       }
-    } else if (mode === 'claude') {
+    } else if (format === 'claude-jsonl') {
       const parent = e.parentUuid ? ancestry.get(e.parentUuid) : undefined;
       if (user && e.type === 'user') {
         const execution: DiscordNativeExecution = {
