@@ -255,7 +255,7 @@ describe('Discord interface mode', () => {
     const click = {
       id: '777777777777777777',
       application_id: '888888888888888888',
-      token: 'test-interaction-token',
+      token: 'opaque+/=test',
       type: 3,
       guild_id: cfg.guildId,
       channel_id: map.s1,
@@ -269,36 +269,43 @@ describe('Discord interface mode', () => {
     await b.onGatewayInteraction(click);
     expect(control).toHaveBeenCalledTimes(2);
     expect(control).toHaveBeenLastCalledWith('s1', 'answer current revision 1');
+    expect(posts.some((p) => p.path.includes('/opaque%2B%2F%3Dtest/callback'))).toBe(true);
     expect(sendInput).not.toHaveBeenCalled();
   });
-  it('shows prompt-bound buttons on a question alert and refuses an unbound digit in Full mode', async () => {
-    const control = async () => ({
-      text: 'Which option?',
-      actions: [{ label: 'One', command: 'answer prompt revision 1', validity: 'prompt' }],
-    });
-    const b = makeBridge(undefined, { control, controlCurrent: () => true, awaitingChoice: () => true });
-    await b.reload();
-    await b.syncSessions();
-    const map = await readFullMap(dir);
-    await b.notify({
-      sessionId: 's1',
-      sessionName: 'one',
-      event: 'question',
-      title: 'Question',
-      body: 'Choose',
-      urgency: 'critical',
-    });
-    expect(posts.some((p) => p.body?.components?.length && p.body?.content === 'Which option?')).toBe(true);
-    await b.onGatewayMessage({
-      id: '555555555555555555',
-      guild_id: cfg.guildId,
-      channel_id: map.s1,
-      author: { id: cfg.allowedUserIds[0] },
-      content: '1',
-    });
-    expect(sendInput).not.toHaveBeenCalled();
-    expect(posts.some((p) => p.body?.content?.includes('prompt-bound answer'))).toBe(true);
-  });
+  it.each(['off', 'critical'] as const)(
+    'respects %s ping policy on prompt buttons and refuses an unbound digit',
+    async (pingMode) => {
+      await writeDiscordConfig(dir, { ...cfg, pingMode });
+      const control = async () => ({
+        text: 'Which option?',
+        actions: [{ label: 'One', command: 'answer prompt revision 1', validity: 'prompt' }],
+      });
+      const b = makeBridge(undefined, { control, controlCurrent: () => true, awaitingChoice: () => true });
+      await b.reload();
+      await b.syncSessions();
+      const map = await readFullMap(dir);
+      await b.notify({
+        sessionId: 's1',
+        sessionName: 'one',
+        event: 'question',
+        title: 'Question',
+        body: 'Choose',
+        urgency: 'critical',
+      });
+      const prompt = posts.find((p) => p.body?.components?.length && p.body?.content?.endsWith('Which option?'));
+      expect(prompt).toBeDefined();
+      expect(prompt!.body!.allowed_mentions.users).toEqual(pingMode === 'critical' ? cfg.allowedUserIds : []);
+      await b.onGatewayMessage({
+        id: '555555555555555555',
+        guild_id: cfg.guildId,
+        channel_id: map.s1,
+        author: { id: cfg.allowedUserIds[0] },
+        content: '1',
+      });
+      expect(sendInput).not.toHaveBeenCalled();
+      expect(posts.some((p) => p.body?.content?.includes('prompt-bound answer'))).toBe(true);
+    }
+  );
   it('defaults legacy and unknown config values to notifications', async () => {
     for (const mode of [undefined, 'unknown', null]) {
       await writeFile(discordConfigPath(dir), JSON.stringify({ enabled: false, mode }));
