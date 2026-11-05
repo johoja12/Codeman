@@ -567,6 +567,83 @@ describe('Discord interface mode', () => {
     expect(posts.filter((p) => p.method === 'POST' && p.body?.content?.includes('Delivered once'))).toHaveLength(1);
   });
 
+  it('filters internal citations before live splitting and consumes metadata-only cursors without empty posts', async () => {
+    let now = 100000;
+    let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+    const metadata =
+      '<oai-mem-citation>\n<citation_entries>\nMEMORY.md:1-2|note=[private]\n</citation_entries>\n</oai-mem-citation>';
+    const history = async () => ({ conversationId: 'native1', partial: false, turns });
+    sessions = [{ id: 's1', name: 'one' }];
+    const b = makeBridge(undefined, { history, now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    turns = [
+      { cursor: 'native1:1', role: 'assistant', text: 'Clean answer\n\n' + metadata, timestamp: '' },
+      { cursor: 'native1:2', role: 'assistant', text: metadata, timestamp: '' },
+    ];
+    await b.pollConversations();
+    expect(posts.filter((p) => p.body?.content === 'Clean answer')).toHaveLength(1);
+    expect(posts.some((p) => p.body?.content?.includes('MEMORY.md') || p.body?.content?.includes('<oai-mem'))).toBe(
+      false
+    );
+    now += 60001;
+    turns.push({ cursor: 'native1:3', role: 'assistant', text: 'Next answer', timestamp: '' });
+    await b.pollConversations();
+    expect(posts.filter((p) => p.body?.content === 'Next answer')).toHaveLength(1);
+    expect(posts.filter((p) => p.body?.content === 'Clean answer')).toHaveLength(1);
+    b.stop();
+    const again = makeBridge(undefined, { history, now: () => now });
+    await again.reload();
+    await again.syncSessions();
+    await again.pollConversations();
+    expect(posts.filter((p) => p.body?.content === 'Clean answer')).toHaveLength(1);
+  });
+
+  it('omits metadata-only historical turns while retaining visible historical context', async () => {
+    const metadata = '<oai-mem-citation>private</oai-mem-citation>';
+    const history = async () => ({
+      conversationId: 'native1',
+      partial: false,
+      turns: [
+        { cursor: 'native1:1', role: 'assistant' as const, text: metadata, timestamp: '' },
+        { cursor: 'native1:2', role: 'assistant' as const, text: 'History answer\n' + metadata, timestamp: '' },
+      ],
+    });
+    sessions = [{ id: 's1', name: 'one' }];
+    const b = makeBridge(undefined, { history });
+    await b.reload();
+    await b.syncSessions();
+    const contexts = posts.filter((p) => p.body?.content?.includes('**Historical context**'));
+    expect(contexts).toHaveLength(1);
+    expect(contexts[0].body.content).toContain('History answer');
+    expect(contexts[0].body.content).not.toContain('oai-mem');
+  });
+
+  it('filters internal metadata from full-text alert fallback when native history is unavailable', async () => {
+    const metadata = '<oai-mem-citation>\nprivate-footer\n</oai-mem-citation>';
+    sessions = [{ id: 's1', name: 'one' }];
+    const b = makeBridge(undefined, {
+      history: async () => {
+        throw new Error('unavailable');
+      },
+    });
+    await b.reload();
+    await b.syncSessions();
+    const result = await b.notify({
+      sessionId: 's1',
+      event: 'hook:idle_prompt',
+      title: 'Waiting for Input',
+      body: 'fallback',
+      urgency: 'warning',
+      fullText: async () => ({ text: 'Visible fallback answer\n' + metadata }),
+    });
+    expect(result?.ok).toBe(true);
+    expect(posts.some((p) => p.body?.content?.includes('Visible fallback answer'))).toBe(true);
+    expect(
+      posts.some((p) => p.body?.content?.includes('private-footer') || p.body?.content?.includes('<oai-mem'))
+    ).toBe(false);
+  });
+
   it('binds component clicks to the prompt, message, channel and allowlisted user and consumes once', async () => {
     const control = vi.fn(async (_id: string, command: string) =>
       command === 'pending'

@@ -1,3 +1,4 @@
+import { discordDisplayText } from './discord-display-text.js';
 import { probeRemoteDiscordConversation } from './discord-remote-conversation.js';
 import { getCli } from './config/cli-registry/registry.js';
 import { nativeExecutions, type DiscordNativeExecution } from './discord-native-execution.js';
@@ -335,9 +336,10 @@ export async function readDiscordSessionHistory(
 }
 export function renderHistory(turns: DiscordHistoryTurn[], options: { includeTimestamps?: boolean } = {}): string {
   return turns
+    .filter((t) => t.role !== 'assistant' || !!discordDisplayText(t.text).trim())
     .map(
       (t) =>
-        `**${t.role === 'user' ? 'You' : t.role === 'tool' ? 'Tool output' : 'Assistant'}**${options.includeTimestamps === false ? '' : ' ' + (t.timestamp || '(time unavailable)')}\n${t.text}`
+        `**${t.role === 'user' ? 'You' : t.role === 'tool' ? 'Tool output' : 'Assistant'}**${options.includeTimestamps === false ? '' : ' ' + (t.timestamp || '(time unavailable)')}\n${t.role === 'assistant' ? discordDisplayText(t.text) : t.text}`
     )
     .join('\n\n');
 }
