@@ -83,7 +83,9 @@ describe('Discord interface mode Settings', () => {
     await page.fill('#discordCategoryId', '666666666666666666');
     expect(await page.isDisabled('#discordThreadCreation')).toBe(true);
     expect(await page.isVisible('#discordSyncRow')).toBe(true);
-    expect(await page.textContent('#discordModeHint')).toContain('does not yet replace the web UI');
+    expect(await page.textContent('#discordModeHint')).toContain(
+      'Some CLI dialogs and ambiguous recoveries still require the terminal'
+    );
     await page.click('#discordSaveBtn');
     await page.waitForFunction(async () => (await (await fetch('/api/discord')).json()).data.mode === 'full');
     await page.locator('#discordMode').scrollIntoViewIfNeeded();

@@ -96,7 +96,7 @@ Settings → Notifications → Discord has a **Discord mode** selector, independ
 - **Notifications** (`mode: "notifications"`, the default) preserves the existing alerts and thread replies. Threads are created on the first alert, or for new tabs when **Create threads** is set to **For every new tab**.
 - **Full interface (preview)** (`mode: "full"`) creates a text channel for every existing session when enabled, after restart/restoration, and for each new session immediately, inside the configured session category. This overrides lazy thread creation without changing the saved Notifications preference. It does not submit a prompt or start an agent.
 
-Channels are available in Full interface mode. Live streaming and expanded controls are tracked separately under fork issue #53. **Full interface does not yet replace the web UI.** Event selection and the current reply/file limitations below still apply.
+Full interface mode includes channel synchronization, bounded native history/backfill, live responses, local/SSH files and the supported controls below. Provider-specific limitations remain; it does not mirror a terminal screen.
 
 Use **Sync sessions** to check discovery, retry failed cleanup and provision missing session destinations. The Settings API returns `sessionSync` with `state`, `total`, `ready` and `failed`; `POST /api/discord/sync` joins or starts a discovery pass (admin only in multi-user mode). Saves schedule discovery in the background so a slow Discord connection does not block Settings. Successful mappings are reused after retry and restart.
 
@@ -200,3 +200,19 @@ Controls bind the exact session, channel, message, prompt ID, revision and allow
 `!codeman interrupt` offers a confirmation for the current task. It sends Ctrl+C through the existing session input path and leaves the session open. A changed/finished task invalidates the confirmation; interruption is requested, not assumed complete. No destructive session deletion control is exposed.
 
 Claude's verified dialogs work through the shared approval service for local/SSH sessions. Codex and other screen-only dialogs flagged by Codeman as terminal-only remain terminal-only: it cannot safely infer their approval keystrokes. Free-text/multipart prompts that the native adapter cannot verify must be completed in the terminal. Discord shows that limitation rather than pretending approval succeeded.
+
+## Session management (Full mode)
+
+Use these commands in a mapped session channel, or in the configured **Parent / control channel** when no sessions exist:
+
+- `!codeman sessions [offset]` lists session ID, host, case, group, CLI and status. `!codeman open <session-id>` returns its owned channel link.
+- `!codeman cases` lists configured cases and their host IDs; `!codeman groups` lists group IDs; `!codeman help` lists commands.
+- `!codeman create <case> <host-id|local> <CLI> <group-id|default>` shows a review and a Confirm button. Choose the exact configured case/host and CLI. `default` inherits the existing case group policy. Confirmations expire after one minute and are single-use. Configuration changes invalidate them. The shared creation path starts the selected CLI with no submitted task.
+- `!codeman recoveries` lists saved Recovery Queue records. `!codeman recover <record-id> <reconnect|resume>` reviews the explicit action. Reconnect attaches an existing remote agent; resume requires an exact native conversation and the shared resumable state. It does not select by cwd, create a blank recovery conversation or replay the interrupted task. Ambiguous/manual cases require the web UI.
+- `!codeman reconnect <session-id>` checks an existing remote transport and attaches only when its local SSH pane is confirmed dead. It shares the automatic reconnect fence and does not restart a healthy agent. A dead remote agent requires a saved recovery record.
+
+Creation and recovery use the same case/group/CLI validation and recovery service as the web UI, including a shared API/connector concurrency fence and cancellation after dismissal. Recovery preserves saved name/group through the shared service; the resulting session channel is linked in the result. A launch returning is not proof of native readiness: check status and the native response stream. A failure or lost acknowledgement is never retried by resubmitting a task.
+
+Lifecycle management is available in single-user mode. It remains disabled in multi-user mode until Discord IDs have explicit Codeman-user mappings, avoiding an implicit administrator identity for lifecycle operations. The existing administrator-configured Discord allowlist still governs all bridge messages. A control-channel message without the `!codeman` prefix is ignored. Notifications mode keeps its original threads and reply behavior.
+
+Full mode covers native conversation output, bounded history, files and supported controls; it is not a pixel/terminal mirror. Unverified provider approval dialogs, Docker history and ambiguous native recovery still require the web UI. Test in a dedicated category before enabling it for live sessions.

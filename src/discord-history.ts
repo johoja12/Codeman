@@ -17,7 +17,14 @@ interface NativeHistoryRow {
   isMeta?: boolean;
   isCompactSummary?: boolean;
   message?: { content?: unknown };
-  payload?: { type?: string; output?: unknown };
+  payload?: {
+    type?: string;
+    output?: unknown;
+    role?: string;
+    content?: unknown;
+    message?: unknown;
+    item?: { type?: string; content?: unknown };
+  };
   attachment?: { type?: string; origin?: { kind?: string }; commandMode?: string; prompt?: string; timestamp?: string };
 }
 function textBlock(value: unknown): value is { type: 'text'; text: string } {
@@ -27,6 +34,32 @@ function textBlock(value: unknown): value is { type: 'text'; text: string } {
     (value as { type?: unknown }).type === 'text' &&
     typeof (value as { text?: unknown }).text === 'string'
   );
+}
+function codexVisibleRow(row: NativeHistoryRow): unknown {
+  const p = row.payload;
+  if (!p) return row;
+  if (row.type === 'response_item' && p.type && p.type !== 'message') return undefined;
+  const content = (value: unknown) =>
+    typeof value === 'string'
+      ? value
+      : Array.isArray(value)
+        ? value.filter(
+            (v): v is { type: string; text: string } =>
+              !!v &&
+              typeof v === 'object' &&
+              ['input_text', 'output_text', 'text'].includes(v.type) &&
+              typeof v.text === 'string'
+          )
+        : value;
+  return {
+    ...row,
+    payload: {
+      ...p,
+      content: content(p.content),
+      message: content(p.message),
+      item: p.item ? { ...p.item, content: content(p.item.content) } : undefined,
+    },
+  };
 }
 export interface DiscordHistoryTurn {
   cursor: string;
@@ -120,8 +153,6 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
     }
     offset += Buffer.byteLength(line) + 1;
   }
-  const preferEvents =
-    source.mode === 'codex' && rows.some(({ value }) => codexMessageFromLine(value)?.shape === 'event');
   const turns: DiscordHistoryTurn[] = [];
   for (const { value: e, offset, raw } of rows) {
     let role: 'user' | 'assistant' | 'tool' | undefined,
@@ -168,8 +199,8 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
         });
     }
     if (source.mode === 'codex') {
-      const msg = codexMessageFromLine(e);
-      if (!msg || (preferEvents && msg.shape !== 'event') || isCodexInjectedContext(msg.text)) continue;
+      const msg = codexMessageFromLine(codexVisibleRow(e));
+      if (!msg || (msg.injectionProne && isCodexInjectedContext(msg.text))) continue;
       role = msg.role;
       text = msg.text;
     } else {

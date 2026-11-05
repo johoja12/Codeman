@@ -1840,7 +1840,7 @@ Object.assign(CodemanApp.prototype, {
   updateDiscordMode() {
     const full = document.getElementById('discordMode').value === 'full';
     document.getElementById('discordModeHint').textContent = full
-      ? 'Preview: creates a channel for each existing and new session in your category. Historical messages, live streaming and remote files are coming in separate updates. This does not yet replace the web UI.'
+      ? 'Session channels provide recent history, live native responses, local/SSH files and supported controls. Use !codeman help for session management. Some CLI dialogs and ambiguous recoveries still require the terminal.'
       : 'Notifications keeps the current alerts and thread replies. Threads appear on the first alert unless configured below.';
     document.getElementById('discordThreadCreation').disabled = full;
     for (const id of ['discordCategoryRow', 'discordChannelDeleteRow']) document.getElementById(id).style.display = full ? '' : 'none';

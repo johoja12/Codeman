@@ -24,7 +24,7 @@ const cfg = {
   allowedUserIds: ['333333333333333333'],
 };
 let dir: string;
-let sessions: Array<{ id: string; name?: string }>;
+let sessions: Array<{ id: string; name?: string; remote?: boolean; working?: boolean }>;
 let bridges: DiscordBridge[];
 let posts: Array<{ path: string; method: string; body?: any }>;
 let sendInput: ReturnType<typeof vi.fn>;
@@ -298,6 +298,65 @@ describe('Discord interface mode', () => {
     });
     expect(sendInput).not.toHaveBeenCalled();
     expect(posts.some((p) => p.body?.content?.includes('prompt-bound answer'))).toBe(true);
+  });
+  it('accepts management commands only in the configured control channel when no sessions exist', async () => {
+    sessions = [];
+    const control = vi.fn(async () => ({ text: 'Management ready' }));
+    const b = makeBridge(undefined, { control });
+    await b.reload();
+    await b.syncSessions();
+    const m = {
+      id: '555555555555555555',
+      guild_id: cfg.guildId,
+      channel_id: cfg.parentChannelId,
+      author: { id: cfg.allowedUserIds[0] },
+      content: '!codeman help',
+    };
+    await b.onGatewayMessage({ ...m, content: 'ordinary chat' });
+    await b.onGatewayMessage({ ...m, channel_id: '999999999999999999' });
+    expect(control).not.toHaveBeenCalled();
+    await b.onGatewayMessage(m);
+    expect(control).toHaveBeenCalledExactlyOnceWith('__management__', 'help');
+    expect(sendInput).not.toHaveBeenCalled();
+    await writeDiscordConfig(dir, { ...cfg, mode: 'notifications' });
+    await b.reload();
+    await b.onGatewayMessage({ ...m, id: '555555555555555556' });
+    expect(control).toHaveBeenCalledTimes(1);
+  });
+  it('caps remote history reads without blocking live output from local sessions', async () => {
+    let slow = false,
+      remoteReads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    sessions = [{ id: 'r1', remote: true }, { id: 'r2', remote: true }, { id: 'r3', remote: true }, { id: 'local' }];
+    const history = async (id: string) => {
+      if (slow && id.startsWith('r')) {
+        remoteReads++;
+        await gate;
+      }
+      return {
+        conversationId: 'native1',
+        partial: false,
+        turns:
+          slow && id === 'local'
+            ? [{ cursor: 'native1:1:abc', role: 'assistant' as const, text: 'local live answer', timestamp: '' }]
+            : [],
+      };
+    };
+    const b = makeBridge(undefined, { history });
+    await b.reload();
+    await b.syncSessions();
+    slow = true;
+    const poll = b.pollConversations();
+    try {
+      await vi.waitFor(() => expect(posts.some((p) => p.body?.content?.includes('local live answer'))).toBe(true));
+      expect(remoteReads).toBe(2);
+    } finally {
+      release();
+      await poll;
+    }
   });
   it('defaults legacy and unknown config values to notifications', async () => {
     for (const mode of [undefined, 'unknown', null]) {

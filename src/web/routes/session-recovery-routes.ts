@@ -12,6 +12,7 @@ import { canAccessOwned, getAuthUser } from '../route-helpers.js';
 import type { ConfigPort, EventPort, SessionPort } from '../ports/index.js';
 import { dismissRecovery, isRecoveryDismissed } from '../../session-recovery-fence.js';
 import {
+  activeSessionRecoveryActions as activeRecoveryActions,
   executeSessionRecovery,
   recoveryRemoteIsLive,
   resolveRecoveryTransport,
@@ -33,7 +34,7 @@ type RecoveryTestSeams = {
   ) => Promise<{ remote?: SessionRemote; docker?: SessionDocker }>;
 };
 /** Process-local claim fence: route handlers share an event loop, so add-before-await is atomic. */
-const activeRecoveryActions = new Set<string>();
+
 /** Tombstones make dismissal win races with an action already past its initial lookup. */
 
 function findRecovery(

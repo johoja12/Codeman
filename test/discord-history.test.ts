@@ -106,6 +106,30 @@ describe('Discord native history', () => {
     const verbose = parseDiscordHistory({ mode: 'claude', conversationId: id, includeTools: true }, data);
     expect(verbose.turns.map((t) => [t.role, t.text])).toEqual([['tool', 'visible tool output']]);
   });
+  it('retains Markdown headings and mixed event/response output while rejecting typed reasoning content', () => {
+    const got = parseDiscordHistory(
+      { mode: 'codex', conversationId: id },
+      packet([
+        { type: 'event_msg', payload: { type: 'user_message', message: 'question' } },
+        {
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [
+              { type: 'output_text', text: '# Answer\nDetails' },
+              { type: 'reasoning_text', text: 'SECRET' },
+            ],
+          },
+        },
+        {
+          type: 'response_item',
+          payload: { type: 'reasoning', role: 'assistant', content: [{ type: 'output_text', text: 'SECRET' }] },
+        },
+      ])
+    );
+    expect(got.turns.map((t) => t.text)).toEqual(['question', '# Answer\nDetails']);
+  });
   it('refuses unsupported providers and non-UUID identities before starting subprocesses', () => {
     expect(() => discordHistoryCommand({ mode: 'shell', conversationId: id })).toThrow();
     expect(() => discordHistoryCommand({ mode: 'claude', conversationId: '../../etc/passwd' })).toThrow();
