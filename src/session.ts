@@ -6726,7 +6726,9 @@ export class Session extends EventEmitter {
     this._assistantPendingWrites++;
     try {
       if (this._mux && this._muxSession) {
-        const sent = await this._mux.sendInput(this.id, data);
+        const sent = options.preserveWhitespace
+          ? await this._mux.sendInput(this.id, data, { preserveWhitespace: true })
+          : await this._mux.sendInput(this.id, data);
         if (sent) {
           this._assistantLastInputAt = Date.now();
           const submittedPrompt = this._trackSubmit(data, options);
@@ -6736,6 +6738,8 @@ export class Session extends EventEmitter {
         return sent;
       }
       if (this.ptyProcess) {
+        // Structured multiline messages require the bracketed-paste/Enter transport above.
+        if (options.preserveWhitespace && data.includes('\n')) return false;
         this.ptyProcess.write(data);
         this._assistantLastInputAt = Date.now();
         const submittedPrompt = this._trackSubmit(data, options);

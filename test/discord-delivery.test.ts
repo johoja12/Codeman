@@ -359,4 +359,31 @@ describe('inbound submission safety', () => {
     expect((await b.notify(msg))?.ok).toBe(false);
     expect(requests).toBe(before);
   });
+
+  it('refuses a changed rendering plan after part of a response has been delivered', async () => {
+    let count = 0;
+    let refuse = false;
+    const { b } = await ready(undefined, async (url) => {
+      if (url.pathname.endsWith('/threads')) return Response.json({ id: THREAD });
+      count++;
+      return refuse && count === 3 ? Response.json({}, { status: 403 }) : Response.json({ id: MESSAGE });
+    });
+    const msg = {
+      event: 'done',
+      title: 'original title',
+      body: 'done',
+      sessionId: 's1',
+      urgency: 'critical' as const,
+      fullText: async () => ({ text: 'a long native response paragraph\n\n'.repeat(150), version: 'turn1' }),
+    };
+    now += 10_000;
+    refuse = true;
+    expect((await b.notify(msg))?.ok).toBe(false);
+    const before = count;
+    refuse = false;
+    const changed = await b.notify({ ...msg, title: 'different rendering header' });
+    expect(changed?.ok).toBe(false);
+    expect(changed?.error).toMatch(/formatting changed/);
+    expect(count).toBe(before);
+  });
 });

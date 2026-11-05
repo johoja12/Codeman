@@ -27,6 +27,8 @@ export interface DiscordDelivery {
   channelId: string;
   guildId: string;
   state: DiscordDeliveryState;
+  /** Outbound formatting fingerprint; guards multipart retries after a formatter upgrade. */
+  payloadHash?: string;
   createdAt: number;
   updatedAt: number;
   /** Fixed codes only. Never store external exception messages or prompt text here. */
@@ -40,7 +42,8 @@ export interface DiscordDelivery {
     | 'scope_changed'
     | 'discord_refused'
     | 'delivery_uncertain'
-    | 'rate_limited';
+    | 'rate_limited'
+    | 'input_too_large';
 }
 
 export class DiscordDeliveryJournal {
@@ -108,6 +111,11 @@ export class DiscordDeliveryJournal {
         createdAt: r.createdAt,
         updatedAt: r.updatedAt,
       };
+      if (r.payloadHash !== undefined) {
+        if (typeof r.payloadHash !== 'string' || !/^[a-f0-9]{64}$/.test(r.payloadHash))
+          throw new DiscordDeliveryError('Invalid Discord delivery fingerprint');
+        record.payloadHash = r.payloadHash;
+      }
       if (['received', 'files_transferred', 'submitting'].includes(record.state)) {
         record.reason = record.state === 'submitting' ? 'restart_during_submit' : 'restart_before_submit';
         record.state = record.reason === 'restart_during_submit' ? 'uncertain' : 'failed';

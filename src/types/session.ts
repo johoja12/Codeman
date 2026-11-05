@@ -118,6 +118,8 @@ export interface SessionWriteOptions {
    * name a tab; Ralph, respawn, cron and approval writes leave this unset.
    */
   fromUser?: boolean;
+  /** Internal writeViaMux option: preserve structured-message whitespace and newline bytes. */
+  preserveWhitespace?: boolean;
   /** Internal assistant coordinator permit; never accepted from HTTP or WebSocket payloads. */
   assistantPermit?: string;
 }
