@@ -230,6 +230,9 @@ describe('session recovery routes', () => {
     expect(harness.ctx.store.upsertSessionRecovery).toHaveBeenCalledTimes(1);
     expect(records[0].recoveredSessionId).toBeTruthy();
     expect(records[0]).toMatchObject({ restoreEvidence: 'launch_returned' });
+    const createdEvents = harness.ctx.broadcast.mock.calls.filter(([event]) => event === 'session:created');
+    expect(createdEvents).toHaveLength(1);
+    expect(createdEvents[0][1]).toMatchObject({ id: records[0].recoveredSessionId });
 
     const sequential = await harness.app.inject({ method: 'POST', url: '/api/session-recoveries/recovery-1/resume' });
     expect(sequential.statusCode).toBe(409);
