@@ -129,6 +129,18 @@ The text explains `codeman notify "message" --urgent`. `codeman` is on the PATH 
 
 ## Security model
 
+### Delivery and retries
+
+Inbound message IDs are durably claimed before any terminal write, including file-only replies. Duplicate gateway events reuse that claim across restart and never type the same message again. An interrupted transfer or attachment refusal prevents the prompt from being typed. A reply rejected by the one-second rate limit is explicitly reported; send a new message to retry it.
+
+The ✅ reaction means **terminal transport accepted the input**, not that the agent started or completed the task. A false/throwing terminal write, or a restart during submission, is **uncertain**. Check the native session before sending anything again. The bridge never retries the entire prompt after an ambiguous write and never silently replays pending input on startup. Correlation with native running/completed turns will be added with live conversation observation.
+
+Outbound posts use a stable Discord nonce for bounded retries (at most three requests) after a network error or server failure. Rate-limit delays are honored; waits over 30 seconds are surfaced instead of retried early. Thread creation is not retried after an ambiguous network/server failure, since Discord does not provide a creation nonce for it. Multi-part responses are serialized per session, record completed parts, and report failure if any part fails. A later retry can skip delivered parts; an uncertain post is not blindly replayed after restart.
+
+Delivery metadata lives in instance-scoped `discord-delivery.json`, mode 0600, written atomically with file sync. It contains IDs, timestamps and delivery states, **not prompt text, message bodies, file bytes or bot tokens**. Retention is seven days with a 2,048-record cap; only the latest 256 completed outbound records are retained. Saturation or corrupt/unreadable tracking pauses new input rather than losing deduplication. Do not delete this file to retry a task: doing so discards the protection against replay.
+
+Admins can inspect the latest 50 records through `GET /api/discord/deliveries`. States distinguish received input, transferred files, submission in progress, transport acceptance, delivered Discord posts, failure and uncertainty. This metadata is not a durable message-body outbox: uncertain output after a long outage requires review rather than a guaranteed automatic resend. Discord's nonce deduplication only covers recent messages.
+
 - Only messages from IDs in `allowedUserIds`, in the configured guild, inside a thread Codeman created, are acted on. Everything else is dropped.
 - A reply is reduced to one line, stripped of control characters and capped in length before it is typed.
 - Replies are rate limited per session.

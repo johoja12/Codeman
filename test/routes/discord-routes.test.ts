@@ -62,6 +62,15 @@ describe('/api/discord', () => {
     expect(data).not.toHaveProperty('token');
   });
 
+  it('returns bounded delivery metadata without message bodies or tokens', async () => {
+    const { app, bridge } = await harness();
+    const res = await app.inject({ method: 'GET', url: '/api/discord/deliveries' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ success: true, data: [] });
+    expect(res.body).not.toContain(TOKEN);
+    bridge.stop();
+  });
+
   it('saves, masks the token in every response and writes the file 0600', async () => {
     const { app, bridge } = await harness();
     const put = await app.inject({ method: 'PUT', url: '/api/discord', payload: FULL });
@@ -152,6 +161,7 @@ describe('/api/discord', () => {
     process.env.CODEMAN_MULTIUSER = '1';
     const { app } = await harness({ username: 'bob', role: 'user' });
     expect((await app.inject({ method: 'GET', url: '/api/discord' })).statusCode).toBe(403);
+    expect((await app.inject({ method: 'GET', url: '/api/discord/deliveries' })).statusCode).toBe(403);
     expect((await app.inject({ method: 'PUT', url: '/api/discord', payload: FULL })).statusCode).toBe(403);
     expect((await app.inject({ method: 'POST', url: '/api/discord/test' })).statusCode).toBe(403);
     expect((await app.inject({ method: 'POST', url: '/api/discord/sync' })).statusCode).toBe(403);
