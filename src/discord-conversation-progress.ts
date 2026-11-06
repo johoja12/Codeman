@@ -10,6 +10,7 @@ export interface DiscordConversationProgress {
   cursor?: string;
   statusMessageId?: string;
   statusHash?: string;
+  lastResponse?: { cursor: string; message: string };
   verbose?: boolean;
   streamOff?: boolean;
 }
@@ -49,6 +50,10 @@ export class DiscordConversationProgressStore {
               (typeof p.statusMessageId !== 'string' || !/^\d{15,25}$/.test(p.statusMessageId))) ||
             (p.statusHash !== undefined &&
               (typeof p.statusHash !== 'string' || !/^[a-f0-9]{64}$/.test(p.statusHash))) ||
+            (p.lastResponse !== undefined &&
+              (!validCursor(p.lastResponse?.cursor) ||
+                typeof p.lastResponse?.message !== 'string' ||
+                !/^\d{15,25}$/.test(p.lastResponse.message))) ||
             (p.verbose !== undefined && typeof p.verbose !== 'boolean') ||
             (p.streamOff !== undefined && typeof p.streamOff !== 'boolean')
           )
@@ -61,6 +66,7 @@ export class DiscordConversationProgressStore {
             cursor: p.cursor,
             statusMessageId: p.statusMessageId,
             statusHash: p.statusHash,
+            lastResponse: p.lastResponse,
             verbose: p.verbose,
             streamOff: p.streamOff,
           });

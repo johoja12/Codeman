@@ -248,7 +248,7 @@ describe('native Discord UI', () => {
     expect(card.components!.flatMap((r) => r.components).map((c) => c.label)).toContain('Settings');
     await f.ui.poll();
     expect(f.messages.size).toBe(2);
-    expect(f.host.request).toHaveBeenCalledWith('PUT', `/channels/${channel}/pins/${card.id}`);
+    expect(f.host.request).toHaveBeenCalledWith('PUT', `/channels/${channel}/messages/pins/${card.id}`);
     const restored = new DiscordNativeUi(f.host);
     await restored.poll();
     expect(f.messages.size).toBe(2);
@@ -793,4 +793,37 @@ it('offers stable read-only response controls with exact history and actor check
   await f.ui.interaction(f.event(button));
   expect(f.host.postFile).toHaveBeenCalledTimes(1);
   expect(f.finishes.at(-1)?.content).toContain('changed');
+});
+it('keeps the shared completion card current and acknowledges only an opened exact result', async () => {
+  const f = await fixture();
+  let entries = [
+    {
+      id: 'a'.repeat(32),
+      session: 's1',
+      conversation: 'conversation-one',
+      userCursor: 'u1',
+      responseCursor: 'r1',
+      guild,
+      channel,
+      name: 'Finished build',
+      completed: 1000,
+    },
+  ];
+  f.host.inbox = {
+    list: async () => entries,
+    review: vi.fn(async (ids) => {
+      entries = entries.filter((e) => !ids.includes(e.id));
+    }),
+    response: vi.fn(async () => ({ text: 'Exact native result', latest: true })),
+  };
+  await f.ui.refreshInbox();
+  const card = [...f.messages.values()].find((m) => m.content.includes('Ready for review'))!;
+  expect(card.content).toContain('Finished build');
+  await f.click(card, 'Open response 1', undefined, { channel_id: parent, message: { id: card.id } });
+  expect(f.host.inbox.response).toHaveBeenCalledWith('a'.repeat(32));
+  expect(f.host.inbox.review).toHaveBeenCalledWith(['a'.repeat(32)], 'discord');
+  await f.ui.refreshInbox();
+  expect([...f.messages.values()].find((m) => m.content.includes('Ready for review'))?.content).toContain(
+    'All caught up'
+  );
 });
