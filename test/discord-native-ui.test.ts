@@ -247,6 +247,13 @@ describe('native Discord UI', () => {
     expect(f.messages.size).toBe(3);
     expect((await restored.store.snapshot()).cards).toBeDefined();
   });
+  it('uses only passive ownership checks for automatic completion cards', async () => {
+    const f = await fixture();
+    f.host.receipts = async () => [{ id: 'completed-input', state: 'completed', updated: 1 }];
+    await f.ui.poll();
+    expect([...f.messages.values()].some((m) => m.content.includes('Results & files'))).toBe(true);
+    expect(f.host.verify).not.toHaveBeenCalled();
+  });
   it('recreates a deleted owned card and refuses a message now owned by someone else', async () => {
     const f = await fixture();
     await f.ui.poll();

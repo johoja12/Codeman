@@ -343,7 +343,7 @@ export class DiscordNativeUi {
           await this.upsert(
             resultKey,
             channel,
-            await this.results({ channel_id: channel } as DiscordInteraction, s.id)
+            await this.results({ channel_id: channel } as DiscordInteraction, s.id, s)
           );
           old.forEach((id) => this.actions.delete(id));
           this.cardActions.set(
@@ -962,8 +962,8 @@ export class DiscordNativeUi {
       else state.queue[at].state = result === 'blocked' ? 'queued' : 'uncertain';
     });
   }
-  private async results(m: DiscordInteraction, id: string): Promise<DiscordUiPayload> {
-    const s = await this.target(id),
+  private async results(m: DiscordInteraction, id: string, snapshot?: DiscordUiSession): Promise<DiscordUiPayload> {
+    const s = snapshot ?? (await this.target(id)),
       ctx = this.ctx(m, s);
     let execution = 'Not available';
     try {

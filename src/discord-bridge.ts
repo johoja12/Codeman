@@ -1094,7 +1094,7 @@ export class DiscordBridge {
           const result = await this.threadFor(id, undefined);
           return typeof result === 'string' ? result : undefined;
         },
-        botId: async () => (await this.api.botUserId())?.id,
+        botId: () => (this.activityBot ??= this.api.botUserId().then((me) => me?.id)),
       });
 
     this.categories = new DiscordCaseCategories(deps.configDir);
@@ -2553,7 +2553,9 @@ export class DiscordBridge {
           !this.deps.agentExited?.(sessionId) &&
           !this.deps.awaitingChoice?.(sessionId);
         if (!current() || !this.deps.history) return 'blocked';
-        await this.channels.assertOwned(this.cfg, sessionId, channel);
+        if (idle) {
+          if (!(await this.channels.activityOwned(this.cfg, sessionId, channel))) return 'blocked';
+        } else await this.channels.assertOwned(this.cfg, sessionId, channel);
         const baseline = await this.deps.history(sessionId);
         if (baseline.conversationId !== conversation || !current()) return 'blocked';
         const id = `ui-submit:${this.cfg.guildId}:${source}`;
