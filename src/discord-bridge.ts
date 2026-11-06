@@ -317,6 +317,7 @@ export interface DiscordPost {
     accent_color?: number;
     divider?: boolean;
     spacing?: number;
+    file?: { url: string };
     components?: Array<Record<string, unknown>>;
   }>;
 }
@@ -599,6 +600,14 @@ export class DiscordApi {
       'payload_json',
       JSON.stringify({
         ...discordWirePost(p),
+        ...((p.flags ?? 0) & DISCORD_COMPONENTS_V2
+          ? {
+              components: [
+                ...(p.components ?? []),
+                { type: 13, file: { url: 'attachment://' + safeAttachmentName(file.name) } },
+              ],
+            }
+          : {}),
         nonce: p.nonce ?? randomUUID().replaceAll('-', '').slice(0, 24),
         enforce_nonce: true,
       })

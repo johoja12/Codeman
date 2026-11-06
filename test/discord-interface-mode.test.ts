@@ -1402,3 +1402,24 @@ it('coalesces explicit commentary into one editable status and delivers the nati
   expect(posts.filter((p) => p.method === 'POST' && visibleText(p.body) === 'The artifact is ready.')).toHaveLength(1);
   expect(sendInput).not.toHaveBeenCalled();
 });
+it('keeps an attached file visible when an alert also contains a native V2 response', async () => {
+  const b = makeBridge();
+  await b.reload();
+  await b.syncSessions();
+  const result = await b.notify(
+    {
+      sessionId: 's1',
+      event: 'explicit',
+      title: 'Review output',
+      body: 'Results attached.',
+      urgency: 'critical',
+      file: { name: 'results.txt', data: Buffer.from('test results') },
+      fullText: async () => ({ text: 'The answer.' }),
+    },
+    { deliberate: true }
+  );
+  expect(result?.ok).toBe(true);
+  const post = posts.find((p) => p.body?.flags === 32772 && visibleText(p.body)?.includes('The answer.'))!.body;
+  expect(post.components).toContainEqual({ type: 13, file: { url: 'attachment://results.txt' } });
+  expect(uploaded.some((f) => f.name === 'results.txt' && f.text === 'test results')).toBe(true);
+});
