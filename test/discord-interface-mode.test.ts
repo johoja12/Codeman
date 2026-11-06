@@ -1312,7 +1312,9 @@ it('reports a missing canonical response once instead of sending cursor-painted 
     body: 'fallback',
     urgency: 'warning' as const,
     tail: 'happen between these recorded\n\nviews\n8–9 Shared placement\nThe three chat workloads now\nutilization',
-    fullText: async () => undefined,
+    fullText: async () => {
+      throw new Error('Original transcript unavailable');
+    },
   };
   await b.notify(msg);
   now += 10000;
@@ -1321,4 +1323,21 @@ it('reports a missing canonical response once instead of sending cursor-painted 
   expect(notices).toHaveLength(1);
   expect(posts.some((p) => JSON.stringify(p.body ?? {}).includes('happen between these recorded'))).toBe(false);
   expect(sendInput).not.toHaveBeenCalled();
+});
+
+it('does not show a reconnect notice for a connected session with no assistant response yet', async () => {
+  const b = makeBridge(undefined, { history: async () => ({ conversationId: 'native1', turns: [], partial: false }) });
+  await b.reload();
+  await b.syncSessions();
+  await b.notify({
+    sessionId: 's1',
+    event: 'hook:idle_prompt',
+    title: 'Waiting for Input',
+    body: 'empty',
+    urgency: 'warning',
+    fullText: async () => undefined,
+    tail: 'Ask Codex to do anything',
+  });
+  expect(posts.some((p) => p.body?.embeds?.[0]?.title === 'Reconnecting to this conversation')).toBe(false);
+  expect(posts.some((p) => JSON.stringify(p.body ?? {}).includes('Ask Codex to do anything'))).toBe(false);
 });

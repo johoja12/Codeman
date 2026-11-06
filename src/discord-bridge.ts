@@ -1915,11 +1915,13 @@ export class DiscordBridge {
     }
     let chunks: string[] = [];
     let responseText: string | undefined;
+    let originalReadSucceeded = false;
     // Remembered only once the first post is out: a failed post must leave the message to be sent again.
     let posted: string | undefined;
     if (msg.fullText) {
       try {
         const got = await withTimeout(msg.fullText(), FULL_TEXT_TIMEOUT_MS);
+        originalReadSucceeded = true;
         const text = got?.text ? discordDisplayText(got.text).trim() : undefined;
         const sid = msg.sessionId;
         if (got?.text && !text) msg = { ...msg, tail: undefined };
@@ -1973,6 +1975,8 @@ export class DiscordBridge {
       !opts.deliberate &&
       ['hook:idle_prompt', 'hook:stop'].includes(msg.event) &&
       !this.deps.awaitingChoice?.(msg.sessionId ?? '');
+    if (this.cfg.mode === 'full' && routine && originalReadSucceeded && !responseText)
+      return { ok: true, deduped: true, at: this.now() };
     const cards = responseText
       ? discordResponsePosts(routine ? responseText : `${msg.body}\n\n${responseText}`, {
           title: routine ? 'Response' : msg.title,
