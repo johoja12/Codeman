@@ -8,15 +8,8 @@ export interface DiscordActivitySession {
 }
 
 export function discordActivityName(session: DiscordActivitySession): string {
-  const label = session.exited
-    ? '⚫ Offline'
-    : session.waiting
-      ? '🔴 Needs input'
-      : session.working
-        ? '🟡 Working'
-        : '🟢 Idle';
   const name = (session.name ?? session.id.slice(0, 8)).replace(/[\r\n]/g, ' ').trim();
-  return `${label} · ${name || session.id.slice(0, 8)}`.slice(0, 100);
+  return `${name || session.id.slice(0, 8)}`.slice(0, 100);
 }
 
 interface ActivityDeps {
@@ -35,7 +28,6 @@ interface Progress {
   renamedAt?: number;
   typedAt?: number;
   verifiedAt?: number;
-  idleSince?: number;
   verifyRetryAt?: number;
   renameRetryAt?: number;
   typingRetryAt?: number;
@@ -46,9 +38,6 @@ function retryAfter(error: unknown): number {
   const delay = (error as { retryAfterMs?: unknown })?.retryAfterMs;
   return typeof delay === 'number' && Number.isFinite(delay) && delay > 0 ? delay : RETRY_MS;
 }
-
-const activityPrefix = (session: DiscordActivitySession) =>
-  discordActivityName({ ...session, name: '' }).split(' · ')[0];
 
 /** Coalesced sweeps, four sessions at a time. No messages, pings, agent input or new destinations. */
 export class DiscordActivity {
@@ -64,11 +53,9 @@ export class DiscordActivity {
   forget(id: string): void {
     this.progress.delete(id);
   }
-  /** Keep other bridge paths from undoing a coalesced activity rename. */
+  /** Every creation/synchronization path uses the same activity-independent title. */
   name(session: DiscordActivitySession): string {
-    const key = JSON.stringify([this.deps.scope(), this.deps.destination(session.id)]);
-    const progress = this.progress.get(session.id);
-    return progress?.key === key && progress.name ? progress.name : discordActivityName(session);
+    return discordActivityName(session);
   }
   poll(): Promise<void> {
     if (this.run) return this.run;
@@ -110,19 +97,12 @@ export class DiscordActivity {
       this.progress.set(id, progress);
     }
     const now = this.deps.now();
-    if (session.working || session.waiting || session.exited) progress.idleSince = undefined;
-    else progress.idleSince ??= now;
     if ((progress.verifyRetryAt ?? 0) > now) return;
     const needsRename = () => {
       const s = current();
       if (!s || (progress.renameRetryAt ?? 0) > now || progress.name === discordActivityName(s)) return false;
-      const active = s.working || s.waiting || s.exited;
-      const stateChanged = !progress.name?.startsWith(activityPrefix(s) + ' · ');
-      // Show a new active state promptly; only settling back to Idle is delayed. Short
-      // gaps between turns must not spend the rename budget or hide the next short turn.
-      if (active && stateChanged) return progress.renamedAt === undefined || now - progress.renamedAt >= 1_000;
-      if (!active && /^(🟡 Working|🔴 Needs input|⚫ Offline) · /.test(progress.name ?? ''))
-        return now - (progress.idleSince ?? now) >= 30_000;
+      // Only a real session rename or a legacy activity prefix needs a PATCH.
+      // Foreground/background task transitions must not create Discord system notices.
       return progress.renamedAt === undefined || now - progress.renamedAt >= 30_000;
     };
     const needsTyping = () => {

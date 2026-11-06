@@ -30,9 +30,9 @@ beforeEach(() => {
 });
 
 describe('Discord live activity', () => {
-  it('shows working, renews typing while work continues, and avoids repeated renames', async () => {
+  it('uses a stable title and renews typing while work continues', async () => {
     await activity.poll();
-    expect(rename).toHaveBeenCalledWith('thread', '🟡 Working · hs-lab', expect.any(Function));
+    expect(rename).toHaveBeenCalledWith('thread', 'hs-lab', expect.any(Function));
     expect(typing).toHaveBeenCalledTimes(1);
     now += 4_000;
     await activity.poll();
@@ -42,25 +42,26 @@ describe('Discord live activity', () => {
     expect(typing).toHaveBeenCalledTimes(2);
     expect(rename).toHaveBeenCalledTimes(1);
   });
-  it('shows questions and exit promptly, stops typing, and delays only settling to Idle', async () => {
+  it('keeps the title stable through questions, idle and exit while stopping typing', async () => {
     await activity.poll();
     sessions[0].waiting = true;
     now += 8_000;
     await activity.poll();
     expect(typing).toHaveBeenCalledTimes(1);
-    expect(rename).toHaveBeenLastCalledWith('thread', '🔴 Needs input · hs-lab', expect.any(Function));
+    expect(rename).toHaveBeenLastCalledWith('thread', 'hs-lab', expect.any(Function));
     sessions[0] = { id: 's1', name: 'hs-lab', working: false };
     now += 30_000;
     await activity.poll();
-    expect(rename).toHaveBeenLastCalledWith('thread', '🔴 Needs input · hs-lab', expect.any(Function));
+    expect(rename).toHaveBeenLastCalledWith('thread', 'hs-lab', expect.any(Function));
     now += 30_000;
     await activity.poll();
-    expect(rename).toHaveBeenLastCalledWith('thread', '🟢 Idle · hs-lab', expect.any(Function));
+    expect(rename).toHaveBeenLastCalledWith('thread', 'hs-lab', expect.any(Function));
     sessions[0].exited = true;
     now += 30_000;
     await activity.poll();
-    expect(rename).toHaveBeenLastCalledWith('thread', '⚫ Offline · hs-lab', expect.any(Function));
+    expect(rename).toHaveBeenLastCalledWith('thread', 'hs-lab', expect.any(Function));
     expect(typing).toHaveBeenCalledTimes(1);
+    expect(rename).toHaveBeenCalledTimes(1);
   });
   it('does not create destinations, reopen archives or bypass ownership refusals', async () => {
     destination = undefined;
@@ -100,7 +101,7 @@ describe('Discord live activity', () => {
       return true;
     });
     await activity.poll();
-    expect(rename).toHaveBeenCalledWith('thread', '🔴 Needs input · hs-lab', expect.any(Function));
+    expect(rename).toHaveBeenCalledWith('thread', 'hs-lab', expect.any(Function));
     expect(typing).not.toHaveBeenCalled();
   });
   it('coalesces overlapping polls, contains REST failures and retries with backoff', async () => {
@@ -115,18 +116,18 @@ describe('Discord live activity', () => {
     expect(rename).toHaveBeenCalledTimes(2);
     expect(typing).toHaveBeenCalledTimes(2);
   });
-  it('does not spend a rename on an already-correct title and shows a new short turn promptly', async () => {
+  it('does not rename an already-correct title when a new turn starts', async () => {
     sessions[0].working = false;
-    verify.mockResolvedValue({ name: '🟢 Idle · hs-lab' });
+    verify.mockResolvedValue({ name: 'hs-lab' });
     await activity.poll();
     expect(rename).not.toHaveBeenCalled();
     now += 4_000;
     sessions[0].working = true;
     await activity.poll();
-    expect(rename).toHaveBeenCalledWith('thread', '🟡 Working · hs-lab', expect.any(Function));
+    expect(rename).not.toHaveBeenCalled();
     expect(typing).toHaveBeenCalledTimes(1);
   });
-  it('delays Idle between short turns rather than spending the title budget on a brief gap', async () => {
+  it('never spends the title budget on short gaps between turns', async () => {
     await activity.poll();
     sessions[0].working = false;
     now += 4_000;
@@ -138,13 +139,13 @@ describe('Discord live activity', () => {
     expect(rename).toHaveBeenCalledTimes(1);
     expect(typing).toHaveBeenCalledTimes(2);
   });
-  it('reconciles a stale Idle title written after our successful Working rename', async () => {
+  it('normalizes a legacy activity title after the rename cooldown', async () => {
     await activity.poll();
     verify.mockResolvedValue({ name: '🟢 Idle · hs-lab' });
-    now += 8_000;
+    now += 30_000;
     await activity.poll();
     expect(rename).toHaveBeenCalledTimes(2);
-    expect(rename).toHaveBeenLastCalledWith('thread', '🟡 Working · hs-lab', expect.any(Function));
+    expect(rename).toHaveBeenLastCalledWith('thread', 'hs-lab', expect.any(Function));
   });
   it('keeps typing through a long rename rate limit and honors the actual retry-after', async () => {
     rename.mockRejectedValueOnce(Object.assign(new Error('limited'), { retryAfterMs: 120_000 }));
@@ -161,14 +162,14 @@ describe('Discord live activity', () => {
     await activity.poll();
     expect(rename).toHaveBeenCalledTimes(2);
   });
-  it('keeps title updates independent of typing endpoint failures', async () => {
+  it('keeps real session renames independent of typing endpoint failures', async () => {
     typing.mockRejectedValueOnce(Object.assign(new Error('typing limited'), { retryAfterMs: 60_000 }));
     await activity.poll();
-    expect(rename).toHaveBeenCalledWith('thread', '🟡 Working · hs-lab', expect.any(Function));
-    now += 8_000;
-    sessions[0].waiting = true;
+    expect(rename).toHaveBeenCalledWith('thread', 'hs-lab', expect.any(Function));
+    now += 30_000;
+    sessions[0].name = 'renamed-lab';
     await activity.poll();
-    expect(rename).toHaveBeenLastCalledWith('thread', '🔴 Needs input · hs-lab', expect.any(Function));
+    expect(rename).toHaveBeenLastCalledWith('thread', 'renamed-lab', expect.any(Function));
     expect(typing).toHaveBeenCalledTimes(1);
   });
   it('measures retry-after from the response rather than an earlier slow ownership check', async () => {
@@ -186,19 +187,19 @@ describe('Discord live activity', () => {
   });
   it('reconciles an externally stale title even while Idle', async () => {
     sessions[0].working = false;
-    verify.mockResolvedValue({ name: '🟢 Idle · hs-lab' });
+    verify.mockResolvedValue({ name: 'hs-lab' });
     await activity.poll();
     verify.mockResolvedValue({ name: '🟡 Working · hs-lab' });
     now += 30_000;
     await activity.poll();
-    expect(rename).toHaveBeenCalledWith('thread', '🟢 Idle · hs-lab', expect.any(Function));
+    expect(rename).toHaveBeenCalledWith('thread', 'hs-lab', expect.any(Function));
   });
   it('refreshes the destination after a scope change, forget and restart', async () => {
     await activity.poll();
     scope = 'new-guild/category';
     destination = 'new-thread';
     await activity.poll();
-    expect(rename).toHaveBeenLastCalledWith('new-thread', '🟡 Working · hs-lab', expect.any(Function));
+    expect(rename).toHaveBeenLastCalledWith('new-thread', 'hs-lab', expect.any(Function));
     activity.forget('s1');
     await activity.poll();
     expect(rename).toHaveBeenCalledTimes(3);
@@ -206,13 +207,15 @@ describe('Discord live activity', () => {
     await activity.poll();
     expect(rename).toHaveBeenCalledTimes(4);
   });
-  it('keeps published titles stable until the next coalesced update', async () => {
+  it('never returns cached activity labels and immediately reflects real session renames', async () => {
     await activity.poll();
     sessions[0].waiting = true;
-    expect(activity.name(sessions[0])).toBe('🟡 Working · hs-lab');
+    expect(activity.name(sessions[0])).toBe('hs-lab');
+    sessions[0].name = 'new-name';
+    expect(activity.name(sessions[0])).toBe('new-name');
     now += 30_000;
     await activity.poll();
-    expect(activity.name(sessions[0])).toBe('🔴 Needs input · hs-lab');
+    expect(activity.name(sessions[0])).toBe('new-name');
   });
   it.each(['typing', 'rename'] as const)(
     'defers a rate-limited cosmetic %s without holding the activity sweep',
@@ -226,9 +229,7 @@ describe('Discord live activity', () => {
         }
       );
       const request =
-        method === 'typing'
-          ? api.typing('thread', () => !!scope)
-          : api.rename('thread', '🟡 Working · hs-lab', () => !!scope);
+        method === 'typing' ? api.typing('thread', () => !!scope) : api.rename('thread', 'hs-lab', () => !!scope);
       await expect(request).rejects.toMatchObject({ status: 429, retryAfterMs: 1000 });
       expect(fetch).toHaveBeenCalledTimes(1);
       expect(scope).toBe('guild/category');
@@ -242,10 +243,10 @@ describe('Discord live activity', () => {
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(sleep).not.toHaveBeenCalled();
   });
-  it('caps names at Discord limits and gives waiting/offline priority over busy', () => {
-    expect(discordActivityName({ id: 's', working: true, waiting: true })).toContain('Needs input');
-    expect(discordActivityName({ id: 's', working: true, waiting: true, exited: true })).toContain('Offline');
+  it('caps and sanitizes stable names independently of activity state', () => {
+    expect(discordActivityName({ id: 's', name: 'lab', working: true, waiting: true })).toBe('lab');
+    expect(discordActivityName({ id: 's', name: 'lab', working: true, exited: true })).toBe('lab');
     expect(discordActivityName({ id: 'abcdefgh-ijkl', name: 'a'.repeat(200) })).toHaveLength(100);
-    expect(discordActivityName({ id: 'abcdefgh-ijkl', name: ' \n ' })).toBe('🟢 Idle · abcdefgh');
+    expect(discordActivityName({ id: 'abcdefgh-ijkl', name: ' \n ' })).toBe('abcdefgh');
   });
 });
