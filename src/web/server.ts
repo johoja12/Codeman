@@ -825,6 +825,8 @@ export class WebServer extends EventEmitter {
       if (!session) throw new Error('Session unavailable');
       return readDiscordSessionHistory(session, options);
     },
+    launchModes: () => enabledClis().map((c) => c.id),
+    launch: (scope, caseKey, mode) => this.discordSessionManager.launch(scope, caseKey, mode),
     controlCurrent: (id, validity) => {
       const session = this.sessions.get(id);
       return (

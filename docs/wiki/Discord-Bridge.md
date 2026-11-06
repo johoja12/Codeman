@@ -103,3 +103,11 @@ Discord for them; only the agent-initiated `codeman notify` habit is missing.
 
 See also: [Notifications And Approvals](Notifications-And-Approvals) for the other ways to hear
 from an agent, and [Security](Security) for how secrets are handled.
+
+### Start a new session from a case channel
+
+In **Full mode**, use `/claude`, `/codex`, `/opencode`, `/shell`, or another enabled CLI's slash command in a Codeman case channel. Review the case, execution host and default group, then press **Confirm** within one minute. Codeman creates a new session and posts its separate thread link. Open that thread to send the first prompt. No prompt is submitted during launch.
+
+The commands also work inside an existing session thread and create a sibling session for the same configured case. They do not change the current thread's agent. Registration happens automatically in the configured Discord server; the bot needs application-command authorization. Unrelated commands are preserved. Disabled commands and commands used outside owned case destinations cannot launch sessions.
+
+Local and linked SSH cases use the same creation service as the web UI and inherit the case's default session group. Unlinked workspaces, ambiguous aliases/names, unavailable cases and Docker cases must be launched through the web UI; Codeman never guesses a replacement host or directory. Existing sessions are left running.

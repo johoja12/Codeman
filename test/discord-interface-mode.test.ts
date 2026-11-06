@@ -57,6 +57,10 @@ function makeBridge(
           uploaded.push({ name: String((file as { name?: string }).name), text: await file.text() });
       }
       posts.push({ path, method, body } as any);
+      if (/\/applications\/.*\/commands$/.test(path)) {
+        if (method === 'GET') return Response.json([]);
+        return Response.json({ ...body, id: body.name === 'codex' ? '777777777777777771' : '777777777777777772' });
+      }
       if (method === 'GET' && path.endsWith('/users/@me')) return Response.json({ id: BOT });
       if (method === 'GET' && path.endsWith('/channels'))
         return Response.json([...remoteChannels.values()].filter((c) => c.type === 0));
@@ -1094,4 +1098,61 @@ describe('Discord interface mode', () => {
     expect(creations().filter((p) => p.body?.parent_id === newParent)).toHaveLength(2);
     expect(Object.keys(await readFullMap(dir))).toEqual(['s1', 's2']);
   });
+});
+
+it('launches from owned case channels and threads with a confirmation, never terminal input', async () => {
+  const root = 'a'.repeat(64);
+  let currentRoot = root;
+  const launch = vi.fn(async () => ({
+    text: 'Create codex in brain on host1?',
+    actions: [{ label: 'Confirm', command: 'confirm launch', validity: 'launch' }],
+  }));
+  const control = vi.fn(async () => {
+    sessions.push({ id: 'new-session', name: 'w3-brain' });
+    return { text: 'Session created', locateSessionId: 'new-session' };
+  });
+  const b = makeBridge(undefined, {
+    caseForSession: async () => ({ key: currentRoot, name: 'brain' }),
+    launchModes: () => ['codex', 'claude'],
+    launch,
+    control,
+    controlCurrent: () => true,
+  });
+  await b.reload();
+  await b.syncSessions();
+  await b.syncLaunchCommands();
+  const parent = [...remoteChannels.values()].find((c) => c.type === 0)!;
+  const map = await readFullMap(dir);
+  const interaction = {
+    id: '900000000000000081',
+    application_id: BOT,
+    token: 'interaction-token',
+    type: 2,
+    guild_id: cfg.guildId,
+    channel_id: parent.id,
+    member: { user: { id: cfg.allowedUserIds[0] } },
+    data: { name: 'codex', id: '777777777777777771' },
+  };
+  await b.onGatewayInteraction(interaction);
+  expect(launch).toHaveBeenCalledExactlyOnceWith('__case__:' + root, root, 'codex');
+  expect(control).not.toHaveBeenCalled();
+  const review = [...remoteMessages.values()].find((m) => m.components?.length)!;
+  await b.onGatewayInteraction({
+    ...interaction,
+    id: '900000000000000082',
+    type: 3,
+    data: { custom_id: review.components[0].components[0].custom_id },
+    message: { id: review.id },
+  });
+  expect(control).toHaveBeenCalledExactlyOnceWith('__case__:' + root, 'confirm launch');
+  expect((await readFullMap(dir))['new-session']).toBeTruthy();
+  await b.onGatewayInteraction({ ...interaction, id: '900000000000000083', channel_id: map.s1 });
+  expect(launch).toHaveBeenLastCalledWith('s1', root, 'codex');
+  await b.onGatewayInteraction({ ...interaction, id: '900000000000000084', channel_id: cfg.parentChannelId });
+  await b.onGatewayInteraction({ ...interaction, id: '900000000000000085', member: { user: { id: 'unauthorized' } } });
+  await b.onGatewayInteraction({ ...interaction, id: '900000000000000086', data: { name: 'codex', id: 'foreign' } });
+  currentRoot = 'b'.repeat(64);
+  await b.onGatewayInteraction({ ...interaction, id: '900000000000000087', channel_id: map.s1 });
+  expect(launch).toHaveBeenCalledTimes(2);
+  expect(sendInput).not.toHaveBeenCalled();
 });
