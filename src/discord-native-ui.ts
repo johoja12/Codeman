@@ -5,7 +5,7 @@ import type { DiscordInteraction, GatewayMessage } from './discord-bridge.js';
 import type { DiscordNativeUiHost, DiscordUiPayload, DiscordUiSession } from './discord-native-ui-types.js';
 const hash = (s: string) => createHash('sha256').update(s).digest('hex');
 const sourceSignature = (m: GatewayMessage) =>
-  hash(JSON.stringify([m.content, (m.attachments ?? []).map((a) => [a.id, a.filename, a.size])]));
+  hash(JSON.stringify([m.content, (m.attachments ?? []).map((a) => [a.id, a.filename, a.size]), m.message_reference]));
 const safe = (s: string, n = 200) =>
   s
     .replace(/[@`*_~<>]/g, '')

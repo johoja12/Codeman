@@ -19,6 +19,7 @@
  *
  * @module discord-bridge
  */
+import { quoteDiscordReply, type DiscordReplyMessage } from './discord-reply-context.js';
 import { DiscordNativeUi } from './discord-native-ui.js';
 import type { DiscordNativeUiServices } from './discord-native-ui-types.js';
 import { registerDiscordLaunchCommands } from './discord-launch-commands.js';
@@ -647,6 +648,7 @@ export interface GatewayMessage {
   guild_id?: string;
   content: string;
   author: { id: string; bot?: boolean };
+  message_reference?: { message_id?: string; channel_id?: string; guild_id?: string; type?: number };
   attachments?: Array<{ id: string; filename: string; size: number; url: string }>;
 }
 
@@ -1011,10 +1013,18 @@ export class DiscordBridge {
           return h;
         },
         prepare: async (id, m) => {
+          const content = await this.replyContent(id, m).catch(() => {
+            throw new Error(
+              'Could not include the replied-to Codeman message in this session thread. Nothing was typed.'
+            );
+          });
           const saved = await this.saveAttachments(id, m);
           if (saved.refused) throw new Error(saved.refused);
-          const text = sanitiseReply(m.content ?? '', saved.paths);
-          if (!text) throw new Error('Empty or unsupported prompt');
+          const text = sanitiseReply(content, saved.paths);
+          if (!text)
+            throw new Error(
+              'The prompt is empty or exceeds the 20,000-character limit including reply context. Nothing was typed.'
+            );
           return text;
         },
         submit: (id, channel, actor, source, text, conversation, idle, inputRevision) =>
@@ -2679,6 +2689,51 @@ export class DiscordBridge {
     if (this.inbound.get(key) === run) this.inbound.delete(key);
   }
 
+  /** Resolve one owned, same-thread quotation before preparing any agent input. */
+  private async replyContent(sessionId: string, m: GatewayMessage): Promise<string> {
+    const ref = m.message_reference;
+    if (!ref) return m.content ?? '';
+    const scope = this.destinationScope();
+    const token = this.cfg.token;
+    const current = () =>
+      !this.stopped &&
+      !this.held &&
+      token === this.cfg.token &&
+      this.cfg.enabled &&
+      scope === this.destinationScope() &&
+      m.guild_id === this.cfg.guildId &&
+      this.cfg.allowedUserIds.includes(m.author.id) &&
+      this.destinationMatches(sessionId, m.channel_id);
+    if (
+      !current() ||
+      (ref.type !== undefined && ref.type !== 0) ||
+      !/^\d{15,25}$/.test(ref.message_id ?? '') ||
+      (ref.channel_id !== undefined && ref.channel_id !== m.channel_id) ||
+      (ref.guild_id !== undefined && ref.guild_id !== m.guild_id)
+    )
+      throw new Error('Reply context must belong to this exact session thread.');
+    // Fetch authoritative content, ignoring the gateway's optional referenced_message snapshot.
+    const message = await this.api.request<DiscordReplyMessage>(
+      'GET',
+      `/channels/${m.channel_id}/messages/${ref.message_id}`,
+      undefined,
+      0,
+      current
+    );
+    const bot = await this.api.botUserId();
+    if (
+      !current() ||
+      !bot?.id ||
+      !message ||
+      message.id !== ref.message_id ||
+      message.channel_id !== m.channel_id ||
+      (message.guild_id && message.guild_id !== m.guild_id) ||
+      message.author?.id !== bot.id
+    )
+      throw new Error('The replied-to Codeman message could not be verified in this thread.');
+    return quoteDiscordReply(message, m.content ?? '');
+  }
+
   /** Every gate here drops silently: a stranger learns nothing. */
   private async handleMessage(m: GatewayMessage): Promise<void> {
     if (!this.cfg.enabled || this.stopped || m.author?.bot) return;
@@ -2886,14 +2941,30 @@ export class DiscordBridge {
         await this.nativeUi.offerBusy(sessionId, m.channel_id, m, id);
         return;
       }
+      let content: string;
+      try {
+        content = await this.replyContent(sessionId, m);
+      } catch {
+        await this.deliveries.update(id, 'failed', 'invalid_command');
+        await this.say(
+          m.channel_id,
+          'Could not include the replied-to message. Reply to a readable Codeman message in this session thread; deleted, unavailable or oversized messages cannot be quoted. Nothing was typed.'
+        );
+        return;
+      }
       this.lastReply.set(sessionId, t);
       if (m.attachments?.length) await this.api.react(m.channel_id, m.id, '📥').catch(() => undefined);
       const saved = await this.saveAttachments(sessionId, m);
       if (saved.paths.length && !saved.refused) await this.api.react(m.channel_id, m.id, '📎').catch(() => undefined);
-      const text = sanitiseReply(m.content ?? '', saved.paths);
+      const text = sanitiseReply(content, saved.paths);
       if (saved.refused) await this.say(m.channel_id, saved.refused);
       if (!text || saved.refused) {
         await this.deliveries.update(id, 'failed', saved.refused ? 'transfer_failed' : 'empty');
+        if (!text && m.message_reference && !saved.refused)
+          await this.say(
+            m.channel_id,
+            'The reply and quoted context exceed the prompt limit. Nothing was typed; shorten your reply.'
+          );
         if (text && saved.refused)
           await this.say(
             m.channel_id,
