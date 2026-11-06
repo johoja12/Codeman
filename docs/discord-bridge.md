@@ -254,6 +254,33 @@ Full mode covers native conversation output, bounded history, files and supporte
 
 For a restored SSH Codex tab without a saved conversation ID, history can recover an exact `codex resume <UUID>` invocation from the attached tmux pane’s sole interactive Codex process. It verifies that exact transcript before recording the ID. Multiple agents, missing resume arguments, missing transcripts and other ambiguity remain unavailable; workspace names and the newest transcript are never used as identity evidence.
 
+### Readable response cards in Full mode
+
+New assistant responses use Discord's native colored embeds: a blue response card,
+bold short step labels, space between numbered steps and inline styling for simple
+file paths. Links remain clickable inside the card without generating an unrelated
+URL-preview card. Code blocks, existing Markdown links, inline code and quoted
+examples retain their contents. Discord controls the client's fonts and layout;
+this does not inject terminal colors or use ANSI code boxes for prose.
+
+Routine completed answers show **Response**, without repeating the session name,
+hostname or “Waiting for Input” wrapper. A second idle/stop event for the same
+fallback answer does not add another bare alert header. Critical alerts retain
+their title/context and use a red accent; warning alerts use amber. Existing
+allowlist/ping rules still apply, and only the first part can ping.
+
+Long answers are split into numbered cards within Discord's embed limits. Very
+long responses keep their explicit continuation notice and the native stream's
+full-response attachment behavior. Notifications mode retains its existing plain
+message format. This affects future posts; it does not edit previous Discord
+messages.
+
+![Mobile response-card layout preview](images/discord-response-card-mobile.png)
+
+The image is a layout preview rendered from a real generated message payload,
+using a generic example. Actual client spacing follows Discord's settings.
+Embed limits and fields follow the [Discord message documentation](https://discord.com/developers/docs/resources/message#embed-object).
+
 ### Native workspace controls (Full mode)
 
 Full mode maintains an owned session control card in each active session thread and a workspace dashboard in the configured control channel. Cards are pinned when the bot has permission; missing pin permission leaves the card usable. Updates edit the existing owned message and do not ping users. `/codeman` opens a private dashboard; `!codeman ui`, `!codeman dashboard`, `!codeman settings`, `!codeman queue` and `!codeman results` are text fallbacks.

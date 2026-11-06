@@ -414,3 +414,33 @@ describe('inbound submission safety', () => {
     expect(count).toBe(before);
   });
 });
+it('fingerprints embed text and color so a changed card cannot replay an existing delivery plan', async () => {
+  const { b } = await ready();
+  const post = {
+    content: '',
+    embeds: [{ description: 'first rendering', color: 0x58a6ff }],
+    allowed_mentions: { parse: [], users: [] },
+  };
+  type ResponsePost = typeof post;
+  const send = (
+    b as unknown as {
+      deliverPost: (
+        channel: string,
+        post: ResponsePost,
+        file: undefined,
+        session: string,
+        key: string
+      ) => Promise<unknown>;
+    }
+  ).deliverPost.bind(b);
+  await send(THREAD, post, undefined, 's1', 'response-card');
+  await expect(
+    send(
+      THREAD,
+      { ...post, embeds: [{ description: 'different rendering', color: 0xed6b6b }] },
+      undefined,
+      's1',
+      'response-card'
+    )
+  ).rejects.toThrow('formatting changed');
+});

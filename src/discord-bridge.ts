@@ -1,15 +1,3 @@
-import { DiscordNativeUi } from './discord-native-ui.js';
-import type { DiscordNativeUiServices } from './discord-native-ui-types.js';
-import { registerDiscordLaunchCommands } from './discord-launch-commands.js';
-import { formatDiscordTables } from './discord-tables.js';
-export { formatDiscordTables } from './discord-tables.js';
-import { discordDisplayText } from './discord-display-text.js';
-import { DiscordCaseCategories } from './discord-case-categories.js';
-import { DiscordCaseThreads, type DiscordStarter } from './discord-case-threads.js';
-import type { DiscordCaseIdentity } from './discord-case-identity.js';
-import { hashDiscordPrompt } from './discord-native-execution.js';
-import { DiscordConversationProgressStore } from './discord-conversation-progress.js';
-import { renderHistory } from './discord-history.js';
 /**
  * @fileoverview Two-way Discord bridge: one thread per tab, alerts out, replies typed back in.
  *
@@ -31,7 +19,25 @@ import { renderHistory } from './discord-history.js';
  *
  * @module discord-bridge
  */
-
+import { DiscordNativeUi } from './discord-native-ui.js';
+import type { DiscordNativeUiServices } from './discord-native-ui-types.js';
+import { registerDiscordLaunchCommands } from './discord-launch-commands.js';
+import {
+  discordResponsePosts,
+  splitForDiscord,
+  DISCORD_WARNING_COLOR,
+  DISCORD_CRITICAL_COLOR,
+} from './discord-response-format.js';
+export { splitForDiscord } from './discord-response-format.js';
+import { formatDiscordTables } from './discord-tables.js';
+export { formatDiscordTables } from './discord-tables.js';
+import { discordDisplayText } from './discord-display-text.js';
+import { DiscordCaseCategories } from './discord-case-categories.js';
+import { DiscordCaseThreads, type DiscordStarter } from './discord-case-threads.js';
+import type { DiscordCaseIdentity } from './discord-case-identity.js';
+import { hashDiscordPrompt } from './discord-native-execution.js';
+import { DiscordConversationProgressStore } from './discord-conversation-progress.js';
+import { renderHistory } from './discord-history.js';
 import { existsSync, mkdirSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
@@ -244,59 +250,6 @@ export function screenTail(screen: string, maxLines = 14, maxChars = 900, compos
   return out.join('\n').slice(-maxChars);
 }
 
-/**
- * Split a long message into posts of at most `max` characters, on blank lines first, then lines, then
- * (for one huge line) by length. A code fence the cut lands inside is closed and reopened, so each post
- * renders on its own. At most `maxPosts`; the last carries a note when text is left over.
- */
-export function splitForDiscord(text: string, max = 1900, maxPosts = 8): string[] {
-  if (!Number.isInteger(max) || max < 128 || max > 1900 || !Number.isInteger(maxPosts) || maxPosts < 1 || maxPosts > 64)
-    throw new RangeError('Invalid Discord message chunk limits');
-  const posts: string[] = [];
-  let cur = '';
-  let fence: string | null = null;
-  let cut = false;
-  const budget = max - 64; // Reserve a closing fence and the explicit overflow note.
-  const opening = () => (fence === null ? '' : '```' + fence + '\n');
-  const flush = () => {
-    if (cur.trim() && cur !== opening()) posts.push(cur.trimEnd() + (fence !== null ? '\n```' : ''));
-    cur = opening();
-  };
-  for (let line of text.replace(/\r\n?/g, '\n').split('\n')) {
-    if (posts.length >= maxPosts) {
-      cut = true;
-      break;
-    }
-    const fenceLine = /^\s*`{3}([^`]*)$/.exec(line);
-    // Carry language hints across chunks, bounded so a hostile hint cannot fill a post.
-    const nextFence: string | null = fenceLine && fence === null ? fenceLine[1].trim().slice(0, 32) : null;
-    if (fenceLine && fence === null) line = '```' + nextFence;
-    if (cur.length + line.length + 1 > budget && cur.trim() && cur !== opening()) flush();
-    while (line.length > budget - cur.length) {
-      let end = budget - cur.length;
-      // Do not split a UTF-16 surrogate pair (emoji and non-BMP characters).
-      if (end > 0 && /[\uD800-\uDBFF]/.test(line[end - 1]) && /[\uDC00-\uDFFF]/.test(line[end] ?? '')) end--;
-      cur += line.slice(0, end) + '\n';
-      line = line.slice(end);
-      flush();
-      if (posts.length >= maxPosts) {
-        cut = true;
-        break;
-      }
-    }
-    if (cut) break;
-    if (cur.length + line.length + 1 > budget) flush();
-    cur += line + '\n';
-    if (fenceLine) {
-      if (fence === null) fence = nextFence ?? '';
-      else if (!fenceLine[1].trim()) fence = null;
-    }
-  }
-  if (!cut) flush();
-  if (cut && posts.length > 0) posts[posts.length - 1] += '\n*(The message continues in the tab.)*';
-  return posts.slice(0, maxPosts);
-}
-
 /** Final path segment only, `[A-Za-z0-9._-]`, no leading dot, at most 80 characters. */
 export function safeAttachmentName(name: string): string {
   const base = (name.split(/[\\/]/).pop() ?? '').replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^[._]+/, '');
@@ -354,6 +307,7 @@ export interface DiscordPost {
   allowed_mentions: { parse: string[]; users: string[] };
   nonce?: string;
   enforce_nonce?: boolean;
+  embeds?: Array<{ title?: string; description: string; color: number; footer?: { text: string } }>;
   components?: Array<{
     type: number;
     components: Array<{ type: number; style: number; label: string; custom_id: string }>;
@@ -1465,15 +1419,12 @@ export class DiscordBridge {
         if (turn.role === 'assistant' || (turn.role === 'tool' && progress.verbose)) {
           const visible = turn.role === 'assistant' ? discordDisplayText(turn.text) : turn.text;
           const formatted = formatDiscordTables((turn.role === 'tool' ? '**Tool output**\n' : '') + visible);
-          const chunks = splitForDiscord(formatted);
-          for (const [i, content] of chunks.entries())
-            await this.deliverPost(
-              channel,
-              { content, allowed_mentions: { parse: [], users: [] } },
-              undefined,
-              sessionId,
-              `native:${turn.cursor}:${i}`
-            );
+          const responsePosts =
+            turn.role === 'assistant'
+              ? discordResponsePosts(formatted)
+              : splitForDiscord(formatted).map((content) => ({ content, allowed_mentions: { parse: [], users: [] } }));
+          for (const [i, post] of responsePosts.entries())
+            await this.deliverPost(channel, post, undefined, sessionId, `native:${turn.cursor}:${i}`);
           if (visible.length > 12000 || formatted.length > 12000)
             await this.deliverPost(
               channel,
@@ -1959,6 +1910,7 @@ export class DiscordBridge {
       }
     }
     let chunks: string[] = [];
+    let responseText: string | undefined;
     // Remembered only once the first post is out: a failed post must leave the message to be sent again.
     let posted: string | undefined;
     if (msg.fullText) {
@@ -1972,9 +1924,21 @@ export class DiscordBridge {
           const key = `${got?.version ?? ''}\u0000${text}`;
           msg = { ...msg, tail: undefined };
           if (this.lastFull.get(sid) !== key) {
-            chunks = splitForDiscord(formatDiscordTables(text.slice(0, MAX_CONVERTED_TEXT)), 1520);
+            if (this.cfg.mode === 'full')
+              responseText =
+                text.slice(0, MAX_CONVERTED_TEXT) +
+                (text.length > MAX_CONVERTED_TEXT ? '\n\n*(The message continues in the tab.)*' : '');
+            else chunks = splitForDiscord(formatDiscordTables(text.slice(0, MAX_CONVERTED_TEXT)), 1520);
             posted = key;
-          } // else: said already, so only the header goes
+          } else if (
+            this.cfg.mode === 'full' &&
+            !opts.deliberate &&
+            ['hook:idle_prompt', 'hook:stop'].includes(msg.event) &&
+            !this.deps.awaitingChoice?.(sid)
+          ) {
+            // A completed answer already has its card; a second hook must not add a bare alert wrapper.
+            return { ok: true, deduped: true, at: this.now() };
+          } // Notifications keeps its legacy header behavior.
         }
       } catch {
         // no transcript to read: the screen tail stands in
@@ -2000,7 +1964,25 @@ export class DiscordBridge {
         /* preserve the ordinary alert if structured controls are unavailable */
       }
     }
-    const post = buildPost(msg, this.cfg, explicitUrgent);
+    const basePost = buildPost(msg, this.cfg, explicitUrgent);
+    const routine =
+      !opts.deliberate &&
+      ['hook:idle_prompt', 'hook:stop'].includes(msg.event) &&
+      !this.deps.awaitingChoice?.(msg.sessionId ?? '');
+    const cards = responseText
+      ? discordResponsePosts(routine ? responseText : `${msg.body}\n\n${responseText}`, {
+          title: routine ? 'Response' : msg.title,
+          color: routine
+            ? undefined
+            : msg.urgency === 'critical'
+              ? DISCORD_CRITICAL_COLOR
+              : msg.urgency === 'warning'
+                ? DISCORD_WARNING_COLOR
+                : undefined,
+          users: basePost.allowed_mentions.users,
+        })
+      : [];
+    const post = cards.shift() ?? basePost;
     // One post when the head and the first part fit together, the rest follow without a ping.
     if (chunks.length > 0) {
       post.content = clip(post.content, 350);
@@ -2041,10 +2023,14 @@ export class DiscordBridge {
         }
       }
       // Every part must be delivered; a missing tail must never be reported as a successful response.
-      for (const [i, part] of chunks.entries())
+      const followups = [
+        ...cards,
+        ...chunks.map((content) => ({ content, allowed_mentions: { parse: [], users: [] } })),
+      ];
+      for (const [i, part] of followups.entries())
         await this.deliverPost(
           this.cfg.mode === 'full' ? target : (this.threads[msg.sessionId ?? ''] ?? target),
-          { content: part, allowed_mentions: { parse: [], users: [] } },
+          part,
           undefined,
           msg.sessionId,
           `${deliveryKey}:${i + 1}`
@@ -2170,7 +2156,7 @@ export class DiscordBridge {
     }
     const id = createHash('sha256').update(`${this.cfg.guildId}:${channelId}:${key}`).digest('hex');
     const hash = createHash('sha256').update(
-      JSON.stringify({ content: post.content, components: post.components, file: file?.name })
+      JSON.stringify({ content: post.content, embeds: post.embeds, components: post.components, file: file?.name })
     );
     if (file) hash.update(file.data);
     const payloadHash = hash.digest('hex');

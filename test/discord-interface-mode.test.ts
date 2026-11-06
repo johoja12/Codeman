@@ -35,6 +35,9 @@ let remoteMessages: Map<string, any>;
 let statusEditRefused: boolean;
 let activityRenameRetryAfter: number | undefined;
 let uploaded: Array<{ name: string; text: string }>;
+/** Assert what a reader sees, across plain text and native response cards. */
+const visibleText = (body: any): string | undefined =>
+  body?.embeds?.map((embed: any) => embed.description).join('\n') || body?.content;
 const BOT = '888888888888888888';
 
 function makeBridge(
@@ -304,7 +307,7 @@ describe('Discord interface mode', () => {
     };
     await b.onGatewayMessage(m);
     expect(sendInput).not.toHaveBeenCalled();
-    const selection = posts.find((p) => p.body?.content?.includes('Nothing was submitted'))!;
+    const selection = posts.find((p) => visibleText(p.body)?.includes('Nothing was submitted'))!;
     expect(selection.path).toContain(parent.id);
     expect(selection.body.content).toContain('<#' + map.s1 + '>');
     expect(selection.body.content).toContain('<#' + map.s2 + '>');
@@ -313,7 +316,7 @@ describe('Discord interface mode', () => {
     await b.onGatewayMessage({ ...m, id: '900000000000000005', content: '!codeman stream verbose' });
     await b.onGatewayMessage({ ...m, id: '900000000000000006', content: '!codeman file /work/file.txt' });
     expect(control).toHaveBeenCalledTimes(1);
-    expect(posts.some((p) => p.body?.content?.includes('Open a session thread for task'))).toBe(true);
+    expect(posts.some((p) => visibleText(p.body)?.includes('Open a session thread for task'))).toBe(true);
 
     await b.onGatewayMessage({ ...m, id: '900000000000000003', channel_id: map.s1, content: 'first' });
     await b.onGatewayMessage({ ...m, id: '900000000000000004', channel_id: map.s2, content: 'second' });
@@ -344,8 +347,8 @@ describe('Discord interface mode', () => {
     fresh = true;
     await b.pollConversations();
     for (const id of ['s1', 's2']) {
-      const historyPost = posts.find((p) => p.body?.content?.includes('historical-' + id));
-      const livePost = posts.find((p) => p.body?.content?.includes('live-' + id));
+      const historyPost = posts.find((p) => visibleText(p.body)?.includes('historical-' + id));
+      const livePost = posts.find((p) => visibleText(p.body)?.includes('live-' + id));
       expect(historyPost?.path).toContain('/' + map[id] + '/messages');
       expect(livePost?.path).toContain('/' + map[id] + '/messages');
     }
@@ -419,7 +422,7 @@ describe('Discord interface mode', () => {
     expect(afterHistory).toBe(true);
     expect(waiting).toBe(true);
     expect(sendInput).not.toHaveBeenCalled();
-    expect(posts.some((p) => p.body?.content?.includes('dialog appeared while preparing this reply'))).toBe(true);
+    expect(posts.some((p) => visibleText(p.body)?.includes('dialog appeared while preparing this reply'))).toBe(true);
     const deliveries = await b.recentDeliveries();
     expect(deliveries.find((d) => d.id === `in:${cfg.guildId}:555555555555555555`)?.state).toBe('failed');
   });
@@ -471,7 +474,7 @@ describe('Discord interface mode', () => {
     await b.onGatewayMessage({ ...message, id: '555555555555555556', author: { id: '999999999999999999' } });
     expect(control).toHaveBeenCalledExactlyOnceWith('s1', 'status');
     expect(sendInput).not.toHaveBeenCalled();
-    expect(posts.some((p) => p.body?.content === 'Working')).toBe(true);
+    expect(posts.some((p) => visibleText(p.body) === 'Working')).toBe(true);
   });
   it('backfills bounded historical turns once across synchronization and process restart', async () => {
     const history = vi.fn(async () => ({
@@ -487,7 +490,7 @@ describe('Discord interface mode', () => {
     const b = makeBridge(undefined, { history });
     await b.reload();
     await b.syncSessions();
-    const historical = () => posts.filter((p) => p.body?.content?.startsWith('**Historical context**'));
+    const historical = () => posts.filter((p) => visibleText(p.body)?.startsWith('**Historical context**'));
     expect(historical()).toHaveLength(12);
     expect(historical()[0].body?.content).toContain('historic 14');
     expect(historical().every((p) => p.body?.allowed_mentions?.parse.length === 0)).toBe(true);
@@ -535,14 +538,14 @@ describe('Discord interface mode', () => {
       { cursor: 'native1:2:abc', role: 'assistant', text: 'fresh answer', timestamp: 't' },
     ];
     await b.pollConversations();
-    const answers = () => posts.filter((p) => p.body?.content?.includes('fresh answer'));
+    const answers = () => posts.filter((p) => visibleText(p.body)?.includes('fresh answer'));
     expect(answers()).toHaveLength(1);
-    expect(posts.some((p) => p.body?.content === '⏳ Working…')).toBe(true);
+    expect(posts.some((p) => visibleText(p.body) === '⏳ Working…')).toBe(true);
     now += 60001;
     state = 'completed';
     await b.pollConversations();
     expect(answers()).toHaveLength(1);
-    expect(posts.some((p) => p.method === 'PATCH' && p.body?.content === '✅ Done')).toBe(true);
+    expect(posts.some((p) => p.method === 'PATCH' && visibleText(p.body) === '✅ Done')).toBe(true);
     b.stop();
     const again = makeBridge(undefined, { history, now: () => now });
     await again.reload();
@@ -576,10 +579,14 @@ describe('Discord interface mode', () => {
     await Promise.all([b.notify(msg), b.pollConversations()]);
     now += 60001;
     await b.notify({ ...msg, event: 'hook:stop', urgency: 'info' });
-    expect(posts.filter((p) => p.body?.content?.includes('**Answer**'))).toHaveLength(1);
-    expect(posts.find((p) => p.body?.content?.includes('**Answer**'))?.body.content).toBe('**Answer**\n- One\n- Two');
+    expect(posts.filter((p) => visibleText(p.body)?.includes('**Answer**'))).toHaveLength(1);
+    expect(visibleText(posts.find((p) => visibleText(p.body)?.includes('**Answer**'))?.body)).toBe(
+      '**Answer**\n- One\n- Two'
+    );
     expect(
-      posts.some((p) => p.body?.content?.includes('Waiting for Input') || p.body?.content?.includes('2026-11-06T'))
+      posts.some(
+        (p) => visibleText(p.body)?.includes('Waiting for Input') || visibleText(p.body)?.includes('2026-11-06T')
+      )
     ).toBe(false);
     expect(fullText).not.toHaveBeenCalled();
     b.stop();
@@ -587,7 +594,7 @@ describe('Discord interface mode', () => {
     await again.reload();
     await again.syncSessions();
     await again.notify(msg);
-    expect(posts.filter((p) => p.body?.content?.includes('**Answer**'))).toHaveLength(1);
+    expect(posts.filter((p) => visibleText(p.body)?.includes('**Answer**'))).toHaveLength(1);
     expect(sendInput).not.toHaveBeenCalled();
   });
 
@@ -626,9 +633,7 @@ describe('Discord interface mode', () => {
       });
       expect(r?.ok).toBe(true);
       expect(
-        posts.some(
-          (p) => p.body?.content?.includes('Waiting for Input') && p.body?.content?.includes('fallback answer')
-        )
+        posts.some((p) => p.body?.embeds?.[0]?.title === 'Response' && visibleText(p.body)?.includes('fallback answer'))
       ).toBe(true);
     }
   );
@@ -652,7 +657,7 @@ describe('Discord interface mode', () => {
       { deliberate: true }
     );
     for (const label of ['hook:elicitation_dialog', 'hook:permission_prompt', 'session:error', 'Explicit message'])
-      expect(posts.some((p) => p.body?.content?.includes(label))).toBe(true);
+      expect(posts.some((p) => visibleText(p.body)?.includes(label))).toBe(true);
   });
 
   it('reuses one editable status across tasks and recreates only a deleted status message', async () => {
@@ -671,27 +676,27 @@ describe('Discord interface mode', () => {
     await b.syncSessions();
     turns = [{ cursor: 'native1:1', role: 'user', text: 'first', timestamp: '' }];
     await b.pollConversations();
-    const statusPost = posts.find((p) => p.method === 'POST' && p.body?.content === '⏳ Working…')!;
+    const statusPost = posts.find((p) => p.method === 'POST' && visibleText(p.body) === '⏳ Working…')!;
     const message = [...remoteMessages.values()].find((m) => m.content === '⏳ Working…')!;
     now += 60001;
     state = 'completed';
     await b.pollConversations();
     expect(
-      posts.filter((p) => p.method === 'POST' && ['⏳ Working…', '✅ Done'].includes(p.body?.content))
+      posts.filter((p) => p.method === 'POST' && ['⏳ Working…', '✅ Done'].includes(visibleText(p.body)))
     ).toHaveLength(1);
     expect(
-      posts.some((p) => p.method === 'PATCH' && p.path.endsWith('/' + message.id) && p.body?.content === '✅ Done')
+      posts.some((p) => p.method === 'PATCH' && p.path.endsWith('/' + message.id) && visibleText(p.body) === '✅ Done')
     ).toBe(true);
     now += 60001;
     state = 'running';
     turns.push({ cursor: 'native1:2', role: 'user', text: 'second', timestamp: '' });
     await b.pollConversations();
-    expect(posts.filter((p) => p.method === 'POST' && p.body?.content === '⏳ Working…')).toHaveLength(1);
+    expect(posts.filter((p) => p.method === 'POST' && visibleText(p.body) === '⏳ Working…')).toHaveLength(1);
     remoteMessages.delete(message.id);
     now += 60001;
     state = 'completed';
     await b.pollConversations();
-    expect(posts.filter((p) => p.method === 'POST' && p.body?.content === '✅ Done')).toHaveLength(1);
+    expect(posts.filter((p) => p.method === 'POST' && visibleText(p.body) === '✅ Done')).toHaveLength(1);
     expect(statusPost.path).toContain('/messages');
   });
 
@@ -723,13 +728,13 @@ describe('Discord interface mode', () => {
       urgency: 'warning',
       fullText: async () => ({ text: 'Delivered once' }),
     });
-    expect(posts.filter((p) => p.method === 'POST' && p.body?.content?.includes('Delivered once'))).toHaveLength(1);
-    expect(posts.some((p) => p.body?.content?.includes('Waiting for Input'))).toBe(false);
+    expect(posts.filter((p) => p.method === 'POST' && visibleText(p.body)?.includes('Delivered once'))).toHaveLength(1);
+    expect(posts.some((p) => visibleText(p.body)?.includes('Waiting for Input'))).toBe(false);
     statusEditRefused = false;
     now += 60001;
     await b.pollConversations();
-    expect(posts.some((p) => p.method === 'PATCH' && p.body?.content === '✅ Done')).toBe(true);
-    expect(posts.filter((p) => p.method === 'POST' && p.body?.content?.includes('Delivered once'))).toHaveLength(1);
+    expect(posts.some((p) => p.method === 'PATCH' && visibleText(p.body) === '✅ Done')).toBe(true);
+    expect(posts.filter((p) => p.method === 'POST' && visibleText(p.body)?.includes('Delivered once'))).toHaveLength(1);
   });
 
   it('filters internal citations before live splitting and consumes metadata-only cursors without empty posts', async () => {
@@ -747,21 +752,21 @@ describe('Discord interface mode', () => {
       { cursor: 'native1:2', role: 'assistant', text: metadata, timestamp: '' },
     ];
     await b.pollConversations();
-    expect(posts.filter((p) => p.body?.content === 'Clean answer')).toHaveLength(1);
-    expect(posts.some((p) => p.body?.content?.includes('MEMORY.md') || p.body?.content?.includes('<oai-mem'))).toBe(
-      false
-    );
+    expect(posts.filter((p) => visibleText(p.body) === 'Clean answer')).toHaveLength(1);
+    expect(
+      posts.some((p) => visibleText(p.body)?.includes('MEMORY.md') || visibleText(p.body)?.includes('<oai-mem'))
+    ).toBe(false);
     now += 60001;
     turns.push({ cursor: 'native1:3', role: 'assistant', text: 'Next answer', timestamp: '' });
     await b.pollConversations();
-    expect(posts.filter((p) => p.body?.content === 'Next answer')).toHaveLength(1);
-    expect(posts.filter((p) => p.body?.content === 'Clean answer')).toHaveLength(1);
+    expect(posts.filter((p) => visibleText(p.body) === 'Next answer')).toHaveLength(1);
+    expect(posts.filter((p) => visibleText(p.body) === 'Clean answer')).toHaveLength(1);
     b.stop();
     const again = makeBridge(undefined, { history, now: () => now });
     await again.reload();
     await again.syncSessions();
     await again.pollConversations();
-    expect(posts.filter((p) => p.body?.content === 'Clean answer')).toHaveLength(1);
+    expect(posts.filter((p) => visibleText(p.body) === 'Clean answer')).toHaveLength(1);
   });
 
   it('omits metadata-only historical turns while retaining visible historical context', async () => {
@@ -778,7 +783,7 @@ describe('Discord interface mode', () => {
     const b = makeBridge(undefined, { history });
     await b.reload();
     await b.syncSessions();
-    const contexts = posts.filter((p) => p.body?.content?.includes('**Historical context**'));
+    const contexts = posts.filter((p) => visibleText(p.body)?.includes('**Historical context**'));
     expect(contexts).toHaveLength(1);
     expect(contexts[0].body.content).toContain('History answer');
     expect(contexts[0].body.content).not.toContain('oai-mem');
@@ -803,9 +808,9 @@ describe('Discord interface mode', () => {
       fullText: async () => ({ text: 'Visible fallback answer\n' + metadata }),
     });
     expect(result?.ok).toBe(true);
-    expect(posts.some((p) => p.body?.content?.includes('Visible fallback answer'))).toBe(true);
+    expect(posts.some((p) => visibleText(p.body)?.includes('Visible fallback answer'))).toBe(true);
     expect(
-      posts.some((p) => p.body?.content?.includes('private-footer') || p.body?.content?.includes('<oai-mem'))
+      posts.some((p) => visibleText(p.body)?.includes('private-footer') || visibleText(p.body)?.includes('<oai-mem'))
     ).toBe(false);
   });
 
@@ -822,15 +827,15 @@ describe('Discord interface mode', () => {
     const b = makeBridge(undefined, { history, control: async () => ({ text: table('Requested history') }) });
     await b.reload();
     await b.syncSessions();
-    const past = posts.find((p) => p.body?.content?.includes('**Historical context**'));
+    const past = posts.find((p) => visibleText(p.body)?.includes('**Historical context**'));
     expect(past?.body.content).toContain('**Item:** Historical');
     expect(past?.body.content).toContain('**Status:** Long status');
     expect(past?.body.content).not.toContain('```');
     turns.push({ cursor: 'native1:2', role: 'assistant', text: table('Live'), timestamp: '' });
     await b.pollConversations();
-    const live = posts.find((p) => p.body?.content?.includes('**Item:** Live'));
-    expect(live?.body.content).toContain('[details](https://example.test)');
-    expect(live?.body.content).not.toContain('|---');
+    const live = posts.find((p) => visibleText(p.body)?.includes('**Item:** Live'));
+    expect(visibleText(live?.body)).toContain('[details](https://example.test)');
+    expect(visibleText(live?.body)).not.toContain('|---');
     await b.onGatewayMessage({
       id: '900000000000000001',
       guild_id: cfg.guildId,
@@ -838,7 +843,7 @@ describe('Discord interface mode', () => {
       author: { id: cfg.allowedUserIds[0] },
       content: '!codeman history',
     });
-    expect(posts.some((p) => p.body?.content?.includes('**Item:** Requested history'))).toBe(true);
+    expect(posts.some((p) => visibleText(p.body)?.includes('**Item:** Requested history'))).toBe(true);
     expect(sendInput).not.toHaveBeenCalled();
   });
 
@@ -923,7 +928,7 @@ describe('Discord interface mode', () => {
         body: 'Choose',
         urgency: 'critical',
       });
-      const prompt = posts.find((p) => p.body?.components?.length && p.body?.content?.endsWith('Which option?'));
+      const prompt = posts.find((p) => p.body?.components?.length && visibleText(p.body)?.endsWith('Which option?'));
       expect(prompt).toBeDefined();
       expect(prompt!.body!.allowed_mentions.users).toEqual(pingMode === 'critical' ? cfg.allowedUserIds : []);
       await b.onGatewayMessage({
@@ -934,7 +939,7 @@ describe('Discord interface mode', () => {
         content: '1',
       });
       expect(sendInput).not.toHaveBeenCalled();
-      expect(posts.some((p) => p.body?.content?.includes('prompt-bound answer'))).toBe(true);
+      expect(posts.some((p) => visibleText(p.body)?.includes('prompt-bound answer'))).toBe(true);
     }
   );
   it('accepts management commands only in the configured control channel when no sessions exist', async () => {
@@ -989,7 +994,7 @@ describe('Discord interface mode', () => {
     slow = true;
     const poll = b.pollConversations();
     try {
-      await vi.waitFor(() => expect(posts.some((p) => p.body?.content?.includes('local live answer'))).toBe(true));
+      await vi.waitFor(() => expect(posts.some((p) => visibleText(p.body)?.includes('local live answer'))).toBe(true));
       expect(remoteReads).toBe(2);
     } finally {
       release();
@@ -1166,6 +1171,71 @@ describe('Discord interface mode', () => {
     expect(creations().filter((p) => p.body?.parent_id === newParent)).toHaveLength(2);
     expect(Object.keys(await readFullMap(dir))).toEqual(['s1', 's2']);
   });
+});
+it('renders routine fallback answers as readable cards without repeating alert metadata or unfurling body links', async () => {
+  sessions = [{ id: 's1', name: 'w5-demo' }];
+  const b = makeBridge();
+  await b.reload();
+  await b.syncSessions();
+  const result = await b.notify({
+    sessionId: 's1',
+    sessionName: 'w5-demo',
+    event: 'hook:idle_prompt',
+    title: 'Waiting for Input',
+    host: 'codeman:example',
+    body: '[w5-demo]',
+    urgency: 'warning',
+    fullText: async () => ({
+      text: 'The revised flow needs:\n1. Spread: details\n2. Shared: details\n\nhttps://example.test/demo',
+    }),
+  });
+  expect(result?.ok).toBe(true);
+  const post = posts.find((p) => p.body?.embeds?.[0]?.description?.includes('**Spread:**'))!.body;
+  expect(post.content).toBe('');
+  expect(post.embeds[0].title).toBe('Response');
+  expect(post.embeds[0].color).toBe(0x58a6ff);
+  expect(post.embeds[0].description).toContain('\n\n2. **Shared:**');
+  expect(post.embeds[0].description).toContain('https://example.test/demo');
+  expect(JSON.stringify(post)).not.toContain('Waiting for Input');
+  expect(JSON.stringify(post)).not.toContain('codeman:example');
+  expect(JSON.stringify(post)).not.toContain('[w5-demo]');
+});
+it('keeps critical alert context and an allowlisted ping when the attached response is styled', async () => {
+  const b = makeBridge();
+  await b.reload();
+  await b.syncSessions();
+  const result = await b.notify({
+    sessionId: 's1',
+    event: 'session:error',
+    title: 'Task failed',
+    body: 'The build command failed.',
+    urgency: 'critical',
+    fullText: async () => ({ text: 'Detailed failure explanation.' }),
+  });
+  expect(result?.ok).toBe(true);
+  const post = posts.find((p) => p.body?.embeds?.[0]?.title === 'Task failed')!.body;
+  expect(post.embeds[0].color).toBe(0xed6b6b);
+  expect(post.embeds[0].description).toContain('The build command failed.');
+  expect(post.embeds[0].description).toContain('Detailed failure explanation.');
+  expect(post.allowed_mentions.parse).toEqual([]);
+  expect(post.allowed_mentions.users).toEqual(cfg.allowedUserIds);
+});
+it('does not add a bare Waiting for Input wrapper after the same fallback answer was already delivered', async () => {
+  const b = makeBridge();
+  await b.reload();
+  await b.syncSessions();
+  const msg = {
+    sessionId: 's1',
+    event: 'hook:idle_prompt',
+    title: 'Waiting for Input',
+    body: '[s1]',
+    urgency: 'warning' as const,
+    fullText: async () => ({ text: 'A completed answer.' }),
+  };
+  expect((await b.notify(msg))?.ok).toBe(true);
+  expect((await b.notify({ ...msg, event: 'hook:stop' }))?.deduped).toBe(true);
+  expect(posts.filter((p) => visibleText(p.body) === 'A completed answer.')).toHaveLength(1);
+  expect(posts.some((p) => p.body?.content?.includes('Waiting for Input'))).toBe(false);
 });
 
 it('launches from owned case channels and threads with a confirmation, never terminal input', async () => {
