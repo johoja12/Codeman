@@ -1311,6 +1311,9 @@ export class DiscordBridge {
         await this.conversationProgress.set(key, progress);
       }
       if (progress.seeded) return;
+      const latestReply = [...history.turns]
+        .reverse()
+        .find((turn) => turn.role === 'assistant' && discordDisplayText(turn.text).trim());
       for (let i = progress.seedIndex; i < progress.seed.length; i++) {
         if (
           this.stopped ||
@@ -1327,19 +1330,33 @@ export class DiscordBridge {
           await this.conversationProgress.set(key, progress);
           continue;
         }
-        const text =
-          '**Historical context**' +
-          (history.partial ? ' (partial)' : '') +
-          '\n' +
-          renderHistory([{ ...turn, text: clip(visible, 1000) }], { includeTimestamps: false }) +
-          '\n`!codeman history` / `!codeman transcript` for more';
-        await this.deliverPost(
-          channel,
-          { content: text, allowed_mentions: { parse: [], users: [] } },
-          undefined,
-          sessionId,
-          `history:${turn.cursor}`
-        );
+        if (turn.cursor === latestReply?.cursor) {
+          // The newest answer is the user's current context, not a clipped history preview.
+          for (const [part, post] of discordResponsePosts(visible, { title: 'Latest response' }).entries())
+            await this.deliverPost(channel, post, undefined, sessionId, `history:${turn.cursor}:full:${part}`);
+          if (visible.length > 12000)
+            await this.deliverPost(
+              channel,
+              { content: 'Full user-visible response', allowed_mentions: { parse: [], users: [] } },
+              { name: 'response.txt', data: Buffer.from(discordDisplayText(turn.text)) },
+              sessionId,
+              `history:${turn.cursor}:full:overflow`
+            );
+        } else {
+          const text =
+            '**Historical context**' +
+            (history.partial ? ' (partial)' : '') +
+            '\n' +
+            renderHistory([{ ...turn, text: clip(visible, 1000) }], { includeTimestamps: false }) +
+            '\n`!codeman history` / `!codeman transcript` for more';
+          await this.deliverPost(
+            channel,
+            { content: text, allowed_mentions: { parse: [], users: [] } },
+            undefined,
+            sessionId,
+            `history:${turn.cursor}`
+          );
+        }
         progress = { ...progress, seedIndex: i + 1 };
         await this.conversationProgress.set(key, progress);
       }

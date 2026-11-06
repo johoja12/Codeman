@@ -490,7 +490,11 @@ describe('Discord interface mode', () => {
     const b = makeBridge(undefined, { history });
     await b.reload();
     await b.syncSessions();
-    const historical = () => posts.filter((p) => visibleText(p.body)?.startsWith('**Historical context**'));
+    const historical = () =>
+      posts.filter(
+        (p) =>
+          visibleText(p.body)?.startsWith('**Historical context**') || p.body?.embeds?.[0]?.title === 'Latest response'
+      );
     expect(historical()).toHaveLength(12);
     expect(historical()[0].body?.content).toContain('historic 14');
     expect(historical().every((p) => p.body?.allowed_mentions?.parse.length === 0)).toBe(true);
@@ -501,6 +505,36 @@ describe('Discord interface mode', () => {
     await again.reload();
     await again.syncSessions();
     expect(historical()).toHaveLength(12);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+  it('backfills the complete latest reply across multiple cards without duplicating it on restart', async () => {
+    const text = 'Full original answer.\n\n' + 'Details preserved.\n'.repeat(300) + '\nLast row preserved.';
+    const history = async () => ({
+      conversationId: 'native1',
+      partial: false,
+      turns: [{ cursor: 'native1:1', role: 'assistant' as const, text, timestamp: '' }],
+    });
+    sessions = [{ id: 's1', name: 'one' }];
+    const b = makeBridge(undefined, { history });
+    await b.reload();
+    await b.syncSessions();
+    const cards = posts.filter((p) => p.body?.embeds?.some((e: { description?: string }) => e.description));
+    expect(cards.length).toBeGreaterThan(1);
+    expect(cards.map((p) => visibleText(p.body)).join('\n')).toContain('Last row preserved.');
+    expect(
+      cards
+        .map((p) => visibleText(p.body))
+        .join('\n')
+        .match(/Details preserved\./g)
+    ).toHaveLength(300);
+    const count = cards.length;
+    b.stop();
+    const again = makeBridge(undefined, { history });
+    await again.reload();
+    await again.syncSessions();
+    expect(posts.filter((p) => p.body?.embeds?.some((e: { description?: string }) => e.description))).toHaveLength(
+      count
+    );
     expect(sendInput).not.toHaveBeenCalled();
   });
   it('keeps other session channels available when one transcript is unavailable and retries without recreating destinations', async () => {
@@ -783,10 +817,10 @@ describe('Discord interface mode', () => {
     const b = makeBridge(undefined, { history });
     await b.reload();
     await b.syncSessions();
-    const contexts = posts.filter((p) => visibleText(p.body)?.includes('**Historical context**'));
+    const contexts = posts.filter((p) => p.body?.embeds?.[0]?.title === 'Latest response');
     expect(contexts).toHaveLength(1);
-    expect(contexts[0].body.content).toContain('History answer');
-    expect(contexts[0].body.content).not.toContain('oai-mem');
+    expect(visibleText(contexts[0].body)).toContain('History answer');
+    expect(visibleText(contexts[0].body)).not.toContain('oai-mem');
   });
 
   it('filters internal metadata from full-text alert fallback when native history is unavailable', async () => {
@@ -827,10 +861,10 @@ describe('Discord interface mode', () => {
     const b = makeBridge(undefined, { history, control: async () => ({ text: table('Requested history') }) });
     await b.reload();
     await b.syncSessions();
-    const past = posts.find((p) => visibleText(p.body)?.includes('**Historical context**'));
-    expect(past?.body.content).toContain('**Item:** Historical');
-    expect(past?.body.content).toContain('**Status:** Long status');
-    expect(past?.body.content).not.toContain('```');
+    const past = posts.find((p) => p.body?.embeds?.[0]?.title === 'Latest response');
+    expect(visibleText(past?.body)).toContain('**Item:** Historical');
+    expect(visibleText(past?.body)).toContain('**Status:** Long status');
+    expect(visibleText(past?.body)).not.toContain('```');
     turns.push({ cursor: 'native1:2', role: 'assistant', text: table('Live'), timestamp: '' });
     await b.pollConversations();
     const live = posts.find((p) => visibleText(p.body)?.includes('**Item:** Live'));
