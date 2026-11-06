@@ -751,6 +751,7 @@ it('forgets metadata for an already-deleted delivery card without deleting anoth
 it('cleans up at most three legacy cards per poll and never recreates them after restart', async () => {
   const f = await fixture();
   for (let i = 0; i < 4; i++) await legacyDelivery(f, 'legacy' + i);
+  f.host.receipts = async () => [{ id: 'legacy3', state: 'running', updated: f.host.now() }];
   await f.ui.poll();
   expect(vi.mocked(f.host.request).mock.calls.filter(([method]) => method === 'DELETE')).toHaveLength(3);
   await f.ui.poll();
