@@ -26,7 +26,7 @@ const cfg = {
   allowedUserIds: ['333333333333333333'],
 };
 let dir: string;
-let sessions: Array<{ id: string; name?: string; remote?: boolean; working?: boolean }>;
+let sessions: Array<import('../src/discord-activity.js').DiscordActivitySession & { remote?: boolean }>;
 let bridges: DiscordBridge[];
 let posts: Array<{ path: string; method: string; body?: any }>;
 let sendInput: ReturnType<typeof vi.fn>;
@@ -189,6 +189,38 @@ afterEach(async () => {
 });
 
 describe('Discord interface mode', () => {
+  it.each([false, true])('preserves Claude background titles over sync and restart (remote=%s)', async (remote) => {
+    let now = 100000;
+    sessions = [
+      { id: 's1', name: 'w29-buildmesh', remote, working: false, watching: '1 shell', activityStatus: 'idle' },
+    ];
+    const b = makeBridge(undefined, { now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    const thread = (await readFullMap(dir)).s1;
+    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    await b.pollActivity();
+    const typing = () => posts.filter((p) => p.path.endsWith('/typing'));
+    expect(typing()).toHaveLength(0);
+    await b.syncSessions();
+    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    b.stop();
+    const restarted = makeBridge(undefined, { now: () => now });
+    await restarted.reload();
+    await restarted.syncSessions();
+    await restarted.pollActivity();
+    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    sessions[0].watching = null;
+    now += 4000;
+    await restarted.pollActivity();
+    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    now += 30000;
+    await restarted.pollActivity();
+    expect(remoteChannels.get(thread).name).toBe('⚫ Idle · w29-buildmesh');
+    expect(typing()).toHaveLength(0);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
   it('groups explicit output files beneath a new response and does not repeat uploads after replay/restart', async () => {
     let now = 100000;
     let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
@@ -390,38 +422,12 @@ describe('Discord interface mode', () => {
     now += 100;
     await b.sessionRenamed('s1', 'hs-lab');
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · hs-lab');
     expect(posts.some((p) => p.path.endsWith('/typing'))).toBe(true);
     expect(sendInput).not.toHaveBeenCalled();
   });
 
-  it('keeps a stable name through repeated background wakeups, synchronization and restart', async () => {
-    let now = 1_000;
-    sessions = [{ id: 's1', name: 'hs-lab', working: false }];
-    const b = makeBridge(undefined, { now: () => now });
-    await b.reload();
-    await b.syncSessions();
-    const thread = (await readFullMap(dir)).s1;
-    posts = [];
-    for (let i = 0; i < 8; i++) {
-      sessions[0].working = i % 2 === 0;
-      now += 120_000;
-      await b.sessionRenamed('s1', 'hs-lab');
-      await b.pollActivity();
-      await b.syncSessions();
-      expect(remoteChannels.get(thread).name).toBe('hs-lab');
-    }
-    const restarted = makeBridge(undefined, { now: () => now });
-    await restarted.reload();
-    await restarted.syncSessions();
-    await restarted.pollActivity();
-    const titleEdits = posts.filter((p) => p.method === 'PATCH' && p.path.endsWith('/' + thread) && p.body?.name);
-    expect(titleEdits).toHaveLength(0);
-    expect(posts.some((p) => p.path.endsWith('/typing'))).toBe(true);
-    expect(sendInput).not.toHaveBeenCalled();
-  });
-
-  it('keeps typing while a legacy activity title cleanup is rate limited', async () => {
+  it('keeps typing when an existing Idle thread cannot be renamed yet, without inline retries', async () => {
     let now = 1_000;
     sessions = [{ id: 's1', name: 'hs-lab', working: false }];
     const b = makeBridge(undefined, { now: () => now });
@@ -433,12 +439,11 @@ describe('Discord interface mode', () => {
     await b.pollActivity();
     expect(titleEdits()).toHaveLength(0);
     expect(typing()).toHaveLength(0);
-    remoteChannels.get(thread).name = '🟢 Idle · hs-lab';
     sessions[0].working = true;
     activityRenameRetryAfter = 120;
     now += 4_000;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('🟢 Idle · hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('⚫ Idle · hs-lab');
     expect(typing()).toHaveLength(1);
     expect(titleEdits()).toHaveLength(1);
     now += 8_000;
@@ -448,7 +453,7 @@ describe('Discord interface mode', () => {
     activityRenameRetryAfter = undefined;
     now += 120_000;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · hs-lab');
     expect(titleEdits()).toHaveLength(2);
     expect(sendInput).not.toHaveBeenCalled();
   });
@@ -461,10 +466,10 @@ describe('Discord interface mode', () => {
     await b.syncSessions();
     const thread = (await readFullMap(dir)).s1;
     await b.pollActivity();
-    remoteChannels.get(thread).name = '🟢 Idle · hs-lab';
+    remoteChannels.get(thread).name = '⚫ Idle · hs-lab';
     now += 8_000;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · hs-lab');
     expect(sendInput).not.toHaveBeenCalled();
   });
 
@@ -477,18 +482,18 @@ describe('Discord interface mode', () => {
     await b.syncSessions();
     const thread = (await readFullMap(dir)).s1;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · hs-lab');
     const typing = () => posts.filter((p) => p.method === 'POST' && p.path.endsWith('/typing'));
     expect(typing().at(-1)?.path).toBe(`/api/v10/channels/${thread}/typing`);
     const count = typing().length;
     waiting = true;
     now += 30_000;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🔴 Needs input · hs-lab');
     expect(typing()).toHaveLength(count);
-    // Synchronization must keep the same stable title.
+    // Synchronization must not strip the activity label.
     await b.syncSessions();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🔴 Needs input · hs-lab');
     await writeDiscordConfig(dir, { ...cfg, enabled: false });
     await b.reload();
     waiting = false;

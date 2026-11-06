@@ -1,15 +1,31 @@
 /** Cosmetic Discord activity, derived from live session state without reading terminal output. */
+import type { SessionActivityStatus } from './types/session.js';
+
 export interface DiscordActivitySession {
   id: string;
   name?: string;
   working?: boolean;
+  watching?: string | null;
+  activityStatus?: SessionActivityStatus;
   waiting?: boolean;
   exited?: boolean;
 }
 
+/** Background work is observable activity, but never foreground typing or a question. */
+function activityLabel(session: DiscordActivitySession): string {
+  if (session.exited) return '⚫ Offline';
+  if (session.waiting) return '🔴 Needs input';
+  if (session.working) return '🟡 Working';
+  if (session.activityStatus === 'waiting_agents') return '🟡 Waiting for agents';
+  if (session.activityStatus === 'checking_agents') return '🟡 Checking agents';
+  if (session.watching?.trim()) return '🟡 Background work';
+  return '⚫ Idle';
+}
+
 export function discordActivityName(session: DiscordActivitySession): string {
+  const label = activityLabel(session);
   const name = (session.name ?? session.id.slice(0, 8)).replace(/[\r\n]/g, ' ').trim();
-  return `${name || session.id.slice(0, 8)}`.slice(0, 100);
+  return `${label} · ${name || session.id.slice(0, 8)}`.slice(0, 100);
 }
 
 interface ActivityDeps {
@@ -28,6 +44,7 @@ interface Progress {
   renamedAt?: number;
   typedAt?: number;
   verifiedAt?: number;
+  idleSince?: number;
   verifyRetryAt?: number;
   renameRetryAt?: number;
   typingRetryAt?: number;
@@ -38,6 +55,9 @@ function retryAfter(error: unknown): number {
   const delay = (error as { retryAfterMs?: unknown })?.retryAfterMs;
   return typeof delay === 'number' && Number.isFinite(delay) && delay > 0 ? delay : RETRY_MS;
 }
+
+const activityPrefix = (session: DiscordActivitySession) =>
+  discordActivityName({ ...session, name: '' }).split(' · ')[0];
 
 /** Coalesced sweeps, four sessions at a time. No messages, pings, agent input or new destinations. */
 export class DiscordActivity {
@@ -53,9 +73,11 @@ export class DiscordActivity {
   forget(id: string): void {
     this.progress.delete(id);
   }
-  /** Every creation/synchronization path uses the same activity-independent title. */
+  /** Keep other bridge paths from undoing a coalesced activity rename. */
   name(session: DiscordActivitySession): string {
-    return discordActivityName(session);
+    const key = JSON.stringify([this.deps.scope(), this.deps.destination(session.id)]);
+    const progress = this.progress.get(session.id);
+    return progress?.key === key && progress.name ? progress.name : discordActivityName(session);
   }
   poll(): Promise<void> {
     if (this.run) return this.run;
@@ -97,12 +119,24 @@ export class DiscordActivity {
       this.progress.set(id, progress);
     }
     const now = this.deps.now();
+    if (session.working || session.waiting || session.exited) progress.idleSince = undefined;
+    else progress.idleSince ??= now;
     if ((progress.verifyRetryAt ?? 0) > now) return;
     const needsRename = () => {
       const s = current();
       if (!s || (progress.renameRetryAt ?? 0) > now || progress.name === discordActivityName(s)) return false;
-      // Only a real session rename or a legacy activity prefix needs a PATCH.
-      // Foreground/background task transitions must not create Discord system notices.
+      const active = activityLabel(s) !== '⚫ Idle';
+      const stateChanged = !progress.name?.startsWith(activityPrefix(s) + ' · ');
+      // Show a new active state promptly; only settling back to Idle is delayed. Short
+      // gaps between turns must not spend the rename budget or hide the next short turn.
+      if (active && stateChanged) return progress.renamedAt === undefined || now - progress.renamedAt >= 1_000;
+      if (
+        !active &&
+        /^(🟡 (?:Working|Background work|Waiting for agents|Checking agents)|🔴 Needs input|⚫ Offline) · /.test(
+          progress.name ?? ''
+        )
+      )
+        return now - (progress.idleSince ?? now) >= 30_000;
       return progress.renamedAt === undefined || now - progress.renamedAt >= 30_000;
     };
     const needsTyping = () => {

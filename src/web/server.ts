@@ -856,6 +856,8 @@ export class WebServer extends EventEmitter {
         name: session.name,
         remote: !!session.remote,
         working: session.isWorking,
+        watching: session.watching,
+        activityStatus: session.activityProjection.activityStatus,
       })),
     history: async (id, options) => {
       const session = this.sessions.get(id);
