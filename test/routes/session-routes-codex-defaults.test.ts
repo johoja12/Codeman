@@ -8,6 +8,7 @@ import { registerSessionRoutes } from '../../src/web/routes/session-routes.js';
 import { registerSystemRoutes } from '../../src/web/routes/system-routes.js';
 import { CASES_DIR, SETTINGS_PATH } from '../../src/web/route-helpers.js';
 import { applyLaunchDefaults } from '../../src/web/launch-defaults.js';
+import { applyDiscordLaunchDefaults } from '../../src/web/discord-launch-defaults.js';
 import { buildCodexCommand } from '../../src/tmux-manager.js';
 import { Session } from '../../src/session.js';
 import { safeRmHomeTree } from '../mocks/index.js';
@@ -77,6 +78,55 @@ describe('Codex launch defaults', () => {
       });
     });
   }
+
+  it('Discord creation inherits approval, animation, model and effort defaults through the create API', async () => {
+    await writeFile(
+      SETTINGS_PATH,
+      JSON.stringify({
+        codexDangerouslyBypassApprovals: true,
+        codexAnimationsEnabled: false,
+        codexModel: 'gpt-6.1',
+        codexReasoningEffort: 'high',
+      })
+    );
+    const payload = await applyDiscordLaunchDefaults({ workingDir, mode: 'codex' });
+    const response = await harness.app.inject({ method: 'POST', url: '/api/sessions', payload });
+    expect(response.statusCode).toBe(200);
+    const session = [...harness.ctx.sessions.values()].at(-1) as Session;
+    expect(session.codexConfig).toMatchObject({
+      dangerouslyBypassApprovals: true,
+      animations: false,
+      renderMode: 'hybrid',
+      model: 'gpt-6.1',
+      reasoningEffort: 'high',
+    });
+    expect(buildCodexCommand(session.codexConfig)).toContain('--dangerously-bypass-approvals-and-sandbox');
+    expect(buildCodexCommand(session.codexConfig)).toContain('tui.animations=false');
+  });
+
+  it('Discord preserves explicit Codex options and leaves other modes untouched', async () => {
+    await writeFile(
+      SETTINGS_PATH,
+      JSON.stringify({ codexDangerouslyBypassApprovals: true, codexAnimationsEnabled: false })
+    );
+    const body = {
+      mode: 'codex',
+      codexConfig: { dangerouslyBypassApprovals: false, animations: true, renderMode: 'tui' },
+    };
+    expect(await applyDiscordLaunchDefaults(body)).toEqual(body);
+    const claude = { mode: 'claude' };
+    expect(await applyDiscordLaunchDefaults(claude)).toBe(claude);
+  });
+
+  it('Discord ignores malformed saved flags and keeps approval prompting when unset', async () => {
+    for (const settings of [{}, { codexDangerouslyBypassApprovals: 'true', codexAnimationsEnabled: 'false' }]) {
+      await writeFile(SETTINGS_PATH, JSON.stringify(settings));
+      expect(await applyDiscordLaunchDefaults({ mode: 'codex' })).toEqual({
+        mode: 'codex',
+        codexConfig: { dangerouslyBypassApprovals: false, renderMode: 'hybrid' },
+      });
+    }
+  });
 
   it('leaves empty defaults to Codex and ignores malformed persisted values', async () => {
     for (const settings of [
