@@ -827,3 +827,188 @@ it('keeps the shared completion card current and acknowledges only an opened exa
     'All caught up'
   );
 });
+it.each(['expired', 'restart'] as const)(
+  'recovers exact read-only response buttons after %s and acknowledges before reads',
+  async (kind) => {
+    const f = await fixture();
+    f.host.history = vi.fn(async () => ({
+      conversationId: 'conversation-one',
+      partial: false,
+      turns: [
+        { cursor: 'u1', role: 'user' as const, text: 'First task', timestamp: '' },
+        { cursor: 'p1', role: 'assistant' as const, text: 'Compiling', timestamp: '', phase: 'commentary' as const },
+        {
+          cursor: 'r1',
+          role: 'assistant' as const,
+          text: 'Original response',
+          timestamp: '',
+          phase: 'final_answer' as const,
+        },
+        { cursor: 'u2', role: 'user' as const, text: 'Second task', timestamp: '' },
+        {
+          cursor: 'r2',
+          role: 'assistant' as const,
+          text: 'Newer response',
+          timestamp: '',
+          phase: 'final_answer' as const,
+        },
+      ],
+    }));
+    const controls = await f.ui.responseControls('s1', channel, 'u1', 'r1');
+    const id = snow();
+    f.messages.set(id, {
+      id,
+      channel,
+      channel_id: channel,
+      author: { id: bot },
+      content: 'Old response',
+      components: controls,
+    } as any);
+    f.advance(7 * 60000);
+    const ui = kind === 'restart' ? new DiscordNativeUi(f.host) : f.ui;
+    const original = f.host.request;
+    f.host.request = vi.fn(async (...args) => {
+      expect(f.responses).toContainEqual({ type: 5, data: { flags: 64 } });
+      return original(...args);
+    });
+    const view = { content: '', components: controls };
+    for (const label of ['Download response', 'Show updates', 'Results & files'])
+      await ui.interaction(f.event(f.component(view, label), { message: { id } }));
+    expect(f.host.postFile).toHaveBeenCalledWith(
+      channel,
+      { name: 'response.txt', data: Buffer.from('Original response') },
+      'Requested assistant response'
+    );
+    expect(f.finishes.some((v) => v.content.includes('Compiling'))).toBe(true);
+    expect(f.finishes.at(-1)?.content).toContain('Results & files');
+    expect(f.host.submit).not.toHaveBeenCalled();
+  }
+);
+
+it.each([
+  'foreign author',
+  'missing button',
+  'missing history',
+  'changed scope',
+  'changed conversation',
+  'wrong channel',
+  'unauthorized actor',
+  'deleted message',
+])('does not recover a response button with %s', async (kind) => {
+  const f = await fixture();
+  f.host.history = async () => ({
+    conversationId: 'conversation-one',
+    partial: false,
+    turns: [
+      { cursor: 'u1', role: 'user', text: 'Build', timestamp: '' },
+      { cursor: 'r1', role: 'assistant', text: 'Answer', timestamp: '' },
+    ],
+  });
+  const controls = await f.ui.responseControls('s1', channel, 'u1', 'r1'),
+    id = snow();
+  f.messages.set(id, {
+    id,
+    channel,
+    channel_id: channel,
+    author: { id: bot },
+    content: 'Response',
+    components: controls,
+  } as any);
+  const button = f.component({ content: '', components: controls }, 'Download response');
+  if (kind === 'foreign author') f.messages.get(id)!.author.id = '999999999999999999';
+  if (kind === 'missing button') f.messages.get(id)!.components = [];
+  if (kind === 'deleted message') f.messages.delete(id);
+  if (kind === 'missing history')
+    f.host.history = async () => ({ conversationId: 'conversation-one', partial: false, turns: [] });
+  if (kind === 'changed scope') f.setScope('another-scope');
+  if (kind === 'changed conversation') f.sessions[0].conversation = 'another-conversation';
+  const ui = new DiscordNativeUi(f.host);
+  await ui.interaction(
+    f.event(button, {
+      message: { id },
+      ...(kind === 'wrong channel' ? { channel_id: parent } : {}),
+      ...(kind === 'unauthorized actor' ? { member: { user: { id: '999999999999999999' } } } : {}),
+    })
+  );
+  expect(f.host.postFile).not.toHaveBeenCalled();
+  expect(f.host.submit).not.toHaveBeenCalled();
+  expect(f.host.services.answer).not.toHaveBeenCalled();
+});
+
+it('does not revive an expired cached response when its native history is gone', async () => {
+  const f = await fixture();
+  const controls = await f.ui.responseControls('s1', channel, 'u1', 'r1'),
+    id = snow();
+  f.messages.set(id, {
+    id,
+    channel,
+    channel_id: channel,
+    author: { id: bot },
+    content: 'Response',
+    components: controls,
+  } as any);
+  f.host.history = async () => ({ conversationId: 'conversation-one', partial: false, turns: [] });
+  f.advance(7 * 60000);
+  await f.ui.interaction(
+    f.event(f.component({ content: '', components: controls }, 'Download response'), { message: { id } })
+  );
+  expect(f.host.postFile).not.toHaveBeenCalled();
+  expect(f.finishes.at(-1)?.content).toContain('no longer available');
+});
+it('keeps state-changing session controls expired instead of recovering them', async () => {
+  const f = await fixture();
+  await f.ui.poll();
+  const card = f.findCard()!;
+  const button = f.component(card, 'Interrupt');
+  expect(button).toBeDefined();
+  const calls = vi.mocked(f.host.control).mock.calls.length;
+  f.advance(7 * 60000);
+  await f.ui.interaction(f.event(button, { message: { id: card.id } }));
+  expect(f.host.control).toHaveBeenCalledTimes(calls);
+  expect(JSON.stringify(f.responses.at(-1))).toContain('expired or changed');
+});
+
+it('abandons response recovery if configuration changes during the history read', async () => {
+  const f = await fixture();
+  const controls = await f.ui.responseControls('s1', channel, 'u1', 'r1'),
+    id = snow();
+  f.messages.set(id, {
+    id,
+    channel,
+    channel_id: channel,
+    author: { id: bot },
+    content: 'Response',
+    components: controls,
+  } as any);
+  f.advance(7 * 60000);
+  f.host.history = async () => {
+    f.setScope('changed-while-reading');
+    return {
+      conversationId: 'conversation-one',
+      partial: false,
+      turns: [
+        { cursor: 'u1', role: 'user', text: 'Build', timestamp: '' },
+        { cursor: 'r1', role: 'assistant', text: 'Answer', timestamp: '' },
+      ],
+    };
+  };
+  await f.ui.interaction(
+    f.event(f.component({ content: '', components: controls }, 'Download response'), { message: { id } })
+  );
+  expect(f.host.postFile).not.toHaveBeenCalled();
+});
+it('does not upload a response when its conversation changes during the final history read', async () => {
+  const f = await fixture();
+  const controls = await f.ui.responseControls('s1', channel, 'u1', 'r1');
+  f.host.history = async () => {
+    f.sessions[0].conversation = 'replacement';
+    return {
+      conversationId: 'conversation-one',
+      partial: false,
+      turns: [{ cursor: 'r1', role: 'assistant', text: 'Old answer', timestamp: '' }],
+    };
+  };
+  await f.click({ content: '', components: controls }, 'Download response');
+  expect(f.host.postFile).not.toHaveBeenCalled();
+  expect(f.finishes.at(-1)?.content).toContain('changed');
+});
