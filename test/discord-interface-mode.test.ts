@@ -1,7 +1,8 @@
 /** Full-interface discovery uses fake Discord only; never attaches to or submits work to a session. */
 import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { readDiscordSessionFile } from '../src/discord-file-transfers.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_DISCORD_CONFIG,
@@ -25,7 +26,7 @@ const cfg = {
   allowedUserIds: ['333333333333333333'],
 };
 let dir: string;
-let sessions: Array<{ id: string; name?: string; remote?: boolean; working?: boolean }>;
+let sessions: Array<import('../src/discord-activity.js').DiscordActivitySession & { remote?: boolean }>;
 let bridges: DiscordBridge[];
 let posts: Array<{ path: string; method: string; body?: any }>;
 let sendInput: ReturnType<typeof vi.fn>;
@@ -33,6 +34,7 @@ let sequence: number;
 let remoteChannels: Map<string, any>;
 let remoteMessages: Map<string, any>;
 let statusEditRefused: boolean;
+let artifactPostRefused: boolean;
 let activityRenameRetryAfter: number | undefined;
 let uploaded: Array<{ name: string; text: string }>;
 /** Assert what a reader sees, across plain text and native response cards. */
@@ -61,11 +63,13 @@ function makeBridge(
         ? JSON.parse(init.body instanceof FormData ? String(init.body.get('payload_json')) : String(init.body))
         : undefined;
       if (init.body instanceof FormData) {
-        const file = init.body.get('files[0]');
-        if (file instanceof Blob)
-          uploaded.push({ name: String((file as { name?: string }).name), text: await file.text() });
+        for (const [key, file] of init.body.entries())
+          if (key.startsWith('files[') && file instanceof Blob)
+            uploaded.push({ name: String((file as { name?: string }).name), text: await file.text() });
       }
       posts.push({ path, method, body } as any);
+      if (artifactPostRefused && method === 'POST' && init.body instanceof FormData)
+        return Response.json({}, { status: 403 });
       if (/\/applications\/.*\/commands$/.test(path)) {
         if (method === 'GET') return Response.json([]);
         return Response.json({ ...body, id: body.name === 'codex' ? '777777777777777771' : '777777777777777772' });
@@ -173,6 +177,7 @@ beforeEach(async () => {
   remoteChannels = new Map();
   remoteMessages = new Map();
   statusEditRefused = false;
+  artifactPostRefused = false;
   activityRenameRetryAfter = undefined;
   uploaded = [];
   sendInput = vi.fn(async () => true);
@@ -184,6 +189,226 @@ afterEach(async () => {
 });
 
 describe('Discord interface mode', () => {
+  it.each([false, true])('preserves Claude background titles over sync and restart (remote=%s)', async (remote) => {
+    let now = 100000;
+    sessions = [
+      { id: 's1', name: 'w29-buildmesh', remote, working: false, watching: '1 shell', activityStatus: 'idle' },
+    ];
+    const b = makeBridge(undefined, { now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    const thread = (await readFullMap(dir)).s1;
+    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    await b.pollActivity();
+    const typing = () => posts.filter((p) => p.path.endsWith('/typing'));
+    expect(typing()).toHaveLength(0);
+    await b.syncSessions();
+    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    b.stop();
+    const restarted = makeBridge(undefined, { now: () => now });
+    await restarted.reload();
+    await restarted.syncSessions();
+    await restarted.pollActivity();
+    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    sessions[0].watching = null;
+    now += 4000;
+    await restarted.pollActivity();
+    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    now += 30000;
+    await restarted.pollActivity();
+    expect(remoteChannels.get(thread).name).toBe('⚫ Idle · w29-buildmesh');
+    expect(typing()).toHaveLength(0);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it('groups explicit output files beneath a new response and does not repeat uploads after replay/restart', async () => {
+    let now = 100000;
+    let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+    sessions = [{ id: 's1', name: 'one' }];
+    await writeFile(join(dir, 'mockup.png'), 'image-bytes');
+    await writeFile(join(dir, 'report.pdf'), 'pdf-bytes');
+    const history = async () => ({ conversationId: 'native1', partial: false, turns });
+    const getAttachment = vi.fn(async (_id: string, path: string, relative?: boolean) => {
+      expect(relative).toBe(true);
+      return readDiscordSessionFile({ workingDir: dir }, resolve(dir, path));
+    });
+    const b = makeBridge(undefined, { history, getAttachment, now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    turns = [
+      { cursor: 'native1:1', role: 'user', text: 'Make the files', timestamp: '' },
+      {
+        cursor: 'native1:2',
+        role: 'assistant',
+        text: 'Done.\n![Mockup](./mockup.png)\n[Report](./report.pdf)\n[source](./app.ts)',
+        timestamp: '',
+      },
+    ];
+    await b.pollConversations();
+    expect(uploaded).toEqual([
+      { name: 'mockup.png', text: 'image-bytes' },
+      { name: 'report.pdf', text: 'pdf-bytes' },
+    ]);
+    const attachments = posts.filter((p) => p.body?.content === 'Files from this response');
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0].body?.allowed_mentions).toEqual({ parse: [], users: [] });
+    expect(getAttachment).toHaveBeenCalledTimes(2);
+    const before = posts.findIndex((p) => p === attachments[0]);
+    expect(posts.slice(0, before).some((p) => visibleText(p.body)?.includes('Done.'))).toBe(true);
+    // Simulate a crash after upload but before the cursor checkpoint reached disk.
+    const saved = JSON.parse(await readFile(join(dir, 'discord-conversations.json'), 'utf8'));
+    saved[0][1].cursor = 'native1:1';
+    await writeFile(join(dir, 'discord-conversations.json'), JSON.stringify(saved));
+    b.stop();
+    now += 60001;
+    const restarted = makeBridge(undefined, { history, getAttachment, now: () => now });
+    await restarted.reload();
+    await restarted.syncSessions();
+    await restarted.pollConversations();
+    expect(uploaded).toHaveLength(2);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it('uses workspace guards for missing, secret and escaped paths without losing this or later text', async () => {
+    let now = 100000;
+    let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+    sessions = [{ id: 's1', name: 'one' }];
+    await writeFile(join(dir, '.env'), 'NOT-A-REAL-SECRET');
+    const history = async () => ({ conversationId: 'native1', partial: false, turns });
+    const getAttachment = vi.fn(async (_id: string, path: string) =>
+      readDiscordSessionFile({ workingDir: dir }, resolve(dir, path))
+    );
+    const b = makeBridge(undefined, { history, getAttachment, now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    turns = [
+      {
+        cursor: 'native1:1',
+        role: 'assistant',
+        text: 'Here are outputs.\n[artifact: .env]\n[Missing](missing.pdf)\n[artifact: ../outside.txt]',
+        timestamp: '',
+      },
+    ];
+    await b.pollConversations();
+    expect(uploaded).toEqual([]);
+    expect(posts.some((p) => visibleText(p.body)?.includes('Here are outputs.'))).toBe(true);
+    expect(posts.filter((p) => p.body?.content?.startsWith('Some linked output files'))).toHaveLength(1);
+    expect(posts.some((p) => p.body?.content?.includes('NOT-A-REAL-SECRET'))).toBe(false);
+    turns.push({ cursor: 'native1:2', role: 'assistant', text: 'The next response still arrives.', timestamp: '' });
+    now += 60001;
+    await b.pollConversations();
+    expect(posts.some((p) => visibleText(p.body)?.includes('The next response still arrives.'))).toBe(true);
+  });
+
+  it('caps automatic file count and combined bytes and includes one concise notice', async () => {
+    let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+    sessions = [{ id: 's1', name: 'one' }];
+    const getAttachment = vi.fn(async (_id: string, path: string) => ({
+      name: path,
+      data: Buffer.alloc(5 * 1024 * 1024),
+    }));
+    const b = makeBridge(undefined, {
+      getAttachment,
+      history: async () => ({ conversationId: 'native1', partial: false, turns }),
+    });
+    await b.reload();
+    await b.syncSessions();
+    turns = [
+      {
+        cursor: 'native1:1',
+        role: 'assistant',
+        text: Array.from({ length: 8 }, (_, i) => `[File](output${i}.pdf)`).join('\n'),
+        timestamp: '',
+      },
+    ];
+    await b.pollConversations();
+    expect(getAttachment).toHaveBeenCalledTimes(4);
+    expect(uploaded).toHaveLength(1);
+    expect(
+      posts.filter((p) => p.body?.content?.startsWith('Files from this response\nSome linked output files'))
+    ).toHaveLength(1);
+  });
+
+  it('reports a refused artifact upload once while advancing live text delivery', async () => {
+    let now = 100000;
+    let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+    sessions = [{ id: 's1', name: 'one' }];
+    const b = makeBridge(undefined, {
+      getAttachment: async () => ({ name: 'pic.png', data: Buffer.from('image') }),
+      history: async () => ({ conversationId: 'native1', partial: false, turns }),
+      now: () => now,
+    });
+    await b.reload();
+    await b.syncSessions();
+    artifactPostRefused = true;
+    turns = [{ cursor: 'native1:1', role: 'assistant', text: 'Here is the picture. ![Image](pic.png)', timestamp: '' }];
+    await b.pollConversations();
+    expect(posts.filter((p) => p.body?.content === 'Files from this response')).toHaveLength(1);
+    expect(
+      posts.filter((p) => p.body?.content?.startsWith('Output file delivery could not be confirmed'))
+    ).toHaveLength(1);
+    now += 60001;
+    await b.pollConversations();
+    expect(posts.filter((p) => p.body?.content === 'Files from this response')).toHaveLength(1);
+    turns.push({ cursor: 'native1:2', role: 'assistant', text: 'Later response.', timestamp: '' });
+    now += 60001;
+    await b.pollConversations();
+    expect(posts.some((p) => visibleText(p.body)?.includes('Later response.'))).toBe(true);
+  });
+
+  it('never auto-uploads historical responses, tool results or stream-off output', async () => {
+    let now = 100000;
+    let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [
+      { cursor: 'native1:1', role: 'assistant', text: '[Old report](old.pdf)', timestamp: '' },
+    ];
+    sessions = [{ id: 's1', name: 'one' }];
+    const getAttachment = vi.fn(async () => ({ name: 'unused.pdf', data: Buffer.from('unused') }));
+    const b = makeBridge(undefined, {
+      getAttachment,
+      history: async () => ({ conversationId: 'native1', partial: false, turns }),
+      now: () => now,
+    });
+    await b.reload();
+    await b.syncSessions();
+    await b.pollConversations();
+    expect(getAttachment).not.toHaveBeenCalled();
+    turns.push({ cursor: 'native1:2', role: 'tool', text: '[Tool file](tool.pdf)', timestamp: '' });
+    now += 60001;
+    await b.pollConversations();
+    expect(getAttachment).not.toHaveBeenCalled();
+    const thread = (await readFullMap(dir)).s1;
+    await b.onGatewayMessage({
+      id: '900000000000000001',
+      guild_id: cfg.guildId,
+      channel_id: thread,
+      author: { id: cfg.allowedUserIds[0] },
+      content: '!codeman stream off',
+    });
+    turns.push({ cursor: 'native1:3', role: 'assistant', text: '[Paused](paused.pdf)', timestamp: '' });
+    now += 60001;
+    await b.pollConversations();
+    expect(getAttachment).not.toHaveBeenCalled();
+  });
+
+  it('abandons automatic attachment delivery when routing stops during a file read', async () => {
+    let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+    sessions = [{ id: 's1', name: 'one', remote: true }];
+    const getAttachment = vi.fn(async () => {
+      b.stop();
+      return { name: 'picture.png', data: Buffer.from('image') };
+    });
+    const b = makeBridge(undefined, {
+      getAttachment,
+      history: async () => ({ conversationId: 'native1', partial: false, turns }),
+    });
+    await b.reload();
+    await b.syncSessions();
+    turns = [{ cursor: 'native1:1', role: 'assistant', text: '![Image](/remote/work/picture.png)', timestamp: '' }];
+    await b.pollConversations();
+    expect(getAttachment).toHaveBeenCalledWith('s1', '/remote/work/picture.png', true);
+    expect(uploaded).toHaveLength(0);
+  });
+
   it('reacts to a native session update even when the thread name did not change', async () => {
     let now = 1_000;
     sessions = [{ id: 's1', name: 'hs-lab', working: false }];
@@ -197,38 +422,12 @@ describe('Discord interface mode', () => {
     now += 100;
     await b.sessionRenamed('s1', 'hs-lab');
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · hs-lab');
     expect(posts.some((p) => p.path.endsWith('/typing'))).toBe(true);
     expect(sendInput).not.toHaveBeenCalled();
   });
 
-  it('keeps a stable name through repeated background wakeups, synchronization and restart', async () => {
-    let now = 1_000;
-    sessions = [{ id: 's1', name: 'hs-lab', working: false }];
-    const b = makeBridge(undefined, { now: () => now });
-    await b.reload();
-    await b.syncSessions();
-    const thread = (await readFullMap(dir)).s1;
-    posts = [];
-    for (let i = 0; i < 8; i++) {
-      sessions[0].working = i % 2 === 0;
-      now += 120_000;
-      await b.sessionRenamed('s1', 'hs-lab');
-      await b.pollActivity();
-      await b.syncSessions();
-      expect(remoteChannels.get(thread).name).toBe('hs-lab');
-    }
-    const restarted = makeBridge(undefined, { now: () => now });
-    await restarted.reload();
-    await restarted.syncSessions();
-    await restarted.pollActivity();
-    const titleEdits = posts.filter((p) => p.method === 'PATCH' && p.path.endsWith('/' + thread) && p.body?.name);
-    expect(titleEdits).toHaveLength(0);
-    expect(posts.some((p) => p.path.endsWith('/typing'))).toBe(true);
-    expect(sendInput).not.toHaveBeenCalled();
-  });
-
-  it('keeps typing while a legacy activity title cleanup is rate limited', async () => {
+  it('keeps typing when an existing Idle thread cannot be renamed yet, without inline retries', async () => {
     let now = 1_000;
     sessions = [{ id: 's1', name: 'hs-lab', working: false }];
     const b = makeBridge(undefined, { now: () => now });
@@ -240,12 +439,11 @@ describe('Discord interface mode', () => {
     await b.pollActivity();
     expect(titleEdits()).toHaveLength(0);
     expect(typing()).toHaveLength(0);
-    remoteChannels.get(thread).name = '🟢 Idle · hs-lab';
     sessions[0].working = true;
     activityRenameRetryAfter = 120;
     now += 4_000;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('🟢 Idle · hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('⚫ Idle · hs-lab');
     expect(typing()).toHaveLength(1);
     expect(titleEdits()).toHaveLength(1);
     now += 8_000;
@@ -255,7 +453,7 @@ describe('Discord interface mode', () => {
     activityRenameRetryAfter = undefined;
     now += 120_000;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · hs-lab');
     expect(titleEdits()).toHaveLength(2);
     expect(sendInput).not.toHaveBeenCalled();
   });
@@ -268,10 +466,10 @@ describe('Discord interface mode', () => {
     await b.syncSessions();
     const thread = (await readFullMap(dir)).s1;
     await b.pollActivity();
-    remoteChannels.get(thread).name = '🟢 Idle · hs-lab';
+    remoteChannels.get(thread).name = '⚫ Idle · hs-lab';
     now += 8_000;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · hs-lab');
     expect(sendInput).not.toHaveBeenCalled();
   });
 
@@ -284,18 +482,18 @@ describe('Discord interface mode', () => {
     await b.syncSessions();
     const thread = (await readFullMap(dir)).s1;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · hs-lab');
     const typing = () => posts.filter((p) => p.method === 'POST' && p.path.endsWith('/typing'));
     expect(typing().at(-1)?.path).toBe(`/api/v10/channels/${thread}/typing`);
     const count = typing().length;
     waiting = true;
     now += 30_000;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🔴 Needs input · hs-lab');
     expect(typing()).toHaveLength(count);
-    // Synchronization must keep the same stable title.
+    // Synchronization must not strip the activity label.
     await b.syncSessions();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🔴 Needs input · hs-lab');
     await writeDiscordConfig(dir, { ...cfg, enabled: false });
     await b.reload();
     waiting = false;
