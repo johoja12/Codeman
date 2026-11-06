@@ -300,7 +300,7 @@ export class DiscordNativeUi {
       if ((this.errors.get(key) ?? 0) > this.host.now()) continue;
       try {
         const channel = this.host.channelForSession(s.id)!;
-        await this.host.verify(s.id, channel);
+        if (!(await this.host.passive(s.id, channel))) continue;
         // Tokens rotate every two minutes, and immediately after process restart.
         const signature = hash(
           JSON.stringify([
@@ -364,6 +364,7 @@ export class DiscordNativeUi {
   async receipt(id: string, receiptId: string): Promise<void> {
     const channel = this.host.channelForSession(id);
     if (!channel) return;
+    if (!(await this.host.passive(id, channel))) return;
     const r = (await this.host.receipts(id)).find((r) => r.id === receiptId);
     if (!r) return;
     const labels: Record<string, string> = {

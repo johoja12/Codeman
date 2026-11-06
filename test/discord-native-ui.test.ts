@@ -72,6 +72,7 @@ async function fixture() {
     channelForSession: (id) => (id === 's1' ? channel : undefined),
     ownsChannel: (c) => [channel, parent].includes(c),
     verify: vi.fn(async () => {}),
+    passive: vi.fn(async () => true),
     request: vi.fn(async (method, path, body) => {
       if (path.endsWith('/commands')) {
         if (method === 'GET') return commands;
@@ -212,6 +213,24 @@ async function fixture() {
   };
 }
 describe('native Discord UI', () => {
+  it('never reopens an archived or locked thread for passive cards or queue dispatch', async () => {
+    const f = await fixture();
+    vi.mocked(f.host.passive).mockResolvedValue(false);
+    await f.ui.store.enqueue({
+      session: 's1',
+      conversation: 'conversation-one',
+      scope: 'scope-a',
+      channel,
+      actor,
+      source: 'q',
+      text: 'Do this next',
+    });
+    f.sessions[0].working = false;
+    await f.ui.poll();
+    expect(f.findCard()).toBeUndefined();
+    expect(f.host.submit).not.toHaveBeenCalled();
+    expect(f.host.verify).not.toHaveBeenCalled();
+  });
   it('publishes one owned control card and dashboard; updates after restart without duplicate posts', async () => {
     const f = await fixture();
     await f.ui.poll();
