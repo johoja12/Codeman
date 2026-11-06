@@ -213,7 +213,7 @@ describe('Discord interface mode', () => {
     activityRenameRetryAfter = 120;
     now += 4_000;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('🟢 Idle · hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('⚫ Idle · hs-lab');
     expect(typing()).toHaveLength(1);
     expect(titleEdits()).toHaveLength(1);
     now += 8_000;
