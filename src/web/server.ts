@@ -48,7 +48,7 @@ import fastifyWebsocket from '@fastify/websocket';
 import fastifyMultipart from '@fastify/multipart';
 import { pasteImageDirInUseByOtherSession, startPasteImageGc, uploadDirs } from './paste-image-gc.js';
 import { CLEAN_EXIT_CLOSE_REASON, shouldCloseCleanlyExitedSession } from '../pane-exit-sweep.js';
-import { join, dirname } from 'node:path';
+import { join, dirname, resolve, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, readFileSync, chmodSync, statSync } from 'node:fs';
 import fs from 'node:fs/promises';
@@ -884,9 +884,11 @@ export class WebServer extends EventEmitter {
         };
       return (await discordTaskControl(session, command)) ?? discordHistoryControl(session, command);
     },
-    getAttachment: async (id, path) => {
+    getAttachment: async (id, path, relativeToWorkspace) => {
       const session = this.sessions.get(id);
       if (!session) throw new Error('Session unavailable');
+      if (relativeToWorkspace)
+        path = session.remote ? posix.resolve(session.remote.remotePath, path) : resolve(session.workingDir, path);
       return readDiscordSessionFile({ workingDir: session.workingDir, remote: session.remote }, path);
     },
     saveRemoteAttachment: async (id, name, bytes) => {

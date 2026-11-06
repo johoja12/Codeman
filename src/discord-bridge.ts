@@ -19,6 +19,7 @@
  *
  * @module discord-bridge
  */
+import { discordArtifactPaths, DISCORD_ARTIFACT_COUNT } from './discord-artifacts.js';
 import { DiscordNativeUi } from './discord-native-ui.js';
 import type { DiscordNativeUiServices } from './discord-native-ui-types.js';
 import { registerDiscordLaunchCommands } from './discord-launch-commands.js';
@@ -42,7 +43,7 @@ import { existsSync, mkdirSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { boundedDiscordDownload } from './discord-file-transfers.js';
+import { boundedDiscordDownload, DISCORD_FILE_LIMIT } from './discord-file-transfers.js';
 import { probePathKind } from './utils/bounded-path-probe.js';
 import { DISCORD_RECEIVED_DIR } from './web/paste-image-gc.js';
 import WebSocket from 'ws';
@@ -573,14 +574,28 @@ export class DiscordApi {
   editChannel(id: string, body: Record<string, unknown>): Promise<unknown> {
     return this.request('PATCH', `/channels/${id}`, body);
   }
-  post(channelId: string, p: DiscordPost): Promise<{ id: string } | null> {
-    return this.request('POST', `/channels/${channelId}/messages`, {
-      ...p,
-      nonce: p.nonce ?? randomUUID().replaceAll('-', '').slice(0, 24),
-      enforce_nonce: true,
-    });
+  post(channelId: string, p: DiscordPost, current?: () => boolean): Promise<{ id: string } | null> {
+    return this.request(
+      'POST',
+      `/channels/${channelId}/messages`,
+      {
+        ...p,
+        nonce: p.nonce ?? randomUUID().replaceAll('-', '').slice(0, 24),
+        enforce_nonce: true,
+      },
+      0,
+      current
+    );
   }
   postWithFile(channelId: string, p: DiscordPost, file: DiscordFile): Promise<{ id: string } | null> {
+    return this.postWithFiles(channelId, p, [file]);
+  }
+  postWithFiles(
+    channelId: string,
+    p: DiscordPost,
+    files: DiscordFile[],
+    current?: () => boolean
+  ): Promise<{ id: string } | null> {
     const form = new FormData();
     form.append(
       'payload_json',
@@ -590,8 +605,9 @@ export class DiscordApi {
         enforce_nonce: true,
       })
     );
-    form.append('files[0]', new Blob([Buffer.from(file.data)]), safeAttachmentName(file.name));
-    return this.request('POST', `/channels/${channelId}/messages`, form);
+    for (const [i, file] of files.entries())
+      form.append(`files[${i}]`, new Blob([Buffer.from(file.data)]), safeAttachmentName(file.name));
+    return this.request('POST', `/channels/${channelId}/messages`, form, 0, current);
   }
   editMessage(channelId: string, id: string, post: Partial<DiscordPost>): Promise<unknown> {
     return this.request('PATCH', `/channels/${channelId}/messages/${id}`, post);
@@ -896,7 +912,7 @@ export interface DiscordBridgeDeps {
     options?: { includeTools?: boolean }
   ) => Promise<import('./discord-history.js').DiscordHistory>;
   saveRemoteAttachment?: (sessionId: string, name: string, bytes: Uint8Array) => Promise<string>;
-  getAttachment?: (sessionId: string, path: string) => Promise<DiscordFile>;
+  getAttachment?: (sessionId: string, path: string, relativeToWorkspace?: boolean) => Promise<DiscordFile>;
   /** Snapshot only: never discovers or starts agents. Called after restoration is released. */
   sessions?: () => Array<{ id: string; name?: string; remote?: boolean; working?: boolean }>;
   socketFactory?: SocketFactory;
@@ -1409,6 +1425,66 @@ export class DiscordBridge {
     }
     await Promise.all(reads);
   }
+  private async deliverArtifacts(sessionId: string, channel: string, cursor: string, visible: string): Promise<void> {
+    const paths = discordArtifactPaths(visible);
+    if (!paths.length) return;
+    const scope = this.controlScope;
+    const current = () =>
+      !this.stopped &&
+      !this.held &&
+      this.acceptsControls &&
+      this.controlScope === scope &&
+      this.destinationMatches(sessionId, channel);
+    const files: DiscordFile[] = [];
+    let bytes = 0,
+      skipped = paths.length > DISCORD_ARTIFACT_COUNT;
+    for (const path of paths.slice(0, DISCORD_ARTIFACT_COUNT)) {
+      if (!current()) return;
+      try {
+        if (!this.deps.getAttachment) throw new Error('File service unavailable');
+        const file = await this.deps.getAttachment(sessionId, path, true);
+        if (!current()) return;
+        if (file.data.byteLength > DISCORD_FILE_LIMIT || bytes + file.data.byteLength > DISCORD_FILE_LIMIT)
+          throw new Error('Artifact batch limit');
+        bytes += file.data.byteLength;
+        files.push(file);
+      } catch {
+        skipped = true;
+      }
+    }
+    if (!current()) return;
+    const note =
+      'Some linked output files could not be attached (workspace access, file/count or 8 MB total limit). Use Results & files or !codeman file to inspect them.';
+    try {
+      await this.deliverPost(
+        channel,
+        {
+          content: files.length ? 'Files from this response' + (skipped ? '\n' + note : '') : note,
+          allowed_mentions: { parse: [], users: [] },
+        },
+        files.length ? files : undefined,
+        sessionId,
+        `native:${cursor}:artifacts`,
+        current
+      );
+    } catch {
+      // File delivery must never block future assistant text or automatically replay an uncertain upload.
+      if (current())
+        await this.deliverPost(
+          channel,
+          {
+            content:
+              'Output file delivery could not be confirmed. Check the thread before downloading again through Results & files or !codeman file.',
+            allowed_mentions: { parse: [], users: [] },
+          },
+          undefined,
+          sessionId,
+          `native:${cursor}:artifacts-notice`,
+          current
+        ).catch(() => undefined);
+    }
+  }
+
   private async observeConversation(sessionId: string, channel: string): Promise<void> {
     await this.seedConversation(sessionId, channel);
     const key = this.conversationKey(sessionId, channel);
@@ -1455,6 +1531,8 @@ export class DiscordBridge {
               `native:${turn.cursor}:overflow`
             );
         }
+        if (turn.role === 'assistant')
+          await this.deliverArtifacts(sessionId, channel, turn.cursor, discordDisplayText(turn.text));
         progress = { ...progress, cursor: turn.cursor };
         await this.conversationProgress.set(key, progress);
       }
@@ -2209,9 +2287,10 @@ export class DiscordBridge {
   private async deliverPost(
     channelId: string,
     post: DiscordPost,
-    file: DiscordFile | undefined,
+    file: DiscordFile | DiscordFile[] | undefined,
     sessionId: string | undefined,
-    key: string
+    key: string,
+    current?: () => boolean
   ): Promise<unknown> {
     if (this.cfg.mode === 'full' && sessionId) {
       if (!this.destinationMatches(sessionId, channelId)) throw new BridgeProblem('Discord destination changed');
@@ -2221,9 +2300,15 @@ export class DiscordBridge {
     }
     const id = createHash('sha256').update(`${this.cfg.guildId}:${channelId}:${key}`).digest('hex');
     const hash = createHash('sha256').update(
-      JSON.stringify({ content: post.content, embeds: post.embeds, components: post.components, file: file?.name })
+      JSON.stringify({
+        content: post.content,
+        embeds: post.embeds,
+        components: post.components,
+        file: Array.isArray(file) ? file.map((f) => [f.name, f.data.byteLength]) : file?.name,
+      })
     );
-    if (file) hash.update(file.data);
+    if (Array.isArray(file)) for (const f of file) hash.update(f.data);
+    else if (file) hash.update(file.data);
     const payloadHash = hash.digest('hex');
     const claim = await this.deliveries.claim({
       id,
@@ -2240,11 +2325,17 @@ export class DiscordBridge {
       throw new BridgeProblem('Previous Discord delivery is uncertain; it will not be replayed automatically');
     }
     await this.deliveries.update(id, 'submitting');
+    if (current && !current()) {
+      await this.deliveries.update(id, 'failed', 'scope_changed');
+      throw new BridgeProblem('Discord destination changed');
+    }
     const payload = { ...post, nonce: id.slice(0, 24), enforce_nonce: true };
     try {
-      const result = file
-        ? await this.api.postWithFile(channelId, payload, file)
-        : await this.api.post(channelId, payload);
+      const result = Array.isArray(file)
+        ? await this.api.postWithFiles(channelId, payload, file, current)
+        : file
+          ? await this.api.postWithFile(channelId, payload, file)
+          : await this.api.post(channelId, payload, current);
       if (!result?.id) throw new BridgeProblem('Discord did not confirm delivery');
       await this.deliveries.annotate(id, { messageId: result.id });
       await this.deliveries.update(id, 'delivered');
