@@ -432,18 +432,21 @@ export class DiscordCaseThreads {
   }
   async deletedCase(scope: DiscordChannelScope, caseKey: string, policy: Policy, enabled: boolean): Promise<void> {
     await this.load();
-    const ids = new Set(
-      Object.values(this.state.entries)
-        .filter(
-          (e) =>
-            e.guildId === scope.guildId &&
-            e.categoryId === scope.categoryId &&
-            e.caseKey === caseKey &&
-            ['active', 'intent', 'posting', 'thread'].includes(e.phase)
+    await this.edit((s) => {
+      for (const [key, e] of Object.entries(s.entries)) {
+        if (
+          e.guildId !== scope.guildId ||
+          e.categoryId !== scope.categoryId ||
+          e.caseKey !== caseKey ||
+          !['active', 'intent', 'posting', 'thread'].includes(e.phase)
         )
-        .map((e) => e.sessionId)
-    );
-    for (const id of ids) await this.deleted(id, policy);
+          continue;
+        // An old thread can share a session ID now routed to another case. Retire only this entry.
+        if (s.current[scopeKey(e, e.sessionId)] === key) s.deleted[e.sessionId] = policy;
+        e.policy = policy;
+        e.phase = policy === 'keep' ? 'kept' : 'retiring';
+      }
+    });
     if (enabled) await this.flushRetirements(scope.guildId);
   }
   flushRetirements(guild: string): Promise<void> {

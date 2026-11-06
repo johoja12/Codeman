@@ -283,3 +283,15 @@ it('keeps a failed case retirement durable and retries without recreating its th
   expect(channels.get(thread)?.thread_metadata?.archived).toBe(true);
   expect(api.createThread).toHaveBeenCalledTimes(1);
 });
+
+it('retiring an old case entry preserves a session now routed to a different case', async () => {
+  let currentIdentity = identity;
+  const m = manager(async () => currentIdentity);
+  const old = await m.forSession(scope, 'moved');
+  currentIdentity = { key: 'b'.repeat(64), name: 'new-case' };
+  const current = await m.forSession(scope, 'moved');
+  await m.deletedCase(scope, identity.key, 'archive', true);
+  expect(channels.get(old)?.thread_metadata?.archived).toBe(true);
+  expect(channels.get(current)?.thread_metadata?.archived).toBe(false);
+  expect(await m.forSession(scope, 'moved')).toBe(current);
+});
