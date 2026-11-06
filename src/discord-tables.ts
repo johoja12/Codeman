@@ -101,10 +101,7 @@ export function formatDiscordTables(text: string): string {
       i = end - 1;
       continue;
     }
-    const labels = Array.from(
-      { length: width },
-      (_, col) => (header[col] ?? '').replace(/\*\*|`/g, '').trim() || `Column ${col + 1}`
-    );
+    const labels = Array.from({ length: width }, (_, col) => (header[col] ?? '').trim() || `Column ${col + 1}`);
     const formatted: string[] = [];
     let size = 0,
       exceeded = false;
@@ -115,7 +112,8 @@ export function formatDiscordTables(text: string): string {
         size++;
       }
       for (let col = 0; col < width; col++) {
-        const field = `**${labels[col]}:** ${row[col] || '—'}`;
+        const label = /[`*_[\]]/.test(labels[col]) ? labels[col] + ':' : `**${labels[col]}:**`;
+        const field = `${label} ${row[col] || '—'}`;
         size += field.length + 1;
         if (size > budget) {
           exceeded = true;

@@ -17,6 +17,15 @@ describe('mobile Discord table records', () => {
     expect(out).toContain('**Project:** 🧠 Brain\n**Status:** **Ready**\n**Link:** [Open](https://example.test)');
     expect(out).toContain('**Project:** 家\n**Status:** `queued`');
   });
+  it('preserves meaningful inline code and link formatting in column labels', () => {
+    const out = formatDiscordTables(
+      '| `**` | **Status** | [Docs](https://example.test) |\n|---|---|---|\n| wildcard | ready | open |'
+    );
+    expect(out).toContain('`**`: wildcard');
+    expect(out).toContain('**Status**: ready');
+    expect(out).toContain('[Docs](https://example.test): open');
+  });
+
   it('keeps escaped pipes and pipes in inline code inside their original cells', () => {
     const out = formatDiscordTables('| Command | Meaning |\n|---|---|\n| `a | b` | x \\| y |');
     expect(out).toBe('**Command:** `a | b`\n**Meaning:** x | y');

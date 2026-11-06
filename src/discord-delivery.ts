@@ -12,6 +12,10 @@ const MAX_BYTES = 2 * 1024 * 1024;
 export class DiscordDeliveryError extends Error {}
 const STATES = [
   'received',
+  'awaiting_choice',
+  'queued',
+  'cancelled',
+  'submitted',
   'files_transferred',
   'submitting',
   'input_accepted',
@@ -147,7 +151,7 @@ export class DiscordDeliveryJournal {
           userCursor: r.native.userCursor,
         };
       }
-      if (['received', 'files_transferred', 'submitting'].includes(record.state)) {
+      if (['received', 'files_transferred', 'awaiting_choice', 'submitting'].includes(record.state)) {
         record.reason = record.state === 'submitting' ? 'restart_during_submit' : 'restart_before_submit';
         record.state = record.reason === 'restart_during_submit' ? 'uncertain' : 'failed';
         record.updatedAt = this.now();
@@ -241,7 +245,7 @@ export class DiscordDeliveryJournal {
           r.direction === 'inbound' &&
           r.sessionId === sessionId &&
           r.native?.conversationId === history.conversationId &&
-          ['input_accepted', 'uncertain', 'running'].includes(r.state)
+          ['input_accepted', 'submitted', 'uncertain', 'running'].includes(r.state)
       )
       .sort((a, b) => a.createdAt - b.createdAt);
     const claimed = new Set(
@@ -261,8 +265,23 @@ export class DiscordDeliveryJournal {
       if (!execution) continue;
       claimed.add(execution.userCursor);
       await this.annotate(record.id, { native: { ...meta, userCursor: execution.userCursor } });
-      if (execution.state !== 'submitted') await this.update(record.id, execution.state);
+      if (record.state !== execution.state) await this.update(record.id, execution.state);
     }
+  }
+  async recentForSession(sessionId: string): Promise<DiscordDelivery[]> {
+    await this.load();
+    await this.chain;
+    return [...this.records.values()]
+      .filter(
+        (r) =>
+          r.direction === 'inbound' &&
+          r.sessionId === sessionId &&
+          r.state !== 'delivered' &&
+          r.createdAt > this.now() - RETENTION_MS
+      )
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, 10)
+      .map((r) => ({ ...r }));
   }
   async recent(): Promise<DiscordDelivery[]> {
     await this.load();

@@ -113,6 +113,7 @@ export function registerDiscordRoutes(app: FastifyInstance, deps: DiscordRouteDe
       tokenMasked: maskToken(token),
       gateway: deps.bridge.gatewayState,
       gatewayError: deps.bridge.gatewayError,
+      ...(deps.bridge.nativeUiError ? { nativeUiError: deps.bridge.nativeUiError } : {}),
       lastResult: deps.bridge.lastResult,
       sessionSync: deps.bridge.sessionSync,
     };
