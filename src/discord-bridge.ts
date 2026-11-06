@@ -25,6 +25,8 @@ import type { DiscordNativeUiServices } from './discord-native-ui-types.js';
 import { registerDiscordLaunchCommands } from './discord-launch-commands.js';
 import {
   discordResponsePosts,
+  discordProgressPost,
+  DISCORD_COMPONENTS_V2,
   splitForDiscord,
   DISCORD_WARNING_COLOR,
   DISCORD_CRITICAL_COLOR,
@@ -312,8 +314,20 @@ export interface DiscordPost {
   embeds?: Array<{ title?: string; description: string; color: number; footer?: { text: string } }>;
   components?: Array<{
     type: number;
-    components: Array<{ type: number; style: number; label: string; custom_id: string }>;
+    content?: string;
+    accent_color?: number;
+    divider?: boolean;
+    spacing?: number;
+    file?: { url: string };
+    components?: Array<Record<string, unknown>>;
   }>;
+}
+
+/** Discord V2 disallows legacy content/embeds even when our internal envelope keeps content empty. */
+function discordWirePost<T extends Partial<DiscordPost>>(post: T): T | Omit<T, 'content' | 'embeds'> {
+  if (!((post.flags ?? 0) & DISCORD_COMPONENTS_V2)) return post;
+  const { content: _content, embeds: _embeds, ...wire } = post;
+  return wire;
 }
 
 export function buildPost(msg: DiscordMessage, cfg: DiscordConfig, explicitUrgent = false): DiscordPost {
@@ -579,7 +593,7 @@ export class DiscordApi {
       'POST',
       `/channels/${channelId}/messages`,
       {
-        ...p,
+        ...discordWirePost(p),
         nonce: p.nonce ?? randomUUID().replaceAll('-', '').slice(0, 24),
         enforce_nonce: true,
       },
@@ -600,7 +614,15 @@ export class DiscordApi {
     form.append(
       'payload_json',
       JSON.stringify({
-        ...p,
+        ...discordWirePost(p),
+        ...((p.flags ?? 0) & DISCORD_COMPONENTS_V2
+          ? {
+              components: [
+                ...(p.components ?? []),
+                ...files.map((file) => ({ type: 13, file: { url: 'attachment://' + safeAttachmentName(file.name) } })),
+              ],
+            }
+          : {}),
         nonce: p.nonce ?? randomUUID().replaceAll('-', '').slice(0, 24),
         enforce_nonce: true,
       })
@@ -610,7 +632,11 @@ export class DiscordApi {
     return this.request('POST', `/channels/${channelId}/messages`, form, 0, current);
   }
   editMessage(channelId: string, id: string, post: Partial<DiscordPost>): Promise<unknown> {
-    return this.request('PATCH', `/channels/${channelId}/messages/${id}`, post);
+    return this.request(
+      'PATCH',
+      `/channels/${channelId}/messages/${id}`,
+      post.flags && post.flags & DISCORD_COMPONENTS_V2 ? { ...discordWirePost(post), content: null, embeds: [] } : post
+    );
   }
   respondInteraction(id: string, token: string, body: unknown): Promise<unknown> {
     return this.request('POST', `/interactions/${encodeURIComponent(id)}/${encodeURIComponent(token)}/callback`, body);
@@ -1513,12 +1539,29 @@ export class DiscordBridge {
           !this.destinationMatches(sessionId, channel)
         )
           throw new BridgeProblem('Session changed');
-        if (turn.role === 'assistant' || (turn.role === 'tool' && progress.verbose)) {
+        if ((turn.role === 'assistant' && turn.phase !== 'commentary') || (turn.role === 'tool' && progress.verbose)) {
           const visible = turn.role === 'assistant' ? discordDisplayText(turn.text) : turn.text;
           const formatted = formatDiscordTables((turn.role === 'tool' ? '**Tool output**\n' : '') + visible);
+          const position = history.turns.findIndex((t) => t.cursor === turn.cursor);
+          const owner = history.turns
+            .slice(0, position)
+            .filter((t) => t.role === 'user')
+            .at(-1);
+          const proof = owner && history.executions?.find((e) => e.userCursor === owner.cursor);
+          const confirmed = proof?.state === 'completed';
+          const controls =
+            turn.role === 'assistant' && owner && this.nativeUi
+              ? await this.nativeUi.responseControls(sessionId, channel, owner.cursor, turn.cursor).catch(() => [])
+              : [];
+          const label = this.deps.sessions?.().find((s) => s.id === sessionId)?.name;
           const responsePosts =
             turn.role === 'assistant'
-              ? discordResponsePosts(formatted)
+              ? discordResponsePosts(formatted, {
+                  title: confirmed ? '✓ Turn finished' : 'Response received',
+                  color: confirmed ? 0x59ca92 : undefined,
+                  subtitle: label ? clip(label.replace(/[@`*_~<>\r\n]/g, ''), 120) : undefined,
+                  controls,
+                })
               : splitForDiscord(formatted).map((content) => ({ content, allowed_mentions: { parse: [], users: [] } }));
           for (const [i, post] of responsePosts.entries())
             await this.deliverPost(channel, post, undefined, sessionId, `native:${turn.cursor}:${i}`);
@@ -1551,7 +1594,23 @@ export class DiscordBridge {
           : this.deps.sessions?.().find((s) => s.id === sessionId)?.working
             ? '⏳ Working…'
             : '💬 Ready for your next message';
-      const hash = createHash('sha256').update(status).digest('hex');
+      const lastUserAt = user ? history.turns.findIndex((t) => t.cursor === user.cursor) : -1;
+      const updates =
+        lastUserAt >= 0
+          ? history.turns.slice(lastUserAt + 1).filter((t) => t.role === 'assistant' && t.phase === 'commentary')
+          : [];
+      const progressControls =
+        user && updates.length && this.nativeUi
+          ? await this.nativeUi.responseControls(sessionId, channel, user.cursor).catch(() => [])
+          : [];
+      const progressPost = discordProgressPost(
+        status,
+        updates.at(-1) ? discordDisplayText(updates.at(-1)!.text) : '',
+        updates.length,
+        progressControls
+      );
+      const hash = createHash('sha256').update(JSON.stringify(progressPost)).digest('hex');
+
       if (progress.statusHash !== hash) {
         if (
           this.stopped ||
@@ -1565,7 +1624,7 @@ export class DiscordBridge {
           let id = progress.statusMessageId;
           if (id) {
             try {
-              await this.api.editMessage(channel, id, { content: status, allowed_mentions: { parse: [], users: [] } });
+              await this.api.editMessage(channel, id, progressPost);
             } catch (err) {
               if (!(err instanceof DiscordHttpError) || err.status !== 404) throw err;
               id = undefined;
@@ -1575,7 +1634,7 @@ export class DiscordBridge {
             id = (
               (await this.deliverPost(
                 channel,
-                { content: status, allowed_mentions: { parse: [], users: [] } },
+                progressPost,
                 undefined,
                 sessionId,
                 `native-status:${progress.conversationId}:${progress.statusMessageId ?? 'initial'}`
