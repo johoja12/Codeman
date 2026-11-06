@@ -940,7 +940,7 @@ export interface DiscordBridgeDeps {
   saveRemoteAttachment?: (sessionId: string, name: string, bytes: Uint8Array) => Promise<string>;
   getAttachment?: (sessionId: string, path: string, relativeToWorkspace?: boolean) => Promise<DiscordFile>;
   /** Snapshot only: never discovers or starts agents. Called after restoration is released. */
-  sessions?: () => Array<{ id: string; name?: string; remote?: boolean; working?: boolean }>;
+  sessions?: () => Array<DiscordActivitySession & { remote?: boolean }>;
   socketFactory?: SocketFactory;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;

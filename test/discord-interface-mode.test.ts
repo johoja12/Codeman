@@ -26,7 +26,7 @@ const cfg = {
   allowedUserIds: ['333333333333333333'],
 };
 let dir: string;
-let sessions: Array<{ id: string; name?: string; remote?: boolean; working?: boolean }>;
+let sessions: Array<import('../src/discord-activity.js').DiscordActivitySession & { remote?: boolean }>;
 let bridges: DiscordBridge[];
 let posts: Array<{ path: string; method: string; body?: any }>;
 let sendInput: ReturnType<typeof vi.fn>;
@@ -189,6 +189,38 @@ afterEach(async () => {
 });
 
 describe('Discord interface mode', () => {
+  it.each([false, true])('preserves Claude background titles over sync and restart (remote=%s)', async (remote) => {
+    let now = 100000;
+    sessions = [
+      { id: 's1', name: 'w29-buildmesh', remote, working: false, watching: '1 shell', activityStatus: 'idle' },
+    ];
+    const b = makeBridge(undefined, { now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    const thread = (await readFullMap(dir)).s1;
+    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    await b.pollActivity();
+    const typing = () => posts.filter((p) => p.path.endsWith('/typing'));
+    expect(typing()).toHaveLength(0);
+    await b.syncSessions();
+    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    b.stop();
+    const restarted = makeBridge(undefined, { now: () => now });
+    await restarted.reload();
+    await restarted.syncSessions();
+    await restarted.pollActivity();
+    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    sessions[0].watching = null;
+    now += 4000;
+    await restarted.pollActivity();
+    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    now += 30000;
+    await restarted.pollActivity();
+    expect(remoteChannels.get(thread).name).toBe('⚫ Idle · w29-buildmesh');
+    expect(typing()).toHaveLength(0);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
   it('groups explicit output files beneath a new response and does not repeat uploads after replay/restart', async () => {
     let now = 100000;
     let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];

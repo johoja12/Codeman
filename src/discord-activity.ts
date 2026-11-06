@@ -1,20 +1,29 @@
 /** Cosmetic Discord activity, derived from live session state without reading terminal output. */
+import type { SessionActivityStatus } from './types/session.js';
+
 export interface DiscordActivitySession {
   id: string;
   name?: string;
   working?: boolean;
+  watching?: string | null;
+  activityStatus?: SessionActivityStatus;
   waiting?: boolean;
   exited?: boolean;
 }
 
+/** Background work is observable activity, but never foreground typing or a question. */
+function activityLabel(session: DiscordActivitySession): string {
+  if (session.exited) return '⚫ Offline';
+  if (session.waiting) return '🔴 Needs input';
+  if (session.working) return '🟡 Working';
+  if (session.activityStatus === 'waiting_agents') return '🟡 Waiting for agents';
+  if (session.activityStatus === 'checking_agents') return '🟡 Checking agents';
+  if (session.watching?.trim()) return '🟡 Background work';
+  return '⚫ Idle';
+}
+
 export function discordActivityName(session: DiscordActivitySession): string {
-  const label = session.exited
-    ? '⚫ Offline'
-    : session.waiting
-      ? '🔴 Needs input'
-      : session.working
-        ? '🟡 Working'
-        : '⚫ Idle';
+  const label = activityLabel(session);
   const name = (session.name ?? session.id.slice(0, 8)).replace(/[\r\n]/g, ' ').trim();
   return `${label} · ${name || session.id.slice(0, 8)}`.slice(0, 100);
 }
@@ -116,12 +125,17 @@ export class DiscordActivity {
     const needsRename = () => {
       const s = current();
       if (!s || (progress.renameRetryAt ?? 0) > now || progress.name === discordActivityName(s)) return false;
-      const active = s.working || s.waiting || s.exited;
+      const active = activityLabel(s) !== '⚫ Idle';
       const stateChanged = !progress.name?.startsWith(activityPrefix(s) + ' · ');
       // Show a new active state promptly; only settling back to Idle is delayed. Short
       // gaps between turns must not spend the rename budget or hide the next short turn.
       if (active && stateChanged) return progress.renamedAt === undefined || now - progress.renamedAt >= 1_000;
-      if (!active && /^(🟡 Working|🔴 Needs input|⚫ Offline) · /.test(progress.name ?? ''))
+      if (
+        !active &&
+        /^(🟡 (?:Working|Background work|Waiting for agents|Checking agents)|🔴 Needs input|⚫ Offline) · /.test(
+          progress.name ?? ''
+        )
+      )
         return now - (progress.idleSince ?? now) >= 30_000;
       return progress.renamedAt === undefined || now - progress.renamedAt >= 30_000;
     };
