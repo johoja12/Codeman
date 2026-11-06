@@ -39,14 +39,14 @@ only), never in the shared settings, and never shown again once saved.
 
 ## Options
 
-| Option                                   | Choices                                     | Default         |
-| ---------------------------------------- | ------------------------------------------- | --------------- |
-| Create threads                           | On the first alert, or for every new tab    | First alert     |
-| When a tab is deleted                    | Keep, archive or delete the thread          | Archive         |
-| Stale threads                            | Keep, archive or delete threads no tab uses | Keep            |
-| @ ping                                   | Never, critical events only, every post     | Critical only   |
-| Which events                             | Needs attention, or everything              | Needs attention |
-| Tell Claude how to reach you             | On or off                                   | On              |
+| Option                       | Choices                                     | Default         |
+| ---------------------------- | ------------------------------------------- | --------------- |
+| Create threads               | On the first alert, or for every new tab    | First alert     |
+| When a tab is deleted        | Keep, archive or delete the thread          | Archive         |
+| Stale threads                | Keep, archive or delete threads no tab uses | Keep            |
+| @ ping                       | Never, critical events only, every post     | Critical only   |
+| Which events                 | Needs attention, or everything              | Needs attention |
+| Tell Claude how to reach you | On or off                                   | On              |
 
 A finished turn, and an error, is posted as the CLI's whole last message, with its formatting and questions
 kept, split over several posts if it is long. A shell, and permission or question dialogs, show the last lines
@@ -111,3 +111,15 @@ In **Full mode**, use `/claude`, `/codex`, `/opencode`, `/shell`, or another ena
 The commands also work inside an existing session thread and create a sibling session for the same configured case. They do not change the current thread's agent. Registration happens automatically in the configured Discord server; the bot needs application-command authorization. Unrelated commands are preserved. Disabled commands and commands used outside owned case destinations cannot launch sessions.
 
 Local and linked SSH cases use the same creation service as the web UI and inherit the case's default session group. Unlinked workspaces, ambiguous aliases/names, unavailable cases and Docker cases must be launched through the web UI; Codeman never guesses a replacement host or directory. Existing sessions are left running.
+
+## Native controls in Full mode
+
+Use `/codeman` for the workspace dashboard, or the pinned session card for **Settings**, **History**, **Question**, **Queue**, **Results & files** and **Interrupt**. `!codeman ui` reopens controls when a menu expires. Working / Needs input / Idle filters and a case/host/CLI picker help you find or create the correct session.
+
+New prompts receive visible delivery receipts. Received, input delivered, native submitted, working and finished are distinct; an unconfirmed prompt is never replayed automatically. While an agent works, choose **Send now**, **Queue next** or **Cancel**. Queued prompts can be edited/removed and wait for a verified empty input boundary. Questions and terminal drafts pause the queue. Ten prompts per session, fifty total; automatic dispatch expires after 24 hours. Queue text is stored privately until delivered or removed.
+
+Model/effort menus change the current supported Claude/Codex conversation through verified native controls. Future Codex defaults are edited separately. Changing an approval launch flag never silently restarts a running session. Questions use exact prompt-bound choice menus or supported idle-response forms; dialogs Codeman cannot verify must still be answered in the terminal.
+
+Results show observed native execution and provide guarded local/SSH file downloads, diff snapshots and execution receipts. A shared-workspace snapshot is not claimed as this task's changes, and tests/merge/deployment are not inferred from conversational text.
+
+A message's **Apps** menu offers **Codeman: Send to session**, **Codeman: Queue follow-up** and **Codeman: Start session**. Review the explicit destination, source text and attachments before confirming. Creating a session and submitting the selected source are separate choices. All controls use the configured allowlist and private destinations; Notifications mode retains its existing behavior.

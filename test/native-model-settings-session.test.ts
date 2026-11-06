@@ -359,3 +359,41 @@ describe('Session native model settings lease', () => {
     expect(cancel).toHaveBeenCalled();
   });
 });
+
+describe('queued Discord follow-up lease', () => {
+  const empty = '› \n\n  GPT-6.1-Sol · /tmp\n  ? for shortcuts';
+  it('submits once through an empty composer and marks it as real user input', async () => {
+    const h = harness();
+    h.mux.capturePaneTextAsync.mockResolvedValue(empty);
+    expect(await h.session.submitDiscordFollowup('Review the diff\r', () => true)).toBe('accepted');
+    expect(h.written.join('')).toContain('Review the diff');
+    expect(h.session.lastSubmitAt).toBeGreaterThan(0);
+  });
+  it.each([
+    '› my unfinished draft\n\n  GPT-6.1-Sol · /tmp\n  ? for shortcuts',
+    'Would you like to run this command?\n› 1. Yes\n2. No\nPress enter to confirm',
+    '› \n  Working (esc to interrupt)\n  GPT-6.1-Sol · /tmp',
+  ])('does not type into a draft, dialog or working frame', async (screen) => {
+    const h = harness();
+    h.mux.capturePaneTextAsync.mockResolvedValue(screen);
+    expect(await h.session.submitDiscordFollowup('Review diff\r', () => true)).toBe('blocked');
+    expect(h.written).toEqual([]);
+  });
+  it('rechecks permission after capture and never writes if scope changes', async () => {
+    const h = harness();
+    let allowed = true;
+    h.mux.capturePaneTextAsync.mockImplementation(async () => {
+      allowed = false;
+      return empty;
+    });
+    expect(await h.session.submitDiscordFollowup('Review diff\r', () => allowed)).toBe('blocked');
+    expect(h.written).toEqual([]);
+  });
+  it('refuses a queue prompt containing multiple submits or a lifecycle command', async () => {
+    const h = harness();
+    h.mux.capturePaneTextAsync.mockResolvedValue(empty);
+    expect(await h.session.submitDiscordFollowup('first\rsecond\r', () => true)).toBe('blocked');
+    expect(await h.session.submitDiscordFollowup('/clear\r', () => true)).toBe('blocked');
+    expect(h.written).toEqual([]);
+  });
+});

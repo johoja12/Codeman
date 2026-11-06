@@ -1,3 +1,4 @@
+import { nativeModelComposerReady } from './native-composer-ready.js';
 /**
  * @fileoverview Core PTY session wrapper for Claude CLI interactions.
  *
@@ -143,6 +144,7 @@ import { legacyResumeSlot } from './session-cli-registry-bridge.js';
 import { SubmitVerifier } from './session-submit-verifier.js';
 import {
   guardedComposerChrome,
+  composerTriggerRefusal,
   promptSha256,
   readGuardedSnapshotDetails,
   type GuardedInputSnapshot,
@@ -6377,6 +6379,40 @@ export class Session extends EventEmitter {
     operation: (lease: NativeModelSettingsLease) => Promise<T>,
     allowed: () => boolean
   ): Promise<T> {
+    return this._withNativeInputLease(operation, allowed, true);
+  }
+  /** One-shot follow-up only after a fresh empty-composer capture under the input lease. */
+  async submitDiscordFollowup(text: string, allowed: () => boolean): Promise<'accepted' | 'blocked' | 'uncertain'> {
+    const chrome = guardedComposerChrome(getCli(this.mode));
+    if (
+      !chrome ||
+      !text.endsWith('\r') ||
+      text.length > 16000 ||
+      Array.from(text.slice(0, -1)).some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127) ||
+      composerTriggerRefusal(text.slice(0, -1), chrome)
+    )
+      return 'blocked';
+    let attempted = false;
+    try {
+      return await this._withNativeInputLease(
+        async (lease) => {
+          const screen = await lease.capture();
+          if (!nativeModelComposerReady(this.mode, screen) || !lease.current() || !allowed()) return 'blocked';
+          attempted = true;
+          return (await lease.write(text)) ? 'accepted' : 'uncertain';
+        },
+        allowed,
+        false
+      );
+    } catch {
+      return attempted ? 'uncertain' : 'blocked';
+    }
+  }
+  private async _withNativeInputLease<T>(
+    operation: (lease: NativeModelSettingsLease) => Promise<T>,
+    allowed: () => boolean,
+    modelOnly: boolean
+  ): Promise<T> {
     if (
       (this.mode !== 'codex' && this.mode !== 'claude') ||
       this.docker ||
@@ -6415,10 +6451,22 @@ export class Session extends EventEmitter {
           return text;
         },
         write: async (input) => {
-          if (!isNativeModelSettingsInput(input) || !current()) return false;
+          if (
+            !(modelOnly
+              ? isNativeModelSettingsInput(input)
+              : input.length <= 16000 &&
+                input.endsWith('\r') &&
+                !Array.from(input.slice(0, -1)).some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)) ||
+            !current()
+          )
+            return false;
           this._submitVerifier?.cancel();
-          const sent = await this._writeViaMuxNow(input, { preserveWhitespace: true, nativeModelSettings: true });
-          this._submitVerifier?.cancel();
+          const sent = await this._writeViaMuxNow(input, {
+            preserveWhitespace: true,
+            nativeModelSettings: modelOnly,
+            fromUser: !modelOnly,
+          });
+          if (modelOnly) this._submitVerifier?.cancel();
           return sent;
         },
         cancelMenu: async () => {
@@ -6431,7 +6479,7 @@ export class Session extends EventEmitter {
         },
       });
     } finally {
-      this._submitVerifier?.cancel();
+      if (modelOnly) this._submitVerifier?.cancel();
       this._guardedSubmitInFlight = false;
       this._drainGuardedHeld();
     }

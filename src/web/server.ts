@@ -1,3 +1,4 @@
+import { createDiscordNativeUiServices } from './discord-native-ui-services.js';
 import { resolveDiscordCase } from '../discord-case-identity.js';
 import { DiscordModelControls } from '../discord-model-controls.js';
 import { readDiscordModelCatalog } from '../discord-model-catalog.js';
@@ -51,7 +52,7 @@ import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, readFileSync, chmodSync, statSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { execFile, execSync } from 'node:child_process';
-import { hostname as getHostname, uptime as osUptime } from 'node:os';
+import { hostname as getHostname, uptime as osUptime, networkInterfaces } from 'node:os';
 import { normalizeSettingsObject } from '../config/settings.js';
 import { looksLikeHostReboot, newestPersistedActivity, planRebootRestore } from '../reboot-restore.js';
 import { rebootRestoreRegistry } from './reboot-restore-registry.js';
@@ -812,6 +813,21 @@ export class WebServer extends EventEmitter {
     },
   });
   private discordBridge: DiscordBridge = new DiscordBridge({
+    nativeUi: createDiscordNativeUiServices({
+      sessions: () => this.sessions,
+      observed: (id) => this.discordModelControls.observed(id),
+      cases: async () => this.discordCases?.() ?? [],
+      allowed: () => !isMultiUserMode() && this.discordBridge.acceptsControls,
+      url: () => {
+        const tunnel = this.tunnelManager.getUrl();
+        if (tunnel) return tunnel + this.basePath;
+        if (this.host === '127.0.0.1' || this.host === '::1') return undefined;
+        const lan = Object.values(networkInterfaces())
+          .flat()
+          .find((a) => a && a.family === 'IPv4' && !a.internal && /^192\.168\./.test(a.address));
+        return lan ? `${this.https ? 'https' : 'http'}://${lan.address}:${this.port}${this.basePath}` : undefined;
+      },
+    }),
     configDir: getDataDir(),
     fetchImpl: webviewFetch,
     sendInput: async (sessionId, text) => {

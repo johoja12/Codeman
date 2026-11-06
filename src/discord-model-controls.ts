@@ -1,6 +1,6 @@
 /** Native, verified, session-only model settings. No respawn or writes to CLI configuration files. */
 import { randomUUID } from 'node:crypto';
-import { readGuardedComposer } from './agent-staging.js';
+import { nativeModelComposerReady } from './native-composer-ready.js';
 import { stripAnsi } from './utils/regex-patterns.js';
 import type { NativeModelSettingsLease } from './native-model-settings.js';
 import type { DiscordControlReply } from './discord-bridge.js';
@@ -62,44 +62,7 @@ export function readNativeModelMenu(mode: string, raw: string): NativeModelMenu 
   return { choices, effort };
 }
 
-export function nativeModelComposerReady(mode: string, raw: string): boolean {
-  if (/\besc to interrupt\b/i.test(stripAnsi(raw).split('\n').slice(-12).join('\n'))) return false;
-  const rows = raw.split('\n');
-  let composer = -1;
-  for (let i = rows.length - 1; i >= 0; i--) {
-    if (
-      stripAnsi(rows[i])
-        .trimStart()
-        .startsWith(mode === 'codex' ? '›' : '❯')
-    ) {
-      composer = i;
-      break;
-    }
-  }
-  // Claude can add a fourth noninteractive footer row inside tmux. Remove only
-  // that exact known hint, never a composer/draft row or arbitrary terminal text.
-  const screen =
-    mode === 'claude'
-      ? rows
-          .filter(
-            (row, index) =>
-              index <= composer ||
-              !/^\s*tmux focus-events off · add 'set -g focus-events on' to ~\/\.tmux\.conf and reattach for focus tracking\s*$/.test(
-                stripAnsi(row)
-              )
-          )
-          .join('\n')
-      : raw;
-  return (
-    readGuardedComposer(screen, {
-      promptGlyph: mode === 'codex' ? '›' : '❯',
-      footerLine:
-        mode === 'codex'
-          ? /^\s*(?:.* · .*|.*\? for shortcuts.*|.*← for agents.*)$/
-          : /^\s*(?:.*\? for shortcuts.*|.*(?:bypass permissions|accept edits|plan mode|shift\+tab|ctrl\+t|context left).*|─+|(?:Fable|Opus|Sonnet|Haiku)\s+\d+(?:\.\d+)?(?:\s+\([^\n)]{1,40}\))?\s+in:[\d,]+\s+out:[\d,]+(?:\s+ctx:\d{1,3}%)?(?:\s+cache:[^\n]{0,40})?(?:\s+Not logged in · Run \/login)?)$/i,
-    }) === ''
-  );
-}
+export { nativeModelComposerReady } from './native-composer-ready.js';
 
 export function readCodexModelStatus(raw: string): { model: string; effort?: string; session: string } | undefined {
   const text = stripAnsi(raw);
@@ -143,6 +106,11 @@ interface ChoiceReceipt {
 
 export class DiscordModelControls {
   private receipts = new Map<string, ChoiceReceipt>();
+  private verified = new Map<string, { scope: string; generation: string; model: string; effort?: string }>();
+  observed(id: string): { model: string; effort?: string } | undefined {
+    const v = this.verified.get(id);
+    return v && v.scope === this.deps.scope() && v.generation === this.deps.target(id)?.generation ? v : undefined;
+  }
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   constructor(private readonly deps: ModelDeps) {
@@ -151,6 +119,7 @@ export class DiscordModelControls {
   }
   stop(): void {
     this.receipts.clear();
+    this.verified.clear();
   }
   current(id: string, token: string): boolean {
     const r = this.receipts.get(token),
@@ -231,7 +200,7 @@ export class DiscordModelControls {
           clearTimeout(timer);
         }
       }
-      return await target.operate(async (lease) => {
+      const result = await target.operate(async (lease) => {
         const initial = await lease.capture();
         if (!nativeModelComposerReady(target.mode, initial))
           throw new Error(
@@ -241,6 +210,9 @@ export class DiscordModelControls {
           ? this.codex(id, target, lease, kind, value, catalog)
           : this.claude(id, target, lease, kind, value);
       }, allowed);
+      if (result.verifiedSettings && allowed())
+        this.verified.set(id, { ...result.verifiedSettings, scope, generation });
+      return result;
     } catch (error) {
       return {
         text:
@@ -314,6 +286,7 @@ export class DiscordModelControls {
             : (current?.efforts ?? []).map((effort) => ({ value: effort, label: effort }));
         const available = kind === 'model' ? models.map((m) => m.value || m.label) : (current?.efforts ?? []);
         return {
+          verifiedSettings: { model: before.model, effort: before.effort },
           text:
             `Current model: ${before.model}\nCurrent effort: ${before.effort || 'not reported'}\n` +
             (available.length
@@ -321,7 +294,7 @@ export class DiscordModelControls {
               : 'The native catalog could not identify supported effort levels; use the CLI’s picker.\n') +
             `Change with !codeman ${kind} <${kind === 'model' ? 'model-id' : 'level'}>. Changes apply to this session only.`,
           actions: options
-            .slice(0, 4)
+            .slice(0, 25)
             .map((o) => this.action(id, target, kind, o.value, o.label))
             .filter((a) => !!a),
         };
@@ -333,7 +306,10 @@ export class DiscordModelControls {
       (kind === 'effort' && before.effort === value) ||
       (kind === 'model' && normalize(before.model) === normalize(value))
     )
-      return { text: `${kind === 'model' ? 'Model' : 'Effort'} is already ${value} in this session.` };
+      return {
+        verifiedSettings: { model: before.model, effort: before.effort },
+        text: `${kind === 'model' ? 'Model' : 'Effort'} is already ${value} in this session.`,
+      };
     const oldScreen = await lease.capture();
     await this.send(lease, kind === 'model' ? `/model ${value}\r` : `/model --reasoning=${value}\r`);
     await this.wait(lease, (s) =>
@@ -359,6 +335,7 @@ export class DiscordModelControls {
         'The CLI’s current setting did not match the request. Inspect the terminal; the change is not confirmed.'
       );
     return {
+      verifiedSettings: { model: after.model, effort: after.effort },
       text: `Verified: model ${after.model}, effort ${after.effort || 'not reported'}. Applied to the same Codex session only.`,
     };
   }
@@ -394,12 +371,13 @@ export class DiscordModelControls {
             ? menu.choices.filter((c) => c.value).map((c) => ({ value: c.value!, label: c.label }))
             : levels.map((level) => ({ value: level, label: level }));
         return {
+          verifiedSettings: { model: original.label, effort: menu.effort },
           text:
             `Current model: ${original.label}\nCurrent effort: ${kind === 'effort' ? levels[0] || 'not adjustable' : menu.effort || 'not reported'}\n` +
             `Available ${kind === 'model' ? 'models' : 'efforts'}: ${options.map((o) => o.value).join(', ') || 'not offered by this CLI/model'}\n` +
             `Use !codeman ${kind} <${kind === 'model' ? 'alias' : 'level'}>. Uses Claude’s session-only picker; future defaults are preserved.`,
           actions: options
-            .slice(0, 4)
+            .slice(0, 25)
             .map((o) => this.action(id, target, kind, o.value, o.label))
             .filter((a) => !!a),
         };
@@ -460,6 +438,7 @@ export class DiscordModelControls {
           'The native picker did not confirm the requested setting. Inspect the terminal before retrying.'
         );
       return {
+        verifiedSettings: { model: after.choices.find((c) => c.current)!.label, effort: after.effort },
         text: `Verified: model ${after.choices.find((c) => c.current)!.label}, effort ${after.effort || 'not reported'}. Applied to this Claude session only; future defaults are unchanged.`,
       };
     } finally {
