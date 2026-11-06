@@ -62,6 +62,7 @@ export type DiscordStatus = Omit<DiscordConfig, 'token'> & {
   tokenMasked: string;
   gateway: DiscordGatewayState;
   gatewayError: string | null;
+  nativeUiError?: string;
   lastResult: DiscordResult | null;
   sessionSync: DiscordSessionSync;
 };

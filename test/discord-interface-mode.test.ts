@@ -33,6 +33,7 @@ let sequence: number;
 let remoteChannels: Map<string, any>;
 let remoteMessages: Map<string, any>;
 let statusEditRefused: boolean;
+let activityRenameRetryAfter: number | undefined;
 let uploaded: Array<{ name: string; text: string }>;
 /** Assert what a reader sees, across plain text and native response cards. */
 const visibleText = (body: any): string | undefined =>
@@ -60,6 +61,10 @@ function makeBridge(
           uploaded.push({ name: String((file as { name?: string }).name), text: await file.text() });
       }
       posts.push({ path, method, body } as any);
+      if (/\/applications\/.*\/commands$/.test(path)) {
+        if (method === 'GET') return Response.json([]);
+        return Response.json({ ...body, id: body.name === 'codex' ? '777777777777777771' : '777777777777777772' });
+      }
       if (method === 'GET' && path.endsWith('/users/@me')) return Response.json({ id: BOT });
       if (method === 'GET' && path.endsWith('/channels'))
         return Response.json([...remoteChannels.values()].filter((c) => c.type === 0));
@@ -124,6 +129,8 @@ function makeBridge(
       }
       const id = path.split('/').pop()!;
       if (method === 'PATCH') {
+        if (body?.name && activityRenameRetryAfter)
+          return Response.json({ retry_after: activityRenameRetryAfter }, { status: 429 });
         const c = remoteChannels.get(id);
         if (c) {
           Object.assign(c, body);
@@ -161,6 +168,7 @@ beforeEach(async () => {
   remoteChannels = new Map();
   remoteMessages = new Map();
   statusEditRefused = false;
+  activityRenameRetryAfter = undefined;
   uploaded = [];
   sendInput = vi.fn(async () => true);
   await writeDiscordConfig(dir, cfg);
@@ -171,6 +179,70 @@ afterEach(async () => {
 });
 
 describe('Discord interface mode', () => {
+  it('reacts to a native session update even when the thread name did not change', async () => {
+    let now = 1_000;
+    sessions = [{ id: 's1', name: 'hs-lab', working: false }];
+    const b = makeBridge(undefined, { now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    const thread = (await readFullMap(dir)).s1;
+    await b.sessionRenamed('s1', 'hs-lab');
+    await b.pollActivity();
+    sessions[0].working = true;
+    now += 100;
+    await b.sessionRenamed('s1', 'hs-lab');
+    await b.pollActivity();
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · hs-lab');
+    expect(posts.some((p) => p.path.endsWith('/typing'))).toBe(true);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it('keeps typing when an existing Idle thread cannot be renamed yet, without inline retries', async () => {
+    let now = 1_000;
+    sessions = [{ id: 's1', name: 'hs-lab', working: false }];
+    const b = makeBridge(undefined, { now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    const thread = (await readFullMap(dir)).s1;
+    const titleEdits = () => posts.filter((p) => p.method === 'PATCH' && p.path.endsWith('/' + thread) && p.body?.name);
+    const typing = () => posts.filter((p) => p.method === 'POST' && p.path.endsWith('/typing'));
+    await b.pollActivity();
+    expect(titleEdits()).toHaveLength(0);
+    expect(typing()).toHaveLength(0);
+    sessions[0].working = true;
+    activityRenameRetryAfter = 120;
+    now += 4_000;
+    await b.pollActivity();
+    expect(remoteChannels.get(thread).name).toBe('🟢 Idle · hs-lab');
+    expect(typing()).toHaveLength(1);
+    expect(titleEdits()).toHaveLength(1);
+    now += 8_000;
+    await b.pollActivity();
+    expect(typing()).toHaveLength(2);
+    expect(titleEdits()).toHaveLength(1);
+    activityRenameRetryAfter = undefined;
+    now += 120_000;
+    await b.pollActivity();
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · hs-lab');
+    expect(titleEdits()).toHaveLength(2);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it('repairs a stale Idle title after a concurrent request overwrites its published Working title', async () => {
+    let now = 1_000;
+    sessions = [{ id: 's1', name: 'hs-lab', working: true }];
+    const b = makeBridge(undefined, { now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    const thread = (await readFullMap(dir)).s1;
+    await b.pollActivity();
+    remoteChannels.get(thread).name = '🟢 Idle · hs-lab';
+    now += 8_000;
+    await b.pollActivity();
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · hs-lab');
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
   it('shows activity in the owned thread, types only while working, and stops on disable', async () => {
     let now = 1_000;
     let waiting = false;
@@ -1164,4 +1236,61 @@ it('does not add a bare Waiting for Input wrapper after the same fallback answer
   expect((await b.notify({ ...msg, event: 'hook:stop' }))?.deduped).toBe(true);
   expect(posts.filter((p) => visibleText(p.body) === 'A completed answer.')).toHaveLength(1);
   expect(posts.some((p) => p.body?.content?.includes('Waiting for Input'))).toBe(false);
+});
+
+it('launches from owned case channels and threads with a confirmation, never terminal input', async () => {
+  const root = 'a'.repeat(64);
+  let currentRoot = root;
+  const launch = vi.fn(async () => ({
+    text: 'Create codex in brain on host1?',
+    actions: [{ label: 'Confirm', command: 'confirm launch', validity: 'launch' }],
+  }));
+  const control = vi.fn(async () => {
+    sessions.push({ id: 'new-session', name: 'w3-brain' });
+    return { text: 'Session created', locateSessionId: 'new-session' };
+  });
+  const b = makeBridge(undefined, {
+    caseForSession: async () => ({ key: currentRoot, name: 'brain' }),
+    launchModes: () => ['codex', 'claude'],
+    launch,
+    control,
+    controlCurrent: () => true,
+  });
+  await b.reload();
+  await b.syncSessions();
+  await b.syncLaunchCommands();
+  const parent = [...remoteChannels.values()].find((c) => c.type === 0)!;
+  const map = await readFullMap(dir);
+  const interaction = {
+    id: '900000000000000081',
+    application_id: BOT,
+    token: 'interaction-token',
+    type: 2,
+    guild_id: cfg.guildId,
+    channel_id: parent.id,
+    member: { user: { id: cfg.allowedUserIds[0] } },
+    data: { name: 'codex', id: '777777777777777771' },
+  };
+  await b.onGatewayInteraction(interaction);
+  expect(launch).toHaveBeenCalledExactlyOnceWith('__case__:' + root, root, 'codex');
+  expect(control).not.toHaveBeenCalled();
+  const review = [...remoteMessages.values()].find((m) => m.components?.length)!;
+  await b.onGatewayInteraction({
+    ...interaction,
+    id: '900000000000000082',
+    type: 3,
+    data: { custom_id: review.components[0].components[0].custom_id },
+    message: { id: review.id },
+  });
+  expect(control).toHaveBeenCalledExactlyOnceWith('__case__:' + root, 'confirm launch');
+  expect((await readFullMap(dir))['new-session']).toBeTruthy();
+  await b.onGatewayInteraction({ ...interaction, id: '900000000000000083', channel_id: map.s1 });
+  expect(launch).toHaveBeenLastCalledWith('s1', root, 'codex');
+  await b.onGatewayInteraction({ ...interaction, id: '900000000000000084', channel_id: cfg.parentChannelId });
+  await b.onGatewayInteraction({ ...interaction, id: '900000000000000085', member: { user: { id: 'unauthorized' } } });
+  await b.onGatewayInteraction({ ...interaction, id: '900000000000000086', data: { name: 'codex', id: 'foreign' } });
+  currentRoot = 'b'.repeat(64);
+  await b.onGatewayInteraction({ ...interaction, id: '900000000000000087', channel_id: map.s1 });
+  expect(launch).toHaveBeenCalledTimes(2);
+  expect(sendInput).not.toHaveBeenCalled();
 });

@@ -19,6 +19,9 @@
  *
  * @module discord-bridge
  */
+import { DiscordNativeUi } from './discord-native-ui.js';
+import type { DiscordNativeUiServices } from './discord-native-ui-types.js';
+import { registerDiscordLaunchCommands } from './discord-launch-commands.js';
 import {
   discordResponsePosts,
   splitForDiscord,
@@ -264,6 +267,7 @@ export function isDiscordCdnUrl(raw: string): boolean {
 }
 
 export interface DiscordControlReply {
+  verifiedSettings?: { model: string; effort?: string };
   text: string;
   locateSessionId?: string;
   file?: DiscordFile;
@@ -276,7 +280,16 @@ export interface DiscordInteraction {
   guild_id?: string;
   channel_id?: string;
   type: number;
-  data?: { custom_id?: string };
+  data?: {
+    custom_id?: string;
+    id?: string;
+    name?: string;
+    options?: unknown[];
+    values?: string[];
+    target_id?: string;
+    resolved?: { messages?: Record<string, GatewayMessage> };
+    components?: Array<{ components?: Array<{ custom_id?: string; value?: string }> }>;
+  };
   member?: { user?: { id: string } };
   user?: { id: string };
   message?: { id: string };
@@ -461,7 +474,9 @@ export class DiscordHttpError extends Error {
   constructor(
     readonly status: number,
     /** Discord's own error code (10003 unknown channel, 50001 missing access ...). */
-    readonly code?: number
+    readonly code?: number,
+    /** Discord's actual wait, retained so independent cosmetic endpoints can defer their own retries. */
+    readonly retryAfterMs?: number
   ) {
     super(`Discord HTTP ${status}${code ? ` (code ${code})` : ''}`);
   }
@@ -480,7 +495,8 @@ export class DiscordApi {
     path: string,
     body?: unknown,
     attempt = 0,
-    current?: () => boolean
+    current?: () => boolean,
+    deferRateLimit = false
   ): Promise<T | null> {
     if (current && !current()) return null;
     const isForm = typeof FormData !== 'undefined' && body instanceof FormData;
@@ -504,19 +520,24 @@ export class DiscordApi {
       // Creating a thread/channel has no idempotency key: a lost response must not create a duplicate.
       if (!retrySafe || attempt >= 2) throw err;
       await this.sleep(500 * 2 ** attempt);
-      return this.request<T>(method, path, body, attempt + 1, current);
+      return this.request<T>(method, path, body, attempt + 1, current, deferRateLimit);
     }
-    if (res.status === 429 && attempt < 2) {
-      const j = (await res.json().catch(() => ({}))) as { retry_after?: number };
-      const delay = Number.isFinite(j.retry_after) ? Math.max((j.retry_after ?? 1) * 1000, 100) : 1000;
+    if (res.status === 429) {
+      const j = (await res.json().catch(() => ({}))) as { retry_after?: number; code?: number };
+      const headerSeconds = Number(res.headers.get('retry-after'));
+      const seconds = Math.max(
+        typeof j.retry_after === 'number' && Number.isFinite(j.retry_after) && j.retry_after > 0 ? j.retry_after : 0,
+        Number.isFinite(headerSeconds) && headerSeconds > 0 ? headerSeconds : 0
+      );
+      const delay = seconds > 0 ? Math.max(seconds * 1000, 100) : 1000;
       // Never retry earlier than Discord permits. A longer wait is surfaced instead of blocking a session chain.
-      if (delay > 30_000) throw new DiscordHttpError(429);
+      if (deferRateLimit || attempt >= 2 || delay > 30_000) throw new DiscordHttpError(429, j.code, delay);
       await this.sleep(delay);
-      return this.request<T>(method, path, body, attempt + 1, current);
+      return this.request<T>(method, path, body, attempt + 1, current, deferRateLimit);
     }
     if (res.status >= 500 && retrySafe && attempt < 2) {
       await this.sleep(500 * 2 ** attempt);
-      return this.request<T>(method, path, body, attempt + 1, current);
+      return this.request<T>(method, path, body, attempt + 1, current, deferRateLimit);
     }
     if (!res.ok) {
       const j = (await res.json().catch(() => ({}))) as { code?: number };
@@ -585,10 +606,10 @@ export class DiscordApi {
     );
   }
   rename(threadId: string, name: string, current?: () => boolean): Promise<unknown> {
-    return this.request('PATCH', `/channels/${threadId}`, { name }, 0, current);
+    return this.request('PATCH', `/channels/${threadId}`, { name }, 0, current, !!current);
   }
   typing(threadId: string, current?: () => boolean): Promise<unknown> {
-    return this.request('POST', `/channels/${threadId}/typing`, undefined, 0, current);
+    return this.request('POST', `/channels/${threadId}/typing`, undefined, 0, current, !!current);
   }
   archive(threadId: string): Promise<unknown> {
     return this.request('PATCH', `/channels/${threadId}`, { archived: true });
@@ -850,6 +871,7 @@ export async function ensureReceivedDir(workingDir: string): Promise<string | nu
 }
 
 export interface DiscordBridgeDeps {
+  nativeUi?: DiscordNativeUiServices;
   configDir: string;
   fetchImpl: DiscordFetch;
   /**
@@ -866,6 +888,8 @@ export interface DiscordBridgeDeps {
   caseForSession?: (sessionId: string) => Promise<DiscordCaseIdentity | undefined>;
   control?: (sessionId: string, command: string) => Promise<DiscordControlReply>;
   controlCurrent?: (sessionId: string, validity: string) => boolean;
+  launchModes?: () => string[];
+  launch?: (scope: string, caseKey: string, mode: string) => Promise<DiscordControlReply>;
   history?: (
     sessionId: string,
     options?: { includeTools?: boolean }
@@ -886,6 +910,9 @@ export class DiscordBridge {
   private loaded = false;
   private gateway: DiscordGateway | null = null;
   /** The token the running gateway was started with ('' when none). */
+  private launchCommands = new Map<string, string>();
+  private launchScope = '';
+  private launchRegistration?: Promise<void>;
   private gatewayToken = '';
   private lastSent = new Map<string, number>();
   private lastReply = new Map<string, number>();
@@ -926,6 +953,8 @@ export class DiscordBridge {
   private outputReads = new Map<string, { remote: boolean; run: Promise<void> }>();
   private outputIndex = 0;
   private actions = new Map<string, DiscordBoundAction>();
+  private nativeUi?: DiscordNativeUi;
+  private uiPrompts = new Map<string, { conversation: string; text: string }>();
   private outputDue = new Map<string, number>();
   private readonly api: DiscordApi;
   private readonly now: () => number;
@@ -940,6 +969,88 @@ export class DiscordBridge {
     this.conversationProgress = new DiscordConversationProgressStore(deps.configDir);
     this.deliveries = new DiscordDeliveryJournal(deps.configDir, this.now);
     this.api = new DiscordApi(() => this.cfg.token, deps.fetchImpl, deps.sleep);
+    if (deps.nativeUi)
+      this.nativeUi = new DiscordNativeUi({
+        dir: deps.configDir,
+        services: deps.nativeUi,
+        now: this.now,
+        scope: () => (this.acceptsControls && !this.held && deps.nativeUi?.enabled() ? this.controlScope : undefined),
+        config: () => ({ guild: this.cfg.guildId, parent: this.cfg.parentChannelId, allowed: this.cfg.allowedUserIds }),
+        sessionForChannel: (channel) => this.channels.sessionForChannel(this.cfg, channel),
+        channelForSession: (id) => this.channels.channelForSession(this.cfg, id),
+        ownsChannel: (channel) =>
+          !!this.channels.sessionForChannel(this.cfg, channel) ||
+          !!this.channels.caseForChannel(this.cfg, channel) ||
+          channel === this.cfg.parentChannelId,
+        verify: (id, channel) => this.channels.assertOwned(this.cfg, id, channel),
+        passive: async (id, channel) => !!(await this.channels.activityOwned(this.cfg, id, channel)),
+        request: (method, path, body) => this.api.request(method, path, body),
+        respond: async (m, body) => {
+          await this.api.respondInteraction(m.id, m.token, body);
+        },
+        finish: async (m, body) => {
+          await this.api.request(
+            'PATCH',
+            `/webhooks/${encodeURIComponent(m.application_id)}/${encodeURIComponent(m.token)}/messages/@original`,
+            body
+          );
+        },
+        control: async (id, command) => this.deps.control?.(id, command) ?? { text: 'Session controls unavailable' },
+        current: (id, validity) => !!this.deps.controlCurrent?.(id, validity),
+        postControl: (id, channel, result, key) => this.postControlReply(id, channel, result, key),
+        latestPrompt: (id, conversation) => {
+          const cached = this.uiPrompts.get(id);
+          return cached?.conversation === conversation ? cached?.text : undefined;
+        },
+        history: async (id) => {
+          if (!this.deps.history) throw new Error('History unavailable');
+          const h = await this.deps.history(id);
+          await this.deliveries.reconcileNative(id, h);
+          return h;
+        },
+        prepare: async (id, m) => {
+          const saved = await this.saveAttachments(id, m);
+          if (saved.refused) throw new Error(saved.refused);
+          const text = sanitiseReply(m.content ?? '', saved.paths);
+          if (!text) throw new Error('Empty or unsupported prompt');
+          return text;
+        },
+        submit: (id, channel, actor, source, text, conversation, idle, inputRevision) =>
+          this.submitUiPrompt(id, channel, actor, source, text, conversation, !!idle, inputRevision),
+        note: (source, state) => this.deliveries.update(source, state),
+        receipts: async (id) =>
+          (await this.deliveries.recentForSession(id)).map((r) => ({
+            id: r.id,
+            state: r.state,
+            reason: r.reason,
+            updated: r.updatedAt,
+            message: r.messageId,
+          })),
+        claim: async (m) =>
+          (
+            await this.deliveries.claim({
+              id: `native-ui:${m.guild_id}:${m.id}`,
+              direction: 'inbound',
+              guildId: m.guild_id!,
+              channelId: m.channel_id!,
+            })
+          ).fresh,
+        file: async (id, path) => {
+          if (!this.deps.getAttachment) throw new Error('File service unavailable');
+          return this.deps.getAttachment(id, path);
+        },
+        postFile: async (channel, file, text) => {
+          await this.api.postWithFile(channel, { content: text, allowed_mentions: { parse: [], users: [] } }, file);
+        },
+        launch: async (scope, key, mode) => this.deps.launch?.(scope, key, mode) ?? { text: 'Launch unavailable' },
+        modes: () => this.deps.launchModes?.() ?? [],
+        locate: async (id) => {
+          const result = await this.threadFor(id, undefined);
+          return typeof result === 'string' ? result : undefined;
+        },
+        botId: () => (this.activityBot ??= this.api.botUserId().then((me) => me?.id)),
+      });
+
     this.categories = new DiscordCaseCategories(deps.configDir);
     this.channels = new DiscordCaseThreads(
       deps.configDir,
@@ -994,7 +1105,7 @@ export class DiscordBridge {
             return undefined;
           });
         const bot = await this.activityBot;
-        return (
+        const owned =
           !!bot &&
           channel?.id === thread &&
           channel.type === 11 &&
@@ -1002,8 +1113,8 @@ export class DiscordBridge {
           channel.parent_id === this.cfg.parentChannelId &&
           channel.owner_id === bot &&
           !channel.thread_metadata?.archived &&
-          !channel.thread_metadata?.locked
-        );
+          !channel.thread_metadata?.locked;
+        return owned ? { name: channel!.name ?? '' } : false;
       },
       rename: (thread, name, current) => this.api.rename(thread, name, current),
       typing: (thread, current) => this.api.typing(thread, current),
@@ -1046,11 +1157,30 @@ export class DiscordBridge {
   get acceptsControls(): boolean {
     return !this.stopped && this.cfg.enabled && this.cfg.mode === 'full' && !!this.cfg.token;
   }
+  /** Opaque revision for an in-flight native setting operation; never expose the token itself. */
+  get controlScope(): string | undefined {
+    return this.acceptsControls
+      ? createHash('sha256')
+          .update(
+            JSON.stringify([
+              this.cfg.token,
+              this.cfg.guildId,
+              this.cfg.parentChannelId,
+              this.cfg.categoryId,
+              this.cfg.allowedUserIds,
+            ])
+          )
+          .digest('hex')
+      : undefined;
+  }
   get lastResult(): DiscordResult | null {
     return this.last;
   }
   get gatewayState(): DiscordGatewayState {
     return this.gateway?.state ?? 'off';
+  }
+  get nativeUiError(): string | null {
+    return this.nativeUi?.lastError ?? null;
   }
   get gatewayError(): string | null {
     return this.gateway?.lastError ?? null;
@@ -1223,6 +1353,7 @@ export class DiscordBridge {
   async pollConversations(): Promise<void> {
     if (this.stopped || this.held || !this.cfg.enabled || this.cfg.mode !== 'full' || !this.deps.history) return;
     await this.refreshControls();
+    await this.nativeUi?.poll().catch(() => undefined);
     const sessions = this.deps.sessions?.() ?? [];
     if (!sessions.length) return;
     const batch = Array.from(
@@ -1268,11 +1399,13 @@ export class DiscordBridge {
     const run = (async () => {
       let progress = await this.conversationProgress.get(key);
       if (!progress?.seeded) return;
-      if (progress.streamOff) return;
       const history = await this.deps.history!(sessionId, { includeTools: progress.verbose });
+      const user = history.turns.filter((t) => t.role === 'user').at(-1);
+      if (user) this.uiPrompts.set(sessionId, { conversation: history.conversationId, text: user.text.slice(0, 400) });
       if (history.conversationId !== progress.conversationId)
         throw new BridgeProblem('Conversation changed; synchronize history first');
       await this.deliveries.reconcileNative(sessionId, history);
+      if (progress.streamOff) return;
       const at = progress.cursor ? history.turns.findIndex((t) => t.cursor === progress!.cursor) : -1;
       if (progress.cursor && at < 0) throw new BridgeProblem('Live boundary expired; request history');
       for (const turn of history.turns.slice(at + 1, at + 21)) {
@@ -1496,6 +1629,7 @@ export class DiscordBridge {
     // A save that changed neither the switch nor the token keeps the gateway session, so it can resume.
     // A gateway that gave up (a fatal close, such as a missing intent) is replaced, or a fix could never take.
     const want = this.cfg.enabled && this.cfg.token && !this.held ? this.cfg.token : '';
+    if (!want || this.cfg.mode !== 'full') this.nativeUi?.stop();
     this.activityBot = undefined;
     this.activity.reset();
     if (want && this.deps.sessions && !this.activityTimer) {
@@ -1521,6 +1655,14 @@ export class DiscordBridge {
       clearInterval(this.outputTimer);
       this.outputTimer = undefined;
     }
+    if (want && this.cfg.mode === 'full' && this.deps.launch && this.deps.launchModes)
+      void this.syncLaunchCommands().catch((err) => {
+        this.last = this.fail(err);
+      });
+    else {
+      this.launchCommands.clear();
+      this.launchScope = '';
+    }
     if (this.gateway && this.gateway.state !== 'error' && want && want === this.gatewayToken) return;
     this.gateway?.stop();
     this.gateway = null;
@@ -1537,7 +1679,47 @@ export class DiscordBridge {
     }
   }
 
+  /** Read back guild registration before accepting a command ID from the gateway. */
+  async syncLaunchCommands(): Promise<void> {
+    if (this.launchRegistration) {
+      await this.launchRegistration.catch(() => undefined);
+      return this.syncLaunchCommands();
+    }
+    const scope = JSON.stringify([this.cfg.guildId, this.cfg.token, this.deps.launchModes?.()]);
+    if (this.launchScope === scope) return;
+    const current = () =>
+      !this.stopped &&
+      this.cfg.enabled &&
+      this.cfg.mode === 'full' &&
+      scope === JSON.stringify([this.cfg.guildId, this.cfg.token, this.deps.launchModes?.()]);
+    this.launchRegistration = (async () => {
+      this.launchCommands.clear();
+      if (!current() || !this.deps.launch) return;
+      const me = await this.api.botUserId();
+      if (!me || !current()) return;
+      const registered = await registerDiscordLaunchCommands(
+        this.api,
+        me.id,
+        this.cfg.guildId,
+        this.deps.launchModes?.() ?? [],
+        current
+      );
+      if (current()) {
+        this.launchCommands = registered;
+        this.launchScope = scope;
+      }
+    })();
+    try {
+      await this.launchRegistration;
+    } finally {
+      this.launchRegistration = undefined;
+    }
+  }
+
   stop(): void {
+    this.nativeUi?.stop();
+    this.launchCommands.clear();
+    this.launchScope = '';
     this.stopped = true;
     this.activity.reset();
     clearInterval(this.activityTimer);
@@ -1904,6 +2086,9 @@ export class DiscordBridge {
   async sessionRenamed(sessionId: string, name: string | undefined): Promise<void> {
     const seen = this.names.get(sessionId);
     this.names.set(sessionId, name ?? '');
+    // SessionUpdated also carries native working/idle changes. React even when its
+    // name is unchanged, so a short turn need not wait for the periodic sweep.
+    if (this.cfg.enabled && this.deps.sessions) void this.pollActivity().catch(() => undefined);
     // First sight only records the name: the thread was made with it, so a PATCH would spend a rename for nothing.
     if (seen === undefined || seen === (name ?? '')) return;
     if (this.cfg.enabled && this.cfg.mode === 'full') {
@@ -2097,6 +2282,85 @@ export class DiscordBridge {
     }
   }
   /** Gateway interactions need no slash-command registration or public callback server. */
+  private async onLaunchInteraction(m: DiscordInteraction): Promise<void> {
+    // Acknowledge before channel verification/network work (Discord's three-second deadline).
+    try {
+      await this.api.respondInteraction(m.id, m.token, { type: 5, data: { flags: 64 } });
+    } catch {
+      return;
+    }
+    const finish = (text: string) => this.api.finishInteraction(m.application_id, m.token, clip(text, 1800));
+    const channel = m.channel_id,
+      mode = m.data?.name;
+    if (
+      !channel ||
+      !mode ||
+      !m.data?.id ||
+      this.launchCommands.get(mode) !== m.data.id ||
+      !this.deps.launchModes?.().includes(mode) ||
+      m.data.options?.length ||
+      !this.deps.launch
+    ) {
+      await finish('This launch command is unavailable. No session was created.');
+      return;
+    }
+    const caseKey = this.channels.caseForChannel(this.cfg, channel);
+    const sessionId = this.channels.sessionForChannel(this.cfg, channel);
+    const scope = caseKey ? '__case__:' + caseKey : sessionId;
+    if (!scope) {
+      await finish('Use this command in a Codeman case channel or session thread.');
+      return;
+    }
+    const snapshot = this.destinationScope();
+    const user = m.member?.user?.id ?? m.user?.id;
+    try {
+      const claim = await this.deliveries.claim({
+        id: `launch:${m.guild_id}:${m.id}`,
+        direction: 'inbound',
+        sessionId: scope,
+        channelId: channel,
+        guildId: m.guild_id!,
+      });
+      if (!claim.fresh) {
+        await finish('This launch request was already received. Check the confirmation below.');
+        return;
+      }
+      if (caseKey) await this.channels.assertCaseOwned(this.cfg, caseKey, channel);
+      else await this.channels.assertOwned(this.cfg, sessionId!, channel);
+      const root = caseKey ?? (await this.deps.caseForSession?.(sessionId!))?.key;
+      if (
+        !root ||
+        (!caseKey &&
+          !this.channels
+            .sessionsForCase(this.cfg, root)
+            .some((s) => s.sessionId === sessionId && s.threadId === channel)) ||
+        this.stopped ||
+        !this.cfg.enabled ||
+        this.cfg.mode !== 'full' ||
+        snapshot !== this.destinationScope() ||
+        !user ||
+        !this.cfg.allowedUserIds.includes(user) ||
+        !this.destinationMatches(scope, channel)
+      )
+        throw new BridgeProblem('Launch context changed');
+      const result = await this.deps.launch(scope, root, mode);
+      if (
+        snapshot !== this.destinationScope() ||
+        !this.destinationMatches(scope, channel) ||
+        this.stopped ||
+        !this.cfg.enabled ||
+        this.cfg.mode !== 'full' ||
+        !this.cfg.allowedUserIds.includes(user)
+      )
+        throw new BridgeProblem('Launch context changed');
+      await this.postControlReply(scope, channel, result, `launch:${m.id}`);
+      await this.deliveries.update(`launch:${m.guild_id}:${m.id}`, 'delivered');
+      await finish(result.actions?.length ? 'Review the launch and press Confirm below.' : result.text);
+    } catch {
+      await finish('Launch could not be prepared. Check the case in the web UI and try again. No session was created.');
+    }
+  }
+
   async onGatewayInteraction(m: DiscordInteraction): Promise<void> {
     if (
       !SNOWFLAKE.test(m.id) ||
@@ -2122,6 +2386,11 @@ export class DiscordBridge {
       !this.cfg.allowedUserIds.includes(user)
     ) {
       await reply('This control is not available to this user.');
+      return;
+    }
+    if (await this.nativeUi?.interaction(m)) return;
+    if (m.type === 2) {
+      await this.onLaunchInteraction(m);
       return;
     }
     const action = m.data?.custom_id ? this.actions.get(m.data.custom_id) : undefined;
@@ -2250,6 +2519,92 @@ export class DiscordBridge {
     };
   }
 
+  private async submitUiPrompt(
+    sessionId: string,
+    channel: string,
+    actor: string,
+    source: string,
+    text: string,
+    conversation: string,
+    idle: boolean,
+    inputRevision?: string
+  ): Promise<'accepted' | 'uncertain' | 'blocked'> {
+    const run = (this.inbound.get(channel) ?? Promise.resolve()).then(
+      async (): Promise<'accepted' | 'uncertain' | 'blocked'> => {
+        const scope = this.controlScope;
+        const current = () =>
+          this.acceptsControls &&
+          this.controlScope === scope &&
+          this.cfg.allowedUserIds.includes(actor) &&
+          this.destinationMatches(sessionId, channel) &&
+          !this.deps.agentExited?.(sessionId) &&
+          !this.deps.awaitingChoice?.(sessionId);
+        if (!current() || !this.deps.history) return 'blocked';
+        if (idle) {
+          if (!(await this.channels.activityOwned(this.cfg, sessionId, channel))) return 'blocked';
+        } else await this.channels.assertOwned(this.cfg, sessionId, channel);
+        const baseline = await this.deps.history(sessionId);
+        if (baseline.conversationId !== conversation || !current()) return 'blocked';
+        const id = `ui-submit:${this.cfg.guildId}:${source}`;
+        const claim = await this.deliveries.claim({
+          id,
+          direction: 'inbound',
+          sessionId,
+          channelId: channel,
+          guildId: this.cfg.guildId,
+        });
+        if (!claim.fresh && !(claim.record.state === 'failed' && claim.record.reason === 'scope_changed'))
+          return claim.record.state === 'input_accepted' ||
+            ['submitted', 'running', 'completed'].includes(claim.record.state)
+            ? 'accepted'
+            : 'uncertain';
+        const keys = text.endsWith('\r') ? text : text + '\r';
+        await this.deliveries.annotate(id, {
+          native: {
+            conversationId: conversation,
+            afterCursor: baseline.turns.at(-1)?.cursor,
+            promptHash: hashDiscordPrompt(keys),
+          },
+        });
+        await this.deliveries.update(id, 'submitting');
+        if (!current()) {
+          await this.deliveries.update(id, 'failed', 'scope_changed');
+          return 'blocked';
+        }
+        let ok: boolean | undefined;
+        try {
+          if (idle) {
+            const service = this.deps.nativeUi;
+            if (!service?.submitQueued) {
+              await this.deliveries.update(id, 'failed', 'scope_changed');
+              return 'blocked';
+            }
+            const result = await service.submitQueued(sessionId, keys, conversation, current, inputRevision);
+            if (result === 'blocked') {
+              await this.deliveries.update(id, 'failed', 'scope_changed');
+              return 'blocked';
+            }
+            ok = result === 'accepted';
+          } else ok = await this.deps.sendInput(sessionId, keys);
+        } catch {
+          ok = false;
+        }
+        await this.deliveries.update(id, ok ? 'input_accepted' : 'uncertain', ok ? undefined : 'input_uncertain');
+        return ok ? 'accepted' : 'uncertain';
+      }
+    );
+    const chain = run.then(
+      () => undefined,
+      () => undefined
+    );
+    this.inbound.set(channel, chain);
+    try {
+      return await run;
+    } finally {
+      if (this.inbound.get(channel) === chain) this.inbound.delete(channel);
+    }
+  }
+
   /** Inbound reply. One chain per thread, so a reply that waits on a file download cannot be overtaken by a later one. */
   async onGatewayMessage(m: GatewayMessage): Promise<void> {
     const key = String(m.channel_id);
@@ -2350,7 +2705,11 @@ export class DiscordBridge {
           if (caseKey) await this.channels.assertCaseOwned(this.cfg, caseKey, m.channel_id);
           else await this.channels.assertOwned(this.cfg, sessionId, m.channel_id);
         }
-        const command = (m.content ?? '').replace(/^!codeman\s*/i, '');
+        const command = (m.content ?? '').replace(/^!codeman\s*/i, '').trim();
+        if (await this.nativeUi?.command(sessionId, m.channel_id, m.author.id, command)) {
+          await this.deliveries.update(id, 'delivered');
+          return;
+        }
         if (
           (caseKey || sessionId === '__management__') &&
           !/^(sessions|open|cases|groups|recoveries|create|recover|reconnect|confirm|help)(?:\s|$)/i.test(command)
@@ -2424,6 +2783,8 @@ export class DiscordBridge {
         }
         return;
       }
+      await this.deliveries.annotate(id, { messageId: m.id });
+      await this.nativeUi?.receipt(sessionId, id).catch(() => undefined);
       const t = this.now();
       const prev = this.lastReply.get(sessionId);
       if (prev !== undefined && t - prev < REPLY_MIN_INTERVAL_MS) {
@@ -2449,6 +2810,15 @@ export class DiscordBridge {
           m.channel_id,
           'A question or permission dialog is pending. Use its buttons or !codeman pending for a prompt-bound answer; nothing was typed.'
         );
+        return;
+      }
+      if (
+        this.cfg.mode === 'full' &&
+        this.nativeUi &&
+        this.deps.sessions?.().find((s) => s.id === sessionId)?.working
+      ) {
+        await this.deliveries.update(id, 'awaiting_choice');
+        await this.nativeUi.offerBusy(sessionId, m.channel_id, m, id);
         return;
       }
       this.lastReply.set(sessionId, t);
@@ -2480,6 +2850,7 @@ export class DiscordBridge {
           /* no native proof; transport acceptance must remain unconfirmed */
         }
       }
+      await this.deliveries.annotate(id, { messageId: m.id });
       await this.deliveries.update(id, 'files_transferred');
       // Persist the submission boundary before the final live routing check.
       await this.deliveries.update(id, 'submitting');
