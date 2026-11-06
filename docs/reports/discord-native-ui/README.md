@@ -15,3 +15,5 @@ Validation before deployment:
 - A separate run of the exact compiled production candidate repeated the native Codex, settings, defaults, HTTP and foreign-revision checks successfully.
 
 Live Discord registration, ownership, pin availability and component payloads are checked after deployment. No automated prompts are sent to existing user sessions. Unsupported native dialog answer types remain terminal-only, and shared-workspace diffs are explicitly not claimed as task-attributed changes.
+
+Registry follow-up (#112): the first full CI run passed 17,177 tests but rejected two CLI-dispatch architecture checks. Native settings now select a validated registry protocol; launch configuration uses registry metadata. All 538 targeted architecture, registry, Discord and session regressions pass, along with typecheck, lint, formatting, lockfile and catalogue checks. A fresh isolated Codex proof repeated model inspection, independent future defaults and input-revision-bound queue submission successfully.

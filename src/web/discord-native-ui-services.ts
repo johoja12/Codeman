@@ -1,3 +1,4 @@
+import { getCli } from '../config/cli-registry/registry.js';
 /** Server adapters for native Discord UI. Reuses settings, approval and file/SSH guards. */
 import { approvalInbox } from './approval-inbox.js';
 import { answerPendingApproval } from './routes/approval-routes.js';
@@ -52,7 +53,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
             : undefined,
         effort: deps.observed?.(s.id)?.effort, // launch effort is not proof of a current setting
         approval:
-          s.mode === 'codex'
+          getCli(s.mode)?.launch.legacyConfigField === 'codexConfig'
             ? s.codexConfig?.baseCommand
               ? 'Custom command authority'
               : s.codexConfig?.dangerouslyBypassApprovals

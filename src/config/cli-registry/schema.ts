@@ -14,7 +14,12 @@
 
 import { z } from 'zod';
 import { compileVersionRegex, countCaptureGroups, TOKEN_PATTERNS } from './patterns.js';
-import { isKnownCheckpointFrameProfile, isKnownLauncherProfile, isKnownSetenvProfile } from './profiles.js';
+import {
+  NATIVE_SETTINGS_PROFILES,
+  isKnownCheckpointFrameProfile,
+  isKnownLauncherProfile,
+  isKnownSetenvProfile,
+} from './profiles.js';
 import type { AgentSkillDir, LaunchDefaultSettingKey, McpConfigFormat, ModelConfigResolverName } from './types.js';
 
 /** Fixed relative paths for installed agent skills. */
@@ -505,6 +510,7 @@ const capabilitiesSchema = z
     // configResolver: a clis.json override names one of the settings this build knows
     // how to validate, never an arbitrary key. Params are checked against the declared
     // ones in the superRefine below.
+    nativeSettingsProfile: z.enum(NATIVE_SETTINGS_PROFILES).optional(),
     launchDefaults: z
       .record(
         z.string(),
