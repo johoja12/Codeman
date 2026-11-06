@@ -6417,7 +6417,7 @@ export class Session extends EventEmitter {
     modelOnly: boolean
   ): Promise<T> {
     if (
-      (this.mode !== 'codex' && this.mode !== 'claude') ||
+      !getCli(this.mode)?.capabilities.nativeSettingsProfile ||
       this.docker ||
       this.guardedInputHeld ||
       this._guardedPendingWrites ||

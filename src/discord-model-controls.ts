@@ -1,3 +1,4 @@
+import { getCli } from './config/cli-registry/registry.js';
 /** Native, verified, session-only model settings. No respawn or writes to CLI configuration files. */
 import { randomUUID } from 'node:crypto';
 import { nativeModelComposerReady } from './native-composer-ready.js';
@@ -24,13 +25,15 @@ const claudeAlias = (label: string): string | undefined => {
 };
 
 export function readNativeModelMenu(mode: string, raw: string): NativeModelMenu | undefined {
+  const profile = getCli(mode)?.capabilities.nativeSettingsProfile;
+  if (!profile) return undefined;
   const text = stripAnsi(raw);
-  const heading = mode === 'codex' ? /(?:^|\n)\s*Select Model and Effort\s*\n/ : /(?:^|\n)\s*Select model\s*\n/;
+  const heading = profile === 'codex-tui' ? /(?:^|\n)\s*Select Model and Effort\s*\n/ : /(?:^|\n)\s*Select model\s*\n/;
   const at = [...text.matchAll(new RegExp(heading.source, 'gi'))].at(-1)?.index;
   if (at === undefined) return undefined;
   const body = text.slice(at);
   if (
-    mode === 'claude'
+    profile === 'claude-tui'
       ? !/Enter to set as default\s*·\s*s to use this session only\s*·\s*Esc to cancel/i.test(body)
       : !/enter select\s*·\s*esc back/i.test(body)
   )
@@ -49,7 +52,7 @@ export function readNativeModelMenu(mode: string, raw: string): NativeModelMenu 
       label,
       selected: !!match[1],
       current: /\(current\)|[✔✓]/i.test(match[3]),
-      value: mode === 'claude' ? claudeAlias(label) : undefined,
+      value: profile === 'claude-tui' ? claudeAlias(label) : undefined,
     });
   }
   if (
@@ -158,7 +161,8 @@ export class DiscordModelControls {
     const scope = this.deps.scope(),
       target = this.deps.target(id);
     if (!scope || !target) return { text: 'Use model/effort controls inside an available session thread.' };
-    if (target.mode !== 'codex' && target.mode !== 'claude')
+    const profile = getCli(target.mode)?.capabilities.nativeSettingsProfile;
+    if (!profile)
       return { text: 'Native model/effort controls currently support Claude and Codex. Use this CLI’s terminal.' };
     if (target.pending || target.exited)
       return { text: 'Resolve the pending dialog or reconnect the agent first. Nothing was changed.' };
@@ -187,7 +191,7 @@ export class DiscordModelControls {
       !this.deps.target(id)?.working;
     try {
       let catalog: Array<{ id: string; label: string; efforts: string[] }> = [];
-      if (target.mode === 'codex' && !value && target.catalog) {
+      if (profile === 'codex-tui' && !value && target.catalog) {
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
           catalog = await Promise.race([
@@ -206,7 +210,7 @@ export class DiscordModelControls {
           throw new Error(
             'An empty native composer is required. Finish the draft or dialog in the web terminal first.'
           );
-        return target.mode === 'codex'
+        return profile === 'codex-tui'
           ? this.codex(id, target, lease, kind, value, catalog)
           : this.claude(id, target, lease, kind, value);
       }, allowed);

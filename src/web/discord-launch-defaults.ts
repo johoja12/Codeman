@@ -1,9 +1,17 @@
+import { getCli } from '../config/cli-registry/registry.js';
 /** Match the web Codex Run button for Discord launches before normal route validation/clamping. */
 import { SettingsUpdateSchema } from './schemas.js';
 import { readJsonConfig, SETTINGS_PATH } from './route-helpers.js';
 
 export async function applyDiscordLaunchDefaults(body: unknown): Promise<unknown> {
-  if (!body || typeof body !== 'object' || !('mode' in body) || body.mode !== 'codex') return body;
+  if (
+    !body ||
+    typeof body !== 'object' ||
+    !('mode' in body) ||
+    typeof body.mode !== 'string' ||
+    getCli(body.mode)?.launch.legacyConfigField !== 'codexConfig'
+  )
+    return body;
   const request = body as Record<string, unknown>;
   const config = request.codexConfig;
   // Leave invalid payloads to the create route's validator.
