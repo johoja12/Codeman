@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm, readFile, writeFile, symlink, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -95,6 +96,10 @@ async function fixture() {
           return m;
         }
         if (!id || !messages.has(id)) throw Object.assign(new Error('not found'), { status: 404 });
+        if (method === 'DELETE') {
+          messages.delete(id);
+          return null;
+        }
         if (method === 'PATCH') {
           const m = { ...messages.get(id)!, ...(body as DiscordUiPayload) };
           messages.set(id, m);
@@ -237,16 +242,16 @@ describe('native Discord UI', () => {
   it('publishes one owned control card and dashboard; updates after restart without duplicate posts', async () => {
     const f = await fixture();
     await f.ui.poll();
-    expect(f.messages.size).toBe(3);
+    expect(f.messages.size).toBe(2);
     const card = f.findCard();
     expect(card.content).toContain('Input delivered; native submission unconfirmed');
     expect(card.components!.flatMap((r) => r.components).map((c) => c.label)).toContain('Settings');
     await f.ui.poll();
-    expect(f.messages.size).toBe(3);
+    expect(f.messages.size).toBe(2);
     expect(f.host.request).toHaveBeenCalledWith('PUT', `/channels/${channel}/pins/${card.id}`);
     const restored = new DiscordNativeUi(f.host);
     await restored.poll();
-    expect(f.messages.size).toBe(3);
+    expect(f.messages.size).toBe(2);
     expect((await restored.store.snapshot()).cards).toBeDefined();
   });
   it('uses only passive ownership checks for automatic completion cards', async () => {
@@ -645,4 +650,112 @@ describe('private UI store', () => {
     await symlink(target, join(f.dir, 'discord-native-ui.json'));
     await expect(new DiscordUiStore(f.dir).snapshot()).rejects.toThrow('unavailable');
   });
+});
+
+async function legacyDelivery(f: Awaited<ReturnType<typeof fixture>>, receipt = 'legacy') {
+  const key = createHash('sha256')
+    .update(f.host.scope() + ':' + channel + ':delivery:' + receipt)
+    .digest('hex');
+  const id = snow();
+  f.messages.set(id, {
+    id,
+    channel,
+    author: { id: bot },
+    content: '**Prompt delivery**\nWorking · native execution\n-# Codeman · delivery · ' + key.slice(0, 10),
+  });
+  await f.ui.store.edit((state) => {
+    state.cards[key] = {
+      kind: 'delivery',
+      channel,
+      message: id,
+      hash: 'legacy',
+      phase: 'ready',
+      updated: f.host.now(),
+    };
+  });
+  return { key, id };
+}
+it('uses reactions/journal state without creating a delivery card at any normal prompt stage', async () => {
+  const f = await fixture();
+  for (const state of ['received', 'input_accepted', 'submitted', 'running', 'completed']) {
+    f.host.receipts = async () => [{ id: 'input-one', state, updated: f.host.now() }];
+    await f.ui.receipt('s1', 'input-one');
+    await f.ui.poll();
+  }
+  expect([...f.messages.values()].some((m) => m.content.includes('**Prompt delivery**'))).toBe(false);
+  expect((await f.host.receipts('s1'))[0].state).toBe('completed');
+  expect(f.host.submit).not.toHaveBeenCalled();
+  expect(f.host.note).not.toHaveBeenCalled();
+});
+it('removes an owned legacy delivery card and its UI metadata while preserving queued prompts', async () => {
+  const f = await fixture();
+  const { key, id } = await legacyDelivery(f);
+  await f.ui.store.enqueue({
+    session: 's1',
+    conversation: 'conversation-one',
+    scope: 'scope-a',
+    channel,
+    actor,
+    source: 'queued-source',
+    text: 'follow-up',
+  });
+  const queue = (await f.ui.store.snapshot()).queue;
+  await f.ui.receipt('s1', 'legacy');
+  expect(f.messages.has(id)).toBe(false);
+  const state = await f.ui.store.snapshot();
+  expect(state.cards[key]).toBeUndefined();
+  expect(state.queue).toEqual(queue);
+  expect(f.host.request).toHaveBeenCalledWith(
+    'DELETE',
+    `/channels/${channel}/messages/${id}`,
+    undefined,
+    expect.any(Function)
+  );
+});
+it.each(['foreign author', 'edited marker', 'archived thread', 'disabled scope'])(
+  'leaves a legacy card alone for %s',
+  async (reason) => {
+    const f = await fixture();
+    const { key, id } = await legacyDelivery(f);
+    if (reason === 'foreign author') f.messages.get(id)!.author.id = actor;
+    if (reason === 'edited marker') f.messages.get(id)!.content = 'A different bot message';
+    if (reason === 'archived thread') vi.mocked(f.host.passive).mockResolvedValue(false);
+    if (reason === 'disabled scope') f.setScope(undefined);
+    await f.ui.receipt('s1', 'legacy');
+    expect(f.messages.has(id)).toBe(true);
+    expect((await f.ui.store.snapshot()).cards[key]).toBeDefined();
+    expect(vi.mocked(f.host.request).mock.calls.some(([method]) => method === 'DELETE')).toBe(false);
+  }
+);
+it('rechecks configuration after reading a legacy card and before deleting it', async () => {
+  const f = await fixture();
+  const { id } = await legacyDelivery(f);
+  const request = f.host.request;
+  f.host.request = vi.fn(async (method, path, body) => {
+    const result = await request(method, path, body);
+    if (method === 'GET' && path.endsWith('/' + id)) f.setScope('changed-scope');
+    return result;
+  });
+  await f.ui.receipt('s1', 'legacy');
+  expect(f.messages.has(id)).toBe(true);
+  expect(vi.mocked(f.host.request).mock.calls.some(([method]) => method === 'DELETE')).toBe(false);
+});
+it('forgets metadata for an already-deleted delivery card without deleting another message', async () => {
+  const f = await fixture();
+  const { key, id } = await legacyDelivery(f);
+  f.messages.delete(id);
+  await f.ui.receipt('s1', 'legacy');
+  expect((await f.ui.store.snapshot()).cards[key]).toBeUndefined();
+  expect(vi.mocked(f.host.request).mock.calls.some(([method]) => method === 'DELETE')).toBe(false);
+});
+it('cleans up at most three legacy cards per poll and never recreates them after restart', async () => {
+  const f = await fixture();
+  for (let i = 0; i < 4; i++) await legacyDelivery(f, 'legacy' + i);
+  await f.ui.poll();
+  expect(vi.mocked(f.host.request).mock.calls.filter(([method]) => method === 'DELETE')).toHaveLength(3);
+  await f.ui.poll();
+  expect([...f.messages.values()].some((m) => m.content.includes('**Prompt delivery**'))).toBe(false);
+  const restored = new DiscordNativeUi(f.host);
+  await restored.poll();
+  expect([...f.messages.values()].some((m) => m.content.includes('**Prompt delivery**'))).toBe(false);
 });

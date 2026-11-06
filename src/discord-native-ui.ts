@@ -297,6 +297,7 @@ export class DiscordNativeUi {
     this.prune();
     await this.refreshQuestionPanels();
     await this.register();
+    await this.retireDeliveryCards();
     const sessions = await this.host.services.sessions();
     const list = sessions.filter((s) => this.host.channelForSession(s.id));
     for (let i = 0; i < Math.min(3, list.length); i++) {
@@ -366,48 +367,75 @@ export class DiscordNativeUi {
         await this.upsert('dashboard:main', channel, await this.dashboard({ channel })).catch(() => undefined);
     }
   }
+  /** Receipt state stays in reactions/the journal; retire only our legacy per-prompt cards. */
   async receipt(id: string, receiptId: string): Promise<void> {
-    const channel = this.host.channelForSession(id);
-    if (!channel) return;
-    if (!(await this.host.passive(id, channel))) return;
-    const r = (await this.host.receipts(id)).find((r) => r.id === receiptId);
-    if (!r) return;
-    const labels: Record<string, string> = {
-      received: 'Received',
-      files_transferred: 'Files prepared',
-      submitting: 'Submission unconfirmed',
-      input_accepted: 'Input delivered · native submission unconfirmed',
-      submitted: 'Submitted · native acknowledgement',
-      running: 'Working · native execution',
-      completed: 'Finished · native execution',
-      failed: 'Not submitted / failed',
-      uncertain: 'Unconfirmed · check before resending',
-      awaiting_choice: 'Awaiting your Send now / Queue next choice',
-      queued: 'Queued · waiting for a verified idle composer',
-      cancelled: 'Closed without submitting input',
-      interrupted: 'Interrupted · native execution',
-      execution_error: 'Failed · native execution',
-    };
-    await this.upsert(
-      'delivery:' + receiptId,
-      channel,
-      this.payload(
-        '**Prompt delivery**' +
-          (r.message
-            ? ' · [original message](https://discord.com/channels/' +
-              this.host.config().guild +
-              '/' +
-              channel +
-              '/' +
-              r.message +
-              ')'
-            : '') +
-          '\n' +
-          (labels[r.state] ?? safe(r.state)) +
-          (r.reason ? '\nReason: ' + safe(r.reason) : '') +
-          '\n-# Received → Submitted → Working → Finished. Only observed boundaries advance; ambiguous input is never replayed.'
+    const scope = this.host.scope(),
+      channel = this.host.channelForSession(id);
+    if (!scope || !channel) return;
+    await this.retireDeliveryCards(new Set([hash(scope + ':' + channel + ':delivery:' + receiptId)]));
+  }
+  private async retireDeliveryCards(keys?: Set<string>): Promise<void> {
+    const scope = this.host.scope();
+    if (!scope) return;
+    const cards = Object.entries((await this.store.snapshot()).cards)
+      .filter(
+        ([key, card]) =>
+          card.kind === 'delivery' &&
+          card.phase === 'ready' &&
+          card.message &&
+          (!keys || keys.has(key)) &&
+          (this.errors.get('retire:' + key) ?? 0) <= this.host.now() &&
+          this.host.sessionForChannel(card.channel) &&
+          this.host.ownsChannel(card.channel)
       )
-    );
+      .slice(0, 3);
+    for (const [key, card] of cards) {
+      const session = this.host.sessionForChannel(card.channel)!;
+      const current = () =>
+        this.host.scope() === scope &&
+        this.host.ownsChannel(card.channel) &&
+        this.host.sessionForChannel(card.channel) === session &&
+        this.host.channelForSession(session) === card.channel;
+      try {
+        if (!current()) return;
+        if (!(await this.host.passive(session, card.channel))) {
+          this.errors.set('retire:' + key, this.host.now() + 60000);
+          continue;
+        }
+        const path = `/channels/${card.channel}/messages/${card.message}`;
+        let missing = false;
+        try {
+          const message = (await this.host.request('GET', path)) as { author?: { id: string }; content?: string };
+          const bot = await this.host.botId();
+          const marker = `\n-# Codeman · delivery · ${key.slice(0, 10)}`;
+          if (
+            !bot ||
+            message.author?.id !== bot ||
+            !message.content?.startsWith('**Prompt delivery**') ||
+            !message.content.endsWith(marker)
+          )
+            throw new Error('Legacy delivery-card ownership changed');
+        } catch (error) {
+          if ((error as { status?: number }).status !== 404) throw error;
+          missing = true;
+        }
+        if (!current()) return;
+        if (!missing) {
+          try {
+            await this.host.request('DELETE', path, undefined, current);
+          } catch (error) {
+            if ((error as { status?: number }).status !== 404) throw error;
+          }
+        }
+        if (!current()) return;
+        await this.store.edit((state) => {
+          if (state.cards[key]?.message === card.message) delete state.cards[key];
+        });
+      } catch (error) {
+        this.lastError = error instanceof Error ? error.message : 'Legacy delivery-card cleanup failed';
+        this.errors.set('retire:' + key, this.host.now() + 60000);
+      }
+    }
   }
   async register(): Promise<void> {
     if (this.registrations) return this.registrations;

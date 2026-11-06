@@ -984,7 +984,7 @@ export class DiscordBridge {
           channel === this.cfg.parentChannelId,
         verify: (id, channel) => this.channels.assertOwned(this.cfg, id, channel),
         passive: async (id, channel) => !!(await this.channels.activityOwned(this.cfg, id, channel)),
-        request: (method, path, body) => this.api.request(method, path, body),
+        request: (method, path, body, current) => this.api.request(method, path, body, 0, current),
         respond: async (m, body) => {
           await this.api.respondInteraction(m.id, m.token, body);
         },
