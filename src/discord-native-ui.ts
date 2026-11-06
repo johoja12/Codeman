@@ -332,7 +332,6 @@ export class DiscordNativeUi {
           this.cardActions.set(key + ':signature', [signature]);
         }
         const receipts = await this.host.receipts(s.id);
-        for (const receipt of receipts.slice(0, 3)) await this.receipt(s.id, receipt.id);
         const completed = receipts.find((r) => r.state === 'completed');
         const resultKey = 'result:' + s.id,
           resultSignature = completed
