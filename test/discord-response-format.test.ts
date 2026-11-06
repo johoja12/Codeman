@@ -1,10 +1,6 @@
 /** @fileoverview Response presentation preserves code/content while adding native Discord hierarchy. */
 import { describe, expect, it } from 'vitest';
-import {
-  discordResponsePosts,
-  formatDiscordResponseText,
-  DISCORD_RESPONSE_COLOR,
-} from '../src/discord-response-format.js';
+import { discordResponsePosts, formatDiscordResponseText } from '../src/discord-response-format.js';
 describe('readable Discord responses', () => {
   it('separates and emphasizes short numbered labels without rewriting prose', () => {
     const body =
@@ -30,31 +26,35 @@ describe('readable Discord responses', () => {
     const body = '1. **Spread:** details\n   - nested bullet\n   - next bullet\n\n2. **Shared:** details';
     expect(formatDiscordResponseText(body)).toBe(body);
   });
-  it('puts response text and links in one colored card, without duplicating metadata or link-preview content', () => {
+  it('uses chat-width text and suppresses URL previews rather than narrow embeds', () => {
     const posts = discordResponsePosts('1. Spread: details\n2. Shared: details\n\nhttps://example.test/demo');
     expect(posts).toHaveLength(1);
-    expect(posts[0].content).toBe('');
-    expect(posts[0].embeds).toEqual([
-      {
-        title: 'Response',
-        description: '1. **Spread:** details\n\n2. **Shared:** details\n\nhttps://example.test/demo',
-        color: DISCORD_RESPONSE_COLOR,
-      },
-    ]);
+    expect(posts[0].content).toBe(
+      '**Response**\n\n1. **Spread:** details\n\n2. **Shared:** details\n\nhttps://example.test/demo'
+    );
+    expect(posts[0].embeds).toBeUndefined();
+    expect(posts[0].flags).toBe(4);
     expect(posts[0].allowed_mentions).toEqual({ parse: [], users: [] });
   });
-  it('keeps long responses within embed limits, numbers continuations and pings only the first part', () => {
+  it('keeps long responses within message limits, numbers continuations and pings only the first part', () => {
     const text = Array.from({ length: 80 }, (_, i) => `Paragraph ${i}: ` + 'detail '.repeat(15)).join('\n\n');
     const posts = discordResponsePosts(text, { users: ['333333333333333333'] });
     expect(posts.length).toBeGreaterThan(1);
     expect(posts.length).toBeLessThanOrEqual(8);
-    expect(posts.every((p) => p.embeds![0].description.length <= 4096)).toBe(true);
-    expect(posts[0].content).toBe('<@333333333333333333>');
-    expect(posts[0].embeds![0].footer?.text).toBe(`1 / ${posts.length}`);
+    expect(posts.every((p) => p.content.length <= 2000)).toBe(true);
+    expect(posts[0].content).toContain('<@333333333333333333>');
+    expect(posts[0].content).toContain(`1 / ${posts.length}`);
     expect(
-      posts.slice(1).every((p) => p.content === '' && p.allowed_mentions.users.length === 0 && !p.embeds![0].title)
+      posts
+        .slice(1)
+        .every(
+          (p) =>
+            !p.content.includes('<@333333333333333333>') &&
+            p.allowed_mentions.users.length === 0 &&
+            !p.content.includes('**Response**')
+        )
     ).toBe(true);
-    const visible = posts.map((p) => p.embeds![0].description).join('\n');
+    const visible = posts.map((p) => p.content).join('\n');
     for (let i = 0; i < 80; i++) expect(visible).toContain(`Paragraph ${i}:`);
   });
   it.each(['```', '````', '~~~'])('closes and reopens long %s code blocks without altering their rows', (fence) => {
@@ -62,16 +62,16 @@ describe('readable Discord responses', () => {
     const posts = discordResponsePosts(`${fence}js\n${lines.join('\n')}\n${fence}`);
     expect(posts.length).toBeGreaterThan(1);
     for (const post of posts) {
-      expect(post.embeds![0].description.startsWith(fence + 'js\n')).toBe(true);
-      expect(post.embeds![0].description.endsWith(fence)).toBe(true);
+      expect(post.content.includes(fence + 'js\n')).toBe(true);
+      expect(post.content.slice(0, post.content.lastIndexOf('\n-#')).endsWith(fence)).toBe(true);
     }
-    const combined = posts.map((p) => p.embeds![0].description).join('\n');
+    const combined = posts.map((p) => p.content).join('\n');
     for (const line of lines) expect(combined.split(line)).toHaveLength(2);
   });
   it('makes truncation explicit and does not turn output mentions into notification permissions', () => {
     const posts = discordResponsePosts('@everyone ' + 'x'.repeat(100000));
     expect(posts).toHaveLength(8);
-    expect(posts.at(-1)!.embeds![0].description).toContain('The message continues in the tab.');
+    expect(posts.at(-1)!.content).toContain('The message continues in the tab.');
     expect(posts.every((p) => p.allowed_mentions.parse.length === 0 && p.allowed_mentions.users.length === 0)).toBe(
       true
     );

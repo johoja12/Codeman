@@ -608,7 +608,7 @@ describe('Discord interface mode', () => {
     await b.notify({ ...msg, event: 'hook:stop', urgency: 'info' });
     expect(posts.filter((p) => visibleText(p.body)?.includes('**Answer**'))).toHaveLength(1);
     expect(visibleText(posts.find((p) => visibleText(p.body)?.includes('**Answer**'))?.body)).toBe(
-      '**Answer**\n- One\n- Two'
+      '**Response**\n\n**Answer**\n- One\n- Two'
     );
     expect(
       posts.some(
@@ -660,7 +660,7 @@ describe('Discord interface mode', () => {
       });
       expect(r?.ok).toBe(true);
       expect(
-        posts.some((p) => p.body?.embeds?.[0]?.title === 'Response' && visibleText(p.body)?.includes('fallback answer'))
+        posts.some((p) => p.body?.content?.includes('**Response**') && visibleText(p.body)?.includes('fallback answer'))
       ).toBe(true);
     }
   );
@@ -779,21 +779,21 @@ describe('Discord interface mode', () => {
       { cursor: 'native1:2', role: 'assistant', text: metadata, timestamp: '' },
     ];
     await b.pollConversations();
-    expect(posts.filter((p) => visibleText(p.body) === 'Clean answer')).toHaveLength(1);
+    expect(posts.filter((p) => visibleText(p.body) === '**Response**\n\nClean answer')).toHaveLength(1);
     expect(
       posts.some((p) => visibleText(p.body)?.includes('MEMORY.md') || visibleText(p.body)?.includes('<oai-mem'))
     ).toBe(false);
     now += 60001;
     turns.push({ cursor: 'native1:3', role: 'assistant', text: 'Next answer', timestamp: '' });
     await b.pollConversations();
-    expect(posts.filter((p) => visibleText(p.body) === 'Next answer')).toHaveLength(1);
-    expect(posts.filter((p) => visibleText(p.body) === 'Clean answer')).toHaveLength(1);
+    expect(posts.filter((p) => visibleText(p.body) === '**Response**\n\nNext answer')).toHaveLength(1);
+    expect(posts.filter((p) => visibleText(p.body) === '**Response**\n\nClean answer')).toHaveLength(1);
     b.stop();
     const again = makeBridge(undefined, { history, now: () => now });
     await again.reload();
     await again.syncSessions();
     await again.pollConversations();
-    expect(posts.filter((p) => visibleText(p.body) === 'Clean answer')).toHaveLength(1);
+    expect(posts.filter((p) => visibleText(p.body) === '**Response**\n\nClean answer')).toHaveLength(1);
   });
 
   it('omits metadata-only historical turns while retaining visible historical context', async () => {
@@ -1217,12 +1217,12 @@ it('renders routine fallback answers as readable cards without repeating alert m
     }),
   });
   expect(result?.ok).toBe(true);
-  const post = posts.find((p) => p.body?.embeds?.[0]?.description?.includes('**Spread:**'))!.body;
-  expect(post.content).toBe('');
-  expect(post.embeds[0].title).toBe('Response');
-  expect(post.embeds[0].color).toBe(0x58a6ff);
-  expect(post.embeds[0].description).toContain('\n\n2. **Shared:**');
-  expect(post.embeds[0].description).toContain('https://example.test/demo');
+  const post = posts.find((p) => p.body?.content?.includes('**Spread:**'))!.body;
+  expect(post.content).toContain('**Response**');
+  expect(post.embeds).toBeUndefined();
+  expect(post.flags).toBe(4);
+  expect(post.content).toContain('\n\n2. **Shared:**');
+  expect(post.content).toContain('https://example.test/demo');
   expect(JSON.stringify(post)).not.toContain('Waiting for Input');
   expect(JSON.stringify(post)).not.toContain('codeman:example');
   expect(JSON.stringify(post)).not.toContain('[w5-demo]');
@@ -1240,10 +1240,11 @@ it('keeps critical alert context and an allowlisted ping when the attached respo
     fullText: async () => ({ text: 'Detailed failure explanation.' }),
   });
   expect(result?.ok).toBe(true);
-  const post = posts.find((p) => p.body?.embeds?.[0]?.title === 'Task failed')!.body;
-  expect(post.embeds[0].color).toBe(0xed6b6b);
-  expect(post.embeds[0].description).toContain('The build command failed.');
-  expect(post.embeds[0].description).toContain('Detailed failure explanation.');
+  const post = posts.find((p) => p.body?.content?.includes('**🔴 Task failed**'))!.body;
+  expect(post.flags).toBe(4);
+  expect(post.embeds).toBeUndefined();
+  expect(post.content).toContain('The build command failed.');
+  expect(post.content).toContain('Detailed failure explanation.');
   expect(post.allowed_mentions.parse).toEqual([]);
   expect(post.allowed_mentions.users).toEqual(cfg.allowedUserIds);
 });
@@ -1261,7 +1262,7 @@ it('does not add a bare Waiting for Input wrapper after the same fallback answer
   };
   expect((await b.notify(msg))?.ok).toBe(true);
   expect((await b.notify({ ...msg, event: 'hook:stop' }))?.deduped).toBe(true);
-  expect(posts.filter((p) => visibleText(p.body) === 'A completed answer.')).toHaveLength(1);
+  expect(posts.filter((p) => visibleText(p.body) === '**Response**\n\nA completed answer.')).toHaveLength(1);
   expect(posts.some((p) => p.body?.content?.includes('Waiting for Input'))).toBe(false);
 });
 
