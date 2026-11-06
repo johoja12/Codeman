@@ -1156,3 +1156,42 @@ it('launches from owned case channels and threads with a confirmation, never ter
   expect(launch).toHaveBeenCalledTimes(2);
   expect(sendInput).not.toHaveBeenCalled();
 });
+
+it('joins configured users to new and existing owned threads, extends archive settings and skips inactive/unowned threads', async () => {
+  let time = 1;
+  const b = makeBridge(undefined, {
+    now: () => time,
+    caseForSession: async () => ({ key: 'a'.repeat(64), name: 'brain' }),
+  });
+  await b.reload();
+  await b.syncSessions();
+  await b.pollThreadMembers();
+  const map = await readFullMap(dir),
+    parent = [...remoteChannels.values()].find((c) => c.type === 0)!;
+  const added = () => posts.filter((p) => p.method === 'PUT' && p.path.includes('/thread-members/'));
+  expect(added()).toHaveLength(2);
+  expect(added().every((p) => p.path.endsWith('/thread-members/' + cfg.allowedUserIds[0]))).toBe(true);
+  expect(parent.default_auto_archive_duration).toBe(10080);
+  expect(posts.filter((p) => p.method === 'PATCH' && p.body?.auto_archive_duration === 10080)).toHaveLength(2);
+  await b.pollThreadMembers();
+  expect(added()).toHaveLength(2);
+  b.stop();
+  const restarted = makeBridge(undefined, {
+    now: () => time,
+    caseForSession: async () => ({ key: 'a'.repeat(64), name: 'brain' }),
+  });
+  await restarted.reload();
+  await restarted.syncSessions();
+  await restarted.pollThreadMembers();
+  expect(added()).toHaveLength(4);
+  for (const [id, archived, locked] of [
+    [map.s1, true, false],
+    [map.s2, false, true],
+  ] as const)
+    remoteChannels.get(id).thread_metadata = { archived, locked, auto_archive_duration: 60 };
+  time += 15 * 60000;
+  await restarted.pollThreadMembers();
+  expect(added()).toHaveLength(4);
+  expect(remoteChannels.get(map.s1).thread_metadata.archived).toBe(true);
+  expect(sendInput).not.toHaveBeenCalled();
+});

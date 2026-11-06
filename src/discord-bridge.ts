@@ -1,3 +1,4 @@
+import { DiscordThreadMembers } from './discord-thread-members.js';
 import { registerDiscordLaunchCommands } from './discord-launch-commands.js';
 import { formatDiscordTables } from './discord-tables.js';
 export { formatDiscordTables } from './discord-tables.js';
@@ -583,6 +584,9 @@ export class DiscordApi {
   channelMessages(parent: string): Promise<DiscordStarter[] | null> {
     return this.request('GET', `/channels/${parent}/messages?limit=100`);
   }
+  addThreadMember(thread: string, user: string, current?: () => boolean): Promise<unknown> {
+    return this.request('PUT', `/channels/${thread}/thread-members/${user}`, undefined, 0, current);
+  }
   createThreadFromMessage(parent: string, id: string, name: string): Promise<DiscordManagedChannel | null> {
     return this.request('POST', `/channels/${parent}/messages/${id}/threads`, { name, auto_archive_duration: 10080 });
   }
@@ -974,6 +978,10 @@ export class DiscordBridge {
   private outputTimer?: ReturnType<typeof setInterval>;
   private activityTimer?: ReturnType<typeof setInterval>;
   private readonly activity: DiscordActivity;
+  private readonly members: DiscordThreadMembers;
+  private memberPoll?: Promise<void>;
+  private retirementDue = 0;
+  private archiveParents = new Set<string>();
   private activityBot?: Promise<string | undefined>;
   private outputReads = new Map<string, { remote: boolean; run: Promise<void> }>();
   private outputIndex = 0;
@@ -1035,32 +1043,127 @@ export class DiscordBridge {
       sessions: () => this.activitySessions(),
       destination: (id) =>
         this.cfg.mode === 'full' ? this.channels.channelForSession(this.cfg, id) : this.threads[id],
-      verify: async (id, thread) => {
-        if (this.cfg.mode === 'full') return this.channels.activityOwned(this.cfg, id, thread);
-        const channel = await this.api.getChannel(thread);
-        this.activityBot ??= this.api
-          .botUserId()
-          .then((me) => me?.id)
-          .catch(() => {
-            this.activityBot = undefined;
-            return undefined;
-          });
-        const bot = await this.activityBot;
-        return (
-          !!bot &&
-          channel?.id === thread &&
-          channel.type === 11 &&
-          channel.guild_id === this.cfg.guildId &&
-          channel.parent_id === this.cfg.parentChannelId &&
-          channel.owner_id === bot &&
-          !channel.thread_metadata?.archived &&
-          !channel.thread_metadata?.locked
-        );
-      },
+      verify: (id, thread) => this.activityOwnedThread(id, thread),
       rename: (thread, name, current) => this.api.rename(thread, name, current),
       typing: (thread, current) => this.api.typing(thread, current),
       now: this.now,
     });
+    this.members = new DiscordThreadMembers(
+      (thread, user, current) => this.api.addThreadMember(thread, user, current),
+      this.now
+    );
+  }
+
+  private async activityOwnedThread(id: string, thread: string): Promise<boolean> {
+    if (this.cfg.mode === 'full') return this.channels.activityOwned(this.cfg, id, thread);
+    const channel = await this.api.getChannel(thread);
+    this.activityBot ??= this.api
+      .botUserId()
+      .then((me) => me?.id)
+      .catch(() => {
+        this.activityBot = undefined;
+        return undefined;
+      });
+    const bot = await this.activityBot;
+    return (
+      !!bot &&
+      channel?.id === thread &&
+      channel.type === 11 &&
+      channel.guild_id === this.cfg.guildId &&
+      channel.parent_id === this.cfg.parentChannelId &&
+      channel.owner_id === bot &&
+      !channel.thread_metadata?.archived &&
+      !channel.thread_metadata?.locked
+    );
+  }
+  private memberScope(): string {
+    return createHash('sha256')
+      .update(JSON.stringify([this.destinationScope(), this.cfg.token, this.cfg.allowedUserIds]))
+      .digest('hex');
+  }
+  private addThreadMembers(id: string, thread: string): Promise<void> {
+    const scope = this.memberScope();
+    return this.members
+      .ensure({
+        scope,
+        thread,
+        users: [...this.cfg.allowedUserIds],
+        current: () =>
+          !this.stopped &&
+          !this.held &&
+          this.cfg.enabled &&
+          !!this.cfg.token &&
+          scope === this.memberScope() &&
+          this.destinationMatches(id, thread),
+        verify: async () => {
+          if (!(await this.activityOwnedThread(id, thread))) return false;
+          const target = await this.api.getChannel(thread);
+          const current = () =>
+            !this.stopped &&
+            !this.held &&
+            this.cfg.enabled &&
+            scope === this.memberScope() &&
+            this.destinationMatches(id, thread);
+          if (!current() || target?.thread_metadata?.archived || target?.thread_metadata?.locked) return false;
+          if (target?.thread_metadata?.auto_archive_duration !== 10080)
+            await this.api.request('PATCH', `/channels/${thread}`, { auto_archive_duration: 10080 }, 0, current);
+          // Only Full-mode parents have durable ownership markers. Leave unrelated notification channels alone.
+          if (
+            this.cfg.mode === 'full' &&
+            target?.parent_id &&
+            !this.archiveParents.has(scope + ':' + target.parent_id)
+          ) {
+            const root = this.channels.caseForChannel(this.cfg, target.parent_id);
+            if (!root) return false;
+            await this.channels.assertCaseOwned(this.cfg, root, target.parent_id);
+            if (!current()) return false;
+            const parent = await this.api.getChannel(target.parent_id);
+            if (parent?.default_auto_archive_duration !== 10080)
+              await this.api.request(
+                'PATCH',
+                `/channels/${target.parent_id}`,
+                { default_auto_archive_duration: 10080 },
+                0,
+                current
+              );
+            if (current()) {
+              if (this.archiveParents.size >= 4096) this.archiveParents.clear();
+              this.archiveParents.add(scope + ':' + target.parent_id);
+            }
+          }
+          return current();
+        },
+      })
+      .catch((err) => {
+        this.last = this.fail(err);
+      });
+  }
+  /** Reconcile existing destinations only; never reopen an archived thread or discover an agent. */
+  pollThreadMembers(): Promise<void> {
+    if (this.memberPoll) return this.memberPoll;
+    const ids = this.cfg.mode === 'full' ? (this.deps.sessions?.() ?? []).map((s) => s.id) : Object.keys(this.threads);
+    const run = (async () => {
+      if (
+        !this.stopped &&
+        !this.held &&
+        this.cfg.enabled &&
+        this.cfg.mode === 'full' &&
+        this.now() >= this.retirementDue
+      ) {
+        this.retirementDue = this.now() + 30000;
+        await this.channels.flushRetirements(this.cfg.guildId).catch((err) => {
+          this.last = this.fail(err);
+        });
+      }
+      for (const id of ids) {
+        const thread = this.cfg.mode === 'full' ? this.channels.channelForSession(this.cfg, id) : this.threads[id];
+        if (thread) await this.addThreadMembers(id, thread);
+      }
+    })().finally(() => {
+      if (this.memberPoll === run) this.memberPoll = undefined;
+    });
+    this.memberPoll = run;
+    return run;
   }
 
   private activitySessions(): DiscordActivitySession[] {
@@ -1076,6 +1179,7 @@ export class DiscordBridge {
   }
   /** Cosmetic status only: safe to call without a native transcript or a working agent. */
   pollActivity(): Promise<void> {
+    void this.pollThreadMembers().catch(() => undefined);
     return this.activity.poll();
   }
 
@@ -1553,7 +1657,10 @@ export class DiscordBridge {
     const want = this.cfg.enabled && this.cfg.token && !this.held ? this.cfg.token : '';
     this.activityBot = undefined;
     this.activity.reset();
-    if (want && this.deps.sessions && !this.activityTimer) {
+    this.members.reset();
+    this.archiveParents.clear();
+    if (want) void this.pollThreadMembers().catch(() => undefined);
+    if (want && !this.activityTimer) {
       this.activityTimer = setInterval(() => void this.pollActivity().catch(() => undefined), 4000);
       this.activityTimer.unref();
     } else if (!want) {
@@ -1642,6 +1749,8 @@ export class DiscordBridge {
     this.launchScope = '';
     this.stopped = true;
     this.activity.reset();
+    this.members.reset();
+    this.archiveParents.clear();
     clearInterval(this.activityTimer);
     this.activityTimer = undefined;
     this.actions.clear();
@@ -1708,7 +1817,12 @@ export class DiscordBridge {
   }
 
   /** The thread for a session, creating it when absent. Concurrent callers share one creation. */
-  private threadFor(sessionId: string, name: string | undefined): Promise<string | DiscordResult> {
+  private async threadFor(sessionId: string, name: string | undefined): Promise<string | DiscordResult> {
+    const result = await this.resolveThreadFor(sessionId, name);
+    if (typeof result === 'string') void this.addThreadMembers(sessionId, result);
+    return result;
+  }
+  private resolveThreadFor(sessionId: string, name: string | undefined): Promise<string | DiscordResult> {
     if (this.cfg.mode === 'full') {
       const scope = this.destinationScope();
       return this.channels
@@ -1995,6 +2109,19 @@ export class DiscordBridge {
     this.lastReply.delete(sessionId);
     this.names.delete(sessionId);
     this.lastFull.delete(sessionId);
+  }
+
+  /** Case removal retires its exact recorded threads without stopping any remaining PTYs. */
+  async caseDeleted(caseKey: string, liveIds: string[] = []): Promise<void> {
+    await this.ensureLoaded();
+    if (this.cfg.mode !== 'full') return;
+    for (const id of liveIds) {
+      this.forgetTab(id);
+      await this.channels.deleted(id, this.cfg.onSessionDelete);
+    }
+    await this.channels.deletedCase(this.cfg, caseKey, this.cfg.onSessionDelete, this.cfg.enabled).catch((err) => {
+      this.last = this.fail(err);
+    });
   }
 
   /** Session tab deleted: apply `onSessionDelete` and forget the mapping. */

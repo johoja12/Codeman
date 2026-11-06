@@ -111,3 +111,11 @@ In **Full mode**, use `/claude`, `/codex`, `/opencode`, `/shell`, or another ena
 The commands also work inside an existing session thread and create a sibling session for the same configured case. They do not change the current thread's agent. Registration happens automatically in the configured Discord server; the bot needs application-command authorization. Unrelated commands are preserved. Disabled commands and commands used outside owned case destinations cannot launch sessions.
 
 Local and linked SSH cases use the same creation service as the web UI and inherit the case's default session group. Unlinked workspaces, ambiguous aliases/names, unavailable cases and Docker cases must be launched through the web UI; Codeman never guesses a replacement host or directory. Existing sessions are left running.
+
+### Joined threads and closing conversations
+
+The bot automatically adds every configured **allowed user** to its owned active session threads, including existing threads after synchronization or restart. This joins the threads for those users without mention spam. Discord still controls sidebar display and notification preferences. Membership is reconciled periodically; a temporary failure retries without replaying a task or recreating a thread. Archived, locked and unowned threads are skipped, and unrelated members are never removed.
+
+New threads use **seven days** of inactivity before auto-archive, Discord's longest supported duration. Discord has no disabled auto-archive setting. Existing active Codeman threads and bot-owned case-channel defaults are brought to the same seven-day setting. Notification-only parent channels that the bot does not own are not modified. No keepalive messages are posted.
+
+Closing/deleting a session applies **When a session is deleted** (archive by default, with delete available). Removing/unlinking a case retires its associated threads using the same policy; another configured alias of that workspace keeps them active. Failed Full-mode retirements are saved and retried. A finished task or an idle agent leaves the conversation open. Removing a case does not terminate remaining live PTYs through the Discord bridge.

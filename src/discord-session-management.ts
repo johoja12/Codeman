@@ -72,7 +72,7 @@ export class DiscordSessionManagement {
     if (!this.deps.allowed() || !this.deps.modes().includes(mode))
       return { text: 'This CLI launch is unavailable. No session was created.' };
     const cases = await this.deps.cases();
-    const matches = cases.filter((c) => configuredDiscordCaseKey(c) === caseKey && !c.unreachable);
+    const matches = cases.filter((c) => configuredDiscordCaseKey(c) === caseKey && !c.unreachable && !c.docker);
     // The shared create endpoint selects by name. Reject aliases/collisions rather than risk another host.
     if (matches.length !== 1 || cases.filter((c) => c.name === matches[0].name).length !== 1)
       return {

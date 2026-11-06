@@ -259,3 +259,27 @@ describe('owned case channels and session threads', () => {
     expect(api.createThread).toHaveBeenCalledTimes(1);
   });
 });
+
+it.each(['archive', 'delete'] as const)('retires all and only the removed case threads with %s', async (policy) => {
+  const m = manager(async (id) => (id === 'unrelated' ? { key: 'b'.repeat(64), name: 'other' } : identity));
+  const a = await m.forSession(scope, 's1'),
+    b = await m.forSession(scope, 's2');
+  const other = await m.forSession(scope, 'unrelated');
+  await m.deletedCase(scope, identity.key, policy, true);
+  for (const id of [a, b]) {
+    if (policy === 'delete') expect(channels.has(id)).toBe(false);
+    else expect(channels.get(id)?.thread_metadata?.archived).toBe(true);
+  }
+  expect(channels.get(other)?.thread_metadata?.archived).toBe(false);
+  await expect(m.forSession(scope, 's1')).rejects.toThrow('deleted');
+  await expect(manager().forSession(scope, 's2')).rejects.toThrow('deleted');
+});
+it('keeps a failed case retirement durable and retries without recreating its thread', async () => {
+  const m = manager();
+  const thread = await m.forSession(scope, 's1');
+  vi.mocked(api.edit).mockRejectedValueOnce(new Error('permission temporary'));
+  await expect(m.deletedCase(scope, identity.key, 'archive', true)).rejects.toThrow('permission temporary');
+  await manager().flushRetirements(scope.guildId);
+  expect(channels.get(thread)?.thread_metadata?.archived).toBe(true);
+  expect(api.createThread).toHaveBeenCalledTimes(1);
+});

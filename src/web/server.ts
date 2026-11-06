@@ -1,4 +1,4 @@
-import { resolveDiscordCase } from '../discord-case-identity.js';
+import { resolveDiscordCase, configuredDiscordCaseKey } from '../discord-case-identity.js';
 import { DiscordSessionManagement } from '../discord-session-management.js';
 import { applyDiscordLaunchDefaults } from './discord-launch-defaults.js';
 import { activeSessionRecoveryActions } from './session-recovery-service.js';
@@ -2243,6 +2243,30 @@ export class WebServer extends EventEmitter {
     registerStatusTelemetryRoutes(this.app, ctx);
     registerSystemRoutes(this.app, ctx);
     registerCaseRoutes(this.app, ctx, {
+      onDeleted: async (target) => {
+        if (isMultiUserMode()) return;
+        const key = configuredDiscordCaseKey(target);
+        if (!key) return;
+        // Another configured alias still owns this root: removing only that alias must not retire it.
+        const remaining = await this.discordCases?.();
+        if (!remaining || remaining.some((c) => configuredDiscordCaseKey(c) === key)) return;
+        const liveIds = [...this.sessions.values()]
+          .filter(
+            (session) =>
+              resolveDiscordCase(
+                {
+                  id: session.id,
+                  workingDir: session.workingDir,
+                  owner: session.owner,
+                  remote: session.remote,
+                  docker: session.docker,
+                },
+                [...remaining, target]
+              ).key === key
+          )
+          .map((session) => session.id);
+        await this.discordBridge.caseDeleted(key, liveIds);
+      },
       onListReady: (reader) => {
         this.discordCases = () => {
           if (isMultiUserMode()) throw new Error('Identity mapping required');

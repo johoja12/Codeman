@@ -430,6 +430,22 @@ export class DiscordCaseThreads {
     });
     if (guild) await this.flushRetirements(guild);
   }
+  async deletedCase(scope: DiscordChannelScope, caseKey: string, policy: Policy, enabled: boolean): Promise<void> {
+    await this.load();
+    const ids = new Set(
+      Object.values(this.state.entries)
+        .filter(
+          (e) =>
+            e.guildId === scope.guildId &&
+            e.categoryId === scope.categoryId &&
+            e.caseKey === caseKey &&
+            ['active', 'intent', 'posting', 'thread'].includes(e.phase)
+        )
+        .map((e) => e.sessionId)
+    );
+    for (const id of ids) await this.deleted(id, policy);
+    if (enabled) await this.flushRetirements(scope.guildId);
+  }
   flushRetirements(guild: string): Promise<void> {
     if (this.retirement) return this.retirement;
     const run = (async () => {
