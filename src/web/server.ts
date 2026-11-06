@@ -1,5 +1,6 @@
 import { resolveDiscordCase } from '../discord-case-identity.js';
 import { DiscordSessionManagement } from '../discord-session-management.js';
+import { applyDiscordLaunchDefaults } from './discord-launch-defaults.js';
 import { activeSessionRecoveryActions } from './session-recovery-service.js';
 import { isRecoveryDismissed } from '../session-recovery-fence.js';
 import { discordTaskControl, discordControlCurrent } from '../discord-task-controls.js';
@@ -2258,7 +2259,8 @@ export class WebServer extends EventEmitter {
         this.discordCreate = async (body) => {
           if (isMultiUserMode() || !this.discordBridge.acceptsControls)
             throw new Error('Discord lifecycle unavailable');
-          const result = (await create({ body, headers: {} } as import('fastify').FastifyRequest)) as {
+          const launchBody = await applyDiscordLaunchDefaults(body);
+          const result = (await create({ body: launchBody, headers: {} } as import('fastify').FastifyRequest)) as {
             session?: { id?: string };
           };
           const session = result.session?.id ? this.sessions.get(result.session.id) : undefined;
