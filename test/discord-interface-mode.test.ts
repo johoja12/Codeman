@@ -525,7 +525,8 @@ describe('Discord interface mode', () => {
     const historical = () =>
       posts.filter(
         (p) =>
-          visibleText(p.body)?.startsWith('**Historical context**') || p.body?.embeds?.[0]?.title === 'Latest response'
+          visibleText(p.body)?.startsWith('**Historical context**') ||
+          p.body?.components?.[0]?.components?.[0]?.content === '**Latest response**'
       );
     expect(historical()).toHaveLength(12);
     expect(historical()[0].body?.content).toContain('historic 14');
@@ -550,7 +551,10 @@ describe('Discord interface mode', () => {
     const b = makeBridge(undefined, { history });
     await b.reload();
     await b.syncSessions();
-    const cards = posts.filter((p) => p.body?.embeds?.some((e: { description?: string }) => e.description));
+    const cards = posts.filter(
+      (p) =>
+        p.body?.flags === 32772 && p.body?.components?.some((c: any) => c.type === 10 && !c.content?.startsWith('-#'))
+    );
     expect(cards.length).toBeGreaterThan(1);
     expect(cards.map((p) => visibleText(p.body)).join('\n')).toContain('Last row preserved.');
     expect(
@@ -564,9 +568,12 @@ describe('Discord interface mode', () => {
     const again = makeBridge(undefined, { history });
     await again.reload();
     await again.syncSessions();
-    expect(posts.filter((p) => p.body?.embeds?.some((e: { description?: string }) => e.description))).toHaveLength(
-      count
-    );
+    expect(
+      posts.filter(
+        (p) =>
+          p.body?.flags === 32772 && p.body?.components?.some((c: any) => c.type === 10 && !c.content?.startsWith('-#'))
+      )
+    ).toHaveLength(count);
     expect(sendInput).not.toHaveBeenCalled();
   });
   it('keeps other session channels available when one transcript is unavailable and retries without recreating destinations', async () => {
@@ -853,7 +860,7 @@ describe('Discord interface mode', () => {
     const b = makeBridge(undefined, { history });
     await b.reload();
     await b.syncSessions();
-    const contexts = posts.filter((p) => p.body?.embeds?.[0]?.title === 'Latest response');
+    const contexts = posts.filter((p) => p.body?.components?.[0]?.components?.[0]?.content === '**Latest response**');
     expect(contexts).toHaveLength(1);
     expect(visibleText(contexts[0].body)).toContain('History answer');
     expect(visibleText(contexts[0].body)).not.toContain('oai-mem');
@@ -897,7 +904,7 @@ describe('Discord interface mode', () => {
     const b = makeBridge(undefined, { history, control: async () => ({ text: table('Requested history') }) });
     await b.reload();
     await b.syncSessions();
-    const past = posts.find((p) => p.body?.embeds?.[0]?.title === 'Latest response');
+    const past = posts.find((p) => p.body?.components?.[0]?.components?.[0]?.content === '**Latest response**');
     expect(visibleText(past?.body)).toContain('**Item:** Historical');
     expect(visibleText(past?.body)).toContain('**Status:** Long status');
     expect(visibleText(past?.body)).not.toContain('```');
