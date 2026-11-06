@@ -179,6 +179,231 @@ afterEach(async () => {
 });
 
 describe('Discord interface mode', () => {
+  it.each(['plain', 'embed'] as const)(
+    'quotes the exact %s response and preserves the new prompt once',
+    async (kind) => {
+      const b = makeBridge();
+      await b.reload();
+      await b.syncSessions();
+      const thread = (await readFullMap(dir)).s1;
+      const sourceId = '987654321000000001';
+      remoteMessages.set(sourceId, {
+        id: sourceId,
+        channel_id: thread,
+        author: { id: BOT },
+        ...(kind === 'plain'
+          ? { content: 'First step\nSecond step' }
+          : {
+              content: '',
+              embeds: [
+                {
+                  title: 'Response',
+                  description: 'First step\nSecond step',
+                  fields: [{ name: 'Tests', value: 'Passed' }],
+                },
+              ],
+            }),
+      });
+      const m = {
+        id: '900000000000000001',
+        guild_id: cfg.guildId,
+        channel_id: thread,
+        author: { id: cfg.allowedUserIds[0] },
+        content: 'Explain step 2\nKeep the code unchanged.',
+        message_reference: { message_id: sourceId, channel_id: thread, guild_id: cfg.guildId },
+        referenced_message: { content: 'Forged gateway snapshot' },
+      };
+      await b.onGatewayMessage(m);
+      await b.onGatewayMessage(m);
+      expect(sendInput).toHaveBeenCalledTimes(1);
+      const [id, text] = sendInput.mock.calls[0];
+      expect(id).toBe('s1');
+      expect(text).toContain('> First step\n> Second step');
+      expect(text).toContain('[New user message]\nExplain step 2\nKeep the code unchanged.\r');
+      expect(text).toContain(sourceId);
+      expect(text).not.toContain('Forged gateway snapshot');
+      if (kind === 'embed') expect(text).toContain('> Tests\n> \n> Passed');
+    }
+  );
+
+  it.each(['deleted', 'foreign', 'channel', 'guild', 'empty', 'large', 'cross-thread', 'forward', 'malformed'])(
+    'refuses %s reply context without submitting bare ambiguous input',
+    async (kind) => {
+      const b = makeBridge();
+      await b.reload();
+      await b.syncSessions();
+      const map = await readFullMap(dir),
+        sourceId = '987654321000000001';
+      const source = {
+        id: sourceId,
+        channel_id: map.s1,
+        author: { id: BOT },
+        content: 'Original response',
+        guild_id: cfg.guildId,
+      };
+      if (kind === 'foreign') source.author.id = cfg.allowedUserIds[0];
+      if (kind === 'channel') source.channel_id = map.s2;
+      if (kind === 'guild') source.guild_id = '999999999999999999';
+      if (kind === 'empty') source.content = '';
+      if (kind === 'large') source.content = 'x'.repeat(10001);
+      if (kind !== 'deleted') remoteMessages.set(sourceId, source);
+      await b.onGatewayMessage({
+        id: '900000000000000001',
+        guild_id: cfg.guildId,
+        channel_id: map.s1,
+        author: { id: cfg.allowedUserIds[0] },
+        content: 'Change this',
+        message_reference: {
+          message_id: kind === 'malformed' ? '../other' : sourceId,
+          channel_id: kind === 'cross-thread' ? map.s2 : map.s1,
+          type: kind === 'forward' ? 1 : 0,
+        },
+      });
+      expect(sendInput).not.toHaveBeenCalled();
+      expect(posts.some((p) => p.body?.content?.includes('Could not include the replied-to message'))).toBe(true);
+      if (['cross-thread', 'forward', 'malformed'].includes(kind))
+        expect(posts.some((p) => p.method === 'GET' && p.path.endsWith('/messages/' + sourceId))).toBe(false);
+    }
+  );
+
+  it('abandons a reference read if the bridge stops while Discord is responding', async () => {
+    const b = makeBridge();
+    await b.reload();
+    await b.syncSessions();
+    const thread = (await readFullMap(dir)).s1,
+      sourceId = '987654321000000001';
+    const source = { id: sourceId, channel_id: thread, author: { id: BOT } };
+    Object.defineProperty(source, 'content', {
+      enumerable: true,
+      get: () => {
+        b.stop();
+        return 'Original answer';
+      },
+    });
+    remoteMessages.set(sourceId, source);
+    await b.onGatewayMessage({
+      id: '900000000000000001',
+      guild_id: cfg.guildId,
+      channel_id: thread,
+      author: { id: cfg.allowedUserIds[0] },
+      content: 'Change this',
+      message_reference: { message_id: sourceId },
+    });
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it('enforces the combined prompt limit without truncating context or sending partial input', async () => {
+    const b = makeBridge();
+    await b.reload();
+    await b.syncSessions();
+    const thread = (await readFullMap(dir)).s1,
+      sourceId = '987654321000000001';
+    remoteMessages.set(sourceId, { id: sourceId, channel_id: thread, author: { id: BOT }, content: 'x'.repeat(9000) });
+    await b.onGatewayMessage({
+      id: '900000000000000001',
+      guild_id: cfg.guildId,
+      channel_id: thread,
+      author: { id: cfg.allowedUserIds[0] },
+      content: 'y'.repeat(12000),
+      message_reference: { message_id: sourceId },
+    });
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(posts.some((p) => p.body?.content?.includes('exceed the prompt limit'))).toBe(true);
+  });
+
+  it('keeps commands out of reply context handling', async () => {
+    const control = vi.fn(async () => ({ text: 'Help' }));
+    const b = makeBridge(undefined, { control });
+    await b.reload();
+    await b.syncSessions();
+    const thread = (await readFullMap(dir)).s1;
+    await b.onGatewayMessage({
+      id: '900000000000000001',
+      guild_id: cfg.guildId,
+      channel_id: thread,
+      author: { id: cfg.allowedUserIds[0] },
+      content: '!codeman help',
+      message_reference: { message_id: '987654321000000001' },
+    });
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(posts.some((p) => p.path.endsWith('/messages/987654321000000001'))).toBe(false);
+  });
+
+  it.each(['Queue next', 'Send now'])('preserves verified reply context through %s', async (timing) => {
+    sessions = [{ id: 's1', name: 'one', working: true }];
+    const nativeUi: import('../src/discord-native-ui-types.js').DiscordNativeUiServices = {
+      enabled: () => true,
+      sessions: async () => [
+        {
+          id: 's1',
+          name: 'one',
+          mode: 'codex',
+          host: 'local',
+          caseName: 'case',
+          conversation: 'conv',
+          inputRevision: 'rev',
+          working: true,
+          pending: false,
+          exited: false,
+          ready: false,
+        },
+      ],
+      submitQueued: vi.fn(async () => 'accepted'),
+      cases: async () => [],
+      defaults: async () => ({ model: '', effort: '', approval: '' }),
+      saveDefaults: async () => {},
+      question: () => undefined,
+      answer: async () => '',
+      workspace: async () => ({ summary: '', diff: '' }),
+    };
+    const b = makeBridge(undefined, {
+      nativeUi,
+      history: async () => ({ conversationId: 'conv', turns: [], partial: false }),
+    });
+    await b.reload();
+    await b.syncSessions();
+    const thread = (await readFullMap(dir)).s1,
+      sourceId = '987654321000000001';
+    remoteMessages.set(sourceId, { id: sourceId, channel_id: thread, author: { id: BOT }, content: 'Original answer' });
+    await b.onGatewayMessage({
+      id: '900000000000000001',
+      guild_id: cfg.guildId,
+      channel_id: thread,
+      author: { id: cfg.allowedUserIds[0] },
+      content: 'Change this',
+      message_reference: { message_id: sourceId },
+    });
+    const offered = [...remoteMessages.values()].findLast((m) =>
+      m.content?.includes('When should this follow-up run?')
+    );
+    expect(offered).toBeDefined();
+    const button = offered.components.flatMap((r: any) => r.components).find((c: any) => c.label === timing);
+    await b.onGatewayInteraction({
+      id: '900000000000000002',
+      application_id: BOT,
+      token: 'fake-token',
+      type: 3,
+      guild_id: cfg.guildId,
+      channel_id: thread,
+      member: { user: { id: cfg.allowedUserIds[0] } },
+      message: { id: offered.id },
+      data: { custom_id: button.custom_id },
+    });
+    remoteMessages.get(sourceId).content = 'Edited later';
+    if (timing === 'Queue next') {
+      const store = JSON.parse(await readFile(join(dir, 'discord-native-ui.json'), 'utf8'));
+      expect(store.queue).toHaveLength(1);
+      expect(store.queue[0].text).toContain('> Original answer');
+      expect(store.queue[0].text).toContain('[New user message]\nChange this');
+      expect(store.queue[0].text).not.toContain('Edited later');
+      expect(sendInput).not.toHaveBeenCalled();
+    } else {
+      expect(sendInput).toHaveBeenCalledTimes(1);
+      expect(sendInput).toHaveBeenCalledWith('s1', expect.stringContaining('> Original answer'));
+      expect(sendInput.mock.calls[0][1]).toContain('[New user message]\nChange this\r');
+    }
+  });
+
   it('reacts to a native session update even when the thread name did not change', async () => {
     let now = 1_000;
     sessions = [{ id: 's1', name: 'hs-lab', working: false }];

@@ -297,3 +297,9 @@ Full mode maintains an owned session control card in each active session thread 
 Menus are bound to the allowed actor, origin channel, current configuration and exact conversation. They expire after six minutes; use `/codeman` or `!codeman ui` to reopen them after restart or expiry. Session/card state and queue ownership survive restart. Legacy Notifications mode is unchanged. A failed UI-state read pauses the queue instead of discarding its ownership or deduplication metadata. `GET /api/discord` includes `nativeUiError` when a card/queue synchronization problem needs attention.
 
 The bot needs the existing guild application-command scope for slash/context actions. Command registration is guild-scoped and never bulk-overwrites unrelated commands. Pinning is optional; no Administrator permission is required.
+
+### Replies to assistant messages
+
+Use Discord **Reply** on a Codeman response, then write “change this” or “explain step 3.” The prompt includes the selected message’s visible text (including response-card titles, descriptions and fields) as quoted conversation context, followed by your new message. Only that message is included, not adjacent response chunks or the reply chain. Referenced attachments are not downloaded. The bridge fetches the message when preparing input and verifies Codeman authored it in the same session thread; gateway snapshots are not trusted. Deleted, inaccessible, empty, oversized, foreign-author or cross-thread references fail visibly without submitting your prompt. Quoted context is limited to 10,000 characters and the combined prompt uses the normal 20,000-character limit.
+
+Send now and Queue next preserve this context: it is fetched when you choose the action, then stored with the queued prompt. Once queued, later edits to the referenced message do not change that snapshot. Ordinary messages and explicit `!codeman` commands keep their existing behavior.
