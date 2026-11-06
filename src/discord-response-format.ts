@@ -147,25 +147,68 @@ export function formatDiscordResponseText(text: string): string {
   return out.join('\n');
 }
 
-/** Chat-width response text; only the first part can ping, and body URLs never unfurl. */
+/** Compact colored header with chat-width Markdown outside the container. */
+export const DISCORD_COMPONENTS_V2 = 1 << 15;
 export function discordResponsePosts(
   text: string,
   options: {
     title?: string;
     color?: number;
     users?: string[];
+    subtitle?: string;
+    controls?: DiscordPost['components'];
   } = {}
 ): DiscordPost[] {
   const users = options.users ?? [];
-  const severity =
-    options.color === DISCORD_CRITICAL_COLOR ? '🔴 ' : options.color === DISCORD_WARNING_COLOR ? '⚠️ ' : '';
   const title = (options.title ?? 'Response').slice(0, 120);
   const mentions = users.map((id) => `<@${id}>`).join(' ');
-  const heading = `${mentions ? mentions + '\n' : ''}**${severity}${title}**\n\n`;
-  const chunks = splitMarkdown(heading + formatDiscordResponseText(text), 1900);
-  return chunks.map((content, index) => ({
-    content: content + (chunks.length > 1 ? `\n-# ${index + 1} / ${chunks.length}` : ''),
-    flags: 4, // SUPPRESS_EMBEDS: retain links without replacing the narrow card with link previews.
+  const chunks = splitMarkdown((mentions ? mentions + '\n' : '') + formatDiscordResponseText(text), 1900);
+  return chunks.map((body, index) => ({
+    content: '', // Removed at the API boundary; V2 uses Text Display components.
+    flags: DISCORD_COMPONENTS_V2 | 4,
+    components: [
+      ...(index === 0
+        ? [
+            {
+              type: 17,
+              accent_color: options.color ?? DISCORD_RESPONSE_COLOR,
+              components: [
+                {
+                  type: 10,
+                  content: `**${title}**${options.subtitle ? '\n-# ' + options.subtitle.slice(0, 160) : ''}`,
+                },
+              ],
+            },
+          ]
+        : []),
+      { type: 10, content: body },
+      ...(chunks.length > 1 ? [{ type: 10, content: `-# ${index + 1} / ${chunks.length}` }] : []),
+      ...(index === chunks.length - 1 && options.controls?.length
+        ? [{ type: 14, divider: true, spacing: 1 }, ...options.controls]
+        : []),
+    ],
     allowed_mentions: { parse: [], users: index === 0 ? users : [] },
   }));
+}
+/** One durable, editable native progress message; no completion is inferred from its prose. */
+export function discordProgressPost(
+  status: string,
+  update: string,
+  count: number,
+  controls: DiscordPost['components'] = []
+): DiscordPost {
+  const compact = update.replace(/\s+/g, ' ').slice(0, 420);
+  return {
+    content: '',
+    flags: DISCORD_COMPONENTS_V2 | 4,
+    allowed_mentions: { parse: [], users: [] },
+    components: [
+      {
+        type: 10,
+        content: `-# ${status}${count ? ' · ' + count + ' progress update' + (count === 1 ? '' : 's') : ''}`,
+      },
+      ...(compact ? [{ type: 10, content: compact }] : []),
+      ...controls,
+    ],
+  };
 }
