@@ -1788,3 +1788,20 @@ it('does not infer a web-visible result from text repeated in a prompt or earlie
   turns.unshift({ cursor: 'older', role: 'assistant', text: sentence, timestamp: '', phase: 'final_answer' });
   expect((await b.completionResponse(entry.id)).viewAnchor).toBeUndefined();
 });
+it('does not block an authorized reply when completion review storage is unavailable', async () => {
+  sessions = [{ id: 's1', name: 'one' }];
+  await writeFile(join(dir, 'completion-inbox.json'), 'not valid JSON');
+  const b = makeBridge();
+  await b.reload();
+  await b.syncSessions();
+  const map = await readFullMap(dir);
+  const id = (((BigInt(Date.now()) - 1420070400000n) << 22n) + 1n).toString();
+  await b.onGatewayMessage({
+    id,
+    guild_id: cfg.guildId,
+    channel_id: map.s1,
+    author: { id: cfg.allowedUserIds[0] },
+    content: 'Continue with the next step',
+  });
+  expect(sendInput).toHaveBeenCalledTimes(1);
+});

@@ -2975,7 +2975,7 @@ export class DiscordBridge {
         !/^!codeman(?:\s|$)/i.test(m.content ?? '')
       )
         await this.reviewCompletions(
-          (await this.completionEntries())
+          (await this.completionEntries().catch(() => []))
             .filter(
               (e) =>
                 e.session === mappedSessionId &&
@@ -2985,7 +2985,9 @@ export class DiscordBridge {
             )
             .map((e) => e.id),
           'discord'
-        );
+        ).catch(() => {
+          this.last = this.fail(new BridgeProblem('Completion review unavailable; reply delivery continues'));
+        });
       if (caseKey && !/^!codeman(?:\s|$)/i.test(m.content ?? '')) {
         const live = this.deps.sessions?.() ?? [];
         const threads = this.channels
