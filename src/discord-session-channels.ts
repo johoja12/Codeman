@@ -12,7 +12,8 @@ export interface DiscordManagedChannel {
   topic?: string | null;
   name?: string;
   owner_id?: string;
-  thread_metadata?: { archived: boolean; locked?: boolean };
+  thread_metadata?: { archived: boolean; locked?: boolean; auto_archive_duration?: number };
+  default_auto_archive_duration?: number;
   permission_overwrites?: Array<{ id: string; type: number; allow: string; deny: string }>;
 }
 export interface DiscordChannelApi {
@@ -243,6 +244,7 @@ export class DiscordSessionChannels {
         parent_id: scope.categoryId,
         name: (this.options.name ?? discordSessionChannelName)(name, id),
         topic: this.marker(e),
+        default_auto_archive_duration: 10080,
         permission_overwrites: category.permission_overwrites ?? [],
       });
     } catch (err) {

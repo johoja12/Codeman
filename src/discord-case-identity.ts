@@ -56,7 +56,8 @@ export function resolveDiscordCase(session: DiscordCaseSession, cases: CaseInfo[
 
 /** Exact configured root identity for launching from a case channel, including empty cases. */
 export function configuredDiscordCaseKey(c: CaseInfo): string | undefined {
-  if (c.docker) return undefined; // Container launch has a separate lifecycle; never fall back to the host.
+  if (c.docker)
+    return key(['@single', 'docker', c.docker.hostId, c.docker.container, c.docker.containerWorkdir ?? c.docker.path]);
   if (c.remote) {
     if (!posix.isAbsolute(c.remote.path)) return undefined;
     return key(['@single', 'ssh', c.remote.hostId, c.remote.username, posix.normalize(c.remote.path)]);

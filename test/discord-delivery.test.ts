@@ -390,8 +390,9 @@ describe('inbound submission safety', () => {
   it('refuses a changed rendering plan after part of a response has been delivered', async () => {
     let count = 0;
     let refuse = false;
-    const { b } = await ready(undefined, async (url) => {
+    const { b } = await ready(undefined, async (url, init) => {
       if (url.pathname.endsWith('/threads')) return Response.json({ id: THREAD });
+      if (init.method !== 'POST' || !url.pathname.endsWith('/messages')) return Response.json({ id: MESSAGE });
       count++;
       return refuse && count === 3 ? Response.json({}, { status: 403 }) : Response.json({ id: MESSAGE });
     });

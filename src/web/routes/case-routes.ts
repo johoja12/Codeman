@@ -438,7 +438,10 @@ async function caseVisibleToCaller(name: string, req: FastifyRequest): Promise<b
 export function registerCaseRoutes(
   app: FastifyInstance,
   ctx: EventPort & ConfigPort & SessionPort & TabLayoutPort,
-  options: { onListReady?: (read: (req: FastifyRequest) => Promise<CaseInfo[]>) => void } = {}
+  options: {
+    onListReady?: (read: (req: FastifyRequest) => Promise<CaseInfo[]>) => void;
+    onDeleted?: (target: CaseInfo) => Promise<void>;
+  } = {}
 ): void {
   const localSelectionMetadata = (
     owner: string | undefined,
@@ -2391,6 +2394,11 @@ export function registerCaseRoutes(
   app.delete('/api/cases/:name', async (req): Promise<ApiResponse<{ name: string }>> => {
     const { name } = req.params as { name: string };
     const user = getAuthUser(req);
+    const notifyDeleted = (target: CaseInfo): void => {
+      void Promise.resolve()
+        .then(() => options.onDeleted?.(target))
+        .catch(() => undefined);
+    };
     // The caller's default session group for this case goes with it (best-effort:
     // a stale value is ignored at creation anyway).
     // An admin deleting another user's remote/Docker case clears that owner's too.
@@ -2415,12 +2423,25 @@ export function registerCaseRoutes(
     const remoteCases = await readRemoteCases(CODEMAN_CONFIG_DIR);
     const remoteCase = remoteCases.find((item) => item.name === name && canAccessOwned(user, item.owner));
     if (remoteCase) {
+      const deletedHost = (await readRemoteHosts(CODEMAN_CONFIG_DIR)).find((h) => h.id === remoteCase.hostId);
       await writeRemoteCases(
         CODEMAN_CONFIG_DIR,
         remoteCases.filter((item) => !(item.name === name && canAccessOwned(user, item.owner)))
       );
       ctx.store.deleteCaseDefaultGroup(ownerLayoutKey(ownerFor(req)), name);
       ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'remote-unlinked' });
+      if (deletedHost)
+        notifyDeleted({
+          name,
+          path: remoteCase.remotePath,
+          location: 'remote',
+          remote: {
+            hostId: deletedHost.id,
+            host: deletedHost.host,
+            username: deletedHost.username,
+            path: remoteCase.remotePath,
+          },
+        });
       await forgetCaseDefault(remoteCase.owner);
       return { success: true, data: { name } };
     }
@@ -2455,6 +2476,17 @@ export function registerCaseRoutes(
           .catch(() => {});
       }
       ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'docker-unlinked' });
+      notifyDeleted({
+        name,
+        path: dockerCase.hostWorkspacePath,
+        location: 'docker',
+        docker: {
+          hostId: dockerCase.hostId,
+          container: dockerCase.container ?? dockerContainerName(name),
+          path: dockerCase.hostWorkspacePath,
+          containerWorkdir: dockerCase.containerWorkdir ?? dockerCase.hostWorkspacePath,
+        },
+      });
       await forgetCaseDefault(dockerCase.owner);
       return { success: true, data: { name } };
     }
@@ -2464,12 +2496,14 @@ export function registerCaseRoutes(
     // must not unlink one either; skip so control falls through to their local delete.
     const linkedCases = await readLinkedCases();
     if (linkedCases[name] && (!isMultiUserMode() || isAdmin(req))) {
+      const deletedPath = linkedCases[name];
       delete linkedCases[name];
       try {
         await fs.writeFile(LINKED_CASES_FILE, JSON.stringify(linkedCases, null, 2));
         ctx.store.deleteCaseDefaultGroup(ownerLayoutKey(ownerFor(req)), name);
         ctx.store.deleteCaseCodexCommandSelection(codexProfileOwner(ownerFor(req)), name);
         ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'unlinked' });
+        notifyDeleted({ name, path: deletedPath, location: 'linked-local' });
         await forgetCaseDefault();
         return { success: true, data: { name } };
       } catch (err) {
@@ -2488,6 +2522,7 @@ export function registerCaseRoutes(
       ctx.store.deleteCaseDefaultGroup(ownerLayoutKey(ownerFor(req)), name);
       ctx.store.deleteCaseCodexCommandSelection(codexProfileOwner(ownerFor(req)), name);
       ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'deleted' });
+      notifyDeleted({ name, path: casePath, location: 'local' });
       await forgetCaseDefault();
       return { success: true, data: { name } };
     } catch (err) {
