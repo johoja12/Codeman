@@ -304,6 +304,7 @@ interface DiscordBoundAction {
 }
 export interface DiscordPost {
   content: string;
+  flags?: number;
   allowed_mentions: { parse: string[]; users: string[] };
   nonce?: string;
   enforce_nonce?: boolean;

@@ -147,7 +147,7 @@ export function formatDiscordResponseText(text: string): string {
   return out.join('\n');
 }
 
-/** One card per bounded chunk; only the first card can ping, and no body URL can unfurl. */
+/** Chat-width response text; only the first part can ping, and body URLs never unfurl. */
 export function discordResponsePosts(
   text: string,
   options: {
@@ -156,17 +156,16 @@ export function discordResponsePosts(
     users?: string[];
   } = {}
 ): DiscordPost[] {
-  const chunks = splitMarkdown(formatDiscordResponseText(text), 3900);
-  return chunks.map((description, index) => ({
-    content: index === 0 ? (options.users ?? []).map((id) => `<@${id}>`).join(' ') : '',
-    embeds: [
-      {
-        ...(index === 0 ? { title: (options.title ?? 'Response').slice(0, 120) } : {}),
-        description,
-        color: options.color ?? DISCORD_RESPONSE_COLOR,
-        ...(chunks.length > 1 ? { footer: { text: `${index + 1} / ${chunks.length}` } } : {}),
-      },
-    ],
-    allowed_mentions: { parse: [], users: index === 0 ? (options.users ?? []) : [] },
+  const users = options.users ?? [];
+  const severity =
+    options.color === DISCORD_CRITICAL_COLOR ? '🔴 ' : options.color === DISCORD_WARNING_COLOR ? '⚠️ ' : '';
+  const title = (options.title ?? 'Response').slice(0, 120);
+  const mentions = users.map((id) => `<@${id}>`).join(' ');
+  const heading = `${mentions ? mentions + '\n' : ''}**${severity}${title}**\n\n`;
+  const chunks = splitMarkdown(heading + formatDiscordResponseText(text), 1900);
+  return chunks.map((content, index) => ({
+    content: content + (chunks.length > 1 ? `\n-# ${index + 1} / ${chunks.length}` : ''),
+    flags: 4, // SUPPRESS_EMBEDS: retain links without replacing the narrow card with link previews.
+    allowed_mentions: { parse: [], users: index === 0 ? users : [] },
   }));
 }
