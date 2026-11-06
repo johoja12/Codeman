@@ -192,38 +192,12 @@ describe('Discord interface mode', () => {
     now += 100;
     await b.sessionRenamed('s1', 'hs-lab');
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · hs-lab');
     expect(posts.some((p) => p.path.endsWith('/typing'))).toBe(true);
     expect(sendInput).not.toHaveBeenCalled();
   });
 
-  it('keeps a stable name through repeated background wakeups, synchronization and restart', async () => {
-    let now = 1_000;
-    sessions = [{ id: 's1', name: 'hs-lab', working: false }];
-    const b = makeBridge(undefined, { now: () => now });
-    await b.reload();
-    await b.syncSessions();
-    const thread = (await readFullMap(dir)).s1;
-    posts = [];
-    for (let i = 0; i < 8; i++) {
-      sessions[0].working = i % 2 === 0;
-      now += 120_000;
-      await b.sessionRenamed('s1', 'hs-lab');
-      await b.pollActivity();
-      await b.syncSessions();
-      expect(remoteChannels.get(thread).name).toBe('hs-lab');
-    }
-    const restarted = makeBridge(undefined, { now: () => now });
-    await restarted.reload();
-    await restarted.syncSessions();
-    await restarted.pollActivity();
-    const titleEdits = posts.filter((p) => p.method === 'PATCH' && p.path.endsWith('/' + thread) && p.body?.name);
-    expect(titleEdits).toHaveLength(0);
-    expect(posts.some((p) => p.path.endsWith('/typing'))).toBe(true);
-    expect(sendInput).not.toHaveBeenCalled();
-  });
-
-  it('keeps typing while a legacy activity title cleanup is rate limited', async () => {
+  it('keeps typing when an existing Idle thread cannot be renamed yet, without inline retries', async () => {
     let now = 1_000;
     sessions = [{ id: 's1', name: 'hs-lab', working: false }];
     const b = makeBridge(undefined, { now: () => now });
@@ -235,12 +209,11 @@ describe('Discord interface mode', () => {
     await b.pollActivity();
     expect(titleEdits()).toHaveLength(0);
     expect(typing()).toHaveLength(0);
-    remoteChannels.get(thread).name = '🟢 Idle · hs-lab';
     sessions[0].working = true;
     activityRenameRetryAfter = 120;
     now += 4_000;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('🟢 Idle · hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('⚫ Idle · hs-lab');
     expect(typing()).toHaveLength(1);
     expect(titleEdits()).toHaveLength(1);
     now += 8_000;
@@ -250,7 +223,7 @@ describe('Discord interface mode', () => {
     activityRenameRetryAfter = undefined;
     now += 120_000;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · hs-lab');
     expect(titleEdits()).toHaveLength(2);
     expect(sendInput).not.toHaveBeenCalled();
   });
@@ -263,10 +236,10 @@ describe('Discord interface mode', () => {
     await b.syncSessions();
     const thread = (await readFullMap(dir)).s1;
     await b.pollActivity();
-    remoteChannels.get(thread).name = '🟢 Idle · hs-lab';
+    remoteChannels.get(thread).name = '⚫ Idle · hs-lab';
     now += 8_000;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · hs-lab');
     expect(sendInput).not.toHaveBeenCalled();
   });
 
@@ -279,18 +252,18 @@ describe('Discord interface mode', () => {
     await b.syncSessions();
     const thread = (await readFullMap(dir)).s1;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · hs-lab');
     const typing = () => posts.filter((p) => p.method === 'POST' && p.path.endsWith('/typing'));
     expect(typing().at(-1)?.path).toBe(`/api/v10/channels/${thread}/typing`);
     const count = typing().length;
     waiting = true;
     now += 30_000;
     await b.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🔴 Needs input · hs-lab');
     expect(typing()).toHaveLength(count);
-    // Synchronization must keep the same stable title.
+    // Synchronization must not strip the activity label.
     await b.syncSessions();
-    expect(remoteChannels.get(thread).name).toBe('hs-lab');
+    expect(remoteChannels.get(thread).name).toBe('🔴 Needs input · hs-lab');
     await writeDiscordConfig(dir, { ...cfg, enabled: false });
     await b.reload();
     waiting = false;
@@ -520,7 +493,8 @@ describe('Discord interface mode', () => {
     const historical = () =>
       posts.filter(
         (p) =>
-          visibleText(p.body)?.startsWith('**Historical context**') || p.body?.embeds?.[0]?.title === 'Latest response'
+          visibleText(p.body)?.startsWith('**Historical context**') ||
+          visibleText(p.body)?.startsWith('**Latest response**')
       );
     expect(historical()).toHaveLength(12);
     expect(historical()[0].body?.content).toContain('historic 14');
@@ -545,7 +519,7 @@ describe('Discord interface mode', () => {
     const b = makeBridge(undefined, { history });
     await b.reload();
     await b.syncSessions();
-    const cards = posts.filter((p) => p.body?.embeds?.some((e: { description?: string }) => e.description));
+    const cards = posts.filter((p) => visibleText(p.body)?.includes('Details preserved.'));
     expect(cards.length).toBeGreaterThan(1);
     expect(cards.map((p) => visibleText(p.body)).join('\n')).toContain('Last row preserved.');
     expect(
@@ -559,9 +533,7 @@ describe('Discord interface mode', () => {
     const again = makeBridge(undefined, { history });
     await again.reload();
     await again.syncSessions();
-    expect(posts.filter((p) => p.body?.embeds?.some((e: { description?: string }) => e.description))).toHaveLength(
-      count
-    );
+    expect(posts.filter((p) => visibleText(p.body)?.includes('Details preserved.'))).toHaveLength(count);
     expect(sendInput).not.toHaveBeenCalled();
   });
   it('keeps other session channels available when one transcript is unavailable and retries without recreating destinations', async () => {
@@ -844,7 +816,7 @@ describe('Discord interface mode', () => {
     const b = makeBridge(undefined, { history });
     await b.reload();
     await b.syncSessions();
-    const contexts = posts.filter((p) => p.body?.embeds?.[0]?.title === 'Latest response');
+    const contexts = posts.filter((p) => visibleText(p.body)?.startsWith('**Latest response**'));
     expect(contexts).toHaveLength(1);
     expect(visibleText(contexts[0].body)).toContain('History answer');
     expect(visibleText(contexts[0].body)).not.toContain('oai-mem');
@@ -888,7 +860,7 @@ describe('Discord interface mode', () => {
     const b = makeBridge(undefined, { history, control: async () => ({ text: table('Requested history') }) });
     await b.reload();
     await b.syncSessions();
-    const past = posts.find((p) => p.body?.embeds?.[0]?.title === 'Latest response');
+    const past = posts.find((p) => visibleText(p.body)?.startsWith('**Latest response**'));
     expect(visibleText(past?.body)).toContain('**Item:** Historical');
     expect(visibleText(past?.body)).toContain('**Status:** Long status');
     expect(visibleText(past?.body)).not.toContain('```');
@@ -1381,7 +1353,7 @@ it('reports a missing canonical response once instead of sending cursor-painted 
   await b.notify(msg);
   now += 10000;
   await b.notify(msg);
-  const notices = posts.filter((p) => p.body?.embeds?.[0]?.title === 'Reconnecting to this conversation');
+  const notices = posts.filter((p) => visibleText(p.body)?.includes('Reconnecting to this conversation'));
   expect(notices).toHaveLength(1);
   expect(posts.some((p) => JSON.stringify(p.body ?? {}).includes('happen between these recorded'))).toBe(false);
   expect(sendInput).not.toHaveBeenCalled();
@@ -1400,6 +1372,6 @@ it('does not show a reconnect notice for a connected session with no assistant r
     fullText: async () => undefined,
     tail: 'Ask Codex to do anything',
   });
-  expect(posts.some((p) => p.body?.embeds?.[0]?.title === 'Reconnecting to this conversation')).toBe(false);
+  expect(posts.some((p) => visibleText(p.body)?.includes('Reconnecting to this conversation'))).toBe(false);
   expect(posts.some((p) => JSON.stringify(p.body ?? {}).includes('Ask Codex to do anything'))).toBe(false);
 });
