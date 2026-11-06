@@ -7,7 +7,7 @@ Codeman can post to a private Discord server when a session needs you, group ses
 
 ## What it does
 
-- Shows **Codeman is typing…** in a session thread while its agent is working. Thread names show **🟡 Working**, **🔴 Needs input**, **🟢 Idle** or **⚫ Offline** before the session name, so activity is visible in the thread list. This works in both bridge modes and for local and SSH sessions. Typing stops when work stops, input is needed, the agent exits, or the bridge is disabled; Discord clears the indicator within about ten seconds. Name updates are coalesced to at most one every 30 seconds per thread. Activity never creates a thread or reopens an archived one, and sends no messages or pings.
+- Shows **Codeman is typing…** in a session thread while its agent is working. Thread names show **🟡 Working**, **🔴 Needs input**, **🟢 Idle** or **⚫ Offline** before the session name, so activity is visible in the thread list. This works in both bridge modes and for local and SSH sessions. Typing stops when work stops, input is needed, the agent exits, or the bridge is disabled; Discord clears the indicator within about ten seconds. Active states update on the next activity check; settling back to Idle is delayed 30 seconds to coalesce short gaps between turns. Discord's own rename limits can delay a title change further: its retry delay is honored, while typing continues independently. Current titles are reconciled so a stale concurrent rename cannot leave a working thread permanently labeled Idle. Activity never creates a thread or reopens an archived one, and sends no messages or pings.
 - Posts when a session asks for permission, asks a question, goes idle or errors. Which of these a CLI can raise depends on the hooks it has: Claude Code sends a turn end (`stop`, an `info` event that posts only when **Which events** is set to Everything, and `idle_prompt`, which posts by default after the turn has waited a minute). DeepSeek Harness sends only `stop`. Codex, OMP, OpenCode, Gemini, Antigravity, Pi, Grok and Copilot send no turn end, so they reach Discord through an error, a blocked respawn, a stopped crash loop or their own `codeman notify`; Codex's permission and question dialogs are also read off its screen.
 - Posts a finished turn, and an error or blocked alert, as the CLI's whole last message, with its bold, lists and numbered questions kept (a Markdown table becomes stacked labeled records that wrap naturally on mobile), split over several posts if it is long. It reads the CLI's transcript where it keeps one (Claude Code, Codex, DeepSeek Harness, OMP) and otherwise splits the screen into turns (OpenCode, Gemini, Antigravity, Pi, Grok, Copilot), which can start mid-message when a long answer has scrolled off. A shell, and a permission or question dialog, show the last lines of the screen instead, without the prompt row and status lines under them.
 - Notifications mode creates one thread per tab in a parent channel. Full interface mode creates one channel per case in your configured category, with one thread per session. For example, `#saif` contains `w1-saif` and `w2-saif`. Replies reach that exact session.
@@ -139,6 +139,24 @@ Case channels and thread IDs are saved privately in instance-scoped `discord-cas
 **Migrating from the earlier per-session-channel preview:** save Full mode and use **Sync sessions**. New case channels/threads are created and bounded historical context is loaded there. Old `discord-channels.json` resources and legacy notification threads/history are preserved, but old destinations do not accept input in Full mode. No Discord messages are moved or deleted. Automatic category ownership is stored privately in `discord-case-categories.json`. Interrupted creation is reconciled from a unique temporary setup name and exact permission overwrites; similarly named unowned categories are never adopted. A permissions refusal leaves the previous configuration intact and can be retried after the bot role is updated.
 
 The old `onChannelDelete` setting is retained for configuration compatibility and does not delete shared case channels. Switching back to Notifications resumes its original maps/preferences. The Notifications stale-thread sweep never runs in Full mode.
+
+## Change an existing session's model or effort
+
+In Full mode, send these commands inside that session's thread:
+
+| Command | Result |
+| --- | --- |
+| `!codeman model` | Inspect the native model and available choices, with selection buttons where canonical IDs are known. |
+| `!codeman model gpt-6-luna` | Select a Codex model by ID for this session. |
+| `!codeman model sonnet` | Select an alias offered by the current Claude picker for this session. |
+| `!codeman effort` | Inspect the current effort and the model's available levels. |
+| `!codeman effort high` | Apply and verify the effort for this session. |
+
+These controls work with an idle Claude or Codex session, including SSH sessions, while keeping the existing conversation and thread. An unfinished composer draft, a pending dialog, a stopped agent or a session which is working is refused. Incoming Codeman keyboard input is held during a native settings transaction and replayed in order afterward; if new input arrives before a setting is applied, the operation cancels and dismisses its own picker. Buttons expire and bind to the session/input revision. Unsupported CLIs, Docker sessions, unknown menu layouts and unverifiable results require the web terminal. In multi-user mode these controls remain disabled until Discord identities can be mapped to Codeman users.
+
+The bridge verifies the CLI's resulting setting before reporting success. It neither restarts the agent nor edits configuration files. Codex uses its session-only inline `/model` commands and rereads `/status`, including the conversation ID. Claude uses its verified native model picker and the **s — use this session only** action for both model and effort, then rereads that picker. It never sends Claude's inline `/model <alias>` or `/effort <level>` commands: those save defaults for future sessions in current Claude builds. Older builds without the explicit session-only picker action are refused. If a change cannot be confirmed, inspect the terminal before retrying; it is not automatically replayed.
+
+Model availability and effort levels come from the running CLI's picker and public catalog metadata. If a Codex catalog cannot supply canonical IDs or supported efforts, the bridge still shows the native model labels and refuses to invent IDs or reasoning choices. CLI-reported selection does not override provider access or organization restrictions.
 
 ## Telling the CLIs
 
