@@ -143,6 +143,7 @@ async function fixture() {
       actions: [{ label: 'Confirm', command: 'confirm launch', validity: 'launch' }],
     })),
     modes: () => ['codex', 'claude'],
+    locate: vi.fn(async () => channel),
     botId: async () => bot,
   };
   const ui = new DiscordNativeUi(host);
@@ -507,6 +508,38 @@ describe('native Discord UI', () => {
     const filtered = await f.click(dashboard, 'Needs input', undefined, { channel_id: parent });
     expect(filtered.content).not.toContain('w1-Codeman');
     expect(f.host.request).not.toHaveBeenCalledWith('PUT', expect.stringContaining('/commands'), expect.anything());
+  });
+  it('creates a source-based session from another channel without posting a management reply there', async () => {
+    const f = await fixture();
+    await f.ui.poll();
+    vi.mocked(f.host.control).mockResolvedValue({ text: 'Session created', locateSessionId: 's1' });
+    const sourceId = snow();
+    const source = {
+      id: sourceId,
+      channel_id: parent,
+      channel: parent,
+      author: { id: actor },
+      content: 'Start from this idea',
+      components: [],
+    };
+    f.messages.set(sourceId, source as unknown as ReturnType<typeof f.findCard>);
+    const picker = await f.command('Codeman: Start session', {
+      data: {
+        name: 'Codeman: Start session',
+        id: f.commands.find((c) => c.name === 'Codeman: Start session')!.id,
+        target_id: sourceId,
+        resolved: { messages: { [sourceId]: source as GatewayMessage } },
+      },
+    });
+    await f.ui.interaction(f.event(picker.components![0].components[0], { channel_id: parent }, ['case-one']));
+    const cli = f.finishes.at(-1)!;
+    await f.ui.interaction(f.event(cli.components![0].components[0], { channel_id: parent }, ['codex']));
+    const confirmation = f.finishes.at(-1)!;
+    await f.click(confirmation, 'Confirm', undefined, { channel_id: parent });
+    expect(f.host.locate).toHaveBeenCalledWith('s1');
+    expect(f.host.postControl).not.toHaveBeenCalled();
+    expect(f.host.submit).not.toHaveBeenCalled();
+    expect(f.finishes.at(-1)?.content).toContain('has not been submitted');
   });
   it('routes a selected source through an explicit destination and reconfirms it before submission', async () => {
     const f = await fixture();

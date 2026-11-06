@@ -1155,15 +1155,19 @@ export class DiscordNativeUi {
                   if (!this.host.current('__management__', a.validity)) throw new Error('Launch confirmation expired');
                   const r = await this.host.control('__management__', a.command);
                   if (r.locateSessionId) {
-                    await this.host.postControl('__management__', m.channel_id!, r, 'ui-launch:' + m.id);
+                    const destination = await this.host.locate(r.locateSessionId);
+                    const located = destination
+                      ? '\n<#' + destination + '>'
+                      : '\nDestination not yet available; open Codeman to inspect the new session.';
                     if (source)
-                      return this.payload('Session created. Source message has not been submitted.', [
+                      return this.payload('Session created. Source message has not been submitted.' + located, [
                         row(
                           this.action(this.ctx(x), 'Review source for new session', async (y) =>
                             this.contextReview(y, source, r.locateSessionId!, 'Queue next')
                           )
                         ),
                       ]);
+                    return this.payload(r.text + located);
                   }
                   return this.payload(r.text);
                 })

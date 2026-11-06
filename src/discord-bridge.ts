@@ -1090,6 +1090,10 @@ export class DiscordBridge {
         },
         launch: async (scope, key, mode) => this.deps.launch?.(scope, key, mode) ?? { text: 'Launch unavailable' },
         modes: () => this.deps.launchModes?.() ?? [],
+        locate: async (id) => {
+          const result = await this.threadFor(id, undefined);
+          return typeof result === 'string' ? result : undefined;
+        },
         botId: async () => (await this.api.botUserId())?.id,
       });
 

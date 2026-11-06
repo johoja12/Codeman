@@ -87,6 +87,7 @@ export interface DiscordNativeUiHost {
   postFile(channel: string, file: DiscordFile, text: string): Promise<void>;
   launch(scope: string, caseKey: string, mode: string): Promise<DiscordControlReply>;
   modes(): string[];
+  locate(id: string): Promise<string | undefined>;
   botId(): Promise<string | undefined>;
   now(): number;
   services: DiscordNativeUiServices;
