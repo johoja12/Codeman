@@ -129,11 +129,18 @@ export function registerDiscordRoutes(app: FastifyInstance, deps: DiscordRouteDe
   app.get('/api/discord/inbox', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');
     if (isMultiUserMode() && !isAdmin(req)) return { success: true, data: { entries: [], enabled: false } };
+    if (!deps.bridge.acceptsControls) return { success: true, data: { entries: [], enabled: false } };
     const entries = (await deps.bridge.completionEntries()).filter((e) => {
       const session = deps.ctx.sessions.get(e.session);
-      return session && canAccessOwned(getAuthUser(req), session.owner);
+      return session ? canAccessOwned(getAuthUser(req), session.owner) : isAdmin(req);
     });
-    return { success: true, data: { entries, enabled: deps.bridge.acceptsControls } };
+    return {
+      success: true,
+      data: {
+        entries: entries.map((e) => ({ ...e, closed: !deps.ctx.sessions.has(e.session) })),
+        enabled: deps.bridge.acceptsControls,
+      },
+    };
   });
   app.get<{ Params: { id: string } }>('/api/discord/inbox/:id/response', async (req, reply) => {
     reply.header('Cache-Control', 'no-store');
@@ -141,7 +148,7 @@ export function registerDiscordRoutes(app: FastifyInstance, deps: DiscordRouteDe
     if (no) return no;
     const entry = (await deps.bridge.completionEntries()).find((e) => e.id === req.params.id);
     if (!entry) return reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, 'Completion not found'));
-    findSessionOrFail(deps.ctx, entry.session, req);
+    if (deps.ctx.sessions.has(entry.session) || !isAdmin(req)) findSessionOrFail(deps.ctx, entry.session, req);
     try {
       return { success: true, data: await deps.bridge.completionResponse(entry.id) };
     } catch {
@@ -161,7 +168,7 @@ export function registerDiscordRoutes(app: FastifyInstance, deps: DiscordRouteDe
     if (no) return no;
     const entry = (await deps.bridge.completionEntries()).find((e) => e.id === req.params.id);
     if (!entry) return reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, 'Completion not found'));
-    findSessionOrFail(deps.ctx, entry.session, req);
+    if (deps.ctx.sessions.has(entry.session) || !isAdmin(req)) findSessionOrFail(deps.ctx, entry.session, req);
     await deps.bridge.reviewCompletions([entry.id], 'web');
     return { success: true, data: { id: entry.id, read: true } };
   });

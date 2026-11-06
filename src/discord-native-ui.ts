@@ -2,6 +2,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { DiscordUiStore } from './discord-ui-store.js';
 import { discordDisplayText } from './discord-display-text.js';
+import { splitForDiscord } from './discord-response-format.js';
 import type { DiscordInteraction, GatewayMessage, DiscordPost } from './discord-bridge.js';
 import type { DiscordNativeUiHost, DiscordUiPayload, DiscordUiSession } from './discord-native-ui-types.js';
 const hash = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -178,7 +179,11 @@ export class DiscordNativeUi {
         s.cards[storeKey] = {
           channel,
           hash: digest,
-          kind: key.split(':')[0] as 'session' | 'delivery' | 'result' | 'dashboard' | 'inbox',
+          kind: (key.startsWith('inbox:') ? 'dashboard' : key.split(':')[0]) as
+            | 'session'
+            | 'delivery'
+            | 'result'
+            | 'dashboard',
           phase: 'posting',
           updated: this.host.now(),
         };
@@ -203,7 +208,11 @@ export class DiscordNativeUi {
         channel,
         message,
         hash: digest,
-        kind: key.split(':')[0] as 'session' | 'delivery' | 'result' | 'dashboard' | 'inbox',
+        kind: (key.startsWith('inbox:') ? 'dashboard' : key.split(':')[0]) as
+          | 'session'
+          | 'delivery'
+          | 'result'
+          | 'dashboard',
         phase: 'ready',
         updated: this.host.now(),
       };
@@ -369,7 +378,7 @@ export class DiscordNativeUi {
               await this.host.inbox!.review([entry.id], 'discord');
               const link = `https://discord.com/channels/${this.host.config().guild}/${entry.channel}${entry.message ? '/' + entry.message : ''}`;
               return this.payload(
-                `**${safe(entry.name)}**\n${response.text.slice(0, 1450)}${response.text.length > 1450 ? '\n\nResponse excerpt; open the original for the full answer.' : ''}\n\n[Open original response](${link})\nMarked read across Codeman and Discord.`
+                `**${safe(entry.name)}**\n${splitForDiscord(response.text, 1400, 1)[0] ?? ''}${response.text.length > 1450 ? '\n\nResponse excerpt; open the original for the full answer.' : ''}\n\n[Open original response](${link})\nMarked read across Codeman and Discord.`
               );
             },
             undefined,

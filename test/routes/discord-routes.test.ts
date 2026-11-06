@@ -464,6 +464,7 @@ describe('discord-notify with a file', () => {
 it('shares exact completion acknowledgements without clearing another task and scopes reads to owned sessions', async () => {
   const { app, bridge } = await harness();
   await app.inject({ method: 'PUT', url: '/api/discord', payload: FULL });
+  vi.spyOn(bridge, 'acceptsControls', 'get').mockReturnValue(true);
   const h = (state: 'running' | 'completed', n: number) => ({
     conversationId: 'convo',
     partial: false,

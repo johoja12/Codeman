@@ -1713,3 +1713,78 @@ it('does not show a reconnect notice for a connected session with no assistant r
   ).toBe(false);
   expect(posts.some((p) => JSON.stringify(p.body ?? {}).includes('Ask Codex to do anything'))).toBe(false);
 });
+it('tracks stream-off completions and synchronizes exact web reads with only timely authorized Discord replies', async () => {
+  sessions = [{ id: 's1', name: 'one' }];
+  let now = Date.now(),
+    turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+  const executions: import('../src/discord-native-execution.js').DiscordNativeExecution[] = [];
+  const history = async () => ({ conversationId: 'native1', partial: false, turns, executions });
+  const b = makeBridge(undefined, { history, now: () => now });
+  await b.reload();
+  await b.syncSessions();
+  const run = async (n: number) => {
+    turns.push({ cursor: 'u' + n, role: 'user', text: 'Task ' + n, timestamp: '' });
+    executions.push({ userCursor: 'u' + n, promptHash: 'proof', state: 'running' });
+    now += 60001;
+    await b.pollConversations();
+    turns.push({ cursor: 'a' + n, role: 'assistant', text: 'Result ' + n, phase: 'final_answer', timestamp: '' });
+    executions.at(-1)!.state = 'completed';
+    now += 60001;
+    await b.pollConversations();
+  };
+  await run(1);
+  const first = (await b.completionEntries())[0];
+  expect(first).toBeDefined();
+  expect((await b.completionResponse(first.id)).text).toBe('Result 1');
+  const msg = async (content: string, at: number) => {
+    const id = (((BigInt(at) - 1420070400000n) << 22n) + 1n).toString();
+    await b.onGatewayMessage({
+      id,
+      guild_id: cfg.guildId,
+      channel_id: first.channel,
+      author: { id: cfg.allowedUserIds[0] },
+      content,
+    });
+    return id;
+  };
+  await msg('!codeman stream off', now + 10);
+  expect((await b.completionEntries())[0].reviewed).toBeUndefined();
+  await run(2);
+  const second = (await b.completionEntries()).find((e) => e.id !== first.id)!;
+  expect(second.reviewed).toBeUndefined();
+  await b.reviewCompletions([first.id], 'web');
+  expect((await b.completionEntries()).find((e) => e.id === second.id)?.reviewed).toBeUndefined();
+  expect((await b.completionResponse(first.id)).latest).toBe(false);
+  await msg('An earlier reply', second.completed - 1000);
+  expect((await b.completionEntries()).find((e) => e.id === second.id)?.reviewed).toBeUndefined();
+  await msg('Thanks, I saw the result', second.completed + 100);
+  expect((await b.completionEntries()).find((e) => e.id === second.id)?.source).toBe('discord');
+  const restored = makeBridge(undefined, { history, now: () => now });
+  await restored.reload();
+  expect((await restored.completionEntries()).filter((e) => e.reviewed === undefined)).toHaveLength(0);
+});
+it('does not infer a web-visible result from text repeated in a prompt or earlier answer', async () => {
+  const sentence = 'All native checks finished successfully with the reviewed build.';
+  let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [
+    { cursor: 'u1', role: 'user', text: 'Reply with ' + sentence, timestamp: '' },
+    { cursor: 'a1', role: 'assistant', text: sentence, timestamp: '', phase: 'final_answer' },
+  ];
+  const h = {
+    conversationId: 'native1',
+    partial: false,
+    turns,
+    executions: [{ userCursor: 'u1', promptHash: 'proof', state: 'running' as 'running' | 'completed' }],
+  };
+  const b = makeBridge(undefined, { history: async () => h });
+  await b.reload();
+  const input = { session: 's1', name: 'one', guild: cfg.guildId, channel: '222222222222222222', history: h };
+  await b.completionInbox.observe(input);
+  h.executions[0].state = 'completed';
+  await b.completionInbox.observe(input);
+  const entry = (await b.completionEntries())[0];
+  expect((await b.completionResponse(entry.id)).viewAnchor).toBeUndefined();
+  turns[0].text = 'Run the native checks';
+  expect((await b.completionResponse(entry.id)).viewAnchor).toBe(sentence);
+  turns.unshift({ cursor: 'older', role: 'assistant', text: sentence, timestamp: '', phase: 'final_answer' });
+  expect((await b.completionResponse(entry.id)).viewAnchor).toBeUndefined();
+});

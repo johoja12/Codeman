@@ -1718,7 +1718,7 @@ export class DiscordBridge {
     )
       await this.nativeUi?.refreshInbox().catch(() => undefined);
   }
-  async completionResponse(id: string): Promise<{ text: string; latest: boolean }> {
+  async completionResponse(id: string): Promise<{ text: string; latest: boolean; viewAnchor?: string }> {
     const entry = (await this.completionEntries()).find((e) => e.id === id);
     if (!entry || !this.deps.history) throw new Error('Response unavailable');
     const h = await this.deps.history(entry.session);
@@ -1726,8 +1726,25 @@ export class DiscordBridge {
       throw new Error('Conversation changed; open the Discord response or mark read explicitly.');
     const turn = h.turns.find((t) => t.role === 'assistant' && t.cursor === entry.responseCursor);
     if (!turn) throw new Error('Exact response no longer available in native history.');
+    const text = discordDisplayText(turn.text);
+    const normal = (value: string) => value.replace(/[\s`*_#>|~]/g, '').toLowerCase();
+    const other = h.turns.filter((t) => t.cursor !== turn.cursor).map((t) => normal(discordDisplayText(t.text)));
+    // Generic/repeated answer lines or text echoed from a prompt do not prove which result was seen.
+    const viewAnchor = text
+      .split('\n')
+      .slice(-40)
+      .reverse()
+      .find(
+        (line) =>
+          line.trim().length >= 32 &&
+          line.replace(/[^\p{L}\p{N}]/gu, '').length >= 24 &&
+          line.length <= 600 &&
+          !/^\s*```/.test(line) &&
+          !other.some((value) => value.includes(normal(line)))
+      );
     return {
-      text: discordDisplayText(turn.text),
+      text,
+      viewAnchor,
       latest: h.turns.filter((t) => t.role === 'assistant' && t.phase !== 'commentary').at(-1)?.cursor === turn.cursor,
     };
   }

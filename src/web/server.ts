@@ -2906,6 +2906,12 @@ export class WebServer extends EventEmitter {
       '<title>Codeman</title>',
       `<title>${escapeHtmlText(this.windowTitle)}</title>`
     );
+    // Keep the completion UI dormant in instances without the Full Discord bridge.
+    // These relative assets pass through the same base-path and cache-busting pipeline below.
+    if (this.discordBridge.acceptsControls)
+      html = html
+        .replace('</head>', '  <link rel="stylesheet" href="completion-inbox.css">\n</head>')
+        .replace('</body>', '  <script defer src="completion-inbox-ui.js"></script>\n</body>');
     // Reverse-proxy sub-path support. The template ships `<base href="/">` and all
     // static asset refs are RELATIVE, so pointing the base at the mount prefix
     // rewrites every asset URL for free. `window.__CODEMAN_BASE__` gives the

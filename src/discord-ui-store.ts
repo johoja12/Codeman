@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 const Card = z
   .object({
-    kind: z.enum(['session', 'delivery', 'result', 'dashboard', 'inbox']).optional(),
+    kind: z.enum(['session', 'delivery', 'result', 'dashboard']).optional(),
     channel: z.string().regex(/^\d{15,25}$/),
     message: z
       .string()

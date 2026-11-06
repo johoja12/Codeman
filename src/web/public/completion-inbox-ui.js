@@ -16,18 +16,28 @@
   function visibleResponseMatches(text, lines) {
     const anchor = text
       .split('\n')
-      .filter((x) => x.trim().length >= 32 && !/^\s*```/.test(x))
+      .filter((x) => x.trim().length >= 32 && x.replace(/[^\p{L}\p{N}]/gu, '').length >= 24 && !/^\s*```/.test(x))
       .at(-1);
     return !!anchor && normal(lines).includes(normal(anchor));
   }
   function canAutoRead(a) {
     if (
-      [...document.querySelectorAll('.modal, [role=dialog], dialog[open]')].some(
-        (e) =>
-          e.getClientRects().length &&
-          getComputedStyle(e).visibility !== 'hidden' &&
+      [...document.querySelectorAll('.modal, [role=dialog], dialog[open]')].some((e) => {
+        const r = e.getBoundingClientRect(),
+          s = getComputedStyle(e);
+        return (
+          !e.inert &&
+          r.width > 0 &&
+          r.height > 0 &&
+          r.bottom > 0 &&
+          r.top < innerHeight &&
+          r.right > 0 &&
+          r.left < innerWidth &&
+          s.visibility !== 'hidden' &&
+          s.opacity !== '0' &&
           e.getAttribute('aria-hidden') !== 'true'
-      )
+        );
+      })
     )
       return false;
     const id = a?.activeSessionId,
@@ -65,6 +75,12 @@
   function showError(text) {
     if (error) error.textContent = text;
   }
+  function viewerIsVisible() {
+    if (!dialog?.open || document.visibilityState !== 'visible' || !document.hasFocus() || viewer?.hidden) return false;
+    const r = viewer.getBoundingClientRect(),
+      d = dialog.getBoundingClientRect();
+    return r.width > 0 && r.bottom > d.top + 48 && r.top < d.bottom;
+  }
   async function openResponse(entry) {
     showError('');
     const data = await api(`/api/discord/inbox/${encodeURIComponent(entry.id)}/response`);
@@ -91,7 +107,9 @@
     }
     viewer.append(body);
     viewer.hidden = false;
-    if (document.visibilityState === 'visible' && document.hasFocus() && dialog.open) await mark(entry);
+    dialog.scrollTop = Math.max(0, viewer.offsetTop - 48);
+    await new Promise(requestAnimationFrame);
+    if (viewerIsVisible()) await mark(entry);
   }
   function render() {
     if (!button) return;
@@ -136,7 +154,8 @@
         actions.append(b);
       }
       const session = document.createElement('button');
-      session.textContent = 'Open session';
+      session.textContent = entry.closed ? 'Session closed' : 'Open session';
+      session.disabled = !!entry.closed;
       session.onclick = () => {
         dialog.close();
         window.app?.selectSession?.(entry.session);
@@ -159,13 +178,13 @@
     const entry = entries.find((e) => e.session === a.activeSessionId && e.reviewed === undefined);
     if (!entry) return;
     const data = await api(`/api/discord/inbox/${encodeURIComponent(entry.id)}/response`);
-    if (!data?.latest || !canAutoRead(a) || a.activeSessionId !== entry.session) return;
+    if (!data?.latest || !data.viewAnchor || !canAutoRead(a) || a.activeSessionId !== entry.session) return;
     const b = a.terminal.buffer.active;
     let lines = '';
     const top = Math.max(0, b.viewportY),
       bottom = Math.min(b.length, top + (a.terminal.rows || 40));
     for (let i = top; i < bottom; i++) lines += (b.getLine(i)?.translateToString(true) || '') + '\n';
-    if (visibleResponseMatches(data.text, lines)) await mark(entry);
+    if (visibleResponseMatches(data.viewAnchor, lines)) await mark(entry);
   }
   async function refresh() {
     if (busy || document.visibilityState !== 'visible') return;
@@ -180,14 +199,14 @@
         if (button) button.hidden = true;
         return;
       }
+      if (!button) mount();
       entries = (data.entries || []).sort((a, b) => b.completed - a.completed);
       if (button) button.hidden = false;
       render();
       if (
         opened &&
         shownText &&
-        dialog?.open &&
-        document.hasFocus() &&
+        viewerIsVisible() &&
         entries.some((e) => e.id === opened.id && e.reviewed === undefined)
       )
         await mark(opened);
@@ -198,7 +217,7 @@
       busy = false;
     }
   }
-  function init() {
+  function mount() {
     const host = document.querySelector('.header-brand');
     if (!host) return;
     button = document.createElement('button');
@@ -225,6 +244,8 @@
       dialog.showModal();
       void refresh();
     };
+  }
+  function init() {
     const start = () => {
       if (!timer) timer = setInterval(() => void refresh(), 4000);
       void refresh();

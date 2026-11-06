@@ -113,3 +113,14 @@
   align-self: center;
   font-size: 12px;
 }
+.completion-inbox-trigger[hidden] {
+  display: none !important;
+}
+
+.completion-inbox-heading {
+  position: sticky;
+  top: -20px;
+  padding: 10px 0;
+  background: var(--bg-primary, #151c27);
+  z-index: 1;
+}

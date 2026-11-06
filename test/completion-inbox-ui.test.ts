@@ -10,7 +10,14 @@ function fixture() {
     addEventListener: () => {},
   };
   const window: any = {};
-  runInNewContext(source, { window, document, getComputedStyle: () => ({ visibility: 'visible' }), console });
+  runInNewContext(source, {
+    window,
+    document,
+    getComputedStyle: () => ({ visibility: 'visible', opacity: '1' }),
+    innerWidth: 1440,
+    innerHeight: 1000,
+    console,
+  });
   const app: any = {
     activeSessionId: 's1',
     terminalLoadStates: new Map(),
@@ -40,7 +47,13 @@ describe('completion read visibility proof', () => {
     f.app._tilesOwnTerminal = () => true;
     expect(f.ui.canAutoRead(f.app)).toBe(false);
     f.app._tilesOwnTerminal = () => false;
-    f.document.querySelectorAll = () => [{ getClientRects: () => [{}], getAttribute: () => null }];
+    f.document.querySelectorAll = () => [
+      {
+        getBoundingClientRect: () => ({ width: 100, height: 100, top: 0, left: 0, bottom: 100, right: 100 }),
+        getClientRects: () => [{}],
+        getAttribute: () => null,
+      },
+    ];
     expect(f.ui.canAutoRead(f.app)).toBe(false);
   });
   it('matches the actual visible answer across wraps and never acknowledges a generic short reply or unrelated output', () => {
@@ -52,6 +65,7 @@ describe('completion read visibility proof', () => {
       )
     ).toBe(true);
     expect(ui.visibleResponseMatches('Done', 'Done')).toBe(false);
+    expect(ui.visibleResponseMatches('*'.repeat(40), 'anything')).toBe(false);
     expect(
       ui.visibleResponseMatches(
         'The reviewed build passed all native regression checks.',
