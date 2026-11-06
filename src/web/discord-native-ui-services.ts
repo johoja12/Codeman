@@ -40,6 +40,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
               : !c.remote && c.path === s.workingDir
           )?.name || 'Unlinked workspace',
         conversation: s.nativeResumeId ?? s.codexConfig?.resumeSessionId,
+        inputRevision: s.discordQueueRevision,
         working: s.isWorking,
         pending: approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle'),
         exited: !!s.paneExit,
@@ -123,12 +124,14 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       const s = session(id);
       return discordWorkspaceResults({ workingDir: s.workingDir, remote: s.remote });
     },
-    submitQueued: async (id, text, conversation, allowed) => {
+    submitQueued: async (id, text, conversation, allowed, inputRevision) => {
       const s = session(id);
       return s.submitDiscordFollowup(
         text,
         () =>
           deps.allowed() &&
+          inputRevision !== undefined &&
+          s.discordQueueRevision === inputRevision &&
           allowed() &&
           deps.sessions().get(id) === s &&
           (s.nativeResumeId ?? s.codexConfig?.resumeSessionId) === conversation &&

@@ -788,6 +788,7 @@ export class DiscordNativeUi {
             await this.store.enqueue({
               session: id,
               conversation: s.conversation!,
+              inputRevision: s.inputRevision,
               scope: this.host.scope()!,
               channel,
               actor: message.author.id,
@@ -830,6 +831,7 @@ export class DiscordNativeUi {
             await this.store.enqueue({
               session: id,
               conversation: s.conversation,
+              inputRevision: s.inputRevision,
               scope: this.host.scope()!,
               channel: this.host.channelForSession(id)!,
               actor: ctx.actor!,
@@ -863,7 +865,7 @@ export class DiscordNativeUi {
         (items
           .map(
             (p, i) =>
-              `${i + 1}. ${safe(p.text, 130)}\n   ${p.state === 'uncertain' ? '⚠ Submission unconfirmed — manual review required' : p.conversation !== s.conversation ? 'Paused: conversation changed' : p.created < this.host.now() - 86400000 ? 'Expired: remove or edit before dispatch' : p.state}`
+              `${i + 1}. ${safe(p.text, 130)}\n   ${p.state === 'uncertain' ? '⚠ Submission unconfirmed — manual review required' : p.scope !== this.host.scope() ? 'Paused: configuration changed' : p.conversation !== s.conversation ? 'Paused: conversation changed' : p.inputRevision !== s.inputRevision ? 'Paused: input changed; remove and add explicitly' : p.created < this.host.now() - 86400000 ? 'Expired: remove or edit before dispatch' : p.state}`
           )
           .join('\n') || 'No follow-ups queued.') +
         '\n\n10 prompts per session · queued text is stored privately until submission/removal · expires after 24 hours. Attachments prepared through the bridge remain in the workspace. Dispatch pauses for drafts, questions, disconnects and changed conversations.',
@@ -930,6 +932,8 @@ export class DiscordNativeUi {
       !p ||
       p.state !== 'queued' ||
       p.conversation !== s.conversation ||
+      !p.inputRevision ||
+      p.inputRevision !== s.inputRevision ||
       p.created < this.host.now() - 86400000 ||
       !this.host.config().allowed.includes(p.actor)
     )
@@ -951,7 +955,16 @@ export class DiscordNativeUi {
     if (!taken) return;
     let result: 'accepted' | 'uncertain' | 'blocked' = 'uncertain';
     try {
-      result = await this.host.submit(s.id, p.channel, p.actor, p.source, p.text, p.conversation, true);
+      result = await this.host.submit(
+        s.id,
+        p.channel,
+        p.actor,
+        p.source,
+        p.text,
+        p.conversation,
+        true,
+        p.inputRevision
+      );
     } catch {
       /* Ambiguous submissions never return to the automatic queue. */
     }
@@ -1015,6 +1028,7 @@ export class DiscordNativeUi {
                     {
                       session: s.id,
                       conversation: s.conversation,
+                      inputRevision: s.inputRevision,
                       nativeExecution: execution,
                       deliveries: receipts,
                       verification: 'not inferred from conversational text',
@@ -1254,6 +1268,7 @@ export class DiscordNativeUi {
         await this.store.enqueue({
           session: id,
           conversation: s.conversation!,
+          inputRevision: s.inputRevision,
           scope: this.host.scope()!,
           channel: this.host.channelForSession(id)!,
           actor: ctx.actor!,

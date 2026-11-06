@@ -8,6 +8,7 @@ export interface DiscordUiSession {
   host: string;
   caseName: string;
   conversation?: string;
+  inputRevision?: string;
   working: boolean;
   pending: boolean;
   exited: boolean;
@@ -37,7 +38,8 @@ export interface DiscordNativeUiServices {
     id: string,
     text: string,
     conversation: string,
-    allowed: () => boolean
+    allowed: () => boolean,
+    inputRevision?: string
   ): Promise<'accepted' | 'blocked' | 'uncertain'>;
   cases(): Promise<DiscordUiCase[]>;
   defaults(): Promise<{ model: string; effort: string; approval: string }>;
@@ -76,7 +78,8 @@ export interface DiscordNativeUiHost {
     source: string,
     text: string,
     conversation: string,
-    idle?: boolean
+    idle?: boolean,
+    inputRevision?: string
   ): Promise<'accepted' | 'uncertain' | 'blocked'>;
   note(source: string, state: 'queued' | 'cancelled'): Promise<void>;
   receipts(

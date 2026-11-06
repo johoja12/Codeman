@@ -6272,6 +6272,9 @@ export class Session extends EventEmitter {
   get guardedInputGeneration(): string {
     return `${this.inspectionGeneration}:${this._guardedGeometryRevision}`;
   }
+  get discordQueueRevision(): string {
+    return `${this.inspectionGeneration}:${this._guardedInputRevision}`;
+  }
   get nativeModelSettingsRevision(): string {
     return `${this.guardedInputGeneration}:${this._guardedInputRevision}`;
   }

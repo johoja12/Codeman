@@ -35,6 +35,7 @@ async function fixture() {
       caseName: 'Codeman',
       mode: 'codex',
       conversation: 'conversation-one',
+      inputRevision: 'input-one',
       working: true,
       pending: false,
       ready: true,
@@ -220,6 +221,7 @@ describe('native Discord UI', () => {
     await f.ui.store.enqueue({
       session: 's1',
       conversation: 'conversation-one',
+      inputRevision: 'input-one',
       scope: 'scope-a',
       channel,
       actor,
@@ -422,6 +424,7 @@ describe('native Discord UI', () => {
     await f.ui.store.enqueue({
       session: 's1',
       conversation: 'conversation-one',
+      inputRevision: 'input-one',
       scope: 'scope-a',
       channel,
       actor,
@@ -445,15 +448,35 @@ describe('native Discord UI', () => {
       'queued-1',
       'Review diff',
       'conversation-one',
-      true
+      true,
+      'input-one'
     );
     expect((await f.ui.store.snapshot()).queue).toHaveLength(0);
+  });
+  it('pauses queued work after manual input even before the new native conversation ID is observed', async () => {
+    const f = await fixture();
+    await f.ui.store.enqueue({
+      session: 's1',
+      conversation: 'conversation-one',
+      inputRevision: 'input-one',
+      scope: 'scope-a',
+      channel,
+      actor,
+      source: 'q',
+      text: 'Follow-up',
+    });
+    f.sessions[0].working = false;
+    f.sessions[0].inputRevision = 'changed-by-clear';
+    await f.ui.poll();
+    expect(f.host.submit).not.toHaveBeenCalled();
+    expect((await f.ui.store.snapshot()).queue[0].state).toBe('queued');
   });
   it('never replays an ambiguous queue submission after restart', async () => {
     const f = await fixture();
     await f.ui.store.enqueue({
       session: 's1',
       conversation: 'conversation-one',
+      inputRevision: 'input-one',
       scope: 'scope-a',
       channel,
       actor,

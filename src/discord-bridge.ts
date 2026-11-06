@@ -1061,8 +1061,8 @@ export class DiscordBridge {
           if (!text) throw new Error('Empty or unsupported prompt');
           return text;
         },
-        submit: (id, channel, actor, source, text, conversation, idle) =>
-          this.submitUiPrompt(id, channel, actor, source, text, conversation, !!idle),
+        submit: (id, channel, actor, source, text, conversation, idle, inputRevision) =>
+          this.submitUiPrompt(id, channel, actor, source, text, conversation, !!idle, inputRevision),
         note: (source, state) => this.deliveries.update(source, state),
         receipts: async (id) =>
           (await this.deliveries.recentForSession(id)).map((r) => ({
@@ -2540,7 +2540,8 @@ export class DiscordBridge {
     source: string,
     text: string,
     conversation: string,
-    idle: boolean
+    idle: boolean,
+    inputRevision?: string
   ): Promise<'accepted' | 'uncertain' | 'blocked'> {
     const run = (this.inbound.get(channel) ?? Promise.resolve()).then(
       async (): Promise<'accepted' | 'uncertain' | 'blocked'> => {
@@ -2592,7 +2593,7 @@ export class DiscordBridge {
               await this.deliveries.update(id, 'failed', 'scope_changed');
               return 'blocked';
             }
-            const result = await service.submitQueued(sessionId, keys, conversation, current);
+            const result = await service.submitQueued(sessionId, keys, conversation, current, inputRevision);
             if (result === 'blocked') {
               await this.deliveries.update(id, 'failed', 'scope_changed');
               return 'blocked';

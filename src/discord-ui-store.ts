@@ -22,6 +22,7 @@ const Prompt = z
     id: z.string().uuid(),
     session: z.string().max(100),
     conversation: z.string().max(100),
+    inputRevision: z.string().max(200).optional(),
     scope: z.string().max(200),
     channel: z.string().regex(/^\d{15,25}$/),
     actor: z.string().regex(/^\d{15,25}$/),
