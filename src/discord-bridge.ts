@@ -957,6 +957,7 @@ export class DiscordBridge {
   private nativeUi?: DiscordNativeUi;
   private uiPrompts = new Map<string, { conversation: string; text: string }>();
   private outputDue = new Map<string, number>();
+  private unavailableNotices = new Set<string>();
   private readonly api: DiscordApi;
   private readonly now: () => number;
   private readonly deliveries: DiscordDeliveryJournal;
@@ -1297,6 +1298,8 @@ export class DiscordBridge {
     if (pending) return pending;
     const run = (async () => {
       const history = await this.deps.history!(sessionId);
+      if (history.turns.some((turn) => turn.role === 'assistant'))
+        this.unavailableNotices.delete(`${sessionId}:${channel}`);
       let progress = await this.conversationProgress.get(key);
       if (!progress || progress.conversationId !== history.conversationId) {
         progress = {
@@ -1309,6 +1312,9 @@ export class DiscordBridge {
         await this.conversationProgress.set(key, progress);
       }
       if (progress.seeded) return;
+      const latestReply = [...history.turns]
+        .reverse()
+        .find((turn) => turn.role === 'assistant' && discordDisplayText(turn.text).trim());
       for (let i = progress.seedIndex; i < progress.seed.length; i++) {
         if (
           this.stopped ||
@@ -1325,19 +1331,33 @@ export class DiscordBridge {
           await this.conversationProgress.set(key, progress);
           continue;
         }
-        const text =
-          '**Historical context**' +
-          (history.partial ? ' (partial)' : '') +
-          '\n' +
-          renderHistory([{ ...turn, text: clip(visible, 1000) }], { includeTimestamps: false }) +
-          '\n`!codeman history` / `!codeman transcript` for more';
-        await this.deliverPost(
-          channel,
-          { content: text, allowed_mentions: { parse: [], users: [] } },
-          undefined,
-          sessionId,
-          `history:${turn.cursor}`
-        );
+        if (turn.cursor === latestReply?.cursor) {
+          // The newest answer is the user's current context, not a clipped history preview.
+          for (const [part, post] of discordResponsePosts(visible, { title: 'Latest response' }).entries())
+            await this.deliverPost(channel, post, undefined, sessionId, `history:${turn.cursor}:full:${part}`);
+          if (visible.length > 12000)
+            await this.deliverPost(
+              channel,
+              { content: 'Full user-visible response', allowed_mentions: { parse: [], users: [] } },
+              { name: 'response.txt', data: Buffer.from(discordDisplayText(turn.text)) },
+              sessionId,
+              `history:${turn.cursor}:full:overflow`
+            );
+        } else {
+          const text =
+            '**Historical context**' +
+            (history.partial ? ' (partial)' : '') +
+            '\n' +
+            renderHistory([{ ...turn, text: clip(visible, 1000) }], { includeTimestamps: false }) +
+            '\n`!codeman history` / `!codeman transcript` for more';
+          await this.deliverPost(
+            channel,
+            { content: text, allowed_mentions: { parse: [], users: [] } },
+            undefined,
+            sessionId,
+            `history:${turn.cursor}`
+          );
+        }
         progress = { ...progress, seedIndex: i + 1 };
         await this.conversationProgress.set(key, progress);
       }
@@ -1726,6 +1746,7 @@ export class DiscordBridge {
     clearInterval(this.activityTimer);
     this.activityTimer = undefined;
     this.actions.clear();
+    this.unavailableNotices.clear();
     this.syncQueued = false;
     clearInterval(this.outputTimer);
     this.outputTimer = undefined;
@@ -1912,11 +1933,13 @@ export class DiscordBridge {
     }
     let chunks: string[] = [];
     let responseText: string | undefined;
+    let originalReadSucceeded = false;
     // Remembered only once the first post is out: a failed post must leave the message to be sent again.
     let posted: string | undefined;
     if (msg.fullText) {
       try {
         const got = await withTimeout(msg.fullText(), FULL_TEXT_TIMEOUT_MS);
+        originalReadSucceeded = true;
         const text = got?.text ? discordDisplayText(got.text).trim() : undefined;
         const sid = msg.sessionId;
         if (got?.text && !text) msg = { ...msg, tail: undefined };
@@ -1970,6 +1993,8 @@ export class DiscordBridge {
       !opts.deliberate &&
       ['hook:idle_prompt', 'hook:stop'].includes(msg.event) &&
       !this.deps.awaitingChoice?.(msg.sessionId ?? '');
+    if (this.cfg.mode === 'full' && routine && originalReadSucceeded && !responseText)
+      return { ok: true, deduped: true, at: this.now() };
     const cards = responseText
       ? discordResponsePosts(routine ? responseText : `${msg.body}\n\n${responseText}`, {
           title: routine ? 'Response' : msg.title,
@@ -1983,6 +2008,44 @@ export class DiscordBridge {
           users: basePost.allowed_mentions.users,
         })
       : [];
+    if (routine && this.deps.history && !responseText && !opts.deliberate && msg.sessionId) {
+      // Cursor-painted terminal output is neither canonical prose nor a recoverable Markdown table.
+      const channel = await this.threadFor(msg.sessionId, msg.sessionName);
+      if (typeof channel !== 'string') return channel;
+      const noticeKey = `${msg.sessionId}:${channel}`;
+      const progress = await this.conversationProgress.get(this.conversationKey(msg.sessionId, channel));
+      if (!progress?.streamOff) {
+        if (this.unavailableNotices.has(noticeKey)) return { ok: true, deduped: true, at: this.now() };
+        const notice = discordResponsePosts(
+          'Your response is available in Codeman. I’m restoring the connection so replies can appear here.',
+          {
+            title: 'Reconnecting to this conversation',
+            color: DISCORD_WARNING_COLOR,
+            users: [],
+          }
+        )[0];
+        try {
+          await this.deliverPost(
+            channel,
+            notice,
+            undefined,
+            msg.sessionId,
+            `history-unavailable:${msg.sessionId}:${this.now()}`
+          );
+          if (this.unavailableNotices.size >= 256)
+            this.unavailableNotices.delete(this.unavailableNotices.values().next().value!);
+          this.unavailableNotices.add(noticeKey);
+          return (this.last = { ok: true, at: this.now() });
+        } catch (err) {
+          this.lastSent.delete(key);
+          return (this.last = this.fail(err));
+        }
+      }
+    }
+    if (responseText && msg.sessionId) {
+      for (const key of this.unavailableNotices)
+        if (key.startsWith(msg.sessionId + ':')) this.unavailableNotices.delete(key);
+    }
     const post = cards.shift() ?? basePost;
     // One post when the head and the first part fit together, the rest follow without a ping.
     if (chunks.length > 0) {
@@ -2109,6 +2172,7 @@ export class DiscordBridge {
    * Per-tab state goes whether or not the tab ever had a thread, so these maps cannot grow for the life of the server.
    */
   forgetTab(sessionId: string): void {
+    for (const key of this.unavailableNotices) if (key.startsWith(sessionId + ':')) this.unavailableNotices.delete(key);
     this.activity.forget(sessionId);
     this.outputDue.delete(sessionId);
     this.lastReply.delete(sessionId);
