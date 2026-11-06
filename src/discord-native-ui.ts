@@ -52,6 +52,10 @@ export class DiscordNativeUi {
   private dashboardDue = 0;
   private errors = new Map<string, number>();
   private epoch = randomUUID();
+  private questionPanels = new Map<
+    string,
+    { interaction: DiscordInteraction; session: string; id: string; revision: string; expires: number }
+  >();
   constructor(private readonly host: DiscordNativeUiHost) {
     this.store = new DiscordUiStore(host.dir, host.now);
   }
@@ -291,6 +295,7 @@ export class DiscordNativeUi {
   private async runPoll(): Promise<void> {
     if (!this.host.scope()) return;
     this.prune();
+    await this.refreshQuestionPanels();
     await this.register();
     const sessions = await this.host.services.sessions();
     const list = sessions.filter((s) => this.host.channelForSession(s.id));
@@ -514,7 +519,7 @@ export class DiscordNativeUi {
       }
     }
     // All network/disk and provider work happens after Discord's immediate acknowledgement.
-    await this.host.respond(m, { type: 5, data: { flags: 64 } });
+    await this.host.respond(m, action?.actor && m.type === 3 ? { type: 6 } : { type: 5, data: { flags: 64 } });
     try {
       if (!(await this.host.claim(m))) {
         await this.host.finish(m, this.payload('This interaction was already received; no action was replayed.'));
@@ -632,6 +637,33 @@ export class DiscordNativeUi {
       ]
     );
   }
+  private async refreshQuestionPanels(): Promise<void> {
+    for (const [key, panel] of this.questionPanels) {
+      if (panel.expires <= this.host.now()) {
+        this.questionPanels.delete(key);
+        continue;
+      }
+      const current = this.host.services.question(panel.session);
+      if (!current || current.id !== panel.id || current.revision !== panel.revision) {
+        this.questionPanels.delete(key);
+        await this.host
+          .finish(
+            panel.interaction,
+            this.payload('This prompt was resolved or replaced. Its old controls are disabled.')
+          )
+          .catch(() => undefined);
+      }
+    }
+  }
+  private async resolveQuestionPanels(id: string, revision: string, text: string): Promise<void> {
+    for (const [key, panel] of this.questionPanels)
+      if (panel.id === id && panel.revision === revision) {
+        this.questionPanels.delete(key);
+        await this.host
+          .finish(panel.interaction, this.payload(text + '\nThe old prompt controls are disabled.'))
+          .catch(() => undefined);
+      }
+  }
   private async question(m: DiscordInteraction, id: string): Promise<DiscordUiPayload> {
     const s = await this.target(id),
       q = this.host.services.question(id),
@@ -643,12 +675,30 @@ export class DiscordNativeUi {
           safe(q.text, 1200) +
           '\nThis CLI dialog cannot be answered safely through Discord. Open the exact session in Codeman.'
       );
+    if (this.questionPanels.size < 128)
+      this.questionPanels.set(hash(m.token + ':' + m.id), {
+        interaction: m,
+        session: id,
+        id: q.id,
+        revision: q.revision,
+        expires: this.host.now() + 6 * 60_000,
+      });
     const answer = async (value: string) => {
       const fresh = this.host.services.question(id);
       if (!fresh || fresh.id !== q.id || fresh.revision !== q.revision)
         throw new Error('This question was answered elsewhere or changed');
+      const result = await this.host.services.answer(id, q.id, q.revision, value);
+      const label =
+        q.kind === 'idle'
+          ? value
+          : value === 'deny'
+            ? 'Deny'
+            : (q.options.find((o) => String(o.n) === value)?.label ?? value);
+      await this.resolveQuestionPanels(q.id, q.revision, 'Answered: ' + safe(label, 700));
       return this.payload(
-        (await this.host.services.answer(id, q.id, q.revision, value)) +
+        result +
+          ' Selected answer: ' +
+          safe(label, 700) +
           '\nThe prompt is resolved when the native answer service confirms it; old controls cannot answer a newer prompt.'
       );
     };
@@ -1238,6 +1288,7 @@ export class DiscordNativeUi {
   /** Config disable invalidates every open ephemeral control immediately. Durable queue remains paused. */
   stop(): void {
     this.actions.clear();
+    this.questionPanels.clear();
     this.cardActions.clear();
     this.consumedGroups.clear();
     this.registeredScope = '';

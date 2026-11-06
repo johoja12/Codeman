@@ -347,6 +347,23 @@ describe('native Discord UI', () => {
     expect(f.host.services.answer).not.toHaveBeenCalled();
     expect(f.finishes.at(-1)?.content).toContain('answered elsewhere');
   });
+  it('clears existing native question panels when another interface resolves the prompt', async () => {
+    const f = await fixture();
+    f.setQuestion({
+      id: 'q1',
+      revision: 'rev1',
+      kind: 'question',
+      text: 'Which test?',
+      options: [{ n: 1, label: 'Targeted' }],
+      terminalOnly: false,
+    });
+    await f.ui.poll();
+    await f.click(f.findCard(), 'Question');
+    f.setQuestion(undefined);
+    await f.ui.poll();
+    expect(f.finishes.at(-1)?.content).toContain('resolved or replaced');
+    expect(f.finishes.at(-1)?.components).toEqual([]);
+  });
   it('keeps unverifiable permission dialogs in the terminal', async () => {
     const f = await fixture();
     f.setQuestion({
