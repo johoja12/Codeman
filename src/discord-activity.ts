@@ -14,7 +14,7 @@ export function discordActivityName(session: DiscordActivitySession): string {
       ? '🔴 Needs input'
       : session.working
         ? '🟡 Working'
-        : '🟢 Idle';
+        : '⚫ Idle';
   const name = (session.name ?? session.id.slice(0, 8)).replace(/[\r\n]/g, ' ').trim();
   return `${label} · ${name || session.id.slice(0, 8)}`.slice(0, 100);
 }
