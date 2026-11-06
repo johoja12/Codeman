@@ -7,7 +7,8 @@ import { applyDiscordLaunchDefaults } from './discord-launch-defaults.js';
 import { activeSessionRecoveryActions } from './session-recovery-service.js';
 import { isRecoveryDismissed } from '../session-recovery-fence.js';
 import { discordTaskControl, discordControlCurrent } from '../discord-task-controls.js';
-import { discordHistoryControl, readDiscordSessionHistory } from '../discord-history.js';
+import { readDiscordCanonicalHistory } from '../discord-history-recovery.js';
+import { discordHistoryControl } from '../discord-history.js';
 import { readDiscordSessionFile, writeDiscordRemoteAttachment } from '../discord-file-transfers.js';
 /**
  * @fileoverview Codeman web server — central hub coordinating all subsystems.
@@ -859,7 +860,7 @@ export class WebServer extends EventEmitter {
     history: async (id, options) => {
       const session = this.sessions.get(id);
       if (!session) throw new Error('Session unavailable');
-      return readDiscordSessionHistory(session, options);
+      return this.discordCanonicalHistory(session, options);
     },
     launchModes: () => enabledClis().map((c) => c.id),
     launch: (scope, caseKey, mode) => this.discordSessionManager.launch(scope, caseKey, mode),
@@ -4362,7 +4363,31 @@ export class WebServer extends EventEmitter {
    * segmented into turns for the CLIs that keep none); undefined for a shell, which has no turns, and the
    * screen tail stands in whenever the reader finds nothing.
    */
+  private async discordCanonicalHistory(session: Session, options?: { includeTools?: boolean }) {
+    const before = session.nativeResumeId;
+    const history = await readDiscordCanonicalHistory(
+      session,
+      options,
+      () =>
+        !isMultiUserMode() &&
+        this.discordBridge.acceptsControls &&
+        this.sessions.get(session.id) === session &&
+        !approvalInbox.listPending().some((item) => item.sessionId === session.id && item.kind !== 'idle')
+    );
+    if (session.nativeResumeId !== before) this._persistSessionStateNow(session);
+    return history;
+  }
+
   private async discordFullText(session: Session): Promise<{ text: string; version?: string } | undefined> {
+    if (
+      this.discordBridge.acceptsControls &&
+      ['claude-jsonl', 'codex-rollout'].includes(getCli(session.mode)?.capabilities.transcript ?? '')
+    ) {
+      const history = await this.discordCanonicalHistory(session);
+      const last = [...history.turns].reverse().find((turn) => turn.role === 'assistant');
+      return last ? { text: last.text, version: history.conversationId + ':' + last.cursor } : undefined;
+    }
+
     if (!this.lastResponseFor) return undefined;
     // A CLI with a transcript reader, or whose pane the viewer segments into turns; a shell has neither.
     if (getCli(session.mode)?.capabilities.transcript === 'none' && !isExternalCliTranscriptMode(session.mode)) {

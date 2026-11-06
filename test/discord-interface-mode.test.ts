@@ -1294,3 +1294,31 @@ it('launches from owned case channels and threads with a confirmation, never ter
   expect(launch).toHaveBeenCalledTimes(2);
   expect(sendInput).not.toHaveBeenCalled();
 });
+
+it('reports a missing canonical response once instead of sending cursor-painted terminal fragments', async () => {
+  let now = 10000;
+  const b = makeBridge(undefined, {
+    now: () => now,
+    history: async () => {
+      throw new Error('No exact identity');
+    },
+  });
+  await b.reload();
+  await b.syncSessions();
+  const msg = {
+    sessionId: 's1',
+    event: 'hook:idle_prompt',
+    title: 'Waiting for Input',
+    body: 'fallback',
+    urgency: 'warning' as const,
+    tail: 'happen between these recorded\n\nviews\n8–9 Shared placement\nThe three chat workloads now\nutilization',
+    fullText: async () => undefined,
+  };
+  await b.notify(msg);
+  now += 10000;
+  await b.notify(msg);
+  const notices = posts.filter((p) => p.body?.embeds?.[0]?.title === 'Reconnecting to this conversation');
+  expect(notices).toHaveLength(1);
+  expect(posts.some((p) => JSON.stringify(p.body ?? {}).includes('happen between these recorded'))).toBe(false);
+  expect(sendInput).not.toHaveBeenCalled();
+});
