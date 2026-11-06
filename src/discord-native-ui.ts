@@ -304,12 +304,24 @@ export class DiscordNativeUi {
     const s = await this.target(id);
     if (this.host.channelForSession(id) !== channel) throw new Error('Response destination changed');
     const ctx: UiContext = { channel, session: id, conversation: s.conversation };
+    const scope = this.host.scope();
+    const responseHistory = async () => {
+      const h = await this.host.history(id);
+      await this.target(id, ctx.conversation);
+      if (
+        scope !== this.host.scope() ||
+        h.conversationId !== ctx.conversation ||
+        this.host.channelForSession(id) !== channel
+      )
+        throw new Error('Response conversation or Discord configuration changed.');
+      return h;
+    };
     const anchor = responseCursor ?? userCursor;
     const bind = (label: string, run: UiAction['run']) =>
       this.action(ctx, label, run, undefined, 2, anchor + ':' + label);
     const controls: Array<Record<string, unknown>> = [
       bind('Show updates', async () => {
-        const h = await this.host.history(id);
+        const h = await responseHistory();
         const start = h.turns.findIndex((t) => t.cursor === userCursor && t.role === 'user');
         if (start < 0) throw new Error('Progress history expired; use the session History control.');
         const after = h.turns.slice(start + 1);
@@ -330,7 +342,7 @@ export class DiscordNativeUi {
     if (responseCursor) {
       controls.push(
         bind('Download response', async () => {
-          const h = await this.host.history(id);
+          const h = await responseHistory();
           const turn = h.turns.find((t) => t.cursor === responseCursor && t.role === 'assistant');
           if (!turn) throw new Error('Response history expired; use History instead.');
           await this.host.postFile(
@@ -347,6 +359,79 @@ export class DiscordNativeUi {
       controls.unshift({ type: 2, style: 5, label: 'Open in Codeman', url: s.url });
     return [row(...controls)];
   }
+  /** Reconstruct only response readers; never revive transient approval/queue/settings actions. */
+  private async recoverResponseAction(
+    m: DiscordInteraction,
+    custom: string,
+    scope: string
+  ): Promise<UiAction | undefined> {
+    const channel = m.channel_id!,
+      id = this.host.sessionForChannel(channel);
+    if (!id || !m.message?.id || !/^\d{15,25}$/.test(m.message.id)) return undefined;
+    const s = await this.target(id);
+    const conversation = s.conversation;
+    if (!conversation) return undefined;
+    const current = () =>
+      scope === this.host.scope() &&
+      this.host.channelForSession(id) === channel &&
+      this.host.config().allowed.includes(m.member?.user?.id ?? m.user?.id ?? '');
+    const message = (await this.host.request(
+      'GET',
+      `/channels/${channel}/messages/${m.message.id}`,
+      undefined,
+      current
+    )) as { id?: string; channel_id?: string; author?: { id?: string }; components?: unknown[] } | null;
+    const bot = await this.host.botId();
+    const contains = (value: unknown, depth = 0): boolean => {
+      if (depth > 8 || !value || typeof value !== 'object') return false;
+      if (Array.isArray(value)) return value.slice(0, 40).some((v) => contains(v, depth + 1));
+      const node = value as { custom_id?: string; components?: unknown };
+      return node.custom_id === custom || contains(node.components, depth + 1);
+    };
+    if (
+      !current() ||
+      !bot ||
+      message?.id !== m.message.id ||
+      message.channel_id !== channel ||
+      message.author?.id !== bot ||
+      !contains(message.components)
+    )
+      return undefined;
+    const h = await this.host.history(id);
+    if (!current() || h.conversationId !== conversation) return undefined;
+    await this.target(id, conversation);
+    if (!current()) return undefined;
+    const ctx: UiContext = { channel, session: id, conversation };
+    const matches = (anchor: string, labels: string[]) =>
+      labels.some(
+        (label) => custom === 'cmui:' + hash(JSON.stringify([scope, ctx, anchor + ':' + label])).slice(0, 40)
+      );
+    let restored = false;
+    let user: string | undefined;
+    for (const turn of h.turns.slice(-2048)) {
+      if (turn.role === 'user') {
+        user = turn.cursor;
+        if (matches(user, ['Show updates'])) {
+          await this.responseControls(id, channel, user);
+          restored = true;
+          break;
+        }
+      } else if (
+        turn.role === 'assistant' &&
+        user &&
+        matches(turn.cursor, ['Show updates', 'Download response', 'Results & files'])
+      ) {
+        await this.responseControls(id, channel, user, turn.cursor);
+        restored = true;
+        break;
+      }
+    }
+    if (!restored || !current()) return undefined;
+    const action = this.actions.get(custom);
+    if (action) action.message = m.message.id;
+    return action;
+  }
+
   async refreshInbox(): Promise<void> {
     const channel = this.host.config().parent;
     if (!this.host.scope() || !this.host.inbox || !channel || !this.host.ownsChannel(channel)) return;
@@ -657,24 +742,28 @@ export class DiscordNativeUi {
       return true;
     }
     let action: UiAction | undefined;
+    let recovering = false;
     if (custom) {
       action = this.actions.get(custom);
+      recovering = m.type === 3 && /^cmui:[a-f0-9]{40}$/.test(custom) && (!action || action.expires <= this.host.now());
       if (
-        !action ||
-        (action.submitOnly ? m.type !== 5 : m.type !== 3) ||
-        (action.group !== undefined && this.consumedGroups.has(action.group)) ||
-        action.scope !== scope ||
-        action.channel !== m.channel_id ||
-        (action.actor && action.actor !== actor) ||
-        action.expires <= this.host.now() ||
-        (m.type === 3 && action.message && m.message?.id !== action.message)
+        !recovering &&
+        (!action ||
+          (action.submitOnly ? m.type !== 5 : m.type !== 3) ||
+          (action.group !== undefined && this.consumedGroups.has(action.group)) ||
+          action.scope !== scope ||
+          action.channel !== m.channel_id ||
+          (action.actor && action.actor !== actor) ||
+          action.expires <= this.host.now() ||
+          (m.type === 3 && action.message && m.message?.id !== action.message))
       ) {
         await reject('This menu expired or changed. Use /codeman or !codeman ui to reopen it.');
         return true;
       }
-      if (!action.modal && (action.actor || action.group || action.submitOnly)) this.actions.delete(custom);
-      if (action.group) this.consumedGroups.set(action.group, this.host.now() + 6 * 60_000);
-      if (action.modal && m.type === 3) {
+      if (!recovering && action && !action.modal && (action.actor || action.group || action.submitOnly))
+        this.actions.delete(custom);
+      if (!recovering && action?.group) this.consumedGroups.set(action.group, this.host.now() + 6 * 60_000);
+      if (!recovering && action?.modal && m.type === 3) {
         const id = 'cmui:' + randomUUID();
         this.actions.set(id, {
           ...action,
@@ -706,7 +795,10 @@ export class DiscordNativeUi {
       }
     }
     // All network/disk and provider work happens after Discord's immediate acknowledgement.
-    await this.host.respond(m, action?.actor && m.type === 3 ? { type: 6 } : { type: 5, data: { flags: 64 } });
+    await this.host.respond(
+      m,
+      !recovering && action?.actor && m.type === 3 ? { type: 6 } : { type: 5, data: { flags: 64 } }
+    );
     try {
       if (!(await this.host.claim(m))) {
         await this.host.finish(m, this.payload('This interaction was already received; no action was replayed.'));
@@ -714,6 +806,18 @@ export class DiscordNativeUi {
       }
       if (scope !== this.host.scope() || !this.host.config().allowed.includes(actor))
         throw new Error('Discord configuration changed');
+      if (recovering) {
+        action = await this.recoverResponseAction(m, custom!, scope);
+        if (!action) {
+          await this.host.finish(
+            m,
+            this.payload(
+              'This response control is no longer available in the current session history. Use /codeman or !codeman ui for current controls.'
+            )
+          );
+          return true;
+        }
+      }
       if (action?.session) await this.target(action.session, action.conversation);
       let result: DiscordUiPayload | void;
       if (action) {
