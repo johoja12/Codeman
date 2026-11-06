@@ -760,3 +760,37 @@ it('cleans up at most three legacy cards per poll and never recreates them after
   await restored.poll();
   expect([...f.messages.values()].some((m) => m.content.includes('**Prompt delivery**'))).toBe(false);
 });
+it('offers stable read-only response controls with exact history and actor checks', async () => {
+  const f = await fixture();
+  f.host.history = async () => ({
+    conversationId: 'conversation-one',
+    partial: false,
+    turns: [
+      { cursor: 'u1', role: 'user', text: 'Build', timestamp: '' },
+      { cursor: 'p1', role: 'assistant', text: 'Compiling', timestamp: '', phase: 'commentary' },
+      { cursor: 'r1', role: 'assistant', text: 'Visible answer', timestamp: '', phase: 'final_answer' },
+    ],
+  });
+  const controls = await f.ui.responseControls('s1', channel, 'u1', 'r1');
+  const again = await f.ui.responseControls('s1', channel, 'u1', 'r1');
+  expect(again).toEqual(controls);
+  const payload = { content: '', components: controls } as DiscordUiPayload;
+  const updates = await f.click(payload, 'Show updates');
+  expect(updates.content).toContain('Compiling');
+  expect(updates.content).not.toContain('Visible answer');
+  await f.click(payload, 'Download response');
+  expect(f.host.postFile).toHaveBeenCalledWith(
+    channel,
+    { name: 'response.txt', data: Buffer.from('Visible answer') },
+    'Requested assistant response'
+  );
+  const fresh = new DiscordNativeUi(f.host);
+  expect(await fresh.responseControls('s1', channel, 'u1', 'r1')).toEqual(controls);
+  const button = f.component(payload, 'Download response');
+  await fresh.interaction(f.event(button, { member: { user: { id: '999999999999999999' } } }));
+  expect(f.host.postFile).toHaveBeenCalledTimes(1);
+  f.sessions[0].conversation = 'different';
+  await f.ui.interaction(f.event(button));
+  expect(f.host.postFile).toHaveBeenCalledTimes(1);
+  expect(f.finishes.at(-1)?.content).toContain('changed');
+});

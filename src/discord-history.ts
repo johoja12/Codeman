@@ -19,7 +19,7 @@ interface NativeHistoryRow {
   isSidechain?: boolean;
   isMeta?: boolean;
   isCompactSummary?: boolean;
-  message?: { content?: unknown };
+  message?: { content?: unknown; stop_reason?: string };
   payload?: {
     type?: string;
     output?: unknown;
@@ -69,6 +69,7 @@ export interface DiscordHistoryTurn {
   role: 'user' | 'assistant' | 'tool';
   timestamp: string;
   text: string;
+  phase?: 'commentary' | 'final_answer';
 }
 export interface DiscordHistory {
   conversationId: string;
@@ -166,6 +167,7 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
   for (const { value: e, offset, raw } of rows) {
     let role: 'user' | 'assistant' | 'tool' | undefined,
       text = '',
+      phase: DiscordHistoryTurn['phase'],
       timestamp = typeof e.timestamp === 'string' ? e.timestamp : '';
     if (source.includeTools) {
       let output = '';
@@ -212,6 +214,7 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
       if (!msg || (msg.injectionProne && isCodexInjectedContext(msg.text))) continue;
       role = msg.role;
       text = msg.text;
+      if (role === 'assistant' && (msg.phase === 'commentary' || msg.phase === 'final_answer')) phase = msg.phase;
     } else {
       if (e.isSidechain || e.isMeta || e.isCompactSummary || (e.sessionId && e.sessionId !== source.conversationId))
         continue;
@@ -227,6 +230,11 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
         timestamp = e.attachment.timestamp || timestamp;
       } else if (e.type === 'user' || e.type === 'assistant') role = e.type;
       if (!role) continue;
+      if (role === 'assistant') {
+        if (e.message?.stop_reason === 'tool_use') phase = 'commentary';
+        else if (e.message?.stop_reason === 'end_turn' || e.message?.stop_reason === 'stop_sequence')
+          phase = 'final_answer';
+      }
       text =
         typeof body === 'string'
           ? body
@@ -246,10 +254,19 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
     }
     if (!role || !text.trim()) continue;
     const prev = turns.at(-1);
-    if (prev?.role === role && prev.text === text) continue;
+    if (prev?.role === role && prev.text === text) {
+      if (prev.phase === phase || phase === undefined) continue;
+      // Native mirror rows may omit phase. Keep their stable cursor while applying explicit metadata.
+      if (prev.phase === undefined) {
+        prev.phase = phase;
+        continue;
+      }
+      // An explicit final answer can repeat commentary verbatim; it still needs its own delivery.
+    }
     turns.push({
       role,
       text,
+      ...(phase ? { phase } : {}),
       timestamp,
       cursor: `${source.conversationId}:${offset}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`,
     });

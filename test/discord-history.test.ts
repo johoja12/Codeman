@@ -47,6 +47,39 @@ describe('Discord native history', () => {
     );
     expect(got.turns.map((t) => t.text)).toEqual(['answer']);
   });
+  it('preserves only explicit native commentary/final metadata without guessing from text', () => {
+    const h = parseDiscordHistory(
+      { mode: 'codex', conversationId: id },
+      packet([
+        {
+          type: 'event_msg',
+          payload: { type: 'agent_message', phase: 'commentary', message: 'Checks passed; still compiling' },
+        },
+        { type: 'event_msg', payload: { type: 'agent_message', phase: 'final_answer', message: 'Result' } },
+        { type: 'event_msg', payload: { type: 'agent_message', message: 'Working on it' } },
+      ])
+    );
+    expect(h.turns.map((t) => t.phase)).toEqual(['commentary', 'final_answer', undefined]);
+    const c = parseDiscordHistory(
+      { mode: 'claude', conversationId: id },
+      packet([
+        { type: 'assistant', message: { stop_reason: 'tool_use', content: 'Before tool' } },
+        { type: 'assistant', message: { stop_reason: 'end_turn', content: 'After tool' } },
+      ])
+    );
+    expect(c.turns.map((t) => t.phase)).toEqual(['commentary', 'final_answer']);
+  });
+  it('does not lose a final answer repeated verbatim after commentary or duplicate a phaseless mirror', () => {
+    const h = parseDiscordHistory(
+      { mode: 'codex', conversationId: id },
+      packet([
+        { type: 'event_msg', payload: { type: 'agent_message', phase: 'commentary', message: 'Done' } },
+        { type: 'event_msg', payload: { type: 'agent_message', phase: 'final_answer', message: 'Done' } },
+        { type: 'event_msg', payload: { type: 'agent_message', message: 'Done' } },
+      ])
+    );
+    expect(h.turns.map((t) => t.phase)).toEqual(['commentary', 'final_answer']);
+  });
   it('paginates with stable conversation/row cursors and rejects stale or foreign cursors', () => {
     const history = parseDiscordHistory(
       { mode: 'claude', conversationId: id },

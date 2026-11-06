@@ -1,0 +1,390 @@
+{
+  "complete": {
+    "progress": {
+      "content": "",
+      "flags": 32772,
+      "allowed_mentions": {
+        "parse": [],
+        "users": []
+      },
+      "components": [
+        {
+          "type": 10,
+          "content": "-# ✅ Done · 5 progress updates"
+        },
+        {
+          "type": 10,
+          "content": "Final reviewed source build: native shim compilation finished."
+        },
+        {
+          "type": 1,
+          "components": [
+            {
+              "type": 2,
+              "style": 5,
+              "label": "Open in Codeman",
+              "url": "https://example.invalid/#session=sample"
+            },
+            {
+              "type": 2,
+              "style": 2,
+              "label": "Show updates",
+              "custom_id": "cmui:b1965a3a8bd64223a6e4d0c6872fc20c92b4ada6"
+            }
+          ]
+        }
+      ]
+    },
+    "responses": [
+      {
+        "content": "",
+        "flags": 32772,
+        "components": [
+          {
+            "type": 17,
+            "accent_color": 5884562,
+            "components": [
+              {
+                "type": 10,
+                "content": "**✓ Turn finished**\n-# Build & native checks"
+              }
+            ]
+          },
+          {
+            "type": 10,
+            "content": "## The build and native checks passed.\n\nThe reviewed source produced a Docker artifact. The changes are ready for review.\n\n### Verification\n- **Rust build, native shim link and FFI header:** passed.\n- **PostgreSQL regression:** 64 worker generations reused the four-slot pool.\n- **RETURNING behavior:** retry, rollback and metadata checks passed.\n\n### Deployment status\nNo deployment has been performed. The temporary test database has been removed.\n\n### Reproduce the build\n```sh\n# Build from the reviewed source tree\ndocker build --no-cache -t plex-shim:review .\n```"
+          },
+          {
+            "type": 14,
+            "divider": true,
+            "spacing": 1
+          },
+          {
+            "type": 1,
+            "components": [
+              {
+                "type": 2,
+                "style": 5,
+                "label": "Open in Codeman",
+                "url": "https://example.invalid/#session=sample"
+              },
+              {
+                "type": 2,
+                "style": 2,
+                "label": "Show updates",
+                "custom_id": "cmui:375a523a65db1cd6989de66865a293f942547abb"
+              },
+              {
+                "type": 2,
+                "style": 2,
+                "label": "Download response",
+                "custom_id": "cmui:0b9517421a80734c9a011013e5626bcbc04dfff4"
+              },
+              {
+                "type": 2,
+                "style": 2,
+                "label": "Results & files",
+                "custom_id": "cmui:940f60bf4115b6949caa1b4fdb3b0e8ef10d0a3c"
+              }
+            ]
+          }
+        ],
+        "allowed_mentions": {
+          "parse": [],
+          "users": []
+        }
+      }
+    ]
+  },
+  "running": {
+    "progress": {
+      "content": "",
+      "flags": 32772,
+      "allowed_mentions": {
+        "parse": [],
+        "users": []
+      },
+      "components": [
+        {
+          "type": 10,
+          "content": "-# ⏳ Working… · 5 progress updates"
+        },
+        {
+          "type": 10,
+          "content": "Final reviewed source build: native shim compilation finished."
+        },
+        {
+          "type": 1,
+          "components": [
+            {
+              "type": 2,
+              "style": 5,
+              "label": "Open in Codeman",
+              "url": "https://example.invalid/#session=sample"
+            },
+            {
+              "type": 2,
+              "style": 2,
+              "label": "Show updates",
+              "custom_id": "cmui:b1965a3a8bd64223a6e4d0c6872fc20c92b4ada6"
+            }
+          ]
+        }
+      ]
+    },
+    "responses": [
+      {
+        "content": "",
+        "flags": 32772,
+        "components": [
+          {
+            "type": 17,
+            "accent_color": 5809919,
+            "components": [
+              {
+                "type": 10,
+                "content": "**Working**\n-# Build & native checks"
+              }
+            ]
+          },
+          {
+            "type": 10,
+            "content": "### Native checks passed. Docker is still building.\n\nThe compiler is active and has not reported an error. Wait for the final artifact export before reporting this build as complete."
+          },
+          {
+            "type": 14,
+            "divider": true,
+            "spacing": 1
+          },
+          {
+            "type": 1,
+            "components": [
+              {
+                "type": 2,
+                "style": 5,
+                "label": "Open in Codeman",
+                "url": "https://example.invalid/#session=sample"
+              },
+              {
+                "type": 2,
+                "style": 2,
+                "label": "Show updates",
+                "custom_id": "cmui:375a523a65db1cd6989de66865a293f942547abb"
+              },
+              {
+                "type": 2,
+                "style": 2,
+                "label": "Download response",
+                "custom_id": "cmui:0b9517421a80734c9a011013e5626bcbc04dfff4"
+              },
+              {
+                "type": 2,
+                "style": 2,
+                "label": "Results & files",
+                "custom_id": "cmui:940f60bf4115b6949caa1b4fdb3b0e8ef10d0a3c"
+              }
+            ]
+          }
+        ],
+        "allowed_mentions": {
+          "parse": [],
+          "users": []
+        }
+      }
+    ]
+  },
+  "question": {
+    "progress": {
+      "content": "",
+      "flags": 32772,
+      "allowed_mentions": {
+        "parse": [],
+        "users": []
+      },
+      "components": [
+        {
+          "type": 10,
+          "content": "-# ❓ Needs your answer · 5 progress updates"
+        },
+        {
+          "type": 10,
+          "content": "Final reviewed source build: native shim compilation finished."
+        },
+        {
+          "type": 1,
+          "components": [
+            {
+              "type": 2,
+              "style": 5,
+              "label": "Open in Codeman",
+              "url": "https://example.invalid/#session=sample"
+            },
+            {
+              "type": 2,
+              "style": 2,
+              "label": "Show updates",
+              "custom_id": "cmui:b1965a3a8bd64223a6e4d0c6872fc20c92b4ada6"
+            }
+          ]
+        }
+      ]
+    },
+    "responses": [
+      {
+        "content": "",
+        "flags": 32772,
+        "components": [
+          {
+            "type": 17,
+            "accent_color": 15906891,
+            "components": [
+              {
+                "type": 10,
+                "content": "**Your input is needed**\n-# Build & native checks"
+              }
+            ]
+          },
+          {
+            "type": 10,
+            "content": "### Which image tag should the artifact use?\n\nUse the session Question control to answer the actual pending prompt. No deployment has started."
+          },
+          {
+            "type": 14,
+            "divider": true,
+            "spacing": 1
+          },
+          {
+            "type": 1,
+            "components": [
+              {
+                "type": 2,
+                "style": 5,
+                "label": "Open in Codeman",
+                "url": "https://example.invalid/#session=sample"
+              },
+              {
+                "type": 2,
+                "style": 2,
+                "label": "Show updates",
+                "custom_id": "cmui:375a523a65db1cd6989de66865a293f942547abb"
+              },
+              {
+                "type": 2,
+                "style": 2,
+                "label": "Download response",
+                "custom_id": "cmui:0b9517421a80734c9a011013e5626bcbc04dfff4"
+              },
+              {
+                "type": 2,
+                "style": 2,
+                "label": "Results & files",
+                "custom_id": "cmui:940f60bf4115b6949caa1b4fdb3b0e8ef10d0a3c"
+              }
+            ]
+          }
+        ],
+        "allowed_mentions": {
+          "parse": [],
+          "users": []
+        }
+      }
+    ]
+  },
+  "failed": {
+    "progress": {
+      "content": "",
+      "flags": 32772,
+      "allowed_mentions": {
+        "parse": [],
+        "users": []
+      },
+      "components": [
+        {
+          "type": 10,
+          "content": "-# ⚠️ Task failed · 5 progress updates"
+        },
+        {
+          "type": 10,
+          "content": "Final reviewed source build: native shim compilation finished."
+        },
+        {
+          "type": 1,
+          "components": [
+            {
+              "type": 2,
+              "style": 5,
+              "label": "Open in Codeman",
+              "url": "https://example.invalid/#session=sample"
+            },
+            {
+              "type": 2,
+              "style": 2,
+              "label": "Show updates",
+              "custom_id": "cmui:b1965a3a8bd64223a6e4d0c6872fc20c92b4ada6"
+            }
+          ]
+        }
+      ]
+    },
+    "responses": [
+      {
+        "content": "",
+        "flags": 32772,
+        "components": [
+          {
+            "type": 17,
+            "accent_color": 15559531,
+            "components": [
+              {
+                "type": 10,
+                "content": "**Task failed**\n-# Build & native checks"
+              }
+            ]
+          },
+          {
+            "type": 10,
+            "content": "### Artifact export failed.\n\nThe build reported insufficient disk space while writing its image layer. Inspect the build log before choosing a next step. No cleanup, retry or deployment was attempted."
+          },
+          {
+            "type": 14,
+            "divider": true,
+            "spacing": 1
+          },
+          {
+            "type": 1,
+            "components": [
+              {
+                "type": 2,
+                "style": 5,
+                "label": "Open in Codeman",
+                "url": "https://example.invalid/#session=sample"
+              },
+              {
+                "type": 2,
+                "style": 2,
+                "label": "Show updates",
+                "custom_id": "cmui:375a523a65db1cd6989de66865a293f942547abb"
+              },
+              {
+                "type": 2,
+                "style": 2,
+                "label": "Download response",
+                "custom_id": "cmui:0b9517421a80734c9a011013e5626bcbc04dfff4"
+              },
+              {
+                "type": 2,
+                "style": 2,
+                "label": "Results & files",
+                "custom_id": "cmui:940f60bf4115b6949caa1b4fdb3b0e8ef10d0a3c"
+              }
+            ]
+          }
+        ],
+        "allowed_mentions": {
+          "parse": [],
+          "users": []
+        }
+      }
+    ]
+  }
+}

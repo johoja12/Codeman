@@ -37,7 +37,12 @@ let activityRenameRetryAfter: number | undefined;
 let uploaded: Array<{ name: string; text: string }>;
 /** Assert what a reader sees, across plain text and native response cards. */
 const visibleText = (body: any): string | undefined =>
-  body?.embeds?.map((embed: any) => embed.description).join('\n') || body?.content;
+  body?.embeds?.map((embed: any) => embed.description).join('\n') ||
+  body?.components
+    ?.filter((c: any) => c.type === 10)
+    .map((c: any) => c.content?.replace(/^-# /, ''))
+    .join('\n') ||
+  body?.content;
 const BOT = '888888888888888888';
 
 function makeBridge(
@@ -70,7 +75,7 @@ function makeBridge(
         return Response.json([...remoteChannels.values()].filter((c) => c.type === 0));
       const messageMatch = /\/channels\/(\d+)\/messages(?:\/(\d+))?$/.exec(path);
       if (method === 'PATCH' && messageMatch?.[2]) {
-        if (statusEditRefused && body?.content) return Response.json({}, { status: 403 });
+        if (statusEditRefused && (body?.content || body?.flags === 32772)) return Response.json({}, { status: 403 });
         const m = remoteMessages.get(messageMatch[2]);
         if (!m) return Response.json({}, { status: 404 });
         Object.assign(m, body);
@@ -608,7 +613,7 @@ describe('Discord interface mode', () => {
     await b.notify({ ...msg, event: 'hook:stop', urgency: 'info' });
     expect(posts.filter((p) => visibleText(p.body)?.includes('**Answer**'))).toHaveLength(1);
     expect(visibleText(posts.find((p) => visibleText(p.body)?.includes('**Answer**'))?.body)).toBe(
-      '**Response**\n\n**Answer**\n- One\n- Two'
+      '**Answer**\n- One\n- Two'
     );
     expect(
       posts.some(
@@ -660,7 +665,11 @@ describe('Discord interface mode', () => {
       });
       expect(r?.ok).toBe(true);
       expect(
-        posts.some((p) => p.body?.content?.includes('**Response**') && visibleText(p.body)?.includes('fallback answer'))
+        posts.some(
+          (p) =>
+            p.body?.components?.[0]?.components?.[0]?.content === '**Response**' &&
+            visibleText(p.body)?.includes('fallback answer')
+        )
       ).toBe(true);
     }
   );
@@ -704,7 +713,7 @@ describe('Discord interface mode', () => {
     turns = [{ cursor: 'native1:1', role: 'user', text: 'first', timestamp: '' }];
     await b.pollConversations();
     const statusPost = posts.find((p) => p.method === 'POST' && visibleText(p.body) === '⏳ Working…')!;
-    const message = [...remoteMessages.values()].find((m) => m.content === '⏳ Working…')!;
+    const message = [...remoteMessages.values()].find((m) => visibleText(m) === '⏳ Working…')!;
     now += 60001;
     state = 'completed';
     await b.pollConversations();
@@ -779,21 +788,21 @@ describe('Discord interface mode', () => {
       { cursor: 'native1:2', role: 'assistant', text: metadata, timestamp: '' },
     ];
     await b.pollConversations();
-    expect(posts.filter((p) => visibleText(p.body) === '**Response**\n\nClean answer')).toHaveLength(1);
+    expect(posts.filter((p) => visibleText(p.body) === 'Clean answer')).toHaveLength(1);
     expect(
       posts.some((p) => visibleText(p.body)?.includes('MEMORY.md') || visibleText(p.body)?.includes('<oai-mem'))
     ).toBe(false);
     now += 60001;
     turns.push({ cursor: 'native1:3', role: 'assistant', text: 'Next answer', timestamp: '' });
     await b.pollConversations();
-    expect(posts.filter((p) => visibleText(p.body) === '**Response**\n\nNext answer')).toHaveLength(1);
-    expect(posts.filter((p) => visibleText(p.body) === '**Response**\n\nClean answer')).toHaveLength(1);
+    expect(posts.filter((p) => visibleText(p.body) === 'Next answer')).toHaveLength(1);
+    expect(posts.filter((p) => visibleText(p.body) === 'Clean answer')).toHaveLength(1);
     b.stop();
     const again = makeBridge(undefined, { history, now: () => now });
     await again.reload();
     await again.syncSessions();
     await again.pollConversations();
-    expect(posts.filter((p) => visibleText(p.body) === '**Response**\n\nClean answer')).toHaveLength(1);
+    expect(posts.filter((p) => visibleText(p.body) === 'Clean answer')).toHaveLength(1);
   });
 
   it('omits metadata-only historical turns while retaining visible historical context', async () => {
@@ -1217,12 +1226,12 @@ it('renders routine fallback answers as readable cards without repeating alert m
     }),
   });
   expect(result?.ok).toBe(true);
-  const post = posts.find((p) => p.body?.content?.includes('**Spread:**'))!.body;
-  expect(post.content).toContain('**Response**');
+  const post = posts.find((p) => visibleText(p.body)?.includes('**Spread:**'))!.body;
+  expect(post.components[0].components[0].content).toBe('**Response**');
   expect(post.embeds).toBeUndefined();
-  expect(post.flags).toBe(4);
-  expect(post.content).toContain('\n\n2. **Shared:**');
-  expect(post.content).toContain('https://example.test/demo');
+  expect(post.flags).toBe(32772);
+  expect(visibleText(post)).toContain('\n\n2. **Shared:**');
+  expect(visibleText(post)).toContain('https://example.test/demo');
   expect(JSON.stringify(post)).not.toContain('Waiting for Input');
   expect(JSON.stringify(post)).not.toContain('codeman:example');
   expect(JSON.stringify(post)).not.toContain('[w5-demo]');
@@ -1240,11 +1249,12 @@ it('keeps critical alert context and an allowlisted ping when the attached respo
     fullText: async () => ({ text: 'Detailed failure explanation.' }),
   });
   expect(result?.ok).toBe(true);
-  const post = posts.find((p) => p.body?.content?.includes('**🔴 Task failed**'))!.body;
-  expect(post.flags).toBe(4);
+  const post = posts.find((p) => p.body?.components?.[0]?.components?.[0]?.content === '**Task failed**')!.body;
+  expect(post.flags).toBe(32772);
   expect(post.embeds).toBeUndefined();
-  expect(post.content).toContain('The build command failed.');
-  expect(post.content).toContain('Detailed failure explanation.');
+  expect(post.components[0].accent_color).toBe(0xed6b6b);
+  expect(visibleText(post)).toContain('The build command failed.');
+  expect(visibleText(post)).toContain('Detailed failure explanation.');
   expect(post.allowed_mentions.parse).toEqual([]);
   expect(post.allowed_mentions.users).toEqual(cfg.allowedUserIds);
 });
@@ -1262,7 +1272,7 @@ it('does not add a bare Waiting for Input wrapper after the same fallback answer
   };
   expect((await b.notify(msg))?.ok).toBe(true);
   expect((await b.notify({ ...msg, event: 'hook:stop' }))?.deduped).toBe(true);
-  expect(posts.filter((p) => visibleText(p.body) === '**Response**\n\nA completed answer.')).toHaveLength(1);
+  expect(posts.filter((p) => visibleText(p.body) === 'A completed answer.')).toHaveLength(1);
   expect(posts.some((p) => p.body?.content?.includes('Waiting for Input'))).toBe(false);
 });
 
@@ -1320,5 +1330,75 @@ it('launches from owned case channels and threads with a confirmation, never ter
   currentRoot = 'b'.repeat(64);
   await b.onGatewayInteraction({ ...interaction, id: '900000000000000087', channel_id: map.s1 });
   expect(launch).toHaveBeenCalledTimes(2);
+  expect(sendInput).not.toHaveBeenCalled();
+});
+it('coalesces explicit commentary into one editable status and delivers the native final once', async () => {
+  sessions = [{ id: 's1', name: 'one' }];
+  let now = 100000;
+  let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+  let state: 'running' | 'completed' = 'running';
+  const history = async () => ({
+    conversationId: 'native1',
+    partial: false,
+    turns,
+    executions: [{ userCursor: 'native1:user', promptHash: 'proof', state }],
+  });
+  const b = makeBridge(undefined, { history, now: () => now });
+  await b.reload();
+  await b.syncSessions();
+  posts = [];
+  turns = [
+    { role: 'user', cursor: 'native1:user', text: 'Build', timestamp: 't' },
+    {
+      role: 'assistant',
+      cursor: 'native1:p1',
+      text: 'Checks passed; still compiling',
+      timestamp: 't',
+      phase: 'commentary',
+    },
+  ];
+  await b.pollConversations();
+  expect(posts.filter((p) => p.method === 'POST' && visibleText(p.body)?.includes('Checks passed'))).toHaveLength(1);
+  expect(
+    posts
+      .find((p) => p.method === 'POST' && visibleText(p.body)?.includes('Checks passed'))!
+      .body.components.some((c: any) => c.type === 17)
+  ).toBe(false);
+  turns.push({
+    role: 'assistant',
+    cursor: 'native1:p2',
+    text: 'Exporting artifact',
+    timestamp: 't',
+    phase: 'commentary',
+  });
+  now += 60001;
+  await b.pollConversations();
+  expect(posts.filter((p) => p.method === 'PATCH' && visibleText(p.body)?.includes('Exporting artifact'))).toHaveLength(
+    1
+  );
+  expect(posts.filter((p) => p.method === 'POST' && visibleText(p.body)?.includes('Exporting artifact'))).toHaveLength(
+    0
+  );
+  turns.push({
+    role: 'assistant',
+    cursor: 'native1:final',
+    text: 'The artifact is ready.',
+    timestamp: 't',
+    phase: 'final_answer',
+  });
+  state = 'completed';
+  now += 60001;
+  await b.pollConversations();
+  const final = posts.filter((p) => p.method === 'POST' && visibleText(p.body) === 'The artifact is ready.');
+  expect(final).toHaveLength(1);
+  expect(final[0].body.components[0].accent_color).toBe(0x59ca92);
+  expect(final[0].body.content).toBeUndefined();
+  expect(final[0].body.embeds).toBeUndefined();
+  b.stop();
+  const restarted = makeBridge(undefined, { history, now: () => now });
+  await restarted.reload();
+  await restarted.syncSessions();
+  await restarted.pollConversations();
+  expect(posts.filter((p) => p.method === 'POST' && visibleText(p.body) === 'The artifact is ready.')).toHaveLength(1);
   expect(sendInput).not.toHaveBeenCalled();
 });

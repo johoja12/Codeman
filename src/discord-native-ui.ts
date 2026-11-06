@@ -1,7 +1,8 @@
 /** Native Discord controls. Tokens bind actor, origin, configuration and exact conversation. */
 import { createHash, randomUUID } from 'node:crypto';
 import { DiscordUiStore } from './discord-ui-store.js';
-import type { DiscordInteraction, GatewayMessage } from './discord-bridge.js';
+import { discordDisplayText } from './discord-display-text.js';
+import type { DiscordInteraction, GatewayMessage, DiscordPost } from './discord-bridge.js';
 import type { DiscordNativeUiHost, DiscordUiPayload, DiscordUiSession } from './discord-native-ui-types.js';
 const hash = (s: string) => createHash('sha256').update(s).digest('hex');
 const sourceSignature = (m: GatewayMessage) =>
@@ -71,11 +72,14 @@ export class DiscordNativeUi {
     label: string,
     run: UiAction['run'],
     modal?: UiAction['modal'],
-    style = 2
+    style = 2,
+    identity?: string
   ): Record<string, unknown> {
     this.prune();
-    if (this.actions.size >= 2048) throw new Error('Too many open controls; retry after older menus expire');
-    const id = 'cmui:' + randomUUID();
+    const id =
+      'cmui:' + (identity ? hash(JSON.stringify([this.host.scope(), ctx, identity])).slice(0, 40) : randomUUID());
+    if (!this.actions.has(id) && this.actions.size >= 2048)
+      throw new Error('Too many open controls; retry after older menus expire');
     this.actions.set(id, { ...ctx, scope: this.host.scope()!, expires: this.host.now() + 6 * 60_000, run, modal });
     return { type: 2, style, label: label.slice(0, 80), custom_id: id };
   }
@@ -279,6 +283,59 @@ export class DiscordNativeUi {
       `**${safe(s.caseName)} · ${safe(s.host)}**\n${status} · ${safe(s.mode)}\n\n**Model:** ${safe(s.model || 'Not reported')}\n**Effort:** ${safe(s.effort || 'Not reported')}\n**Launch approvals:** ${safe(s.approval || 'CLI default / not reported')}\n**Conversation:** ${safe(s.conversation || 'Not yet identified')}\n${task ? '\n**Latest prompt:** ' + safe(task, 240) + '\n' : ''}${last ? '\n**Latest delivery:** ' + (stateLabels[last.state] ?? safe(last.state)) : ''}${q.some((p) => p.state === 'uncertain') ? '\n⚠ A queued submission is unconfirmed; it will not replay.' : ''}`,
       controls
     );
+  }
+  /** Read-only response controls have stable IDs so multipart retries keep an identical fingerprint. */
+  async responseControls(
+    id: string,
+    channel: string,
+    userCursor: string,
+    responseCursor?: string
+  ): Promise<NonNullable<DiscordPost['components']>> {
+    const s = await this.target(id);
+    if (this.host.channelForSession(id) !== channel) throw new Error('Response destination changed');
+    const ctx: UiContext = { channel, session: id, conversation: s.conversation };
+    const anchor = responseCursor ?? userCursor;
+    const bind = (label: string, run: UiAction['run']) =>
+      this.action(ctx, label, run, undefined, 2, anchor + ':' + label);
+    const controls: Array<Record<string, unknown>> = [
+      bind('Show updates', async () => {
+        const h = await this.host.history(id);
+        const start = h.turns.findIndex((t) => t.cursor === userCursor && t.role === 'user');
+        if (start < 0) throw new Error('Progress history expired; use the session History control.');
+        const after = h.turns.slice(start + 1);
+        const end = after.findIndex((t) => t.role === 'user');
+        const updates = (end < 0 ? after : after.slice(0, end)).filter(
+          (t) => t.role === 'assistant' && t.phase === 'commentary'
+        );
+        return this.payload(
+          '**Progress updates**\n' +
+            (updates
+              .slice(-6)
+              .map((t) => `${safe(t.timestamp, 30)}\n${discordDisplayText(t.text).slice(0, 250)}`)
+              .join('\n\n') || 'No explicitly identified progress updates are available.') +
+            (updates.length > 6 ? '\n\nLatest six shown. Use History for earlier updates.' : '')
+        );
+      }),
+    ];
+    if (responseCursor) {
+      controls.push(
+        bind('Download response', async () => {
+          const h = await this.host.history(id);
+          const turn = h.turns.find((t) => t.cursor === responseCursor && t.role === 'assistant');
+          if (!turn) throw new Error('Response history expired; use History instead.');
+          await this.host.postFile(
+            channel,
+            { name: 'response.txt', data: Buffer.from(discordDisplayText(turn.text)) },
+            'Requested assistant response'
+          );
+          return this.payload('Response file posted in this session thread.');
+        }),
+        bind('Results & files', (m) => this.results(m, id))
+      );
+    }
+    if (s.url && /^https?:\/\//.test(s.url))
+      controls.unshift({ type: 2, style: 5, label: 'Open in Codeman', url: s.url });
+    return [row(...controls)];
   }
   async poll(): Promise<void> {
     if (this.polls) return this.polls;
