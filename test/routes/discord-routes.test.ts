@@ -461,3 +461,47 @@ describe('discord-notify with a file', () => {
     bridge.stop();
   });
 });
+it('shares exact completion acknowledgements without clearing another task and scopes reads to owned sessions', async () => {
+  const { app, bridge } = await harness();
+  await app.inject({ method: 'PUT', url: '/api/discord', payload: FULL });
+  const h = (state: 'running' | 'completed', n: number) => ({
+    conversationId: 'convo',
+    partial: false,
+    turns: [
+      { role: 'user' as const, cursor: 'u' + n, text: 'Build', timestamp: '' },
+      { role: 'assistant' as const, cursor: 'a' + n, text: 'Response', timestamp: '' },
+    ],
+    executions: [{ userCursor: 'u' + n, promptHash: 'proof', state }],
+  });
+  const input = (state: 'running' | 'completed', n: number) => ({
+    session: 'test-session-1',
+    name: 'Build',
+    guild: FULL.guildId,
+    channel: '444444444444444444',
+    history: h(state, n),
+  });
+  await bridge.completionInbox.observe(input('running', 1));
+  await bridge.completionInbox.observe(input('completed', 1));
+  await bridge.completionInbox.observe(input('running', 2));
+  await bridge.completionInbox.observe(input('completed', 2));
+  const list = (await app.inject({ method: 'GET', url: '/api/discord/inbox' })).json().data.entries;
+  expect(list).toHaveLength(2);
+  const read = await app.inject({ method: 'POST', url: `/api/discord/inbox/${list[0].id}/read` });
+  expect(read.statusCode).toBe(200);
+  const updated = (await app.inject({ method: 'GET', url: '/api/discord/inbox' })).json().data.entries;
+  expect(updated.filter((e: any) => e.reviewed === undefined)).toHaveLength(1);
+  expect((await app.inject({ method: 'POST', url: '/api/discord/inbox/' + 'f'.repeat(32) + '/read' })).statusCode).toBe(
+    404
+  );
+  bridge.stop();
+  await app.close();
+});
+it('does not expose shared Discord inbox state to non-admin multi-user callers', async () => {
+  process.env.CODEMAN_MULTIUSER = '1';
+  const { app, bridge } = await harness({ username: 'other', role: 'user' });
+  const response = await app.inject({ method: 'GET', url: '/api/discord/inbox' });
+  expect(response.statusCode).toBe(200);
+  expect(response.json().data).toEqual({ entries: [], enabled: false });
+  bridge.stop();
+  await app.close();
+});

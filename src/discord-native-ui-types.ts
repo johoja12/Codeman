@@ -1,5 +1,6 @@
 /** Narrow ports: native Discord UI reuses existing session, input and file services. */
 import type { DiscordControlReply, DiscordFile, GatewayMessage, DiscordInteraction } from './discord-bridge.js';
+import type { CompletionEntry } from './completion-inbox.js';
 import type { DiscordHistory } from './discord-history.js';
 export interface DiscordUiSession {
   id: string;
@@ -55,6 +56,11 @@ export interface DiscordUiPayload {
 }
 export interface DiscordNativeUiHost {
   dir: string;
+  inbox?: {
+    list(): Promise<CompletionEntry[]>;
+    review(ids: string[], source: 'web' | 'discord'): Promise<void>;
+    response(id: string): Promise<{ text: string; latest: boolean }>;
+  };
   scope(): string | undefined;
   config(): { guild: string; parent: string; allowed: string[] };
   sessionForChannel(channel: string): string | undefined;

@@ -1,0 +1,115 @@
+.completion-inbox-trigger {
+  margin-left: 6px;
+  flex-shrink: 0;
+  min-width: 30px;
+  padding: 5px 7px;
+  border: 1px solid var(--glass-border, #414955);
+  border-radius: 6px;
+  background: var(--glass-bg, #252d38);
+  color: var(--text-secondary, #b5c1d4);
+  font: 600 12px system-ui;
+  cursor: pointer;
+}
+.completion-inbox-trigger[data-unread='true'] {
+  color: #84d9ae;
+  border-color: #47765f;
+}
+.completion-inbox-dialog {
+  position: fixed;
+  margin: 0;
+  inset: 64px 12px auto auto;
+  width: min(470px, calc(100vw - 24px));
+  max-height: calc(100dvh - 80px);
+  overflow: auto;
+  padding: 20px;
+  border: 1px solid var(--glass-border, #465164);
+  border-radius: 12px;
+  background: var(--bg-primary, #151c27);
+  color: var(--text-primary, #e6ecf5);
+  box-shadow: 0 16px 80px #0009;
+  font: 14px/1.5 system-ui;
+  z-index: 10010;
+}
+.completion-inbox-dialog::backdrop {
+  background: #0005;
+}
+.completion-inbox-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 4px;
+}
+.completion-inbox-heading h2 {
+  font-size: 17px;
+  margin: 0;
+}
+.completion-inbox-dialog button {
+  padding: 6px 10px;
+  border: 1px solid var(--glass-border, #49576a);
+  border-radius: 5px;
+  background: var(--glass-bg, #2a3445);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.completion-inbox-dialog button:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+.completion-inbox-note {
+  color: var(--text-secondary, #a0adbf);
+  font-size: 12px;
+  margin: 0 0 16px;
+}
+.completion-inbox-item {
+  padding: 14px 0;
+  border-top: 1px solid var(--glass-border, #354052);
+}
+.completion-inbox-item strong {
+  overflow-wrap: anywhere;
+}
+.completion-inbox-item time {
+  display: block;
+  font-size: 12px;
+  color: var(--text-secondary, #a0adbf);
+  margin: 3px 0 10px;
+}
+.completion-inbox-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.completion-inbox-response {
+  border-top: 1px solid var(--glass-border, #354052);
+  margin-top: 16px;
+  padding-top: 16px;
+  overflow-wrap: anywhere;
+}
+.completion-inbox-response pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  background: #101620;
+  padding: 12px;
+  border-radius: 6px;
+}
+.completion-inbox-response h2 {
+  font-size: 17px;
+}
+.completion-inbox-response h3 {
+  font-size: 15px;
+}
+.completion-inbox-response a {
+  color: #87b5ff;
+}
+.completion-inbox-error {
+  color: #e9b772;
+  font-size: 12px;
+}
+
+.completion-inbox-actions a {
+  color: #87b5ff;
+  align-self: center;
+  font-size: 12px;
+}
