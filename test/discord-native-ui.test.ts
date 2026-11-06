@@ -307,6 +307,17 @@ describe('native Discord UI', () => {
     );
     expect(f.host.submit).not.toHaveBeenCalled();
   });
+  it('lets a cancelled form reopen while consuming each submitted form token once', async () => {
+    const f = await fixture();
+    await f.ui.poll();
+    const settings = await f.click(f.findCard(), 'Settings');
+    const defaults = await f.click(settings, 'Future Codex defaults');
+    await f.click(defaults, 'Edit future defaults');
+    expect((f.responses.at(-1) as { type: number }).type).toBe(9);
+    await f.click(defaults, 'Edit future defaults');
+    expect((f.responses.at(-1) as { type: number }).type).toBe(9);
+    expect(f.host.services.saveDefaults).not.toHaveBeenCalled();
+  });
   it('binds menus to actor, origin, message, scope, interaction type and conversation', async () => {
     const f = await fixture();
     await f.ui.poll();

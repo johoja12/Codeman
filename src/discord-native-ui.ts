@@ -485,7 +485,7 @@ export class DiscordNativeUi {
         await reject('This menu expired or changed. Use /codeman or !codeman ui to reopen it.');
         return true;
       }
-      if (action.actor || action.group || action.submitOnly) this.actions.delete(custom);
+      if (!action.modal && (action.actor || action.group || action.submitOnly)) this.actions.delete(custom);
       if (action.group) this.consumedGroups.set(action.group, this.host.now() + 6 * 60_000);
       if (action.modal && m.type === 3) {
         const id = 'cmui:' + randomUUID();
