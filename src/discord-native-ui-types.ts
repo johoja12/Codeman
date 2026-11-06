@@ -62,7 +62,7 @@ export interface DiscordNativeUiHost {
   ownsChannel(channel: string): boolean;
   verify(id: string, channel: string): Promise<void>;
   passive(id: string, channel: string): Promise<boolean>;
-  request(method: string, path: string, body?: unknown): Promise<unknown>;
+  request(method: string, path: string, body?: unknown, current?: () => boolean): Promise<unknown>;
   respond(m: DiscordInteraction, body: unknown): Promise<void>;
   finish(m: DiscordInteraction, body: DiscordUiPayload): Promise<void>;
   control(id: string, command: string): Promise<DiscordControlReply>;
