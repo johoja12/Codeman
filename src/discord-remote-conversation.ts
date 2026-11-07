@@ -151,7 +151,7 @@ export async function probeRemoteDiscordRuntime(
     typeof value.configHome !== 'string' ||
     value.configHome.length > 4096 ||
     !value.configHome.startsWith('/') ||
-    /[\x00-\x1f]/.test(value.configHome) ||
+    Array.from(value.configHome).some((c) => c.charCodeAt(0) < 32) ||
     typeof value.fingerprint !== 'string' ||
     !/^[a-f0-9]{64}$/.test(value.fingerprint) ||
     (value.id != null &&
