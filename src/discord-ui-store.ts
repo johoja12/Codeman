@@ -32,13 +32,29 @@ const Prompt = z
     state: z.enum(['queued', 'submitting', 'uncertain']),
   })
   .strict();
+const ResponseRef = z
+  .object({
+    scope: z.string().max(200),
+    session: z.string().max(100),
+    channel: z.string().regex(/^\d{15,25}$/),
+    conversation: z.string().max(100),
+    userCursor: z.string().max(200),
+    responseCursor: z.string().max(200).optional(),
+    updated: z.number(),
+  })
+  .strict();
 const State = z
-  .object({ version: z.literal(1), cards: z.record(z.string().max(200), Card), queue: z.array(Prompt).max(50) })
+  .object({
+    version: z.literal(1),
+    cards: z.record(z.string().max(200), Card),
+    queue: z.array(Prompt).max(50),
+    responses: z.record(z.string().max(200), ResponseRef).default({}),
+  })
   .strict();
 export type DiscordQueuedPrompt = z.infer<typeof Prompt>;
 export type DiscordUiState = z.infer<typeof State>;
 export class DiscordUiStore {
-  private state: DiscordUiState = { version: 1, cards: {}, queue: [] };
+  private state: DiscordUiState = { version: 1, cards: {}, queue: [], responses: {} };
   private loaded?: Promise<void>;
   private chain: Promise<unknown> = Promise.resolve();
   constructor(
@@ -61,6 +77,7 @@ export class DiscordUiStore {
         } finally {
           await f.close();
         }
+        if (Object.keys(raw.responses).length > 1024) throw new Error('Too many response references');
         if (Object.keys(raw.cards).length > 4096) throw new Error('Too many UI cards');
         this.state = raw;
         for (const p of this.state.queue) if (p.state === 'submitting') p.state = 'uncertain';
@@ -83,6 +100,10 @@ export class DiscordUiStore {
       for (const [key, card] of Object.entries(next.cards))
         if (card.kind === 'delivery' && card.phase === 'ready' && card.updated < this.now() - 7 * 86400000)
           delete next.cards[key];
+      for (const [key, ref] of Object.entries(next.responses))
+        if (ref.updated < this.now() - 30 * 86400000) delete next.responses[key];
+      const refs = Object.entries(next.responses).sort((a, b) => b[1].updated - a[1].updated);
+      for (const [key] of refs.slice(1024)) delete next.responses[key];
       State.parse(next);
       if (Object.keys(next.cards).length > 4096) throw new Error('UI card capacity reached');
       await fs.mkdir(this.dir, { recursive: true });

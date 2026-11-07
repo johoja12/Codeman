@@ -6,8 +6,15 @@ export const DISCORD_RESPONSE_COLOR = 0x58a6ff;
 export const DISCORD_WARNING_COLOR = 0xf2b84b;
 export const DISCORD_CRITICAL_COLOR = 0xed6b6b;
 
-function splitMarkdown(text: string, max = 1900, maxPosts = 8): string[] {
-  if (!Number.isInteger(max) || max < 128 || max > 4096 || !Number.isInteger(maxPosts) || maxPosts < 1 || maxPosts > 64)
+function splitMarkdown(text: string, max = 1900, maxPosts = 8, detail = false): string[] {
+  if (
+    !Number.isInteger(max) ||
+    max < 128 ||
+    max > 4096 ||
+    !Number.isInteger(maxPosts) ||
+    maxPosts < 1 ||
+    maxPosts > (detail ? 8192 : 64)
+  )
     throw new RangeError('Invalid Discord message chunk limits');
   const posts: string[] = [];
   let cur = '';
@@ -69,6 +76,12 @@ function splitMarkdown(text: string, max = 1900, maxPosts = 8): string[] {
 export function splitForDiscord(text: string, max = 1900, maxPosts = 8): string[] {
   if (max > 1900) throw new RangeError('Invalid Discord message chunk limits');
   return splitMarkdown(text, max, maxPosts);
+}
+
+/** Detail panels page one bounded export without the normal chat-message count cap. */
+export function discordDetailPages(text: string): string[] {
+  if (Buffer.byteLength(text) > 8 * 1024 * 1024) throw new RangeError('Detail export exceeds 8 MB');
+  return splitMarkdown(text, 1700, 8192, true);
 }
 
 /** Only style obvious prose, never fenced/indented code, inline code, URLs or Markdown links. */
