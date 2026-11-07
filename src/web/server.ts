@@ -816,7 +816,7 @@ export class WebServer extends EventEmitter {
   });
   private discordBridge: DiscordBridge = new DiscordBridge({
     nativeUi: createDiscordNativeUiServices({
-      // Read-only fallback: hookless remote Claude checkbox dialogs must also reach Discord.
+      // Read-only fallback: hookless remote Claude choice dialogs must also reach Discord.
       questionObserved: async (item) => {
         const result = await this.discordBridge.notify({
           event: SseEvent.HookElicitationDialog,
@@ -824,7 +824,7 @@ export class WebServer extends EventEmitter {
           urgency: 'critical',
           sessionId: item.sessionId,
           sessionName: item.sessionName,
-          body: 'Choose in the terminal; this is a multi-select question.',
+          body: 'Choose in the terminal; this question is waiting for your answer.',
           tail: () => item.message || '',
           host: this.windowTitle,
         });
