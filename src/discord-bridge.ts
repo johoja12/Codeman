@@ -1918,19 +1918,27 @@ export class DiscordBridge {
               ? await this.nativeUi.responseControls(sessionId, channel, owner, turn.cursor).catch(() => [])
               : [];
           const label = this.deps.sessions?.().find((s) => s.id === sessionId)?.name;
+          const responseOptions = {
+            title: confirmed ? '✓ Turn finished' : 'Response received',
+            color: confirmed ? 0x59ca92 : undefined,
+            subtitle: label ? clip(label.replace(/[@`*_~<>\r\n]/g, ''), 120) : undefined,
+            controls,
+          };
+          const tablePosts =
+            turn.role === 'assistant' && owner && this.nativeUi
+              ? await this.nativeUi
+                  .tableResponsePosts(sessionId, channel, owner, turn.cursor, visible, responseOptions)
+                  .catch(() => undefined)
+              : undefined;
           const responsePosts =
-            turn.role === 'assistant'
-              ? discordResponsePosts(formatted, {
-                  title: confirmed ? '✓ Turn finished' : 'Response received',
-                  color: confirmed ? 0x59ca92 : undefined,
-                  subtitle: label ? clip(label.replace(/[@`*_~<>\r\n]/g, ''), 120) : undefined,
-                  controls,
-                })
+            tablePosts ??
+            (turn.role === 'assistant'
+              ? discordResponsePosts(visible, responseOptions)
               : splitForDiscord(formatted).map((content) => ({
                   content,
                   flags: DISCORD_SUPPRESS_NOTIFICATIONS,
                   allowed_mentions: { parse: [], users: [] },
-                }));
+                })));
           let response: { id: string; post: DiscordPost } | undefined;
           for (const [i, post] of responsePosts.entries()) {
             const sent = (await this.deliverPost(

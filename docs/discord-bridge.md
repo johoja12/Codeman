@@ -281,6 +281,35 @@ full-response attachment behavior. Notifications mode retains its existing plain
 message format. This affects future posts; it does not edit previous Discord
 messages.
 
+#### Compact table cards
+
+New native assistant answers in Full mode render eligible Markdown tables as
+Components V2 cards with the first column as a record heading, the remaining
+column headings shown once, and cell values kept in their original column order.
+Three records appear per page, separated by dividers. **Next** opens a private
+view; subsequent **Previous/Next** clicks update that view without changing the
+shared answer. Prose before, between and after tables stays in sequence.
+
+**View table** posts a dark PNG table preview into the same session thread.
+The preview includes all rows when it fits the bounded image size; taller tables
+show the selected three-row page. **Download CSV** posts all rows, with quoted
+cells, UTF-8 text and spreadsheet formula protection. Both actions read the exact
+original assistant response and recheck the session/conversation and permissions;
+they never submit a model prompt. Initial shared-card buttons can recover after a
+restart from stored response references and a verified bot-owned message. Private
+browsing panels expire normally.
+
+Tables with more than 200 rows/24 columns, oversized cells, excessive response
+parts or unrecognized syntax retain the existing text fallback. Literal code
+examples stay literal. Existing Discord messages are not rewritten. Table parsing
+and export evaluate no HTML, links, external images or cell code; PNG rendering
+uses the bundled resvg library and system fonts.
+
+![Compact table card layout preview](images/discord-table-card-mobile.png)
+
+This table preview is rendered from a generated Components V2 payload; Discord
+controls the exact client typography and spacing.
+
 ![Mobile response-card layout preview](images/discord-response-card-mobile.png)
 
 The image is a layout preview rendered from a real generated message payload,
