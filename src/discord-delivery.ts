@@ -349,6 +349,24 @@ export class DiscordDeliveryJournal {
     );
   }
 
+  /** Exact confirmed outbound lookup; inbound receipts must never stand in for response delivery. */
+  async deliveredMessage(
+    id: string,
+    scope: { sessionId: string; guildId: string; channelId: string }
+  ): Promise<string | undefined> {
+    await this.load();
+    await this.chain;
+    const record = this.records.get(id);
+    return record?.direction === 'outbound' &&
+      record.state === 'delivered' &&
+      record.sessionId === scope.sessionId &&
+      record.guildId === scope.guildId &&
+      record.channelId === scope.channelId &&
+      record.createdAt > this.now() - RETENTION_MS &&
+      /^\d{15,25}$/.test(record.messageId ?? '')
+      ? record.messageId
+      : undefined;
+  }
   async recentForSession(sessionId: string): Promise<DiscordDelivery[]> {
     await this.load();
     await this.chain;

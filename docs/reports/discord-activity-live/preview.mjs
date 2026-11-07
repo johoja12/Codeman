@@ -48,6 +48,7 @@ function md(input) {
           (_, t) =>
             `<span class="relative" data-time="${t}" title="${new Date(Number(t) * 1000).toLocaleString()}">${relative(Number(t))}</span>`
         );
+      value = value.replace(/\[([^\]\n]+)\]\((https:\/\/discord\.com\/channels\/[0-9/]+)\)/g, '<a href="$2">$1</a>');
       value = withEmoji(value);
       return heading ? '<h2>' + value + '</h2>' : sub ? '<small>' + value + '</small>' : '<p>' + value + '</p>';
     })

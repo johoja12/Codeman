@@ -1119,14 +1119,15 @@ export class DiscordBridge {
           const keys = [`native:${cursor}:0`, `history:${cursor}:full:0`].map((key) =>
             createHash('sha256').update(`${this.cfg.guildId}:${channel}:${key}`).digest('hex')
           );
-          const record = (await this.deliveries.recentForSession(id)).find(
-            (r) =>
-              keys.includes(r.id) &&
-              r.guildId === this.cfg.guildId &&
-              r.channelId === channel &&
-              r.state === 'delivered'
-          );
-          return record?.messageId;
+          for (const key of keys) {
+            const message = await this.deliveries.deliveredMessage(key, {
+              sessionId: id,
+              guildId: this.cfg.guildId,
+              channelId: channel,
+            });
+            if (message) return message;
+          }
+          return undefined;
         },
         botId: () => (this.activityBot ??= this.api.botUserId().then((me) => me?.id)),
       });

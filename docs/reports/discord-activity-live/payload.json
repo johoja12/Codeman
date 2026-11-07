@@ -22,7 +22,7 @@
           "components": [
             {
               "type": 3,
-              "custom_id": "cmui:44bb0e00-337a-40df-a691-9f59798a3585",
+              "custom_id": "cmui:ae3eb15f-e6de-417a-b0ea-6e5c4b18ec74",
               "placeholder": "Choose activity view",
               "min_values": 1,
               "max_values": 1,
@@ -69,7 +69,7 @@
           "components": [
             {
               "type": 10,
-              "content": "**✅ w4-Codeman**\nTurn finished · <t:1794035916:R>\n-# Silent updates deployed. All 25 sessions preserved.\n-# Codeman · beelink"
+              "content": "**[✅ w4-Codeman](https://discord.com/channels/111111111111111111/222222222222222222)**\nTurn finished · <t:1794036949:R>\n-# [Silent updates deployed. All 25 sessions preserved.](https://discord.com/channels/111111111111111111/222222222222222222)\n-# Codeman · beelink"
             }
           ],
           "accessory": {
@@ -89,7 +89,7 @@
           "components": [
             {
               "type": 10,
-              "content": "**🟡 w1-Plex**\nProgress update · <t:1794035862:R>\n-# Checking preview generation across the library.\n-# Plex previews · beelink"
+              "content": "**[🟡 w1-Plex](https://discord.com/channels/111111111111111111/222222222222222223)**\nProgress update · <t:1794036895:R>\n-# [Checking preview generation across the library.](https://discord.com/channels/111111111111111111/222222222222222223)\n-# Plex previews · beelink"
             }
           ],
           "accessory": {
@@ -109,14 +109,14 @@
           "components": [
             {
               "type": 10,
-              "content": "**🔴 w2-brain**\nNeeds your answer · <t:1794035744:R>\n-# Waiting for your answer to continue.\n-# brain · remote"
+              "content": "**[🔴 w2-brain](https://discord.com/channels/111111111111111111/222222222222222224)**\nNeeds your answer · <t:1794036777:R>\n-# [Waiting for your answer to continue.](https://discord.com/channels/111111111111111111/222222222222222224)\n-# brain · remote"
             }
           ],
           "accessory": {
             "type": 2,
             "style": 1,
             "label": "Review",
-            "custom_id": "cmui:b635349e-d7d9-4ab3-84e5-12164e0c1b75"
+            "custom_id": "cmui:f5864536-7675-471a-bb32-ae2cbbb20704"
           }
         },
         {
@@ -129,7 +129,7 @@
           "components": [
             {
               "type": 10,
-              "content": "**✅ w3-home-mon**\nTurn finished · <t:1794035581:R>\n-# Health checks passed. Services are responding.\n-# home-mon · beelink"
+              "content": "**[✅ w3-home-mon](https://discord.com/channels/111111111111111111/222222222222222225)**\nTurn finished · <t:1794036614:R>\n-# [Health checks passed. Services are responding.](https://discord.com/channels/111111111111111111/222222222222222225)\n-# home-mon · beelink"
             }
           ],
           "accessory": {
@@ -149,7 +149,7 @@
           "components": [
             {
               "type": 10,
-              "content": "**🟡 w1-Coffee**\nProgress update · <t:1794035410:R>\n-# Validating the updated store ordering flow.\n-# Third Culture Coffee · remote"
+              "content": "**[🟡 w1-Coffee](https://discord.com/channels/111111111111111111/222222222222222226)**\nProgress update · <t:1794036443:R>\n-# [Validating the updated store ordering flow.](https://discord.com/channels/111111111111111111/222222222222222226)\n-# Third Culture Coffee · remote"
             }
           ],
           "accessory": {
@@ -163,7 +163,7 @@
     },
     {
       "type": 10,
-      "content": "-# 1–5 of 6 · Synced <t:1794035938:R> · Updates silently"
+      "content": "-# 1–5 of 6 · Synced <t:1794036971:R> · Updates silently"
     },
     {
       "type": 1,
@@ -172,21 +172,21 @@
           "type": 2,
           "style": 2,
           "label": "Previous",
-          "custom_id": "cmui:70210853-bf8d-4788-a985-20f80181dc1f",
+          "custom_id": "cmui:2088b722-5cea-43fc-8143-30032635e7f2",
           "disabled": true
         },
         {
           "type": 2,
           "style": 2,
           "label": "Next",
-          "custom_id": "cmui:1fff231a-659a-4f6b-b7a0-f5c9bc3493ff",
+          "custom_id": "cmui:6bad69ae-51fe-4d13-babd-7fc21d5e2e8d",
           "disabled": false
         },
         {
           "type": 2,
           "style": 2,
           "label": "Refresh",
-          "custom_id": "cmui:add786af-fbf0-48e7-98cc-98ccb9201bad"
+          "custom_id": "cmui:6881f701-beeb-45d8-862a-6de03477eb8d"
         }
       ]
     },
@@ -197,7 +197,7 @@
           "type": 2,
           "style": 1,
           "label": "+ New session",
-          "custom_id": "cmui:69d841df-9342-4387-9486-f8c2d2d1a06a"
+          "custom_id": "cmui:341a5afb-c045-4c08-8558-c02a390ff3a9"
         },
         {
           "type": 2,
