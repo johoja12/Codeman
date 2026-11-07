@@ -1595,13 +1595,14 @@ it('does not bump an unchanged pending question when the hook registry is restor
   expect(Object.values((await f.ui.store.snapshot()).activities)[0].at).toBe(f.host.now());
 });
 
-it('makes the session heading and preview direct thread links without making Review submit input', async () => {
+it('keeps a plain session heading and a clickable preview without making Review submit input', async () => {
   const f = await fixture();
   const view = await f.command('codeman');
   const section = discordUiNodes(view.components).find((n) => n.type === 9)!;
   const text = String((section.components as Array<{ content: string }>)[0].content);
   const target = `https://discord.com/channels/${guild}/${channel}`;
-  expect(text).toContain(`[🟡 w1-Codeman](${target})`);
+  expect(text).toContain('**🟡 w1-Codeman**');
+  expect(text).not.toContain(`[🟡 w1-Codeman](${target})`);
   expect(text).toContain(`[Work is in progress.](${target})`);
   expect(f.host.submit).not.toHaveBeenCalled();
 });

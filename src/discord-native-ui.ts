@@ -1809,7 +1809,7 @@ export class DiscordNativeUi {
         type: 9,
         components: [
           text(
-            `**${threadUrl ? `[${heading}](${threadUrl})` : heading}**\n${label}${time}\n-# ${threadUrl ? `[${preview}](${threadUrl})` : preview}\n-# ${activityText(s.caseName, 40)} · ${activityText(s.host, 30)}`
+            `**${heading}**\n${label}${time}\n-# ${threadUrl ? `[${preview}](${threadUrl})` : preview}\n-# ${activityText(s.caseName, 40)} · ${activityText(s.host, 30)}`
           ),
         ],
         accessory,
