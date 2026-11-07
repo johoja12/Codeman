@@ -162,6 +162,8 @@ export function formatDiscordResponseText(text: string): string {
 
 /** One cohesive native card per chunk, including heading, Markdown and controls. */
 export const DISCORD_COMPONENTS_V2 = 1 << 15;
+/** Visible in history/unread badges, without desktop or push notifications. */
+export const DISCORD_SUPPRESS_NOTIFICATIONS = 1 << 12;
 export function discordResponsePosts(
   text: string,
   options: {
@@ -170,6 +172,7 @@ export function discordResponsePosts(
     users?: string[];
     subtitle?: string;
     controls?: DiscordPost['components'];
+    silent?: boolean;
   } = {}
 ): DiscordPost[] {
   const users = options.users ?? [];
@@ -178,7 +181,7 @@ export function discordResponsePosts(
   const chunks = splitMarkdown((mentions ? mentions + '\n' : '') + formatDiscordResponseText(text), 1900);
   return chunks.map((body, index) => ({
     content: '', // Removed at the API boundary; V2 uses Text Display components.
-    flags: DISCORD_COMPONENTS_V2 | 4,
+    flags: DISCORD_COMPONENTS_V2 | 4 | (options.silent || index > 0 ? DISCORD_SUPPRESS_NOTIFICATIONS : 0),
     components: [
       {
         type: 17,
@@ -213,7 +216,7 @@ export function discordProgressPost(
   const compact = update.replace(/\s+/g, ' ').slice(0, 420);
   return {
     content: '',
-    flags: DISCORD_COMPONENTS_V2 | 4,
+    flags: DISCORD_COMPONENTS_V2 | 4 | DISCORD_SUPPRESS_NOTIFICATIONS,
     allowed_mentions: { parse: [], users: [] },
     components: [
       {

@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { hashDiscordPrompt } from '../src/discord-native-execution.js';
 import { readDiscordSessionFile } from '../src/discord-file-transfers.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { DISCORD_SUPPRESS_NOTIFICATIONS } from '../src/discord-response-format.js';
 import { DiscordHistoryReadError } from '../src/discord-history.js';
 import {
   DEFAULT_DISCORD_CONFIG,
@@ -88,7 +89,8 @@ function makeBridge(
         return Response.json([...remoteChannels.values()].filter((c) => c.type === 0));
       const messageMatch = /\/channels\/(\d+)\/messages(?:\/(\d+))?$/.exec(path);
       if (method === 'PATCH' && messageMatch?.[2]) {
-        if (statusEditRefused && (body?.content || body?.flags === 32772)) return Response.json({}, { status: 403 });
+        if (statusEditRefused && (body?.content || (body?.flags & 32768) !== 0))
+          return Response.json({}, { status: 403 });
         const m = remoteMessages.get(messageMatch[2]);
         if (!m) return Response.json({}, { status: 404 });
         Object.assign(m, body);
@@ -1217,7 +1219,9 @@ describe('Discord interface mode', () => {
     const b = makeBridge(undefined, { history });
     await b.reload();
     await b.syncSessions();
-    const cards = posts.filter((p) => p.body?.flags === 32772 && p.body?.components?.some((c: any) => c.type === 17));
+    const cards = posts.filter(
+      (p) => (p.body?.flags & 32768) !== 0 && p.body?.components?.some((c: any) => c.type === 17)
+    );
     expect(cards.length).toBeGreaterThan(1);
     expect(cards.map((p) => visibleText(p.body)).join('\n')).toContain('Last row preserved.');
     expect(
@@ -1232,7 +1236,7 @@ describe('Discord interface mode', () => {
     await again.reload();
     await again.syncSessions();
     expect(
-      posts.filter((p) => p.body?.flags === 32772 && p.body?.components?.some((c: any) => c.type === 17))
+      posts.filter((p) => (p.body?.flags & 32768) !== 0 && p.body?.components?.some((c: any) => c.type === 17))
     ).toHaveLength(count);
     expect(sendInput).not.toHaveBeenCalled();
   });
@@ -1667,6 +1671,7 @@ describe('Discord interface mode', () => {
       });
       const prompt = posts.find((p) => p.body?.components?.length && visibleText(p.body)?.endsWith('Which option?'));
       expect(prompt).toBeDefined();
+      expect((prompt!.body!.flags ?? 0) & DISCORD_SUPPRESS_NOTIFICATIONS).toBe(0);
       expect(prompt!.body!.allowed_mentions.users).toEqual(pingMode === 'critical' ? cfg.allowedUserIds : []);
       await b.onGatewayMessage({
         id: '555555555555555555',
@@ -2093,6 +2098,18 @@ it('streams explicit commentary as conversation cards and delivers the native fi
   const final = posts.filter((p) => p.method === 'POST' && visibleText(p.body) === 'The artifact is ready.');
   expect(final).toHaveLength(1);
   expect(final[0].body.components[0].accent_color).toBe(0x59ca92);
+  expect(final[0].body.flags & DISCORD_SUPPRESS_NOTIFICATIONS).toBe(0);
+  const updates = posts.filter(
+    (p) => p.method === 'POST' && /Checks passed|Exporting artifact/.test(visibleText(p.body) ?? '')
+  );
+  expect(updates).toHaveLength(2);
+  expect(updates.every((p) => !!(p.body.flags & DISCORD_SUPPRESS_NOTIFICATIONS))).toBe(true);
+  const progress = posts.filter(
+    (p) => p.method === 'POST' && /Working|Done/.test(p.body?.components?.[0]?.content ?? '')
+  );
+  expect(progress.length).toBeGreaterThan(0);
+  expect(progress.every((p) => !!(p.body.flags & DISCORD_SUPPRESS_NOTIFICATIONS))).toBe(true);
+
   expect(final[0].body.content).toBeUndefined();
   expect(final[0].body.embeds).toBeUndefined();
   b.stop();
@@ -2120,7 +2137,7 @@ it('keeps an attached file visible when an alert also contains a native V2 respo
     { deliberate: true }
   );
   expect(result?.ok).toBe(true);
-  const post = posts.find((p) => p.body?.flags === 32772 && visibleText(p.body)?.includes('The answer.'))!.body;
+  const post = posts.find((p) => (p.body?.flags & 32768) !== 0 && visibleText(p.body)?.includes('The answer.'))!.body;
   expect(post.components).toHaveLength(1);
   expect(post.components[0].components).toContainEqual({ type: 13, file: { url: 'attachment://results.txt' } });
   expect(uploaded.some((f) => f.name === 'results.txt' && f.text === 'test results')).toBe(true);
@@ -2225,6 +2242,7 @@ it('groups adjacent commentary by default, preserves final order and supports Qu
   const cards = posts.filter((p) => p.method === 'POST');
   const update = cards.find((p) => visibleText(p.body)?.includes('First progress'))!;
   expect(visibleText(update.body)).toContain('Second progress');
+  expect(update.body.flags & DISCORD_SUPPRESS_NOTIFICATIONS).toBeTruthy();
   expect(cards.indexOf(update)).toBeLessThan(cards.findIndex((p) => visibleText(p.body)?.includes('Final answer')));
   now += 60001;
   await b.pollConversations();
@@ -2247,6 +2265,9 @@ it('groups adjacent commentary by default, preserves final order and supports Qu
   now += 60001;
   await b.pollConversations();
   expect(posts.some((p) => visibleText(p.body)?.includes('Tool visible'))).toBe(true);
+  expect(
+    posts.find((p) => visibleText(p.body)?.includes('Tool visible'))!.body.flags & DISCORD_SUPPRESS_NOTIFICATIONS
+  ).toBeTruthy();
   expect(sendInput).not.toHaveBeenCalled();
 });
 it('replays a reserved update group without changing its payload when more progress arrives', async () => {
@@ -2286,5 +2307,49 @@ it('replays a reserved update group without changing its payload when more progr
   expect(
     posts.filter((p) => p.method === 'POST' && visibleText(p.body)?.includes('New separate progress'))
   ).toHaveLength(1);
+  expect(sendInput).not.toHaveBeenCalled();
+});
+
+it('keeps long streamed updates and files silent with just one notification-eligible final chunk', async () => {
+  sessions = [{ id: 's1', name: 'one' }];
+  let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+  const history = async () => ({
+    conversationId: 'native1',
+    partial: false,
+    turns,
+    executions: [{ userCursor: 'native1:u', promptHash: 'proof', state: 'completed' as const }],
+  });
+  const b = makeBridge(undefined, {
+    history,
+    getAttachment: async () => ({ name: 'report.txt', data: Buffer.from('report') }),
+  });
+  await b.reload();
+  await b.syncSessions();
+  posts = [];
+  turns = [
+    { cursor: 'native1:u', role: 'user', text: 'Build report', timestamp: '' },
+    {
+      cursor: 'native1:p',
+      role: 'assistant',
+      phase: 'commentary',
+      text: 'Progress detail.\n'.repeat(900) + '\n[Download report](/tmp/report.txt)',
+      timestamp: '',
+    },
+    {
+      cursor: 'native1:r',
+      role: 'assistant',
+      phase: 'final_answer',
+      text: 'Final detail.\n'.repeat(1100),
+      timestamp: '',
+    },
+  ];
+  await b.pollConversations();
+  const messages = posts.filter((p) => p.method === 'POST' && /\/messages$/.test(p.path));
+  const audible = messages.filter((p) => !(p.body.flags & DISCORD_SUPPRESS_NOTIFICATIONS));
+  expect(audible).toHaveLength(1);
+  expect(audible[0].body.components[0].components[0].content).toBe('**✓ Turn finished**\n-# one');
+  expect(uploaded.map((f) => f.name)).toEqual(expect.arrayContaining(['updates.txt', 'response.txt', 'report.txt']));
+  expect(messages.filter((p) => visibleText(p.body)?.includes('Progress detail')).length).toBeGreaterThan(1);
+  expect(messages.filter((p) => visibleText(p.body)?.includes('Final detail')).length).toBeGreaterThan(1);
   expect(sendInput).not.toHaveBeenCalled();
 });
