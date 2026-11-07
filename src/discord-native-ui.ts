@@ -1753,6 +1753,7 @@ export class DiscordNativeUi {
     for (const [i, { s, activity, finished, error }] of visible.entries()) {
       if (i) body.push({ type: 14, divider: true, spacing: 1 });
       const channel = this.host.channelForSession(s.id);
+      const threadUrl = channel ? `https://discord.com/channels/${this.host.config().guild}/${channel}` : undefined;
       const icon = s.pending || error ? '🔴' : s.exited ? '⚫' : s.working ? '🟡' : finished ? '✅' : '⚫';
       const labels = {
         prompt: 'Prompt submitted',
@@ -1802,11 +1803,13 @@ export class DiscordNativeUi {
           ),
           disabled: true,
         };
+      const heading = `${icon} ${activityText(s.name, 60)}`;
+      const preview = activityText(summary, 120);
       body.push({
         type: 9,
         components: [
           text(
-            `**${icon} ${activityText(s.name, 60)}**\n${label}${time}\n-# ${safe(summary, 120)}\n-# ${activityText(s.caseName, 40)} · ${activityText(s.host, 30)}`
+            `**${threadUrl ? `[${heading}](${threadUrl})` : heading}**\n${label}${time}\n-# ${threadUrl ? `[${preview}](${threadUrl})` : preview}\n-# ${activityText(s.caseName, 40)} · ${activityText(s.host, 30)}`
           ),
         ],
         accessory,

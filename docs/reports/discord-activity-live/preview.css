@@ -713,3 +713,11 @@ dialog a {
 .bottomnote a {
   color: inherit;
 }
+
+.textdisplay a {
+  color: #a9b9ff;
+  text-decoration: none;
+}
+.textdisplay a:hover {
+  text-decoration: underline;
+}
