@@ -2,6 +2,7 @@
 import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { hashDiscordPrompt } from '../src/discord-native-execution.js';
 import { readDiscordSessionFile } from '../src/discord-file-transfers.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -407,6 +408,142 @@ describe('Discord interface mode', () => {
     await b.pollConversations();
     expect(getAttachment).toHaveBeenCalledWith('s1', '/remote/work/picture.png', true);
     expect(uploaded).toHaveLength(0);
+  });
+
+  it.each([false, true])(
+    'mirrors newly submitted native prompts before answers (remote=%s) without pings or input',
+    async (remote) => {
+      let now = 100000;
+      let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+      sessions = [{ id: 's1', name: 'one', remote }];
+      const getAttachment = vi.fn();
+      const history = async () => ({ conversationId: 'native1', partial: false, turns });
+      const b = makeBridge(undefined, { history, getAttachment, now: () => now });
+      await b.reload();
+      await b.syncSessions();
+      await b.pollConversations();
+      expect(posts.some((p) => JSON.stringify(p.body ?? {}).includes('User prompt'))).toBe(false);
+      turns = [
+        {
+          cursor: 'native1:1',
+          role: 'user',
+          text: 'Explain this.\n```ts\nconst x = 1;\n```\n[My input](input.pdf)',
+          timestamp: '',
+        },
+        { cursor: 'native1:2', role: 'assistant', text: 'Here is the explanation.', timestamp: '' },
+      ];
+      now += 60001;
+      await b.pollConversations();
+      const prompt = posts.find((p) => p.method === 'POST' && JSON.stringify(p.body ?? {}).includes('User prompt'))!;
+      expect(prompt).toBeDefined();
+      expect(visibleText(prompt.body)).toContain('const x = 1;');
+      expect(prompt.body.allowed_mentions).toEqual({ parse: [], users: [] });
+      const answer = posts.find(
+        (p) => p.method === 'POST' && visibleText(p.body)?.includes('Here is the explanation.')
+      )!;
+      expect(posts.indexOf(prompt)).toBeLessThan(posts.indexOf(answer));
+      expect(getAttachment).not.toHaveBeenCalled();
+      expect(sendInput).not.toHaveBeenCalled();
+      b.stop();
+      const restarted = makeBridge(undefined, { history, now: () => now });
+      await restarted.reload();
+      await restarted.syncSessions();
+      now += 60001;
+      await restarted.pollConversations();
+      expect(
+        posts.filter((p) => p.method === 'POST' && JSON.stringify(p.body ?? {}).includes('User prompt'))
+      ).toHaveLength(1);
+    }
+  );
+
+  it('does not echo an attributed Discord prompt but mirrors later identical text from outside Discord', async () => {
+    let now = 100000;
+    let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+    let executions: import('../src/discord-native-execution.js').DiscordNativeExecution[] = [];
+    sessions = [{ id: 's1', name: 'one' }];
+    const history = async () => ({ conversationId: 'native1', partial: false, turns, executions });
+    const b = makeBridge(undefined, { history, now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    const thread = (await readFullMap(dir)).s1;
+    const text = 'Review this change';
+    await b.onGatewayMessage({
+      id: '900000000000000001',
+      guild_id: cfg.guildId,
+      channel_id: thread,
+      author: { id: cfg.allowedUserIds[0] },
+      content: text,
+    });
+    expect(sendInput).toHaveBeenCalledTimes(1);
+    turns = [{ cursor: 'native1:1', role: 'user', text, timestamp: '' }];
+    executions = [{ userCursor: 'native1:1', promptHash: hashDiscordPrompt(text), state: 'completed' }];
+    await b.pollConversations();
+    const prompts = () =>
+      posts.filter((p) => p.method === 'POST' && JSON.stringify(p.body ?? {}).includes('User prompt'));
+    expect(prompts()).toHaveLength(0);
+    turns.push({ cursor: 'native1:2', role: 'user', text, timestamp: '' });
+    executions.push({ userCursor: 'native1:2', promptHash: hashDiscordPrompt(text), state: 'running' });
+    now += 60001;
+    await b.pollConversations();
+    expect(prompts()).toHaveLength(1);
+    expect(visibleText(prompts()[0].body)).toContain(text);
+    expect(sendInput).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves historical and stream-off boundaries for user prompt mirroring', async () => {
+    let now = 100000;
+    const turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [
+      { cursor: 'native1:1', role: 'user', text: 'Historical prompt', timestamp: '' },
+    ];
+    sessions = [{ id: 's1', name: 'one' }];
+    const b = makeBridge(undefined, {
+      history: async () => ({ conversationId: 'native1', partial: false, turns }),
+      now: () => now,
+    });
+    await b.reload();
+    await b.syncSessions();
+    await b.pollConversations();
+    expect(posts.some((p) => JSON.stringify(p.body ?? {}).includes('User prompt'))).toBe(false);
+    await b.onGatewayMessage({
+      id: '900000000000000001',
+      guild_id: cfg.guildId,
+      channel_id: (await readFullMap(dir)).s1,
+      author: { id: cfg.allowedUserIds[0] },
+      content: '!codeman stream off',
+    });
+    turns.push({ cursor: 'native1:2', role: 'user', text: 'Submitted while streaming off', timestamp: '' });
+    now += 60001;
+    await b.pollConversations();
+    expect(posts.some((p) => JSON.stringify(p.body ?? {}).includes('User prompt'))).toBe(false);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
+  it('exports a full long prompt once and deduplicates a replay after a lost cursor checkpoint', async () => {
+    let now = 100000;
+    let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+    sessions = [{ id: 's1', name: 'one' }];
+    const history = async () => ({ conversationId: 'native1', partial: false, turns });
+    const b = makeBridge(undefined, { history, now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    const text = 'Long user input. '.repeat(900);
+    turns = [{ cursor: 'native1:1', role: 'user', text, timestamp: '' }];
+    await b.pollConversations();
+    expect(uploaded).toEqual([{ name: 'prompt.txt', text }]);
+    const before = posts.length;
+    const saved = JSON.parse(await readFile(join(dir, 'discord-conversations.json'), 'utf8'));
+    delete saved[0][1].cursor;
+    await writeFile(join(dir, 'discord-conversations.json'), JSON.stringify(saved));
+    b.stop();
+    const restarted = makeBridge(undefined, { history, now: () => now });
+    await restarted.reload();
+    await restarted.syncSessions();
+    now += 60001;
+    await restarted.pollConversations();
+    expect(uploaded).toHaveLength(1);
+    expect(
+      posts.slice(before).some((p) => p.method === 'POST' && JSON.stringify(p.body ?? {}).includes('User prompt'))
+    ).toBe(false);
   });
 
   it('reacts to a native session update even when the thread name did not change', async () => {
