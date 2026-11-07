@@ -57,6 +57,21 @@ export interface DiscordDelivery {
     | 'invalid_command';
 }
 
+/** Offset ordering is meaningful only inside the same exact native transcript. */
+function nativeOffset(cursor: string | undefined, conversationId: string): number | undefined {
+  if (!cursor || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(conversationId)) return undefined;
+  const parts = cursor.split(':');
+  if (
+    parts.length !== 3 ||
+    parts[0] !== conversationId ||
+    !/^(?:0|[1-9][0-9]{0,15})$/.test(parts[1]) ||
+    !/^[a-f0-9]{16}$/.test(parts[2])
+  )
+    return undefined;
+  const offset = Number(parts[1]);
+  return Number.isSafeInteger(offset) ? offset : undefined;
+}
+
 export class DiscordDeliveryJournal {
   private records = new Map<string, DiscordDelivery>();
   private loadRun?: Promise<void>;
@@ -237,7 +252,11 @@ export class DiscordDeliveryJournal {
       }
     });
   }
-  async reconcileNative(sessionId: string, history: import('./discord-history.js').DiscordHistory): Promise<void> {
+  async reconcileNative(
+    sessionId: string,
+    history: import('./discord-history.js').DiscordHistory,
+    readAfter?: (cursor: string) => Promise<import('./discord-history.js').DiscordHistory>
+  ): Promise<void> {
     await this.load();
     const records = [...this.records.values()]
       .filter(
@@ -251,21 +270,49 @@ export class DiscordDeliveryJournal {
     const claimed = new Set(
       [...this.records.values()].flatMap((r) => (r.native?.userCursor ? [r.native.userCursor] : []))
     );
+    const recovery = new Map<string, DiscordDelivery>();
     for (const record of records) {
       const meta = record.native!;
       const baseline = meta.afterCursor ? history.turns.findIndex((t) => t.cursor === meta.afterCursor) : -1;
-      if (meta.afterCursor && baseline < 0) continue;
-      const execution = history.executions?.find((e) =>
-        meta.userCursor
-          ? e.userCursor === meta.userCursor
-          : e.promptHash === meta.promptHash &&
-            !claimed.has(e.userCursor) &&
-            history.turns.findIndex((t) => t.cursor === e.userCursor) > baseline
-      );
+      const execution = history.executions?.find((e) => {
+        if (meta.userCursor) return e.userCursor === meta.userCursor;
+        if (e.promptHash !== meta.promptHash || claimed.has(e.userCursor)) return false;
+        const user = history.turns.findIndex((t) => t.cursor === e.userCursor && t.role === 'user');
+        if (user < 0) return false;
+        if (!meta.afterCursor || baseline >= 0) return user > baseline;
+        // Paged reads exclude the verified anchor itself. Raw metadata may also
+        // move the live checkpoint beyond the submission's last visible turn.
+        if (history.verifiedAfter === meta.afterCursor) return true;
+        const sentAfter = nativeOffset(meta.afterCursor, history.conversationId);
+        const verified = nativeOffset(history.verifiedAfter, history.conversationId);
+        const submitted = nativeOffset(e.userCursor, history.conversationId);
+        if (
+          readAfter &&
+          sentAfter !== undefined &&
+          verified !== undefined &&
+          submitted !== undefined &&
+          sentAfter < verified &&
+          verified < submitted
+        )
+          recovery.set(record.id, record);
+        return false;
+      });
       if (!execution) continue;
       claimed.add(execution.userCursor);
       await this.annotate(record.id, { native: { ...meta, userCursor: execution.userCursor } });
       if (record.state !== execution.state) await this.update(record.id, execution.state);
+    }
+    if (readAfter) {
+      let reads = 0;
+      for (const record of [...recovery.values()].sort((a, b) => b.createdAt - a.createdAt)) {
+        if (reads >= 4) break;
+        if (this.records.get(record.id)?.native?.userCursor) continue;
+        reads++;
+        const anchor = record.native!.afterCursor!;
+        const verified = await readAfter(anchor).catch(() => undefined);
+        if (verified?.conversationId === history.conversationId && verified.verifiedAfter === anchor)
+          await this.reconcileNative(sessionId, verified);
+      }
     }
   }
   /** Exact native turns already submitted through this Discord destination, including queued input. */

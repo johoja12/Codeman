@@ -546,6 +546,86 @@ describe('Discord interface mode', () => {
     }
   );
 
+  it('suppresses a Discord prompt after metadata advances the verified live cursor beyond its send boundary', async () => {
+    let now = 100000;
+    const conv = '12345678-1234-1234-1234-123456789abc';
+    const baseline = conv + ':100:aaaaaaaaaaaaaaaa',
+      scanned = conv + ':150:bbbbbbbbbbbbbbbb',
+      submitted = conv + ':200:cccccccccccccccc',
+      external = conv + ':300:dddddddddddddddd';
+    const old = { cursor: baseline, role: 'assistant' as const, text: 'Previous response', timestamp: '' };
+    let page: import('../src/discord-history.js').DiscordHistory = {
+      conversationId: conv,
+      partial: true,
+      verifiedAfter: baseline,
+      scannedCursor: scanned,
+      hasMore: false,
+      turns: [],
+    };
+    const history = async (_id: string, options?: { after?: string }) => {
+      if (!options?.after) return { conversationId: conv, partial: false, turns: [old] };
+      if (options.after === baseline && page.verifiedAfter !== baseline)
+        return {
+          conversationId: conv,
+          partial: true,
+          verifiedAfter: baseline,
+          turns: [
+            {
+              cursor: submitted,
+              role: 'user' as const,
+              text: 'Do a manual refresh now and check again',
+              timestamp: '',
+            },
+          ],
+          executions: [
+            {
+              userCursor: submitted,
+              promptHash: hashDiscordPrompt('Do a manual refresh now and check again'),
+              state: 'running' as const,
+            },
+          ],
+        };
+      return page;
+    };
+    sessions = [{ id: 's1', name: 'one' }];
+    const b = makeBridge(undefined, { history, now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    await b.pollConversations();
+    const thread = (await readFullMap(dir)).s1,
+      text = 'Do a manual refresh now and check again';
+    await b.onGatewayMessage({
+      id: '900000000000000001',
+      guild_id: cfg.guildId,
+      channel_id: thread,
+      author: { id: cfg.allowedUserIds[0] },
+      content: text,
+    });
+    page = {
+      conversationId: conv,
+      partial: true,
+      verifiedAfter: scanned,
+      turns: [{ cursor: submitted, role: 'user', text, timestamp: '' }],
+      executions: [{ userCursor: submitted, promptHash: hashDiscordPrompt(text), state: 'running' }],
+    };
+    now += 60001;
+    await b.pollConversations();
+    const prompts = () =>
+      posts.filter((p) => p.method === 'POST' && JSON.stringify(p.body ?? {}).includes('User prompt'));
+    expect(prompts()).toHaveLength(0);
+    page = {
+      conversationId: conv,
+      partial: true,
+      verifiedAfter: submitted,
+      turns: [{ cursor: external, role: 'user', text, timestamp: '' }],
+      executions: [{ userCursor: external, promptHash: hashDiscordPrompt(text), state: 'running' }],
+    };
+    now += 60001;
+    await b.pollConversations();
+    expect(prompts()).toHaveLength(1);
+    expect(sendInput).toHaveBeenCalledTimes(1);
+  });
+
   it('does not echo an attributed Discord prompt but mirrors later identical text from outside Discord', async () => {
     let now = 100000;
     let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
