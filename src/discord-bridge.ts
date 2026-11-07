@@ -1,4 +1,3 @@
-import { CompletionInbox, type CompletionEntry } from './completion-inbox.js';
 /**
  * @fileoverview Two-way Discord bridge: one thread per tab, alerts out, replies typed back in.
  *
@@ -1004,7 +1003,6 @@ export class DiscordBridge {
   private readonly api: DiscordApi;
   private readonly now: () => number;
   private readonly deliveries: DiscordDeliveryJournal;
-  readonly completionInbox: CompletionInbox;
   private readonly channels: DiscordCaseThreads;
   private readonly categories: DiscordCaseCategories;
   private readonly conversationProgress: DiscordConversationProgressStore;
@@ -1012,18 +1010,12 @@ export class DiscordBridge {
 
   constructor(private readonly deps: DiscordBridgeDeps) {
     this.now = deps.now ?? Date.now;
-    this.completionInbox = new CompletionInbox(deps.configDir, this.now);
     this.conversationProgress = new DiscordConversationProgressStore(deps.configDir);
     this.deliveries = new DiscordDeliveryJournal(deps.configDir, this.now);
     this.api = new DiscordApi(() => this.cfg.token, deps.fetchImpl, deps.sleep);
     if (deps.nativeUi)
       this.nativeUi = new DiscordNativeUi({
         dir: deps.configDir,
-        inbox: {
-          list: () => this.completionEntries(),
-          review: (ids, source) => this.reviewCompletions(ids, source),
-          response: (id) => this.completionResponse(id),
-        },
         services: deps.nativeUi,
         now: this.now,
         scope: () => (this.acceptsControls && !this.held && deps.nativeUi?.enabled() ? this.controlScope : undefined),
@@ -1536,22 +1528,6 @@ export class DiscordBridge {
       if (history.conversationId !== progress.conversationId)
         throw new BridgeProblem('Conversation changed; synchronize history first');
       await this.deliveries.reconcileNative(sessionId, history);
-      const discovered = await this.completionInbox
-        .observe({
-          session: sessionId,
-          name: this.deps.sessions?.().find((s) => s.id === sessionId)?.name ?? sessionId,
-          guild: this.cfg.guildId,
-          channel,
-          history,
-          messages: progress.lastResponse
-            ? { [progress.lastResponse.cursor]: progress.lastResponse.message }
-            : undefined,
-        })
-        .catch(() => {
-          this.last = this.fail(new BridgeProblem('Completion inbox unavailable; review tracking paused'));
-          return false;
-        });
-      if (discovered) await this.nativeUi?.refreshInbox().catch(() => undefined);
       if (progress.streamOff) return;
       const discordPrompts = await this.deliveries.submittedUserCursors(sessionId, channel, history.conversationId);
       const at = progress.cursor ? history.turns.findIndex((t) => t.cursor === progress!.cursor) : -1;
@@ -1603,17 +1579,8 @@ export class DiscordBridge {
                   controls,
                 })
               : splitForDiscord(formatted).map((content) => ({ content, allowed_mentions: { parse: [], users: [] } }));
-          for (const [i, post] of responsePosts.entries()) {
-            const posted = (await this.deliverPost(
-              channel,
-              post,
-              undefined,
-              sessionId,
-              `native:${turn.cursor}:${i}`
-            )) as { id?: string };
-            if (turn.role === 'assistant' && i === 0 && posted?.id)
-              progress = { ...progress, lastResponse: { cursor: turn.cursor, message: posted.id } };
-          }
+          for (const [i, post] of responsePosts.entries())
+            await this.deliverPost(channel, post, undefined, sessionId, `native:${turn.cursor}:${i}`);
           if (visible.length > 12000 || formatted.length > 12000)
             await this.deliverPost(
               channel,
@@ -1628,22 +1595,6 @@ export class DiscordBridge {
         progress = { ...progress, cursor: turn.cursor };
         await this.conversationProgress.set(key, progress);
       }
-      const added = await this.completionInbox
-        .observe({
-          session: sessionId,
-          name: this.deps.sessions?.().find((s) => s.id === sessionId)?.name ?? sessionId,
-          guild: this.cfg.guildId,
-          channel,
-          history,
-          messages: progress.lastResponse
-            ? { [progress.lastResponse.cursor]: progress.lastResponse.message }
-            : undefined,
-        })
-        .catch(() => {
-          this.last = this.fail(new BridgeProblem('Completion inbox unavailable; review tracking paused'));
-          return false;
-        });
-      if (added) await this.nativeUi?.refreshInbox().catch(() => undefined);
       const latest = history.executions?.at(-1);
       const stateLabels = {
         submitted: '📨 Sent to the agent',
@@ -1720,50 +1671,6 @@ export class DiscordBridge {
     await run;
   }
 
-  async completionEntries(): Promise<CompletionEntry[]> {
-    await this.ensureLoaded();
-    return (await this.completionInbox.list()).filter((e) => e.guild === this.cfg.guildId);
-  }
-  async reviewCompletions(ids: string[], source: 'web' | 'discord'): Promise<void> {
-    const visible = new Set((await this.completionEntries()).map((e) => e.id));
-    if (
-      await this.completionInbox.review(
-        ids.filter((id) => visible.has(id)),
-        source
-      )
-    )
-      await this.nativeUi?.refreshInbox().catch(() => undefined);
-  }
-  async completionResponse(id: string): Promise<{ text: string; latest: boolean; viewAnchor?: string }> {
-    const entry = (await this.completionEntries()).find((e) => e.id === id);
-    if (!entry || !this.deps.history) throw new Error('Response unavailable');
-    const h = await this.deps.history(entry.session);
-    if (h.conversationId !== entry.conversation)
-      throw new Error('Conversation changed; open the Discord response or mark read explicitly.');
-    const turn = h.turns.find((t) => t.role === 'assistant' && t.cursor === entry.responseCursor);
-    if (!turn) throw new Error('Exact response no longer available in native history.');
-    const text = discordDisplayText(turn.text);
-    const normal = (value: string) => value.replace(/[\s`*_#>|~]/g, '').toLowerCase();
-    const other = h.turns.filter((t) => t.cursor !== turn.cursor).map((t) => normal(discordDisplayText(t.text)));
-    // Generic/repeated answer lines or text echoed from a prompt do not prove which result was seen.
-    const viewAnchor = text
-      .split('\n')
-      .slice(-40)
-      .reverse()
-      .find(
-        (line) =>
-          line.trim().length >= 32 &&
-          line.replace(/[^\p{L}\p{N}]/gu, '').length >= 24 &&
-          line.length <= 600 &&
-          !/^\s*```/.test(line) &&
-          !other.some((value) => value.includes(normal(line)))
-      );
-    return {
-      text,
-      viewAnchor,
-      latest: h.turns.filter((t) => t.role === 'assistant' && t.phase !== 'commentary').at(-1)?.cursor === turn.cursor,
-    };
-  }
   async ensureLoaded(): Promise<void> {
     if (this.loaded) return;
     this.firstLoad ??= this.reload();
@@ -2984,26 +2891,6 @@ export class DiscordBridge {
       return;
     }
     try {
-      if (
-        mappedSessionId &&
-        this.cfg.mode === 'full' &&
-        /^\d{15,25}$/.test(m.id) &&
-        !/^!codeman(?:\s|$)/i.test(m.content ?? '')
-      )
-        await this.reviewCompletions(
-          (await this.completionEntries().catch(() => []))
-            .filter(
-              (e) =>
-                e.session === mappedSessionId &&
-                e.channel === m.channel_id &&
-                e.reviewed === undefined &&
-                e.completed <= Number((BigInt(m.id) >> 22n) + 1420070400000n)
-            )
-            .map((e) => e.id),
-          'discord'
-        ).catch(() => {
-          this.last = this.fail(new BridgeProblem('Completion review unavailable; reply delivery continues'));
-        });
       if (caseKey && !/^!codeman(?:\s|$)/i.test(m.content ?? '')) {
         const live = this.deps.sessions?.() ?? [];
         const threads = this.channels
