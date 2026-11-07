@@ -237,7 +237,21 @@ export class DiscordDeliveryJournal {
       }
     });
   }
-  async reconcileNative(sessionId: string, history: import('./discord-history.js').DiscordHistory): Promise<void> {
+  private reconciliation: Promise<void> = Promise.resolve();
+  reconcileNative(
+    sessionId: string,
+    history: import('./discord-history.js').DiscordHistory,
+    readAfter?: (cursor: string) => Promise<import('./discord-history.js').DiscordHistory>
+  ): Promise<void> {
+    const run = this.reconciliation.then(() => this.reconcile(sessionId, history, readAfter));
+    this.reconciliation = run.catch(() => undefined);
+    return run;
+  }
+  private async reconcile(
+    sessionId: string,
+    history: import('./discord-history.js').DiscordHistory,
+    readAfter?: (cursor: string) => Promise<import('./discord-history.js').DiscordHistory>
+  ): Promise<void> {
     await this.load();
     const records = [...this.records.values()]
       .filter(
@@ -245,7 +259,7 @@ export class DiscordDeliveryJournal {
           r.direction === 'inbound' &&
           r.sessionId === sessionId &&
           r.native?.conversationId === history.conversationId &&
-          ['input_accepted', 'submitted', 'uncertain', 'running'].includes(r.state)
+          ['submitting', 'input_accepted', 'submitted', 'uncertain', 'running'].includes(r.state)
       )
       .sort((a, b) => a.createdAt - b.createdAt);
     const claimed = new Set(
@@ -253,14 +267,27 @@ export class DiscordDeliveryJournal {
     );
     for (const record of records) {
       const meta = record.native!;
-      const baseline = meta.afterCursor ? history.turns.findIndex((t) => t.cursor === meta.afterCursor) : -1;
-      if (meta.afterCursor && baseline < 0) continue;
-      const execution = history.executions?.find((e) =>
+      let evidence = history;
+      let baseline = meta.afterCursor ? evidence.turns.findIndex((t) => t.cursor === meta.afterCursor) : -1;
+      if (!meta.userCursor && meta.afterCursor && baseline < 0 && evidence.verifiedAfter !== meta.afterCursor) {
+        // Incremental live pages can start beyond the input's submission boundary. A matching
+        // hash alone cannot distinguish an identical prompt typed elsewhere; verify the saved row.
+        if (
+          !readAfter ||
+          !history.executions?.some((e) => e.promptHash === meta.promptHash && !claimed.has(e.userCursor))
+        )
+          continue;
+        evidence = await readAfter(meta.afterCursor);
+        if (evidence.conversationId !== meta.conversationId || evidence.verifiedAfter !== meta.afterCursor)
+          throw new DiscordDeliveryError('Native submission boundary could not be verified');
+        baseline = evidence.turns.findIndex((t) => t.cursor === meta.afterCursor);
+      }
+      const execution = evidence.executions?.find((e) =>
         meta.userCursor
           ? e.userCursor === meta.userCursor
           : e.promptHash === meta.promptHash &&
             !claimed.has(e.userCursor) &&
-            history.turns.findIndex((t) => t.cursor === e.userCursor) > baseline
+            evidence.turns.findIndex((t) => t.cursor === e.userCursor) > baseline
       );
       if (!execution) continue;
       claimed.add(execution.userCursor);

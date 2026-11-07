@@ -110,6 +110,86 @@ describe('delivery journal', () => {
     const restored = new DiscordDeliveryJournal(dir, () => now);
     expect((await restored.recent())[0].native?.userCursor).toBe(user);
   });
+  it.each(['input_accepted', 'submitting'] as const)(
+    'recovers an unbound %s input from its verified boundary before a later page can echo it',
+    async (state) => {
+      const journal = new DiscordDeliveryJournal(dir, () => now);
+      await journal.claim(meta);
+      await journal.annotate(meta.id, {
+        native: { conversationId: 'native', promptHash: 'a'.repeat(64), afterCursor: 'native:old' },
+      });
+      await journal.update(meta.id, state);
+      const history = {
+        conversationId: 'native',
+        partial: true,
+        verifiedAfter: 'native:later-tool',
+        turns: [
+          {
+            cursor: 'native:user',
+            role: 'user' as const,
+            text: 'Prompt with [attached: /tmp/image.png]',
+            timestamp: '',
+          },
+        ],
+        executions: [{ userCursor: 'native:user', promptHash: 'a'.repeat(64), state: 'running' as const }],
+      };
+      const readAfter = vi.fn(async () => ({ ...history, verifiedAfter: 'native:old' }));
+      await journal.reconcileNative('s1', history, readAfter);
+      expect(readAfter).toHaveBeenCalledWith('native:old');
+      expect(await journal.submittedUserCursors('s1', THREAD, 'native')).toEqual(new Set(['native:user']));
+      const restored = new DiscordDeliveryJournal(dir, () => now);
+      await restored.reconcileNative('s1', {
+        ...history,
+        executions: [{ ...history.executions[0], state: 'completed' }],
+      });
+      expect((await restored.recent())[0].state).toBe('completed');
+    }
+  );
+  it('does not accept an unverified boundary or steal an identical externally typed prompt', async () => {
+    const journal = new DiscordDeliveryJournal(dir, () => now);
+    await journal.claim(meta);
+    await journal.annotate(meta.id, {
+      native: { conversationId: 'native', promptHash: 'a'.repeat(64), afterCursor: 'native:old' },
+    });
+    await journal.update(meta.id, 'input_accepted');
+    const external = {
+      conversationId: 'native',
+      partial: true,
+      turns: [{ cursor: 'native:external', role: 'user' as const, text: 'same', timestamp: '' }],
+      executions: [{ userCursor: 'native:external', promptHash: 'a'.repeat(64), state: 'running' as const }],
+    };
+    await expect(journal.reconcileNative('s1', external, async () => external)).rejects.toThrow('boundary');
+    expect((await journal.submittedUserCursors('s1', THREAD, 'native')).size).toBe(0);
+    await journal.reconcileNative('s1', external, async () => ({
+      ...external,
+      verifiedAfter: 'native:old',
+      turns: [{ cursor: 'native:discord', role: 'user' as const, text: 'same', timestamp: '' }, ...external.turns],
+      executions: [
+        { userCursor: 'native:discord', promptHash: 'a'.repeat(64), state: 'completed' },
+        ...external.executions,
+      ],
+    }));
+    expect(await journal.submittedUserCursors('s1', THREAD, 'native')).toEqual(new Set(['native:discord']));
+  });
+  it('serializes concurrent native reads so identical pending inputs cannot claim one execution twice', async () => {
+    const journal = new DiscordDeliveryJournal(dir, () => now);
+    for (const id of ['first', 'second']) {
+      await journal.claim({ ...meta, id });
+      await journal.annotate(id, {
+        native: { conversationId: 'native', promptHash: 'a'.repeat(64), afterCursor: 'native:old' },
+      });
+      await journal.update(id, 'input_accepted');
+    }
+    const h = {
+      conversationId: 'native',
+      partial: true,
+      verifiedAfter: 'native:old',
+      turns: [{ cursor: 'native:user', role: 'user' as const, text: 'same', timestamp: '' }],
+      executions: [{ userCursor: 'native:user', promptHash: 'a'.repeat(64), state: 'running' as const }],
+    };
+    await Promise.all([journal.reconcileNative('s1', h), journal.reconcileNative('s1', h)]);
+    expect((await journal.recent()).filter((r) => r.native?.userCursor === 'native:user')).toHaveLength(1);
+  });
   it('finds exact Discord-origin native cursors across the full durable ledger and scoped destination', async () => {
     const journal = new DiscordDeliveryJournal(dir, () => now);
     for (let i = 0; i < 15; i++) {

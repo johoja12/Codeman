@@ -573,6 +573,72 @@ describe('Discord interface mode', () => {
     expect(sendInput).toHaveBeenCalledTimes(1);
   });
 
+  it.each([false, true])(
+    'does not echo Discord attachment prompts past their saved boundary (inflight=%s)',
+    async (inflight) => {
+      let now = 100000;
+      const text = 'Review this [attached: /tmp/example.png]';
+      const baseline = { cursor: 'native1:old', role: 'assistant' as const, text: 'Previous response', timestamp: '' };
+      const intermediate = {
+        cursor: 'native1:intermediate',
+        role: 'assistant' as const,
+        text: 'An update',
+        timestamp: '',
+      };
+      const input = { cursor: 'native1:input', role: 'user' as const, text, timestamp: '' };
+      let sent = false,
+        advanced = false;
+      const history = vi.fn(async (_id: string, options?: { after?: string }) => {
+        if (!sent)
+          return { conversationId: 'native1', partial: false, turns: advanced ? [baseline, intermediate] : [baseline] };
+        return {
+          conversationId: 'native1',
+          partial: true,
+          verifiedAfter: options?.after,
+          turns: options?.after === intermediate.cursor ? [intermediate, input] : [baseline, intermediate, input],
+          executions: [{ userCursor: input.cursor, promptHash: hashDiscordPrompt(text), state: 'running' as const }],
+        };
+      });
+      sessions = [{ id: 's1', name: 'one' }];
+      const b = makeBridge(undefined, { history, now: () => now });
+      await b.reload();
+      await b.syncSessions();
+      const thread = (await readFullMap(dir)).s1;
+      sendInput.mockImplementationOnce(async () => {
+        advanced = true;
+        await b.pollConversations();
+        sent = true;
+        if (inflight) {
+          now += 20000;
+          await b.pollConversations();
+        }
+        return true;
+      });
+      await b.onGatewayMessage({
+        id: '900000000000000011',
+        guild_id: cfg.guildId,
+        channel_id: thread,
+        author: { id: cfg.allowedUserIds[0] },
+        content: text,
+      });
+      now += 20000;
+      await b.pollConversations();
+      expect(history).toHaveBeenCalledWith('s1', { after: baseline.cursor });
+      expect(
+        posts.filter((p) => p.method === 'POST' && JSON.stringify(p.body ?? {}).includes('User prompt'))
+      ).toHaveLength(0);
+      expect(sendInput).toHaveBeenCalledTimes(1);
+      b.stop();
+      const restarted = makeBridge(undefined, { history, now: () => now });
+      await restarted.reload();
+      await restarted.syncSessions();
+      await restarted.pollConversations();
+      expect(
+        posts.filter((p) => p.method === 'POST' && JSON.stringify(p.body ?? {}).includes('User prompt'))
+      ).toHaveLength(0);
+      expect(sendInput).toHaveBeenCalledTimes(1);
+    }
+  );
   it('preserves historical and stream-off boundaries for user prompt mirroring', async () => {
     let now = 100000;
     const turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [
