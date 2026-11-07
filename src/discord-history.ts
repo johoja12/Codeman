@@ -25,12 +25,21 @@ interface NativeHistoryRow {
   isCompactSummary?: boolean;
   message?: { content?: unknown; stop_reason?: string };
   payload?: {
+    thread_id?: string;
     type?: string;
     output?: unknown;
     role?: string;
     content?: unknown;
     message?: unknown;
-    item?: { type?: string; content?: unknown };
+    item?: {
+      type?: string;
+      content?: unknown;
+      kind?: string;
+      id?: string;
+      status?: string;
+      savedPath?: string;
+      failure?: unknown;
+    };
   };
   attachment?: { type?: string; origin?: { kind?: string }; commandMode?: string; prompt?: string; timestamp?: string };
 }
@@ -75,9 +84,15 @@ export interface DiscordHistoryTurn {
   text: string;
   phase?: 'commentary' | 'final_answer';
 }
+export interface DiscordGeneratedImage {
+  id: string;
+  cursor: string;
+  timestamp: string;
+}
 export interface DiscordHistory {
   conversationId: string;
   turns: DiscordHistoryTurn[];
+  generatedImages?: DiscordGeneratedImage[];
   partial: boolean;
   executions?: DiscordNativeExecution[];
   notice?: string;
@@ -119,11 +134,12 @@ export function discordHistoryFailureReason(error: unknown): string {
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Bounded inventory and bounded tail. Exact UUID only; ambiguous copies are unavailable. */
 const HISTORY_SCRIPT = String.raw`
-import os,sys,json,stat,base64,hashlib
+import os,sys,json,stat,base64,hashlib,re
 s=json.loads(sys.argv[1]);mode=s['format'];ident=s['id'];limit=2*1024*1024
 def fail(code):
  print(json.dumps({'error':code}));sys.exit(0)
 root=os.path.expanduser(s.get('home') or os.environ.get('CLAUDE_CONFIG_DIR' if mode=='claude-jsonl' else 'CODEX_HOME') or ('~/.claude' if mode=='claude-jsonl' else '~/.codex'))
+home=root
 root=os.path.join(root,'projects' if mode=='claude-jsonl' else 'sessions');found=[];count=0
 for parent,dirs,files in os.walk(root,followlinks=False):
  dirs[:]=[d for d in dirs if not os.path.islink(os.path.join(parent,d))]
@@ -138,6 +154,15 @@ for parent,dirs,files in os.walk(root,followlinks=False):
   if os.path.islink(path) or not stat.S_ISREG(os.lstat(path).st_mode): continue
   found.append(path)
 if len(found)!=1: raise Exception('missing or ambiguous transcript')
+def generated(v,cursor):
+ if mode!='codex-rollout' or not isinstance(v,dict) or v.get('type')!='event_msg':return None
+ p=v.get('payload');i=p.get('item') if isinstance(p,dict) else None
+ if not isinstance(i,dict) or p.get('type')!='item_completed' or p.get('thread_id')!=ident:return None
+ image=i.get('id')
+ if i.get('type')!='Extension' or i.get('kind')!='image_gen.generation' or i.get('status')!='completed' or i.get('failure') is not None:return None
+ if not isinstance(image,str) or not re.fullmatch(r'exec-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',image):return None
+ if i.get('savedPath')!=os.path.join(home,'generated_images',ident,image+'.png'):return None
+ return {'id':image,'cursor':cursor,'timestamp':v.get('timestamp') if isinstance(v.get('timestamp'),str) else ''}
 f=os.open(found[0],os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
 try:
  info=os.fstat(f)
@@ -146,7 +171,33 @@ try:
  if mode=='codex-rollout':
   meta=json.loads(head)
   if meta.get('type')!='session_meta' or meta.get('payload',{}).get('id')!=ident: raise Exception('identity mismatch')
- after=s.get('after');scanned=None
+ if s.get('image'):
+  image=s['image'];cursor=image['cursor'];parts=cursor.split(':')
+  if len(parts)!=3 or parts[0]!=ident:raise Exception('image conversation mismatch')
+  with os.fdopen(os.dup(f),'rb') as stream:
+   stream.seek(int(parts[1]));line=stream.readline(16*1024*1024+1)
+  if not line.endswith(b'\n') or len(line)>16*1024*1024 or hashlib.sha256(line[:-1]).hexdigest()[:16]!=parts[2]:raise Exception('image event changed')
+  proof=generated(json.loads(line),cursor)
+  if not proof or proof['id']!=image['id']:raise Exception('image event unverified')
+  fds=[]
+  try:
+   parent=os.open(os.path.realpath(home),os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);fds.append(parent)
+   for part in ['generated_images',ident]:
+    parent=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent);fds.append(parent)
+   imagefd=os.open(image['id']+'.png',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent);fds.append(imagefd)
+   st=os.fstat(imagefd)
+   if not stat.S_ISREG(st.st_mode) or st.st_size>8*1024*1024:raise Exception('image is unavailable or oversized')
+   data=bytearray()
+   while len(data)<=8*1024*1024:
+    chunk=os.read(imagefd,min(65536,8*1024*1024+1-len(data)))
+    if not chunk:break
+    data.extend(chunk)
+   if len(data)>8*1024*1024 or not data.startswith(b'\x89PNG\r\n\x1a\n'):raise Exception('invalid generated PNG')
+   sys.stdout.buffer.write(data)
+  finally:
+   for fd in reversed(fds):os.close(fd)
+  sys.exit(0)
+ after=s.get('after');scanned=None;images=[]
  if after:
   parts=after.split(':');offset=int(parts[1])
   if offset>=info.st_size:fail('cursor_missing')
@@ -166,7 +217,10 @@ try:
    stream.seek(offset);anchor=stream.readline(16*1024*1024+1)
    if len(anchor)>16*1024*1024:fail('record_too_large')
    if not anchor.endswith(b'\n') or hashlib.sha256(anchor[:-1]).hexdigest()[:16]!=parts[2]:fail('cursor_changed')
-   if len(anchor)>limit:
+   try: anchored_image=generated(json.loads(anchor),after) if b'image_gen.generation' in anchor else None
+   except Exception: anchored_image=None
+   if anchored_image:offset+=len(anchor)
+   elif len(anchor)>limit:
     if not ignored_large(anchor):fail('record_too_large')
     offset+=len(anchor)
    stream.seek(offset);chunks=[];size=0;budget=limit+(len(anchor) if len(anchor)<=limit else 0)
@@ -176,6 +230,10 @@ try:
     if len(line)>16*1024*1024:fail('record_too_large')
     if not line or not line.endswith(b'\n'):break
     cursor=ident+':'+str(at)+':'+hashlib.sha256(line[:-1]).hexdigest()[:16]
+    try: image=generated(json.loads(line),cursor) if b'image_gen.generation' in line else None
+    except Exception:image=None
+    if image:
+     images.append(image);scanned=cursor;skipped_end=at+len(line);break
     if len(line)>limit:
      if not ignored_large(line):fail('record_too_large')
      scanned=cursor;skipped_end=at+len(line)
@@ -194,10 +252,10 @@ try:
    offset+=end+1;data=data[end+1:]
   end=data.rfind(b'\n');data=data[:end+1] if end>=0 else b''
   more=offset+len(data)<info.st_size
- print(json.dumps({'offset':offset,'data':base64.b64encode(data).decode(),'partial':offset>0,'verifiedAfter':after,'hasMore':more,'scannedCursor':scanned}))
+ print(json.dumps({'offset':offset,'data':base64.b64encode(data).decode(),'partial':offset>0,'verifiedAfter':after,'hasMore':more,'scannedCursor':scanned,'images':images}))
 finally: os.close(f)
 `;
-export function discordHistoryCommand(source: DiscordHistorySource): string {
+export function discordHistoryCommand(source: DiscordHistorySource, image?: DiscordGeneratedImage): string {
   const format = getCli(source.mode)?.capabilities.transcript;
   if (
     !source.conversationId ||
@@ -209,6 +267,14 @@ export function discordHistoryCommand(source: DiscordHistorySource): string {
     throw new Error('Invalid history recovery cursor');
   if (source.after && !Number.isSafeInteger(Number(source.after.split(':')[1])))
     throw new Error('Invalid history recovery offset');
+  if (
+    image &&
+    (!/^exec-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(image.id) ||
+      !new RegExp(`^${source.conversationId}:[0-9]{1,16}:[a-f0-9]{16}$`).test(image.cursor) ||
+      !Number.isSafeInteger(Number(image.cursor.split(':')[1])) ||
+      getCli(source.mode)?.capabilities.transcript !== 'codex-rollout')
+  )
+    throw new Error('Invalid generated image identity');
   return withRemotePathBootstrap(
     'python3 -c ' +
       shellescape(HISTORY_SCRIPT) +
@@ -220,6 +286,7 @@ export function discordHistoryCommand(source: DiscordHistorySource): string {
           home: source.configHome,
           after: source.after,
           tools: source.includeTools === true,
+          image,
         })
       )
   );
@@ -234,6 +301,7 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
     verifiedAfter?: string;
     hasMore?: boolean;
     scannedCursor?: string;
+    images?: DiscordGeneratedImage[];
   };
   if (packet.error) throw new DiscordHistoryReadError(packet.error);
   if (source.after && packet.verifiedAfter !== source.after) throw new DiscordHistoryReadError('cursor_changed');
@@ -268,11 +336,52 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
     offset += Buffer.byteLength(line) + 1;
   }
   const turns: DiscordHistoryTurn[] = [];
+  const generatedImages: DiscordGeneratedImage[] = [];
+  const addImage = (image: DiscordGeneratedImage) => {
+    if (
+      generatedImages.length >= 4 ||
+      !/^exec-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(image.id) ||
+      !new RegExp(`^${source.conversationId}:[0-9]{1,16}:[a-f0-9]{16}$`).test(image.cursor) ||
+      !Number.isSafeInteger(Number(image.cursor.split(':')[1])) ||
+      typeof image.timestamp !== 'string' ||
+      image.timestamp.length > 100
+    )
+      throw new Error('Invalid generated image metadata');
+    if (!generatedImages.some((i) => i.cursor === image.cursor)) generatedImages.push(image);
+  };
+  if (packet.images !== undefined) {
+    if (
+      !Array.isArray(packet.images) ||
+      packet.images.length > 4 ||
+      (packet.images.length > 0 && format !== 'codex-rollout')
+    )
+      throw new Error('Invalid generated image metadata');
+    for (const image of packet.images) addImage(image);
+  }
   for (const { value: e, offset, raw } of rows) {
     let role: 'user' | 'assistant' | 'tool' | undefined,
       text = '',
       phase: DiscordHistoryTurn['phase'],
       timestamp = typeof e.timestamp === 'string' ? e.timestamp : '';
+    const item = e.payload?.item;
+    if (
+      format === 'codex-rollout' &&
+      e.type === 'event_msg' &&
+      e.payload?.type === 'item_completed' &&
+      e.payload.thread_id === source.conversationId &&
+      item?.type === 'Extension' &&
+      item.kind === 'image_gen.generation' &&
+      item.status === 'completed' &&
+      item.failure == null &&
+      typeof item.id === 'string' &&
+      typeof item.savedPath === 'string' &&
+      item.savedPath.endsWith(`/generated_images/${source.conversationId}/${item.id}.png`)
+    )
+      addImage({
+        id: item.id,
+        timestamp,
+        cursor: `${source.conversationId}:${offset}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`,
+      });
     if (source.includeTools) {
       let output = '';
       if (
@@ -388,6 +497,7 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
   return {
     conversationId: source.conversationId!,
     turns,
+    ...(generatedImages.length ? { generatedImages } : {}),
     partial: packet.partial === true,
     executions,
     ...(source.after
@@ -402,6 +512,20 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
         }
       : {}),
   };
+}
+export async function readDiscordGeneratedImage(
+  source: DiscordHistorySource,
+  image: DiscordGeneratedImage
+): Promise<{ name: string; data: Uint8Array }> {
+  const command = discordHistoryCommand(source, image);
+  const bytes = source.remote
+    ? await runDiscordRemoteRead(source.remote, command)
+    : (await exec('sh', ['-c', command], { encoding: 'buffer', timeout: 30000, maxBuffer: 8 * 1024 * 1024 + 1 }))
+        .stdout;
+  const data = Buffer.from(bytes);
+  if (data.length > 8 * 1024 * 1024 || !data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])))
+    throw new Error('Generated image could not be verified');
+  return { name: image.id + '.png', data };
 }
 export async function readDiscordHistory(source: DiscordHistorySource): Promise<DiscordHistory> {
   const command = discordHistoryCommand(source);
@@ -447,11 +571,13 @@ function remoteHistoryScope(
 }
 
 /** Adapts live Session metadata; never guesses by shared directory or falls back to terminal redraws. */
-export async function readDiscordSessionHistory(
+async function withDiscordSessionHistorySource<T>(
   session: import('./session.js').Session,
-  options?: { includeTools?: boolean; after?: string },
-  recoveredId?: string
-): Promise<DiscordHistory> {
+  options: { includeTools?: boolean; after?: string } | undefined,
+  recoveredId: string | undefined,
+  read: (source: DiscordHistorySource) => Promise<T>
+): Promise<T> {
+  if (session.docker) throw new Error('Container history is not available through this reader');
   const format = getCli(session.mode)?.capabilities.transcript;
   let id =
     format === 'claude-jsonl'
@@ -511,7 +637,7 @@ export async function readDiscordSessionHistory(
       discovered = await probeRemoteDiscordConversation(remote, session.id).catch(() => undefined);
     }
     id ??= discovered;
-    const history = await readDiscordHistory({
+    const history = await read({
       mode: session.mode,
       conversationId: id,
       remote,
@@ -531,10 +657,10 @@ export async function readDiscordSessionHistory(
         )
           throw new DiscordHistoryReadError('profile_changed');
       }
-      const compatibleAdoption = session.nativeResumeId === id && remoteHistoryScope(session, resumeIdBefore) === scope;
-      if (session.remote !== remote || (remoteHistoryScope(session) !== scope && !compatibleAdoption))
-        throw new DiscordHistoryReadError('profile_changed');
     }
+    const compatibleAdoption = session.nativeResumeId === id && remoteHistoryScope(session, resumeIdBefore) === scope;
+    if (session.remote !== remote || (remoteHistoryScope(session) !== scope && !compatibleAdoption))
+      throw new DiscordHistoryReadError('profile_changed');
     // The exact native file/header and current owned runtime must both confirm the binding first.
     if (discovered && !session.nativeResumeId) session.setNativeResumeId(discovered);
     if (runtime) remoteRuntimeHomes.set(session, { scope: remoteHistoryScope(session), runtime });
@@ -543,6 +669,21 @@ export async function readDiscordSessionHistory(
     remoteRuntimeHomes.delete(session);
     throw error;
   }
+}
+export async function readDiscordSessionHistory(
+  session: import('./session.js').Session,
+  options?: { includeTools?: boolean; after?: string },
+  recoveredId?: string
+): Promise<DiscordHistory> {
+  return withDiscordSessionHistorySource(session, options, recoveredId, readDiscordHistory);
+}
+export async function readDiscordSessionGeneratedImage(
+  session: import('./session.js').Session,
+  image: DiscordGeneratedImage
+): Promise<{ name: string; data: Uint8Array }> {
+  return withDiscordSessionHistorySource(session, undefined, undefined, (source) =>
+    readDiscordGeneratedImage(source, image)
+  );
 }
 export function renderHistory(turns: DiscordHistoryTurn[], options: { includeTimestamps?: boolean } = {}): string {
   return turns

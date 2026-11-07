@@ -20,6 +20,8 @@ Codeman can post to a private Discord server when a session needs you, group ses
 
 Streamed commentary, progress status, mirrored prompts, tool output and supplemental chunks/files are silent: they remain visible and may show an unread badge, but do not trigger push or desktop notifications. The first final-response card remains eligible for normal notifications; permission and needs-input alerts retain their existing notification and mention policy. Discord server/thread mute settings and per-user notification preferences still apply.
 
+Completed native Codex PNG-generation events are delivered as silent inline image galleries even when the final reply has no Markdown file link. The reader verifies the exact native event cursor and current conversation/profile, and opens only that event’s PNG under its conversation’s `generated_images` directory. Symlinks, non-PNG data, changed events/profiles and files over 8 MB are refused. Opaque result/base64 and revised prompts are not forwarded. General file-serving roots remain workspace-confined; container and multi-user image export are unavailable. Historical events already passed by the live checkpoint are not automatically replayed.
+
 ## Setup
 
 Do these once, in order. Never paste the bot token into a chat or a session.
