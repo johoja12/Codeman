@@ -47,6 +47,7 @@ export interface DiscordNativeUiServices {
   saveDefaults(values: { model: string; effort: string; approval: string }, current: () => boolean): Promise<void>;
   question(id: string): DiscordUiQuestion | undefined;
   answer(id: string, question: string, revision: string, value: string): Promise<string>;
+  workspaceHasChanges?(id: string): Promise<boolean>;
   workspace(id: string): Promise<{ summary: string; diff: string }>;
 }
 export interface DiscordUiPayload {

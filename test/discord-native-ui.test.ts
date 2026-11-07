@@ -254,11 +254,11 @@ describe('native Discord UI', () => {
     expect(f.messages.size).toBe(2);
     expect((await restored.store.snapshot()).cards).toBeDefined();
   });
-  it('uses only passive ownership checks for automatic completion cards', async () => {
+  it('does not post duplicate results cards when a task completes', async () => {
     const f = await fixture();
     f.host.receipts = async () => [{ id: 'completed-input', state: 'completed', updated: 1 }];
     await f.ui.poll();
-    expect([...f.messages.values()].some((m) => m.content.includes('Results & files'))).toBe(true);
+    expect([...f.messages.values()].some((m) => m.content.startsWith('**Results & files'))).toBe(false);
     expect(f.host.verify).not.toHaveBeenCalled();
   });
   it('recreates a deleted owned card and refuses a message now owned by someone else', async () => {
@@ -528,10 +528,12 @@ describe('native Discord UI', () => {
     const f = await fixture();
     await f.ui.poll();
     const result = await f.click(f.findCard(), 'Results & files');
-    expect(result.content).toContain('not inferred');
-    await f.click(result, 'Workspace changes');
-    expect(f.finishes.at(-1)?.content).toContain('attribution unverified');
-    await f.click(result, 'Download execution receipt');
+    expect(result.content).not.toContain('not inferred');
+    await f.click(result, 'View changes');
+    expect(f.finishes.at(-1)?.content).toContain('other sessions');
+    const more = await f.click(result, 'More');
+    expect(more.content).toContain('not inferred');
+    await f.click(more, 'Download execution receipt');
     expect(f.host.postFile).toHaveBeenCalledWith(
       channel,
       expect.objectContaining({ name: 'execution-receipt.json' }),
@@ -849,7 +851,8 @@ it.each(['expired', 'restart'] as const)(
       expect.any(Function)
     );
     expect(f.finishes.some((v) => v.content.includes('Compiling'))).toBe(true);
-    expect(f.finishes.at(-1)?.content).toContain('Results & files');
+    expect(f.finishes.at(-1)?.content).toContain('Original response');
+    expect(f.finishes.at(-1)?.content).not.toContain('Newer response');
     expect(f.host.submit).not.toHaveBeenCalled();
   }
 );
@@ -1122,4 +1125,131 @@ it('recovers stored read-only task buttons after restart outside the recent hist
   );
   expect(f.finishes.at(-1)?.content).toContain('Older task full progress');
   expect(f.host.submit).not.toHaveBeenCalled();
+});
+
+async function resultFixture(text = 'Created [report.pdf](/work/report.pdf).') {
+  const f = await fixture();
+  f.host.history = vi.fn(async () => ({
+    conversationId: 'conversation-one',
+    partial: false,
+    turns: [
+      { cursor: 'u1', role: 'user' as const, text: 'Create report', timestamp: '' },
+      { cursor: 'r1', role: 'assistant' as const, text, timestamp: '', phase: 'final_answer' as const },
+    ],
+    executions: [{ userCursor: 'u1', promptHash: 'abc', state: 'completed' as const }],
+  }));
+  await f.ui.poll();
+  const result = await f.click(f.findCard(), 'Results & files');
+  return { ...f, result };
+}
+it('shows the answer, compact status and a named guarded file download with technical details hidden', async () => {
+  const f = await resultFixture();
+  expect(f.result.content).toContain('Created [report.pdf]');
+  expect(f.result.content).toContain('✓ Completed');
+  expect(f.result.content).not.toMatch(/Native execution|shared-worktree|receipt/);
+  expect(f.host.file).not.toHaveBeenCalled();
+  await f.click(f.result, 'Download report.pdf');
+  expect(f.host.file).toHaveBeenCalledWith('s1', '/work/report.pdf');
+  expect(f.host.postFile).toHaveBeenCalledWith(
+    channel,
+    expect.objectContaining({ name: 'report.html' }),
+    expect.any(String),
+    expect.any(Function)
+  );
+  expect(f.host.submit).not.toHaveBeenCalled();
+});
+it.each(['', 'No exportable tracked diff.\n'])('hides View changes for an empty workspace (%s)', async (diff) => {
+  const f = await resultFixture();
+  f.host.services.workspace = vi.fn(async () => ({ summary: 'No changes', diff }));
+  const result = await f.click(f.findCard(), 'Results & files');
+  expect(result.components?.flatMap((r) => r.components).map((c) => c.label)).not.toContain('View changes');
+});
+it('keeps results useful for non-Git workspaces', async () => {
+  const f = await resultFixture();
+  f.host.services.workspace = vi.fn(async () => {
+    throw Error('Not a repository');
+  });
+  const result = await f.click(f.findCard(), 'Results & files');
+  expect(result.content).toContain('Created [report.pdf]');
+  expect(result.components?.flatMap((r) => r.components).map((c) => c.label)).toEqual(['Download report.pdf', 'More']);
+});
+it('does not read external URLs, code examples or secrets as generated files', async () => {
+  const f = await resultFixture('See [video](https://example.org/movie.mp4)\n```\n[artifact: /work/secret.pdf]\n```');
+  expect(f.result.components?.flatMap((r) => r.components).map((c) => c.label)).toEqual(['View changes', 'More']);
+  expect(f.host.file).not.toHaveBeenCalled();
+});
+it('preserves file guards and stops a download after a conversation change', async () => {
+  const f = await resultFixture();
+  f.host.file = vi.fn(async () => {
+    f.sessions[0].conversation = 'replacement';
+    return { name: 'report.pdf', data: Buffer.from('PDF') };
+  });
+  await f.click(f.result, 'Download report.pdf');
+  expect(f.host.postFile).not.toHaveBeenCalled();
+  expect(f.finishes.at(-1)?.content).toContain('changed');
+});
+it('exports the complete long answer without breaking the preview fence or message size', async () => {
+  const text = '```text\n' + 'long result line\n'.repeat(250) + '```';
+  const f = await resultFixture(text);
+  expect(f.result.content.length).toBeLessThan(1951);
+  expect(f.result.content.match(/```/g)?.length).toBe(2);
+  await f.click(f.result, 'Download answer');
+  expect(f.host.postFile).toHaveBeenCalledWith(
+    channel,
+    { name: 'response.txt', data: Buffer.from(text) },
+    'Full answer',
+    expect.any(Function)
+  );
+});
+it('does not label a missing answer as completed', async () => {
+  const f = await fixture();
+  await f.ui.poll();
+  const result = await f.click(f.findCard(), 'Results & files');
+  expect(result.content).toContain('No answer is available yet.');
+  expect(result.content).not.toContain('Completed');
+});
+it.each([false, true])('retires old automatic results cards only with matching bot ownership (%s)', async (foreign) => {
+  const f = await fixture(),
+    key = createHash('sha256')
+      .update(guild + ':' + channel + ':result:s1')
+      .digest('hex'),
+    id = snow();
+  f.messages.set(id, {
+    id,
+    channel,
+    author: { id: foreign ? '999999999999999999' : bot },
+    content: '**Results & files · w1-Codeman**\nNative execution: completed\n-# Codeman · result · ' + key.slice(0, 10),
+  });
+  await f.ui.store.edit((s) => {
+    s.cards[key] = { channel, message: id, hash: 'old', kind: 'result', phase: 'ready', updated: 1 };
+  });
+  await f.ui.poll();
+  expect(f.messages.has(id)).toBe(foreign);
+  expect(Boolean((await f.ui.store.snapshot()).cards[key])).toBe(foreign);
+});
+
+it('uses a names-only workspace check before showing View changes', async () => {
+  const f = await resultFixture();
+  f.host.services.workspaceHasChanges = vi.fn(async () => true);
+  vi.mocked(f.host.services.workspace).mockClear();
+  const result = await f.click(f.findCard(), 'Results & files');
+  expect(f.host.services.workspace).not.toHaveBeenCalled();
+  await f.click(result, 'View changes');
+  expect(f.host.services.workspace).toHaveBeenCalledOnce();
+});
+it('never substitutes a newer response when selected historical output is missing', async () => {
+  const f = await fixture();
+  const controls = await f.ui.responseControls('s1', channel, 'u1', 'missing');
+  f.host.history = vi.fn(async () => ({
+    conversationId: 'conversation-one',
+    partial: false,
+    turns: [
+      { cursor: 'u1', role: 'user', text: 'Old task', timestamp: '' },
+      { cursor: 'u2', role: 'user', text: 'New task', timestamp: '' },
+      { cursor: 'r2', role: 'assistant', text: 'Unrelated [new.pdf](/work/new.pdf)', timestamp: '' },
+    ],
+  }));
+  await f.click({ content: '', components: controls }, 'Results & files');
+  expect(f.finishes.at(-1)?.content).toContain('outside the available history');
+  expect(f.host.file).not.toHaveBeenCalled();
 });

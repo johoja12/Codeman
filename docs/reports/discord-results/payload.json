@@ -1,0 +1,77 @@
+{
+  "result": {
+    "content": "**w1-Codeman** · ✓ Completed\n\nCreated the deployment runbook.\n\n[Download runbook.pdf](/work/runbook.pdf)\n\nThe three-page guide includes setup steps and verification commands.",
+    "components": [
+      {
+        "type": 1,
+        "components": [
+          {
+            "type": 2,
+            "style": 2,
+            "label": "Download runbook.pdf",
+            "custom_id": "cmui:041e7567-46bd-4c99-b31b-9547ac047fb7"
+          },
+          {
+            "type": 2,
+            "style": 2,
+            "label": "View changes",
+            "custom_id": "cmui:7be32730-1ef2-4221-a02b-bb8f052b2c60"
+          },
+          {
+            "type": 2,
+            "style": 2,
+            "label": "More",
+            "custom_id": "cmui:e7738917-d2e1-4f4a-8fd4-e3ca07837ab1"
+          }
+        ]
+      }
+    ],
+    "allowed_mentions": {
+      "parse": [],
+      "users": []
+    }
+  },
+  "more": {
+    "content": "**More · w1-Codeman**\nNative execution: completed\n\nWorkspace changes are a shared-worktree snapshot, not automatically attributed to this task. Verification results are not inferred from assistant prose. Use History for the agent’s report and inspect the actual evidence.",
+    "components": [
+      {
+        "type": 1,
+        "components": [
+          {
+            "type": 2,
+            "style": 2,
+            "label": "Workspace changes",
+            "custom_id": "cmui:3624a2c3-6d9d-4adc-bda7-18d843c3eca2"
+          },
+          {
+            "type": 2,
+            "style": 2,
+            "label": "Download diff",
+            "custom_id": "cmui:3c55c803-85bb-4e02-a334-443d5fbfa907"
+          },
+          {
+            "type": 2,
+            "style": 2,
+            "label": "Download / preview file",
+            "custom_id": "cmui:b5905333-57d7-44a0-81c5-619bdf5072ad"
+          }
+        ]
+      },
+      {
+        "type": 1,
+        "components": [
+          {
+            "type": 2,
+            "style": 2,
+            "label": "Download execution receipt",
+            "custom_id": "cmui:6e8193d4-6ecb-4909-87fe-a219a1325dd0"
+          }
+        ]
+      }
+    ],
+    "allowed_mentions": {
+      "parse": [],
+      "users": []
+    }
+  }
+}

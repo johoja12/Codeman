@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { discordWorkspaceResults } from '../src/discord-workspace-results.js';
+import { discordWorkspaceResults, discordWorkspaceHasChanges } from '../src/discord-workspace-results.js';
 const exec = promisify(execFile);
 describe('Discord workspace result export', () => {
   it('labels a shared snapshot and filters secret, symlink and deleted paths before diff export', async () => {
@@ -17,7 +17,9 @@ describe('Discord workspace result export', () => {
       await writeFile(join(dir, 'deleted.ts'), 'deleted\n');
       await git('add', 'example.ts', '.env', 'deleted.ts');
       await git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture');
+      expect(await discordWorkspaceHasChanges({ workingDir: dir })).toBe(false);
       await writeFile(join(dir, 'example.ts'), 'export const value = 2;\n');
+      expect(await discordWorkspaceHasChanges({ workingDir: dir })).toBe(true);
       await writeFile(join(dir, '.env'), 'DEMO_SECRET=fixture-after\n');
       await rm(join(dir, 'deleted.ts'));
       await symlink('/etc/passwd', join(dir, 'outside.ts'));
