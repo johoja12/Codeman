@@ -1033,7 +1033,7 @@ describe('Discord interface mode', () => {
     expect(selection.body.content).toContain('<#' + map.s1 + '>');
     expect(selection.body.content).toContain('<#' + map.s2 + '>');
     await b.onGatewayMessage({ ...m, id: '900000000000000002', content: '!codeman sessions' });
-    expect(control).toHaveBeenCalledExactlyOnceWith('__case__:' + caseKey, 'sessions');
+    expect(control).toHaveBeenCalledExactlyOnceWith('__case__:' + caseKey, 'sessions', expect.any(Function));
     await b.onGatewayMessage({ ...m, id: '900000000000000005', content: '!codeman stream verbose' });
     await b.onGatewayMessage({ ...m, id: '900000000000000006', content: '!codeman file /work/file.txt' });
     expect(control).toHaveBeenCalledTimes(1);
@@ -1193,7 +1193,7 @@ describe('Discord interface mode', () => {
     await b.onGatewayMessage(message);
     await b.onGatewayMessage(message);
     await b.onGatewayMessage({ ...message, id: '555555555555555556', author: { id: '999999999999999999' } });
-    expect(control).toHaveBeenCalledExactlyOnceWith('s1', 'status');
+    expect(control).toHaveBeenCalledExactlyOnceWith('s1', 'status', expect.any(Function));
     expect(sendInput).not.toHaveBeenCalled();
     expect(posts.some((p) => visibleText(p.body) === 'Working')).toBe(true);
   });
@@ -1666,7 +1666,7 @@ describe('Discord interface mode', () => {
     await b.onGatewayInteraction(click);
     await b.onGatewayInteraction(click);
     expect(control).toHaveBeenCalledTimes(2);
-    expect(control).toHaveBeenLastCalledWith('s1', 'answer current revision 1');
+    expect(control).toHaveBeenLastCalledWith('s1', 'answer current revision 1', expect.any(Function));
     expect(posts.some((p) => p.path.includes('/opaque%2B%2F%3Dtest/callback'))).toBe(true);
     expect(sendInput).not.toHaveBeenCalled();
   });
@@ -1722,7 +1722,7 @@ describe('Discord interface mode', () => {
     await b.onGatewayMessage({ ...m, channel_id: '999999999999999999' });
     expect(control).not.toHaveBeenCalled();
     await b.onGatewayMessage(m);
-    expect(control).toHaveBeenCalledExactlyOnceWith('__management__', 'help');
+    expect(control).toHaveBeenCalledExactlyOnceWith('__management__', 'help', expect.any(Function));
     expect(sendInput).not.toHaveBeenCalled();
     await writeDiscordConfig(dir, { ...cfg, mode: 'notifications' });
     await b.reload();
@@ -2047,7 +2047,7 @@ it('launches from owned case channels and threads with a confirmation, never ter
     data: { custom_id: review.components[0].components[0].custom_id },
     message: { id: review.id },
   });
-  expect(control).toHaveBeenCalledExactlyOnceWith('__case__:' + root, 'confirm launch');
+  expect(control).toHaveBeenCalledExactlyOnceWith('__case__:' + root, 'confirm launch', expect.any(Function));
   expect((await readFullMap(dir))['new-session']).toBeTruthy();
   await b.onGatewayInteraction({ ...interaction, id: '900000000000000083', channel_id: map.s1 });
   expect(launch).toHaveBeenLastCalledWith('s1', root, 'codex');
@@ -2737,4 +2737,67 @@ it('attaches colliding file basenames to the exact final part of a split respons
   expect(visibleText(edits[0].body)).toContain('One\nTwo');
   expect(visibleText(edits[0].body)).not.toContain('/work/');
   expect(posts.filter((p) => p.method === 'POST' && (p as any).fileFields?.length)).toHaveLength(0);
+});
+
+it('posts a selectable native question as one V2 card and binds buttons to that exact message', async () => {
+  sessions = [{ id: 's1', name: 'one' }];
+  let pending = true;
+  let now = 100000,
+    answers = 0;
+  const b = makeBridge(undefined, {
+    now: () => now,
+    history: async () => ({ conversationId: 'native1', turns: [], partial: false }),
+    control: async (_id, command) =>
+      command === 'pending'
+        ? {
+            questionCard: true,
+            text: 'Which test color?\n\n1. Red\n2. Blue',
+            actions: [
+              { label: 'Red', command: 'answer q rev 1', validity: 'q:rev' },
+              { label: 'Blue', command: 'answer q rev 2', validity: 'q:rev' },
+            ],
+          }
+        : (answers++, { text: 'Answer sent.' }),
+    controlCurrent: () => pending,
+  });
+  await b.reload();
+  await b.syncSessions();
+  await b.notify({
+    sessionId: 's1',
+    sessionName: 'one',
+    event: 'hook:elicitation_dialog',
+    title: 'Question Asked',
+    body: 'Question pending',
+    urgency: 'critical',
+  });
+  const cards = posts.filter(
+    (p) => p.method === 'POST' && p.body?.flags & 32768 && visibleText(p.body)?.includes('Which test color?')
+  );
+  expect(cards).toHaveLength(1);
+  const nodes = cards[0].body.components[0].components;
+  const buttons = nodes.filter((c: any) => c.type === 1).flatMap((c: any) => c.components);
+  expect(buttons.map((c: any) => c.label)).toEqual(['Red', 'Blue']);
+  expect(visibleText(cards[0].body)).not.toContain('!codeman');
+  // A still-pending question remains usable beyond the ordinary control timeout.
+  now += 11 * 60 * 1000;
+  await b.pollConversations();
+  const destination = (await readFullMap(dir)).s1;
+  const source = [...remoteMessages.values()].find((m) => visibleText(m)?.includes('Which test color?'));
+  await b.onGatewayInteraction({
+    id: '900000000000000006',
+    application_id: BOT,
+    token: 'question-test',
+    guild_id: cfg.guildId,
+    channel_id: destination,
+    type: 3,
+    member: { user: { id: cfg.allowedUserIds[0] } },
+    data: { custom_id: buttons[1].custom_id },
+    message: { id: source.id },
+  });
+  expect(answers).toBe(1);
+  pending = false;
+  await b.pollConversations();
+  expect(
+    posts.filter((p) => p.method === 'PATCH').some((p) => visibleText(p.body)?.includes('Which test color?'))
+  ).toBe(true);
 });

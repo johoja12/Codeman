@@ -1,4 +1,4 @@
-import { claudeVisibleQuestion, claudeQuestionGone } from './claude-visible-question.js';
+import { parseClaudeVisibleQuestion, claudeQuestionGone } from './claude-visible-question.js';
 import type { ApprovalItem } from './approval-inbox.js';
 import { claudePromptSuggestion } from '../session-submit-verifier.js';
 import { discordActivityWorking } from '../discord-activity.js';
@@ -44,7 +44,14 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
     });
   const observed = new Map<
     string,
-    { id: string; text: string; conversation: string; revision: string; delivered: boolean }
+    {
+      id: string;
+      text: string;
+      conversation: string;
+      revision: string;
+      delivered: boolean;
+      control?: ApprovalItem['nativeQuestion'];
+    }
   >();
   const reading = new Set<string>();
   const suggestion = async (s: Session) => {
@@ -78,25 +85,48 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       )
         return undefined;
       if (!frame) return undefined;
-      const text = claudeVisibleQuestion(frame);
+      const dialog = parseClaudeVisibleQuestion(frame);
+      const text = dialog?.text;
       const previous = observed.get(s.id);
-      if (text && conversation && revision !== undefined) {
-        if (!previous || previous.text !== text || previous.conversation !== conversation) {
+      if (text && dialog && conversation && revision !== undefined) {
+        if (
+          !previous ||
+          previous.text !== text ||
+          previous.conversation !== conversation ||
+          (previous.control &&
+            (previous.control.state === 'answered' ||
+              previous.revision !== revision ||
+              previous.control.dialog.identity !== dialog.identity))
+        ) {
           const item = approvalInbox.notePrompt({
             sessionId: s.id,
             sessionName: s.name || s.id.slice(0, 8),
             mode: 'claude',
             kind: 'question',
             toolName: 'AskUserQuestion',
-            answerInTerminal: true,
-            message: text,
+            answerInTerminal: dialog.multiSelect || typeof s.withNativeQuestionInput !== 'function',
+            nativeQuestion:
+              !dialog.multiSelect && typeof s.withNativeQuestionInput === 'function'
+                ? { conversation, inputRevision: revision, dialog, state: 'pending' }
+                : undefined,
+            message: !dialog.multiSelect && typeof s.withNativeQuestionInput === 'function' ? dialog.question : text,
             context: frame,
             cwd: s.workingDir,
           });
-          observed.set(s.id, { id: item.id, text, conversation, revision, delivered: false });
+          observed.set(s.id, {
+            id: item.id,
+            text,
+            conversation,
+            revision,
+            delivered: false,
+            control: item.nativeQuestion,
+          });
         }
         const current = observed.get(s.id)!;
         const item = approvalInbox.getById(current.id);
+        if (item?.nativeQuestion?.state === 'pending' && item.nativeQuestion.dialog.identity === dialog.identity) {
+          item.nativeQuestion.dialog = dialog;
+        }
         if (item && !current.delivered) current.delivered = (await deps.questionObserved?.(item)) !== false;
         return undefined;
       }
@@ -214,7 +244,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
         terminalOnly: !!p.answerInTerminal,
       };
     },
-    answer: async (id, question, revision, value) => {
+    answer: async (id, question, revision, value, current = () => true) => {
       const s = session(id),
         p = approvalInbox.getById(question);
       if (!p || p.sessionId !== id || discordApprovalRevision(p) !== revision)
@@ -225,7 +255,12 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
           : value === 'deny'
             ? { action: 'deny' as const }
             : { action: 'option' as const, option: Number(value) };
-      const result = await answerPendingApproval(s, question, answer);
+      const result = await answerPendingApproval(
+        s,
+        question,
+        answer,
+        () => current() && deps.allowed() && deps.sessions().get(id) === s
+      );
       if (!result.success) throw new Error('Native approval service refused the answer');
       return 'Answer sent to the exact pending prompt.';
     },
