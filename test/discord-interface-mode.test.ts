@@ -42,7 +42,14 @@ let uploaded: Array<{ name: string; text: string }>;
 const visibleText = (body: any): string | undefined =>
   body?.embeds?.map((embed: any) => embed.description).join('\n') ||
   body?.components
-    ?.filter((c: any) => c.type === 10)
+    ?.flatMap((c: any) =>
+      c.type === 17
+        ? (c.components ?? []).filter(
+            (n: any, i: number) => i !== 0 || !/^\*\*[^\n*]+\*\*(?:\n-# [^\n]*)?$/.test(n.content ?? '')
+          )
+        : [c]
+    )
+    .filter((c: any) => c.type === 10)
     .map((c: any) => c.content?.replace(/^-# /, ''))
     .join('\n') ||
   body?.content;
@@ -539,6 +546,86 @@ describe('Discord interface mode', () => {
     }
   );
 
+  it('suppresses a Discord prompt after metadata advances the verified live cursor beyond its send boundary', async () => {
+    let now = 100000;
+    const conv = '12345678-1234-1234-1234-123456789abc';
+    const baseline = conv + ':100:aaaaaaaaaaaaaaaa',
+      scanned = conv + ':150:bbbbbbbbbbbbbbbb',
+      submitted = conv + ':200:cccccccccccccccc',
+      external = conv + ':300:dddddddddddddddd';
+    const old = { cursor: baseline, role: 'assistant' as const, text: 'Previous response', timestamp: '' };
+    let page: import('../src/discord-history.js').DiscordHistory = {
+      conversationId: conv,
+      partial: true,
+      verifiedAfter: baseline,
+      scannedCursor: scanned,
+      hasMore: false,
+      turns: [],
+    };
+    const history = async (_id: string, options?: { after?: string }) => {
+      if (!options?.after) return { conversationId: conv, partial: false, turns: [old] };
+      if (options.after === baseline && page.verifiedAfter !== baseline)
+        return {
+          conversationId: conv,
+          partial: true,
+          verifiedAfter: baseline,
+          turns: [
+            {
+              cursor: submitted,
+              role: 'user' as const,
+              text: 'Do a manual refresh now and check again',
+              timestamp: '',
+            },
+          ],
+          executions: [
+            {
+              userCursor: submitted,
+              promptHash: hashDiscordPrompt('Do a manual refresh now and check again'),
+              state: 'running' as const,
+            },
+          ],
+        };
+      return page;
+    };
+    sessions = [{ id: 's1', name: 'one' }];
+    const b = makeBridge(undefined, { history, now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    await b.pollConversations();
+    const thread = (await readFullMap(dir)).s1,
+      text = 'Do a manual refresh now and check again';
+    await b.onGatewayMessage({
+      id: '900000000000000001',
+      guild_id: cfg.guildId,
+      channel_id: thread,
+      author: { id: cfg.allowedUserIds[0] },
+      content: text,
+    });
+    page = {
+      conversationId: conv,
+      partial: true,
+      verifiedAfter: scanned,
+      turns: [{ cursor: submitted, role: 'user', text, timestamp: '' }],
+      executions: [{ userCursor: submitted, promptHash: hashDiscordPrompt(text), state: 'running' }],
+    };
+    now += 60001;
+    await b.pollConversations();
+    const prompts = () =>
+      posts.filter((p) => p.method === 'POST' && JSON.stringify(p.body ?? {}).includes('User prompt'));
+    expect(prompts()).toHaveLength(0);
+    page = {
+      conversationId: conv,
+      partial: true,
+      verifiedAfter: submitted,
+      turns: [{ cursor: external, role: 'user', text, timestamp: '' }],
+      executions: [{ userCursor: external, promptHash: hashDiscordPrompt(text), state: 'running' }],
+    };
+    now += 60001;
+    await b.pollConversations();
+    expect(prompts()).toHaveLength(1);
+    expect(sendInput).toHaveBeenCalledTimes(1);
+  });
+
   it('does not echo an attributed Discord prompt but mirrors later identical text from outside Discord', async () => {
     let now = 100000;
     let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
@@ -578,21 +665,35 @@ describe('Discord interface mode', () => {
     async (inflight) => {
       let now = 100000;
       const text = 'Review this [attached: /tmp/example.png]';
-      const baseline = { cursor: 'native1:old', role: 'assistant' as const, text: 'Previous response', timestamp: '' };
+      const baseline = {
+        cursor: '12345678-1234-1234-1234-123456789abc:10:aaaaaaaaaaaaaaaa',
+        role: 'assistant' as const,
+        text: 'Previous response',
+        timestamp: '',
+      };
       const intermediate = {
-        cursor: 'native1:intermediate',
+        cursor: '12345678-1234-1234-1234-123456789abc:20:aaaaaaaaaaaaaaaa',
         role: 'assistant' as const,
         text: 'An update',
         timestamp: '',
       };
-      const input = { cursor: 'native1:input', role: 'user' as const, text, timestamp: '' };
+      const input = {
+        cursor: '12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa',
+        role: 'user' as const,
+        text,
+        timestamp: '',
+      };
       let sent = false,
         advanced = false;
       const history = vi.fn(async (_id: string, options?: { after?: string }) => {
         if (!sent)
-          return { conversationId: 'native1', partial: false, turns: advanced ? [baseline, intermediate] : [baseline] };
+          return {
+            conversationId: '12345678-1234-1234-1234-123456789abc',
+            partial: false,
+            turns: advanced ? [baseline, intermediate] : [baseline],
+          };
         return {
-          conversationId: 'native1',
+          conversationId: '12345678-1234-1234-1234-123456789abc',
           partial: true,
           verifiedAfter: options?.after,
           turns: options?.after === intermediate.cursor ? [intermediate, input] : [baseline, intermediate, input],
@@ -623,7 +724,7 @@ describe('Discord interface mode', () => {
       });
       now += 20000;
       await b.pollConversations();
-      expect(history).toHaveBeenCalledWith('s1', { after: baseline.cursor });
+      expect(history).toHaveBeenCalledWith('s1', { includeTools: undefined, after: baseline.cursor });
       expect(
         posts.filter((p) => p.method === 'POST' && JSON.stringify(p.body ?? {}).includes('User prompt'))
       ).toHaveLength(0);
@@ -1035,10 +1136,7 @@ describe('Discord interface mode', () => {
     const b = makeBridge(undefined, { history });
     await b.reload();
     await b.syncSessions();
-    const cards = posts.filter(
-      (p) =>
-        p.body?.flags === 32772 && p.body?.components?.some((c: any) => c.type === 10 && !c.content?.startsWith('-#'))
-    );
+    const cards = posts.filter((p) => p.body?.flags === 32772 && p.body?.components?.some((c: any) => c.type === 17));
     expect(cards.length).toBeGreaterThan(1);
     expect(cards.map((p) => visibleText(p.body)).join('\n')).toContain('Last row preserved.');
     expect(
@@ -1053,10 +1151,7 @@ describe('Discord interface mode', () => {
     await again.reload();
     await again.syncSessions();
     expect(
-      posts.filter(
-        (p) =>
-          p.body?.flags === 32772 && p.body?.components?.some((c: any) => c.type === 10 && !c.content?.startsWith('-#'))
-      )
+      posts.filter((p) => p.body?.flags === 32772 && p.body?.components?.some((c: any) => c.type === 17))
     ).toHaveLength(count);
     expect(sendInput).not.toHaveBeenCalled();
   });
@@ -1945,7 +2040,8 @@ it('keeps an attached file visible when an alert also contains a native V2 respo
   );
   expect(result?.ok).toBe(true);
   const post = posts.find((p) => p.body?.flags === 32772 && visibleText(p.body)?.includes('The answer.'))!.body;
-  expect(post.components).toContainEqual({ type: 13, file: { url: 'attachment://results.txt' } });
+  expect(post.components).toHaveLength(1);
+  expect(post.components[0].components).toContainEqual({ type: 13, file: { url: 'attachment://results.txt' } });
   expect(uploaded.some((f) => f.name === 'results.txt' && f.text === 'test results')).toBe(true);
 });
 

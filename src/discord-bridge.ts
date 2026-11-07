@@ -610,6 +610,15 @@ export class DiscordApi {
     files: DiscordFile[],
     current?: () => boolean
   ): Promise<{ id: string } | null> {
+    const fileNodes = files.map((file) => ({
+      type: 13,
+      file: { url: 'attachment://' + safeAttachmentName(file.name) },
+    }));
+    const card = p.components?.length === 1 && p.components[0].type === 17 ? p.components[0] : undefined;
+    const components =
+      card && Array.isArray(card.components) && card.components.length + fileNodes.length <= 10
+        ? [{ ...card, components: [...card.components, ...fileNodes] }]
+        : [...(p.components ?? []), ...fileNodes];
     const form = new FormData();
     form.append(
       'payload_json',
@@ -617,10 +626,7 @@ export class DiscordApi {
         ...discordWirePost(p),
         ...((p.flags ?? 0) & DISCORD_COMPONENTS_V2
           ? {
-              components: [
-                ...(p.components ?? []),
-                ...files.map((file) => ({ type: 13, file: { url: 'attachment://' + safeAttachmentName(file.name) } })),
-              ],
+              components,
             }
           : {}),
         nonce: p.nonce ?? randomUUID().replaceAll('-', '').slice(0, 24),
@@ -1551,8 +1557,9 @@ export class DiscordBridge {
       if (user) this.uiPrompts.set(sessionId, { conversation: history.conversationId, text: user.text.slice(0, 400) });
       if (history.conversationId !== progress.conversationId)
         throw new BridgeProblem('Conversation changed; synchronize history first');
+      const includeTools = progress.verbose;
       const attributed = await this.deliveries.reconcileNative(sessionId, history, (after) =>
-        this.deps.history!(sessionId, { after })
+        this.deps.history!(sessionId, { includeTools, after })
       );
       if (!attributed) return;
       if (progress.streamOff) return;

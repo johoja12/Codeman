@@ -116,32 +116,47 @@ describe('delivery journal', () => {
       const journal = new DiscordDeliveryJournal(dir, () => now);
       await journal.claim(meta);
       await journal.annotate(meta.id, {
-        native: { conversationId: 'native', promptHash: 'a'.repeat(64), afterCursor: 'native:old' },
+        native: {
+          conversationId: '12345678-1234-1234-1234-123456789abc',
+          promptHash: 'a'.repeat(64),
+          afterCursor: '12345678-1234-1234-1234-123456789abc:10:aaaaaaaaaaaaaaaa',
+        },
       });
       await journal.update(meta.id, state);
       const history = {
-        conversationId: 'native',
+        conversationId: '12345678-1234-1234-1234-123456789abc',
         partial: true,
-        verifiedAfter: 'native:later-tool',
+        verifiedAfter: '12345678-1234-1234-1234-123456789abc:20:aaaaaaaaaaaaaaaa',
         turns: [
           {
-            cursor: 'native:user',
+            cursor: '12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa',
             role: 'user' as const,
             text: 'Prompt with [attached: /tmp/image.png]',
             timestamp: '',
           },
         ],
-        executions: [{ userCursor: 'native:user', promptHash: 'a'.repeat(64), state: 'running' as const }],
+        executions: [
+          {
+            userCursor: '12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa',
+            promptHash: 'a'.repeat(64),
+            state: 'running' as const,
+          },
+        ],
       };
-      const readAfter = vi.fn(async () => ({ ...history, verifiedAfter: 'native:old' }));
+      const readAfter = vi.fn(async () => ({
+        ...history,
+        verifiedAfter: '12345678-1234-1234-1234-123456789abc:10:aaaaaaaaaaaaaaaa',
+      }));
       if (state === 'submitting') {
         expect(await journal.reconcileNative('s1', history, readAfter)).toBe(false);
-        expect((await journal.submittedUserCursors('s1', THREAD, 'native')).size).toBe(0);
+        expect((await journal.submittedUserCursors('s1', THREAD, '12345678-1234-1234-1234-123456789abc')).size).toBe(0);
         await journal.update(meta.id, 'input_accepted');
       }
       expect(await journal.reconcileNative('s1', history, readAfter)).toBe(true);
-      expect(readAfter).toHaveBeenCalledWith('native:old');
-      expect(await journal.submittedUserCursors('s1', THREAD, 'native')).toEqual(new Set(['native:user']));
+      expect(readAfter).toHaveBeenCalledWith('12345678-1234-1234-1234-123456789abc:10:aaaaaaaaaaaaaaaa');
+      expect(await journal.submittedUserCursors('s1', THREAD, '12345678-1234-1234-1234-123456789abc')).toEqual(
+        new Set(['12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa'])
+      );
       const restored = new DiscordDeliveryJournal(dir, () => now);
       await restored.reconcileNative('s1', {
         ...history,
@@ -154,46 +169,244 @@ describe('delivery journal', () => {
     const journal = new DiscordDeliveryJournal(dir, () => now);
     await journal.claim(meta);
     await journal.annotate(meta.id, {
-      native: { conversationId: 'native', promptHash: 'a'.repeat(64), afterCursor: 'native:old' },
+      native: {
+        conversationId: '12345678-1234-1234-1234-123456789abc',
+        promptHash: 'a'.repeat(64),
+        afterCursor: '12345678-1234-1234-1234-123456789abc:10:aaaaaaaaaaaaaaaa',
+      },
     });
     await journal.update(meta.id, 'input_accepted');
     const external = {
-      conversationId: 'native',
+      conversationId: '12345678-1234-1234-1234-123456789abc',
       partial: true,
-      turns: [{ cursor: 'native:external', role: 'user' as const, text: 'same', timestamp: '' }],
-      executions: [{ userCursor: 'native:external', promptHash: 'a'.repeat(64), state: 'running' as const }],
+      verifiedAfter: '12345678-1234-1234-1234-123456789abc:20:aaaaaaaaaaaaaaaa',
+      turns: [
+        {
+          cursor: '12345678-1234-1234-1234-123456789abc:40:aaaaaaaaaaaaaaaa',
+          role: 'user' as const,
+          text: 'same',
+          timestamp: '',
+        },
+      ],
+      executions: [
+        {
+          userCursor: '12345678-1234-1234-1234-123456789abc:40:aaaaaaaaaaaaaaaa',
+          promptHash: 'a'.repeat(64),
+          state: 'running' as const,
+        },
+      ],
     };
-    await expect(journal.reconcileNative('s1', external, async () => external)).rejects.toThrow('boundary');
-    expect((await journal.submittedUserCursors('s1', THREAD, 'native')).size).toBe(0);
+    await journal.reconcileNative('s1', external, async () => external);
+    expect((await journal.submittedUserCursors('s1', THREAD, '12345678-1234-1234-1234-123456789abc')).size).toBe(0);
     await journal.reconcileNative('s1', external, async () => ({
       ...external,
-      verifiedAfter: 'native:old',
-      turns: [{ cursor: 'native:discord', role: 'user' as const, text: 'same', timestamp: '' }, ...external.turns],
+      verifiedAfter: '12345678-1234-1234-1234-123456789abc:10:aaaaaaaaaaaaaaaa',
+      turns: [
+        {
+          cursor: '12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa',
+          role: 'user' as const,
+          text: 'same',
+          timestamp: '',
+        },
+        ...external.turns,
+      ],
       executions: [
-        { userCursor: 'native:discord', promptHash: 'a'.repeat(64), state: 'completed' },
+        {
+          userCursor: '12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa',
+          promptHash: 'a'.repeat(64),
+          state: 'completed',
+        },
         ...external.executions,
       ],
     }));
-    expect(await journal.submittedUserCursors('s1', THREAD, 'native')).toEqual(new Set(['native:discord']));
+    expect(await journal.submittedUserCursors('s1', THREAD, '12345678-1234-1234-1234-123456789abc')).toEqual(
+      new Set(['12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa'])
+    );
   });
   it('serializes concurrent native reads so identical pending inputs cannot claim one execution twice', async () => {
     const journal = new DiscordDeliveryJournal(dir, () => now);
     for (const id of ['first', 'second']) {
       await journal.claim({ ...meta, id });
       await journal.annotate(id, {
-        native: { conversationId: 'native', promptHash: 'a'.repeat(64), afterCursor: 'native:old' },
+        native: {
+          conversationId: '12345678-1234-1234-1234-123456789abc',
+          promptHash: 'a'.repeat(64),
+          afterCursor: '12345678-1234-1234-1234-123456789abc:10:aaaaaaaaaaaaaaaa',
+        },
       });
       await journal.update(id, 'input_accepted');
     }
     const h = {
-      conversationId: 'native',
+      conversationId: '12345678-1234-1234-1234-123456789abc',
       partial: true,
-      verifiedAfter: 'native:old',
-      turns: [{ cursor: 'native:user', role: 'user' as const, text: 'same', timestamp: '' }],
-      executions: [{ userCursor: 'native:user', promptHash: 'a'.repeat(64), state: 'running' as const }],
+      verifiedAfter: '12345678-1234-1234-1234-123456789abc:10:aaaaaaaaaaaaaaaa',
+      turns: [
+        {
+          cursor: '12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa',
+          role: 'user' as const,
+          text: 'same',
+          timestamp: '',
+        },
+      ],
+      executions: [
+        {
+          userCursor: '12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa',
+          promptHash: 'a'.repeat(64),
+          state: 'running' as const,
+        },
+      ],
     };
     await Promise.all([journal.reconcileNative('s1', h), journal.reconcileNative('s1', h)]);
-    expect((await journal.recent()).filter((r) => r.native?.userCursor === 'native:user')).toHaveLength(1);
+    expect(
+      (await journal.recent()).filter(
+        (r) => r.native?.userCursor === '12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa'
+      )
+    ).toHaveLength(1);
+  });
+  it.each(['anchor', 'metadata'] as const)(
+    'binds Discord provenance when a verified page omits its %s boundary',
+    async (kind) => {
+      const journal = new DiscordDeliveryJournal(dir, () => now);
+      const conv = '12345678-1234-1234-1234-123456789abc';
+      const baseline = conv + ':100:aaaaaaaaaaaaaaaa',
+        verified = kind === 'anchor' ? baseline : conv + ':150:bbbbbbbbbbbbbbbb',
+        user = conv + ':200:cccccccccccccccc';
+      await journal.claim(meta);
+      await journal.update(meta.id, 'input_accepted');
+      await journal.annotate(meta.id, {
+        native: { conversationId: conv, promptHash: 'a'.repeat(64), afterCursor: baseline },
+      });
+      const h = {
+        conversationId: conv,
+        partial: true,
+        verifiedAfter: verified,
+        turns: [{ role: 'user' as const, cursor: user, text: 'Same prompt', timestamp: '' }],
+        executions: [{ userCursor: user, promptHash: 'a'.repeat(64), state: 'running' as const }],
+      };
+      await journal.reconcileNative('s1', h, async (after) => ({ ...h, verifiedAfter: after }));
+      expect(await journal.submittedUserCursors('s1', THREAD, conv)).toEqual(new Set([user]));
+      const restored = new DiscordDeliveryJournal(dir, () => now);
+      expect((await restored.recent())[0].native?.userCursor).toBe(user);
+    }
+  );
+
+  it.each([
+    'unverified',
+    'changed anchor',
+    'foreign anchor',
+    'older page',
+    'unsafe offset',
+    'foreign user',
+    'old user',
+    'wrong hash',
+  ])('does not guess Discord provenance from a paged prompt with %s', async (kind) => {
+    const journal = new DiscordDeliveryJournal(dir, () => now),
+      conv = '12345678-1234-1234-1234-123456789abc';
+    const baseline = conv + ':100:aaaaaaaaaaaaaaaa';
+    let verified: string | undefined = conv + ':150:bbbbbbbbbbbbbbbb',
+      user = conv + ':200:cccccccccccccccc';
+    if (kind === 'unverified') verified = undefined;
+    if (kind === 'changed anchor') verified = conv + ':100:dddddddddddddddd';
+    if (kind === 'foreign anchor') verified = 'abcdef12-1234-1234-1234-123456789abc:150:bbbbbbbbbbbbbbbb';
+    if (kind === 'older page') verified = conv + ':50:bbbbbbbbbbbbbbbb';
+    if (kind === 'unsafe offset') verified = conv + ':9007199254740992:bbbbbbbbbbbbbbbb';
+    if (kind === 'foreign user') user = 'abcdef12-1234-1234-1234-123456789abc:200:cccccccccccccccc';
+    if (kind === 'old user') user = conv + ':120:cccccccccccccccc';
+    await journal.claim(meta);
+    await journal.update(meta.id, 'input_accepted');
+    await journal.annotate(meta.id, {
+      native: { conversationId: conv, promptHash: 'a'.repeat(64), afterCursor: baseline },
+    });
+    await journal.reconcileNative('s1', {
+      conversationId: conv,
+      partial: true,
+      verifiedAfter: verified,
+      turns: [{ role: 'user', cursor: user, text: 'Prompt', timestamp: '' }],
+      executions: [{ userCursor: user, promptHash: (kind === 'wrong hash' ? 'b' : 'a').repeat(64), state: 'running' }],
+    });
+    expect(await journal.submittedUserCursors('s1', THREAD, conv)).toEqual(new Set());
+  });
+
+  it('verifies the original submission page instead of attributing later identical external text to an old record', async () => {
+    const journal = new DiscordDeliveryJournal(dir, () => now),
+      conv = '12345678-1234-1234-1234-123456789abc';
+    const baseline = conv + ':100:aaaaaaaaaaaaaaaa',
+      original = conv + ':200:cccccccccccccccc',
+      boundary = conv + ':500:bbbbbbbbbbbbbbbb',
+      external = conv + ':600:dddddddddddddddd';
+    await journal.claim(meta);
+    await journal.update(meta.id, 'input_accepted');
+    await journal.annotate(meta.id, {
+      native: { conversationId: conv, promptHash: 'a'.repeat(64), afterCursor: baseline },
+    });
+    const read = vi.fn(async (after: string) => ({
+      conversationId: conv,
+      partial: true,
+      verifiedAfter: after,
+      turns: [{ cursor: original, role: 'user' as const, text: 'Same text', timestamp: '' }],
+      executions: [{ userCursor: original, promptHash: 'a'.repeat(64), state: 'completed' as const }],
+    }));
+    await journal.reconcileNative(
+      's1',
+      {
+        conversationId: conv,
+        partial: true,
+        verifiedAfter: boundary,
+        turns: [{ cursor: external, role: 'user', text: 'Same text', timestamp: '' }],
+        executions: [{ userCursor: external, promptHash: 'a'.repeat(64), state: 'running' }],
+      },
+      read
+    );
+    expect(read).toHaveBeenCalledWith(baseline);
+    expect(await journal.submittedUserCursors('s1', THREAD, conv)).toEqual(new Set([original]));
+  });
+
+  it.each(['wrong anchor', 'wrong conversation', 'read failure'])(
+    'refuses an unverified fallback page: %s',
+    async (kind) => {
+      const journal = new DiscordDeliveryJournal(dir, () => now),
+        conv = '12345678-1234-1234-1234-123456789abc';
+      const baseline = conv + ':100:aaaaaaaaaaaaaaaa',
+        boundary = conv + ':150:bbbbbbbbbbbbbbbb',
+        user = conv + ':200:cccccccccccccccc';
+      await journal.claim(meta);
+      await journal.update(meta.id, 'input_accepted');
+      await journal.annotate(meta.id, {
+        native: { conversationId: conv, promptHash: 'a'.repeat(64), afterCursor: baseline },
+      });
+      const h = {
+        conversationId: conv,
+        partial: true,
+        verifiedAfter: boundary,
+        turns: [{ cursor: user, role: 'user' as const, text: 'Prompt', timestamp: '' }],
+        executions: [{ userCursor: user, promptHash: 'a'.repeat(64), state: 'running' as const }],
+      };
+      await journal.reconcileNative('s1', h, async () => {
+        if (kind === 'read failure') throw Error('unavailable');
+        return {
+          ...h,
+          verifiedAfter: kind === 'wrong anchor' ? boundary : baseline,
+          conversationId: kind === 'wrong conversation' ? 'foreign' : conv,
+        };
+      });
+      expect(await journal.submittedUserCursors('s1', THREAD, conv)).toEqual(new Set());
+    }
+  );
+
+  it('continues an already bound native execution even when its original baseline is outside the page', async () => {
+    const journal = new DiscordDeliveryJournal(dir, () => now);
+    await journal.claim(meta);
+    await journal.update(meta.id, 'running');
+    await journal.annotate(meta.id, {
+      native: { conversationId: 'native', promptHash: 'a'.repeat(64), afterCursor: 'older', userCursor: 'exact-user' },
+    });
+    await journal.reconcileNative('s1', {
+      conversationId: 'native',
+      partial: true,
+      turns: [],
+      executions: [{ userCursor: 'exact-user', promptHash: 'a'.repeat(64), state: 'completed' }],
+    });
+    expect((await journal.recent())[0].state).toBe('completed');
   });
   it('finds exact Discord-origin native cursors across the full durable ledger and scoped destination', async () => {
     const journal = new DiscordDeliveryJournal(dir, () => now);

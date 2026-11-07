@@ -147,7 +147,7 @@ export function formatDiscordResponseText(text: string): string {
   return out.join('\n');
 }
 
-/** Compact colored header with chat-width Markdown outside the container. */
+/** One cohesive native card per chunk, including heading, Markdown and controls. */
 export const DISCORD_COMPONENTS_V2 = 1 << 15;
 export function discordResponsePosts(
   text: string,
@@ -167,25 +167,25 @@ export function discordResponsePosts(
     content: '', // Removed at the API boundary; V2 uses Text Display components.
     flags: DISCORD_COMPONENTS_V2 | 4,
     components: [
-      ...(index === 0
-        ? [
-            {
-              type: 17,
-              accent_color: options.color ?? DISCORD_RESPONSE_COLOR,
-              components: [
+      {
+        type: 17,
+        accent_color: options.color ?? DISCORD_RESPONSE_COLOR,
+        components: [
+          ...(index === 0
+            ? [
                 {
                   type: 10,
                   content: `**${title}**${options.subtitle ? '\n-# ' + options.subtitle.slice(0, 160) : ''}`,
                 },
-              ],
-            },
-          ]
-        : []),
-      { type: 10, content: body },
-      ...(chunks.length > 1 ? [{ type: 10, content: `-# ${index + 1} / ${chunks.length}` }] : []),
-      ...(index === chunks.length - 1 && options.controls?.length
-        ? [{ type: 14, divider: true, spacing: 1 }, ...options.controls]
-        : []),
+              ]
+            : []),
+          { type: 10, content: body },
+          ...(chunks.length > 1 ? [{ type: 10, content: `-# ${index + 1} / ${chunks.length}` }] : []),
+          ...(index === chunks.length - 1 && options.controls?.length
+            ? [{ type: 14, divider: true, spacing: 1 }, ...options.controls]
+            : []),
+        ],
+      },
     ],
     allowed_mentions: { parse: [], users: index === 0 ? users : [] },
   }));

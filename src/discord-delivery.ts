@@ -57,6 +57,21 @@ export interface DiscordDelivery {
     | 'invalid_command';
 }
 
+/** Offset ordering is meaningful only inside the same exact native transcript. */
+function nativeOffset(cursor: string | undefined, conversationId: string): number | undefined {
+  if (!cursor || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(conversationId)) return undefined;
+  const parts = cursor.split(':');
+  if (
+    parts.length !== 3 ||
+    parts[0] !== conversationId ||
+    !/^(?:0|[1-9][0-9]{0,15})$/.test(parts[1]) ||
+    !/^[a-f0-9]{16}$/.test(parts[2])
+  )
+    return undefined;
+  const offset = Number(parts[1]);
+  return Number.isSafeInteger(offset) ? offset : undefined;
+}
+
 export class DiscordDeliveryJournal {
   private records = new Map<string, DiscordDelivery>();
   private loadRun?: Promise<void>;
@@ -268,37 +283,52 @@ export class DiscordDeliveryJournal {
     const claimed = new Set(
       [...this.records.values()].flatMap((r) => (r.native?.userCursor ? [r.native.userCursor] : []))
     );
+    const recovery = new Map<string, DiscordDelivery>();
     for (const record of records) {
       const meta = record.native!;
-      let evidence = history;
-      let baseline = meta.afterCursor ? evidence.turns.findIndex((t) => t.cursor === meta.afterCursor) : -1;
-      if (!meta.userCursor && meta.afterCursor && baseline < 0 && evidence.verifiedAfter !== meta.afterCursor) {
-        // Incremental live pages can start beyond the input's submission boundary. A matching
-        // hash alone cannot distinguish an identical prompt typed elsewhere; verify the saved row.
+      const baseline = meta.afterCursor ? history.turns.findIndex((t) => t.cursor === meta.afterCursor) : -1;
+      const execution = history.executions?.find((e) => {
+        if (meta.userCursor) return e.userCursor === meta.userCursor;
+        if (e.promptHash !== meta.promptHash || claimed.has(e.userCursor)) return false;
+        const user = history.turns.findIndex((t) => t.cursor === e.userCursor && t.role === 'user');
+        if (user < 0) return false;
+        if (!meta.afterCursor || baseline >= 0) return user > baseline;
+        // Paged reads exclude the verified anchor itself. Raw metadata may also
+        // move the live checkpoint beyond the submission's last visible turn.
+        if (history.verifiedAfter === meta.afterCursor) return true;
+        const sentAfter = nativeOffset(meta.afterCursor, history.conversationId);
+        const verified = nativeOffset(history.verifiedAfter, history.conversationId);
+        const submitted = nativeOffset(e.userCursor, history.conversationId);
         if (
-          !readAfter ||
-          !history.executions?.some((e) => e.promptHash === meta.promptHash && !claimed.has(e.userCursor))
+          readAfter &&
+          sentAfter !== undefined &&
+          verified !== undefined &&
+          submitted !== undefined &&
+          sentAfter < verified &&
+          verified < submitted
         )
-          continue;
-        evidence = await readAfter(meta.afterCursor);
-        if (evidence.conversationId !== meta.conversationId || evidence.verifiedAfter !== meta.afterCursor)
-          throw new DiscordDeliveryError('Native submission boundary could not be verified');
-        baseline = evidence.turns.findIndex((t) => t.cursor === meta.afterCursor);
-      }
-      const execution = evidence.executions?.find((e) =>
-        meta.userCursor
-          ? e.userCursor === meta.userCursor
-          : e.promptHash === meta.promptHash &&
-            !claimed.has(e.userCursor) &&
-            evidence.turns.findIndex((t) => t.cursor === e.userCursor) > baseline
-      );
+          recovery.set(record.id, record);
+        return false;
+      });
       if (!execution) continue;
-      // The native turn can appear while the terminal write is still returning. Defer
-      // mirroring without claiming its origin until the transport outcome is recorded.
+      // Native history can appear before the terminal write returns. Do not advance the
+      // live checkpoint until its transport outcome is known, or claim an external draft.
       if (record.state === 'submitting') return false;
       claimed.add(execution.userCursor);
       await this.annotate(record.id, { native: { ...meta, userCursor: execution.userCursor } });
       if (record.state !== execution.state) await this.update(record.id, execution.state);
+    }
+    if (readAfter) {
+      let reads = 0;
+      for (const record of [...recovery.values()].sort((a, b) => b.createdAt - a.createdAt)) {
+        if (reads >= 4) break;
+        if (this.records.get(record.id)?.native?.userCursor) continue;
+        reads++;
+        const anchor = record.native!.afterCursor!;
+        const verified = await readAfter(anchor).catch(() => undefined);
+        if (verified?.conversationId === history.conversationId && verified.verifiedAfter === anchor)
+          if (!(await this.reconcile(sessionId, verified))) return false;
+      }
     }
     return true;
   }
