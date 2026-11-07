@@ -68,7 +68,12 @@ it.each([
   expect(deps.create).not.toHaveBeenCalled();
   const result = await manager.control('channel', command);
   expect(result?.locateSessionId).toBe('new1');
-  expect(deps.create).toHaveBeenCalledExactlyOnceWith({ caseName: name, mode: 'codex', tabGroupId: 'g1' });
+  expect(deps.create).toHaveBeenCalledExactlyOnceWith({
+    caseName: name,
+    name: `w1-${name}`,
+    mode: 'codex',
+    tabGroupId: 'g1',
+  });
   await manager.control('channel', command);
   expect(deps.create).toHaveBeenCalledTimes(1);
 });
@@ -120,7 +125,12 @@ it.each(['localcase', 'remote'])(
     expect(review.text).toContain(c.remote?.hostId || 'local');
     expect(deps.create).not.toHaveBeenCalled();
     await manager.control('owned-channel', review.actions![0].command);
-    expect(deps.create).toHaveBeenCalledExactlyOnceWith({ caseName: name, mode: 'codex', tabGroupId: undefined });
+    expect(deps.create).toHaveBeenCalledExactlyOnceWith({
+      caseName: name,
+      name: `w1-${name}`,
+      mode: 'codex',
+      tabGroupId: undefined,
+    });
     await manager.control('owned-channel', review.actions![0].command);
     expect(deps.create).toHaveBeenCalledTimes(1);
   }
@@ -139,4 +149,84 @@ it('rejects unmapped roots, duplicate case names and disabled CLIs at confirmati
   cases.push({ name: cases[0].name, path: '/other' });
   expect((await manager.launch('scope', root, 'codex')).actions).toBeUndefined();
   expect(deps.create).not.toHaveBeenCalled();
+});
+
+it('names Discord agents after the case and highest existing instance, rather than a UUID', async () => {
+  const { manager, deps } = setup();
+  deps.sessions = async () => [
+    {
+      id: 'old',
+      name: 'w14-localcase - work',
+      host: 'local',
+      caseName: 'localcase',
+      group: '',
+      mode: 'codex',
+      state: 'idle',
+    },
+    {
+      id: 'other',
+      name: 'w98-localcase-other',
+      host: 'local',
+      caseName: 'other',
+      group: '',
+      mode: 'codex',
+      state: 'idle',
+    },
+    {
+      id: 'shell',
+      name: 's99-localcase',
+      host: 'local',
+      caseName: 'localcase',
+      group: '',
+      mode: 'shell',
+      state: 'idle',
+    },
+  ];
+  const review = await manager.control('scope', 'create localcase local claude default');
+  await manager.control('scope', review!.actions![0].command);
+  expect(deps.create).toHaveBeenCalledExactlyOnceWith({
+    caseName: 'localcase',
+    name: 'w15-localcase',
+    mode: 'claude',
+    tabGroupId: undefined,
+  });
+});
+it('uses sN-case for shell launches', async () => {
+  const { manager, deps } = setup();
+  deps.modes = () => ['shell'];
+  const review = await manager.control('scope', 'create localcase local shell default');
+  await manager.control('scope', review!.actions![0].command);
+  expect(deps.create).toHaveBeenCalledWith(expect.objectContaining({ name: 's1-localcase', mode: 'shell' }));
+});
+it('reserves unique names across concurrent agent-mode confirmations', async () => {
+  const { manager, deps } = setup();
+  const release: Array<() => void> = [];
+  deps.create = vi.fn(async () => {
+    await new Promise<void>((resolve) => release.push(resolve));
+    return 'new';
+  });
+  const a = await manager.control('a', 'create localcase local claude default'),
+    b = await manager.control('b', 'create localcase local codex default');
+  const first = manager.control('a', a!.actions![0].command),
+    second = manager.control('b', b!.actions![0].command);
+  await vi.waitFor(() => expect(deps.create).toHaveBeenCalledTimes(2));
+  expect(vi.mocked(deps.create).mock.calls.map(([body]) => body.name)).toEqual(['w1-localcase', 'w2-localcase']);
+  for (const resolve of release) resolve();
+  await Promise.all([first, second]);
+});
+it('releases a failed name reservation and rechecks authorization after listing sessions', async () => {
+  const { manager, deps, disallow } = setup();
+  vi.mocked(deps.create).mockRejectedValueOnce(Error('Refused'));
+  const first = await manager.control('a', 'create localcase local claude default');
+  await expect(manager.control('a', first!.actions![0].command)).rejects.toThrow('Refused');
+  const second = await manager.control('a', 'create localcase local claude default');
+  await manager.control('a', second!.actions![0].command);
+  expect(vi.mocked(deps.create).mock.calls[1][0].name).toBe('w1-localcase');
+  deps.sessions = async () => {
+    disallow();
+    return [];
+  };
+  const third = await manager.control('a', 'create localcase local claude default');
+  await expect(manager.control('a', third!.actions![0].command)).rejects.toThrow('no longer allowed');
+  expect(deps.create).toHaveBeenCalledTimes(2);
 });
