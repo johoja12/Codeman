@@ -42,7 +42,14 @@ let uploaded: Array<{ name: string; text: string }>;
 const visibleText = (body: any): string | undefined =>
   body?.embeds?.map((embed: any) => embed.description).join('\n') ||
   body?.components
-    ?.filter((c: any) => c.type === 10)
+    ?.flatMap((c: any) =>
+      c.type === 17
+        ? (c.components ?? []).filter(
+            (n: any, i: number) => i !== 0 || !/^\*\*[^\n*]+\*\*(?:\n-# [^\n]*)?$/.test(n.content ?? '')
+          )
+        : [c]
+    )
+    .filter((c: any) => c.type === 10)
     .map((c: any) => c.content?.replace(/^-# /, ''))
     .join('\n') ||
   body?.content;
@@ -969,10 +976,7 @@ describe('Discord interface mode', () => {
     const b = makeBridge(undefined, { history });
     await b.reload();
     await b.syncSessions();
-    const cards = posts.filter(
-      (p) =>
-        p.body?.flags === 32772 && p.body?.components?.some((c: any) => c.type === 10 && !c.content?.startsWith('-#'))
-    );
+    const cards = posts.filter((p) => p.body?.flags === 32772 && p.body?.components?.some((c: any) => c.type === 17));
     expect(cards.length).toBeGreaterThan(1);
     expect(cards.map((p) => visibleText(p.body)).join('\n')).toContain('Last row preserved.');
     expect(
@@ -987,10 +991,7 @@ describe('Discord interface mode', () => {
     await again.reload();
     await again.syncSessions();
     expect(
-      posts.filter(
-        (p) =>
-          p.body?.flags === 32772 && p.body?.components?.some((c: any) => c.type === 10 && !c.content?.startsWith('-#'))
-      )
+      posts.filter((p) => p.body?.flags === 32772 && p.body?.components?.some((c: any) => c.type === 17))
     ).toHaveLength(count);
     expect(sendInput).not.toHaveBeenCalled();
   });
@@ -1879,7 +1880,8 @@ it('keeps an attached file visible when an alert also contains a native V2 respo
   );
   expect(result?.ok).toBe(true);
   const post = posts.find((p) => p.body?.flags === 32772 && visibleText(p.body)?.includes('The answer.'))!.body;
-  expect(post.components).toContainEqual({ type: 13, file: { url: 'attachment://results.txt' } });
+  expect(post.components).toHaveLength(1);
+  expect(post.components[0].components).toContainEqual({ type: 13, file: { url: 'attachment://results.txt' } });
   expect(uploaded.some((f) => f.name === 'results.txt' && f.text === 'test results')).toBe(true);
 });
 
