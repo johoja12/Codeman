@@ -110,6 +110,159 @@ describe('delivery journal', () => {
     const restored = new DiscordDeliveryJournal(dir, () => now);
     expect((await restored.recent())[0].native?.userCursor).toBe(user);
   });
+  it.each(['input_accepted', 'submitting'] as const)(
+    'recovers an unbound %s input from its verified boundary before a later page can echo it',
+    async (state) => {
+      const journal = new DiscordDeliveryJournal(dir, () => now);
+      await journal.claim(meta);
+      await journal.annotate(meta.id, {
+        native: {
+          conversationId: '12345678-1234-1234-1234-123456789abc',
+          promptHash: 'a'.repeat(64),
+          afterCursor: '12345678-1234-1234-1234-123456789abc:10:aaaaaaaaaaaaaaaa',
+        },
+      });
+      await journal.update(meta.id, state);
+      const history = {
+        conversationId: '12345678-1234-1234-1234-123456789abc',
+        partial: true,
+        verifiedAfter: '12345678-1234-1234-1234-123456789abc:20:aaaaaaaaaaaaaaaa',
+        turns: [
+          {
+            cursor: '12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa',
+            role: 'user' as const,
+            text: 'Prompt with [attached: /tmp/image.png]',
+            timestamp: '',
+          },
+        ],
+        executions: [
+          {
+            userCursor: '12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa',
+            promptHash: 'a'.repeat(64),
+            state: 'running' as const,
+          },
+        ],
+      };
+      const readAfter = vi.fn(async () => ({
+        ...history,
+        verifiedAfter: '12345678-1234-1234-1234-123456789abc:10:aaaaaaaaaaaaaaaa',
+      }));
+      if (state === 'submitting') {
+        expect(await journal.reconcileNative('s1', history, readAfter)).toBe(false);
+        expect((await journal.submittedUserCursors('s1', THREAD, '12345678-1234-1234-1234-123456789abc')).size).toBe(0);
+        await journal.update(meta.id, 'input_accepted');
+      }
+      expect(await journal.reconcileNative('s1', history, readAfter)).toBe(true);
+      expect(readAfter).toHaveBeenCalledWith('12345678-1234-1234-1234-123456789abc:10:aaaaaaaaaaaaaaaa');
+      expect(await journal.submittedUserCursors('s1', THREAD, '12345678-1234-1234-1234-123456789abc')).toEqual(
+        new Set(['12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa'])
+      );
+      const restored = new DiscordDeliveryJournal(dir, () => now);
+      await restored.reconcileNative('s1', {
+        ...history,
+        executions: [{ ...history.executions[0], state: 'completed' }],
+      });
+      expect((await restored.recent())[0].state).toBe('completed');
+    }
+  );
+  it('does not accept an unverified boundary or steal an identical externally typed prompt', async () => {
+    const journal = new DiscordDeliveryJournal(dir, () => now);
+    await journal.claim(meta);
+    await journal.annotate(meta.id, {
+      native: {
+        conversationId: '12345678-1234-1234-1234-123456789abc',
+        promptHash: 'a'.repeat(64),
+        afterCursor: '12345678-1234-1234-1234-123456789abc:10:aaaaaaaaaaaaaaaa',
+      },
+    });
+    await journal.update(meta.id, 'input_accepted');
+    const external = {
+      conversationId: '12345678-1234-1234-1234-123456789abc',
+      partial: true,
+      verifiedAfter: '12345678-1234-1234-1234-123456789abc:20:aaaaaaaaaaaaaaaa',
+      turns: [
+        {
+          cursor: '12345678-1234-1234-1234-123456789abc:40:aaaaaaaaaaaaaaaa',
+          role: 'user' as const,
+          text: 'same',
+          timestamp: '',
+        },
+      ],
+      executions: [
+        {
+          userCursor: '12345678-1234-1234-1234-123456789abc:40:aaaaaaaaaaaaaaaa',
+          promptHash: 'a'.repeat(64),
+          state: 'running' as const,
+        },
+      ],
+    };
+    await journal.reconcileNative('s1', external, async () => external);
+    expect((await journal.submittedUserCursors('s1', THREAD, '12345678-1234-1234-1234-123456789abc')).size).toBe(0);
+    await journal.reconcileNative('s1', external, async () => ({
+      ...external,
+      verifiedAfter: '12345678-1234-1234-1234-123456789abc:10:aaaaaaaaaaaaaaaa',
+      turns: [
+        {
+          cursor: '12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa',
+          role: 'user' as const,
+          text: 'same',
+          timestamp: '',
+        },
+        ...external.turns,
+      ],
+      executions: [
+        {
+          userCursor: '12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa',
+          promptHash: 'a'.repeat(64),
+          state: 'completed',
+        },
+        ...external.executions,
+      ],
+    }));
+    expect(await journal.submittedUserCursors('s1', THREAD, '12345678-1234-1234-1234-123456789abc')).toEqual(
+      new Set(['12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa'])
+    );
+  });
+  it('serializes concurrent native reads so identical pending inputs cannot claim one execution twice', async () => {
+    const journal = new DiscordDeliveryJournal(dir, () => now);
+    for (const id of ['first', 'second']) {
+      await journal.claim({ ...meta, id });
+      await journal.annotate(id, {
+        native: {
+          conversationId: '12345678-1234-1234-1234-123456789abc',
+          promptHash: 'a'.repeat(64),
+          afterCursor: '12345678-1234-1234-1234-123456789abc:10:aaaaaaaaaaaaaaaa',
+        },
+      });
+      await journal.update(id, 'input_accepted');
+    }
+    const h = {
+      conversationId: '12345678-1234-1234-1234-123456789abc',
+      partial: true,
+      verifiedAfter: '12345678-1234-1234-1234-123456789abc:10:aaaaaaaaaaaaaaaa',
+      turns: [
+        {
+          cursor: '12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa',
+          role: 'user' as const,
+          text: 'same',
+          timestamp: '',
+        },
+      ],
+      executions: [
+        {
+          userCursor: '12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa',
+          promptHash: 'a'.repeat(64),
+          state: 'running' as const,
+        },
+      ],
+    };
+    await Promise.all([journal.reconcileNative('s1', h), journal.reconcileNative('s1', h)]);
+    expect(
+      (await journal.recent()).filter(
+        (r) => r.native?.userCursor === '12345678-1234-1234-1234-123456789abc:30:aaaaaaaaaaaaaaaa'
+      )
+    ).toHaveLength(1);
+  });
   it.each(['anchor', 'metadata'] as const)(
     'binds Discord provenance when a verified page omits its %s boundary',
     async (kind) => {

@@ -252,11 +252,24 @@ export class DiscordDeliveryJournal {
       }
     });
   }
-  async reconcileNative(
+  private reconciliation: Promise<void> = Promise.resolve();
+  reconcileNative(
     sessionId: string,
     history: import('./discord-history.js').DiscordHistory,
     readAfter?: (cursor: string) => Promise<import('./discord-history.js').DiscordHistory>
-  ): Promise<void> {
+  ): Promise<boolean> {
+    const run = this.reconciliation.then(() => this.reconcile(sessionId, history, readAfter));
+    this.reconciliation = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+  private async reconcile(
+    sessionId: string,
+    history: import('./discord-history.js').DiscordHistory,
+    readAfter?: (cursor: string) => Promise<import('./discord-history.js').DiscordHistory>
+  ): Promise<boolean> {
     await this.load();
     const records = [...this.records.values()]
       .filter(
@@ -264,7 +277,7 @@ export class DiscordDeliveryJournal {
           r.direction === 'inbound' &&
           r.sessionId === sessionId &&
           r.native?.conversationId === history.conversationId &&
-          ['input_accepted', 'submitted', 'uncertain', 'running'].includes(r.state)
+          ['submitting', 'input_accepted', 'submitted', 'uncertain', 'running'].includes(r.state)
       )
       .sort((a, b) => a.createdAt - b.createdAt);
     const claimed = new Set(
@@ -298,6 +311,9 @@ export class DiscordDeliveryJournal {
         return false;
       });
       if (!execution) continue;
+      // Native history can appear before the terminal write returns. Do not advance the
+      // live checkpoint until its transport outcome is known, or claim an external draft.
+      if (record.state === 'submitting') return false;
       claimed.add(execution.userCursor);
       await this.annotate(record.id, { native: { ...meta, userCursor: execution.userCursor } });
       if (record.state !== execution.state) await this.update(record.id, execution.state);
@@ -311,9 +327,10 @@ export class DiscordDeliveryJournal {
         const anchor = record.native!.afterCursor!;
         const verified = await readAfter(anchor).catch(() => undefined);
         if (verified?.conversationId === history.conversationId && verified.verifiedAfter === anchor)
-          await this.reconcileNative(sessionId, verified);
+          if (!(await this.reconcile(sessionId, verified))) return false;
       }
     }
+    return true;
   }
   /** Exact native turns already submitted through this Discord destination, including queued input. */
   async submittedUserCursors(sessionId: string, channelId: string, conversationId: string): Promise<Set<string>> {
