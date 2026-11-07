@@ -816,6 +816,20 @@ export class WebServer extends EventEmitter {
   });
   private discordBridge: DiscordBridge = new DiscordBridge({
     nativeUi: createDiscordNativeUiServices({
+      // Read-only fallback: hookless remote Claude checkbox dialogs must also reach Discord.
+      questionObserved: async (item) => {
+        const result = await this.discordBridge.notify({
+          event: SseEvent.HookElicitationDialog,
+          title: 'Question Asked',
+          urgency: 'critical',
+          sessionId: item.sessionId,
+          sessionName: item.sessionName,
+          body: 'Choose in the terminal; this is a multi-select question.',
+          tail: () => item.message || '',
+          host: this.windowTitle,
+        });
+        return result?.ok === true;
+      },
       capture: (id) => {
         const s = this.sessions.get(id);
         return s?.muxName ? this.mux.capturePaneTextAsync?.(s.muxName, { ansi: true }) : null;
