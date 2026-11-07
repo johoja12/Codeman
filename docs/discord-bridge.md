@@ -303,7 +303,7 @@ The bot needs the existing guild application-command scope for slash/context act
 
 ### Automatic output attachments
 
-In Full mode, new Claude/Codex assistant responses that link a workspace image, PDF, office document, CSV, archive or media output also upload the actual file beneath the answer. For example, `![Mockup](./output/mockup.png)` and `[Report](./output/report.pdf)` produce Discord attachments. Relative paths resolve against that exact local or SSH session workspace. Absolute paths, local `file:///` links and `sandbox:/` paths also work when the file is inside the workspace. Files generated elsewhere must first be saved/copied into that workspace.
+In Full mode, new Claude/Codex assistant responses, including the full-text Response fallback, that link a workspace image, PDF, office document, CSV, archive or media output also upload the actual file beneath the answer. For example, `![Mockup](./output/mockup.png)` and `[Report](./output/report.pdf)` produce Discord attachments. Relative paths resolve against that exact local or SSH session workspace. Absolute paths, local `file:///` links and `sandbox:/` paths also work when the file is inside the workspace. Files generated elsewhere must first be saved/copied into that workspace.
 
 For other types, use an explicit `[artifact: ./output/data.json]` declaration or `[Download source](./output/example.ts)` link. Ordinary source/documentation references, unlinked prose paths, external URLs, quoted text and fenced/inline code examples do not trigger uploads. Only assistant text is inspected; tool output, historical backfill and stream-off responses do not automatically transfer files. The bridge does not scan directories or infer task ownership from workspace changes.
 
