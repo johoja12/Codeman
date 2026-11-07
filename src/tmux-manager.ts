@@ -4244,15 +4244,26 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
   async getCodexProviderEnvironment(muxName: string): Promise<CodexProviderEnvironment | null> {
     if (IS_TEST_MODE) return null;
-    const tracked = [...this.sessions.values()].some((session) => session.muxName === muxName);
-    return readTmuxCodexProviderEnvironment(this.tmuxSocket, muxName, tracked, async (file, args) => {
-      const { stdout } = await execFileAsync(file, args, {
-        encoding: 'utf8',
-        timeout: EXEC_TIMEOUT_MS,
-        maxBuffer: 1024 * 1024,
-      });
-      return { stdout };
-    });
+    const tracked = [...this.sessions.values()].find((session) => session.muxName === muxName);
+    const environment = await readTmuxCodexProviderEnvironment(
+      this.tmuxSocket,
+      muxName,
+      !!tracked,
+      async (file, args) => {
+        const { stdout } = await execFileAsync(file, args, {
+          encoding: 'utf8',
+          timeout: EXEC_TIMEOUT_MS,
+          maxBuffer: 1024 * 1024,
+        });
+        return { stdout };
+      }
+    );
+    if (tracked?.mode === 'codex' && environment) {
+      const { probeLocalDiscordRuntime } = await import('./discord-local-conversation.js');
+      const runtime = await probeLocalDiscordRuntime({ id: tracked.sessionId, muxName }, this.tmuxSocket);
+      if (runtime) environment.CODEX_HOME = runtime.configHome;
+    }
+    return environment;
   }
 
   async getProcessStats(sessionId: string): Promise<ProcessStats | null> {

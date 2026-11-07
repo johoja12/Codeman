@@ -165,6 +165,10 @@ export async function probeRemoteDiscordRuntime(
         shellescape(JSON.stringify({ location: remoteTmuxLocation(remote, sessionId) }))
     )
   );
+  return parseDiscordRuntime(result);
+}
+
+export function parseDiscordRuntime(result: Buffer): RemoteDiscordRuntime | undefined {
   if (result.length > 16384) return undefined;
   const value = JSON.parse(result.toString('utf8')) as Partial<RemoteDiscordRuntime>;
   if (

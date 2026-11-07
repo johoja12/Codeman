@@ -1,3 +1,4 @@
+import { DiscordHistoryWarnings } from './discord-history-warnings.js';
 /**
  * @fileoverview Two-way Discord bridge: one thread per tab, alerts out, replies typed back in.
  *
@@ -1009,6 +1010,7 @@ export class DiscordBridge {
   private outputDue = new Map<string, number>();
   private unavailableNotices = new Set<string>();
   private historyWarningsChecked = new Set<string>();
+  private readonly historyWarnings: DiscordHistoryWarnings;
   private readonly api: DiscordApi;
   private readonly now: () => number;
   private readonly deliveries: DiscordDeliveryJournal;
@@ -1019,6 +1021,7 @@ export class DiscordBridge {
 
   constructor(private readonly deps: DiscordBridgeDeps) {
     this.now = deps.now ?? Date.now;
+    this.historyWarnings = new DiscordHistoryWarnings(deps.configDir);
     this.conversationProgress = new DiscordConversationProgressStore(deps.configDir);
     this.deliveries = new DiscordDeliveryJournal(deps.configDir, this.now);
     this.api = new DiscordApi(() => this.cfg.token, deps.fetchImpl, deps.sleep);
@@ -1314,17 +1317,7 @@ export class DiscordBridge {
             this.syncState.failed++;
             this.last = this.fail(new BridgeProblem('History unavailable: ' + discordHistoryFailureReason(error)));
             if (this.destinationMatches(session.id, result))
-              await this.deliverPost(
-                result,
-                {
-                  content:
-                    'History is unavailable or partial. Use !codeman history to retry; this session channel remains available.',
-                  allowed_mentions: { parse: [], users: [] },
-                },
-                undefined,
-                session.id,
-                'history-unavailable'
-              ).catch(() => undefined);
+              await this.warnUnavailableHistory(session.id, result).catch(() => undefined);
           }
         } else {
           this.syncState.failed++;
@@ -1520,6 +1513,63 @@ export class DiscordBridge {
     }
   }
 
+  private warningDisplays(nodes: unknown, depth = 0): string[] {
+    if (!Array.isArray(nodes) || depth > 5) return [];
+    return nodes.flatMap((node) =>
+      !node || typeof node !== 'object'
+        ? []
+        : node.type === 10 && typeof node.content === 'string'
+          ? [node.content]
+          : this.warningDisplays(node.components, depth + 1)
+    );
+  }
+  private isHistoryWarning(
+    message: { author?: { id: string }; content?: string; components?: unknown },
+    bot: string
+  ): boolean {
+    if (message.author?.id !== bot) return false;
+    if (
+      message.content ===
+      'History is unavailable or partial. Use !codeman history to retry; this session channel remains available.'
+    )
+      return true;
+    const text = this.warningDisplays(message.components);
+    return (
+      (text[0] === '**Reconnecting to this conversation**' &&
+        text.includes(
+          'Your response is available in Codeman. I’m restoring the connection so replies can appear here.'
+        )) ||
+      (text[0] === '**Reply history needs attention**' &&
+        text.includes(
+          'I couldn’t verify this session’s Codex profile. Check its launch profile or CODEX_HOME setting, then retry history. The session remains available in Codeman.'
+        ))
+    );
+  }
+  private async warnUnavailableHistory(sessionId: string, channel: string): Promise<void> {
+    this.historyWarningsChecked.delete(`${sessionId}:${channel}`);
+    const key = this.conversationKey(sessionId, channel);
+    if (await this.historyWarnings.get(key)) return;
+    await this.channels.assertOwned(this.cfg, sessionId, channel);
+    const bot = await this.api.botUserId();
+    if (!bot?.id || !this.destinationMatches(sessionId, channel)) return;
+    const text =
+      'History is unavailable or partial. Use !codeman history to retry; this session channel remains available.';
+    const existing = (await this.api.channelMessages(channel))?.find((m) => this.isHistoryWarning(m, bot.id));
+    if (existing) {
+      await this.historyWarnings.set(key, existing.id);
+      return;
+    }
+    // Persist intent before HTTP. An ambiguous post must never turn into a warning loop.
+    if (!(await this.historyWarnings.claim(key))) return;
+    const posted = (await this.deliverPost(
+      channel,
+      { content: text, allowed_mentions: { parse: [], users: [] } },
+      undefined,
+      sessionId,
+      'history-unavailable:' + randomUUID()
+    )) as { id?: string };
+    if (posted?.id) await this.historyWarnings.set(key, posted.id);
+  }
   private async clearRecoveredHistoryWarning(sessionId: string, channel: string): Promise<void> {
     const key = `${sessionId}:${channel}`;
     if (this.historyWarningsChecked.has(key)) return;
@@ -1529,27 +1579,15 @@ export class DiscordBridge {
       await this.channels.assertOwned(this.cfg, sessionId, channel);
       const bot = await this.api.botUserId();
       if (!bot?.id || !current()) return;
-      const messages = await this.api.channelMessages(channel);
-      const displays = (nodes: unknown, depth = 0): string[] => {
-        if (!Array.isArray(nodes) || depth > 5) return [];
-        return nodes.flatMap((node) =>
-          !node || typeof node !== 'object'
-            ? []
-            : node.type === 10 && typeof node.content === 'string'
-              ? [node.content]
-              : displays(node.components, depth + 1)
-        );
-      };
+      const messages = (await this.api.channelMessages(channel)) ?? [];
+      const saved = await this.historyWarnings.get(this.conversationKey(sessionId, channel));
+      if (saved?.message && !messages.some((m) => m.id === saved.message)) {
+        const old = await this.api.getMessage(channel, saved.message).catch(() => undefined);
+        if (old) messages.push(old);
+      }
       for (const message of messages ?? []) {
         if (!current()) return;
-        const text = displays(message.components);
-        if (
-          message.author?.id === bot.id &&
-          text[0] === '**Reconnecting to this conversation**' &&
-          text.includes(
-            'Your response is available in Codeman. I’m restoring the connection so replies can appear here.'
-          )
-        ) {
+        if (this.isHistoryWarning(message, bot.id) && message.components?.length) {
           await this.api.editMessage(
             channel,
             message.id,
@@ -1568,6 +1606,7 @@ export class DiscordBridge {
             allowed_mentions: { parse: [], users: [] },
           });
       }
+      await this.historyWarnings.set(this.conversationKey(sessionId, channel), undefined);
       if (this.historyWarningsChecked.size >= 1024) this.historyWarningsChecked.clear();
       this.historyWarningsChecked.add(key);
     } catch {
@@ -2303,6 +2342,7 @@ export class DiscordBridge {
       const noticeKey = `${msg.sessionId}:${channel}`;
       const progress = await this.conversationProgress.get(this.conversationKey(msg.sessionId, channel));
       if (!progress?.streamOff) {
+        this.historyWarningsChecked.delete(noticeKey);
         if (this.unavailableNotices.has(noticeKey)) return { ok: true, deduped: true, at: this.now() };
         const notice = discordResponsePosts(
           profileReadFailure
@@ -2315,13 +2355,31 @@ export class DiscordBridge {
           }
         )[0];
         try {
-          await this.deliverPost(
+          const warningKey = this.conversationKey(msg.sessionId, channel);
+          const savedWarning = await this.historyWarnings.get(warningKey);
+          if (savedWarning) {
+            if (savedWarning.message) {
+              await this.channels.assertOwned(this.cfg, msg.sessionId, channel);
+              const bot = await this.api.botUserId();
+              const old = (await this.api.getMessage(channel, savedWarning.message)) as
+                | (DiscordStarter & { content?: string; components?: DiscordPost['components'] })
+                | null;
+              if (bot?.id && old && this.isHistoryWarning(old, bot.id))
+                await this.api.editMessage(channel, savedWarning.message, notice);
+            }
+            this.unavailableNotices.add(noticeKey);
+            return { ok: true, deduped: true, at: this.now() };
+          }
+          if (!(await this.historyWarnings.claim(warningKey))) return { ok: true, deduped: true, at: this.now() };
+          const warningPost = await this.deliverPost(
             channel,
             notice,
             undefined,
             msg.sessionId,
             `history-unavailable:${msg.sessionId}:${this.now()}`
           );
+          const warningId = (warningPost as { id?: string })?.id;
+          if (warningId) await this.historyWarnings.set(warningKey, warningId);
           if (this.unavailableNotices.size >= 256)
             this.unavailableNotices.delete(this.unavailableNotices.values().next().value!);
           this.unavailableNotices.add(noticeKey);
@@ -2472,6 +2530,9 @@ export class DiscordBridge {
 
   /** Session tab deleted: apply `onSessionDelete` and forget the mapping. */
   async sessionDeleted(sessionId: string): Promise<void> {
+    const warningChannel = this.channels.channelForSession(this.cfg, sessionId);
+    if (warningChannel)
+      await this.historyWarnings.set(this.conversationKey(sessionId, warningChannel), undefined).catch(() => undefined);
     this.forgetTab(sessionId);
     await this.channels
       .deleted(sessionId, this.cfg.onSessionDelete, this.cfg.enabled ? this.cfg.guildId : undefined)
