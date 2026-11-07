@@ -87,9 +87,9 @@ function makeBridge(
           ? { fileFields: [...init.body.keys()].filter((k) => k.startsWith('files[')) }
           : {}),
       } as any);
-      if (artifactPostUncertain && method === 'POST' && init.body instanceof FormData)
+      if (artifactPostUncertain && ['POST', 'PATCH'].includes(method) && init.body instanceof FormData)
         throw Error('Upload outcome unknown');
-      if (artifactPostRefused && method === 'POST' && init.body instanceof FormData)
+      if (artifactPostRefused && ['POST', 'PATCH'].includes(method) && init.body instanceof FormData)
         return Response.json({}, { status: 403 });
       if (/\/applications\/.*\/commands$/.test(path)) {
         if (method === 'GET') return Response.json([]);
@@ -407,7 +407,7 @@ describe('Discord interface mode', () => {
     expect(sendInput).not.toHaveBeenCalled();
   });
 
-  it('groups explicit output files beneath a new response and does not repeat uploads after replay/restart', async () => {
+  it('groups explicit output files inside a new response and does not repeat uploads after replay/restart', async () => {
     let now = 100000;
     let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
     sessions = [{ id: 's1', name: 'one' }];
@@ -435,9 +435,16 @@ describe('Discord interface mode', () => {
       { name: 'mockup.png', text: 'image-bytes' },
       { name: 'report.pdf', text: 'pdf-bytes' },
     ]);
-    const attachments = posts.filter((p) => p.body?.content === 'Files from this response');
+    const attachments = posts.filter((p) => p.method === 'PATCH' && (p as any).fileFields?.length);
     expect(attachments).toHaveLength(1);
     expect(attachments[0].body?.allowed_mentions).toEqual({ parse: [], users: [] });
+    expect(visibleText(attachments[0].body)).toContain('Done.');
+    expect(attachments[0].body.content).toBeNull();
+    expect(attachments[0].body.embeds).toEqual([]);
+    expect(visibleText(attachments[0].body)).not.toContain('./report.pdf');
+    expect(attachments[0].body.components[0].components.filter((c: any) => c.type === 13)).toHaveLength(2);
+    expect(remoteMessages.has(attachments[0].path.split('/').at(-1)!)).toBe(true);
+    expect(posts.some((p) => p.method === 'POST' && p.body?.content === 'Files from this response')).toBe(false);
     expect(getAttachment).toHaveBeenCalledTimes(2);
     const before = posts.findIndex((p) => p === attachments[0]);
     expect(posts.slice(0, before).some((p) => visibleText(p.body)?.includes('Done.'))).toBe(true);
@@ -478,7 +485,9 @@ describe('Discord interface mode', () => {
     await b.pollConversations();
     expect(uploaded).toEqual([]);
     expect(posts.some((p) => visibleText(p.body)?.includes('Here are outputs.'))).toBe(true);
-    expect(posts.filter((p) => p.body?.content?.startsWith('Some linked output files'))).toHaveLength(1);
+    expect(
+      posts.filter((p) => p.method === 'PATCH' && visibleText(p.body)?.includes('Some linked output files'))
+    ).toHaveLength(1);
     expect(posts.some((p) => p.body?.content?.includes('NOT-A-REAL-SECRET'))).toBe(false);
     turns.push({ cursor: 'native1:2', role: 'assistant', text: 'The next response still arrives.', timestamp: '' });
     now += 60001;
@@ -511,7 +520,7 @@ describe('Discord interface mode', () => {
     expect(getAttachment).toHaveBeenCalledTimes(4);
     expect(uploaded).toHaveLength(1);
     expect(
-      posts.filter((p) => p.body?.content?.startsWith('Files from this response\nSome linked output files'))
+      posts.filter((p) => p.method === 'PATCH' && visibleText(p.body)?.includes('Some linked output files'))
     ).toHaveLength(1);
   });
 
@@ -529,13 +538,13 @@ describe('Discord interface mode', () => {
     artifactPostRefused = true;
     turns = [{ cursor: 'native1:1', role: 'assistant', text: 'Here is the picture. ![Image](pic.png)', timestamp: '' }];
     await b.pollConversations();
-    expect(posts.filter((p) => p.body?.content === 'Files from this response')).toHaveLength(1);
+    expect(posts.filter((p) => p.method === 'PATCH' && (p as any).fileFields?.length)).toHaveLength(1);
     expect(
       posts.filter((p) => p.body?.content?.startsWith('Output file delivery could not be confirmed'))
     ).toHaveLength(1);
     now += 60001;
     await b.pollConversations();
-    expect(posts.filter((p) => p.body?.content === 'Files from this response')).toHaveLength(1);
+    expect(posts.filter((p) => p.method === 'PATCH' && (p as any).fileFields?.length)).toHaveLength(1);
     turns.push({ cursor: 'native1:2', role: 'assistant', text: 'Later response.', timestamp: '' });
     now += 60001;
     await b.pollConversations();
@@ -2602,7 +2611,7 @@ function fallbackFiles() {
     data: Buffer.from('image-fixture'),
   }));
 }
-it('uploads generated fallback images together after the answer, including remote workspaces', async () => {
+it('uploads generated fallback images together inside the answer, including remote workspaces', async () => {
   sessions = [{ id: 's1', name: 'one', remote: true }];
   const getAttachment = fallbackFiles();
   const b = makeBridge(undefined, { getAttachment });
@@ -2610,7 +2619,7 @@ it('uploads generated fallback images together after the answer, including remot
   await b.syncSessions();
   expect((await b.notify(fallbackImageAlert()))?.ok).toBe(true);
   expect(uploaded.map((f) => f.name)).toEqual(['desktop.png', 'inspector.png', 'mobile.png']);
-  const batches = posts.filter((p) => p.method === 'POST' && p.body?.content === 'Files from this response');
+  const batches = posts.filter((p) => p.method === 'PATCH' && (p as any).fileFields?.length);
   expect(batches).toHaveLength(1);
   expect(batches[0].fileFields).toHaveLength(3);
   expect(posts.findIndex((p) => visibleText(p.body)?.includes('**Build overview**'))).toBeLessThan(
@@ -2631,7 +2640,7 @@ it('does not duplicate a fallback image batch on redelivery or restart', async (
   await restored.reload();
   await restored.syncSessions();
   await restored.notify(fallbackImageAlert());
-  expect(posts.filter((p) => p.method === 'POST' && p.body?.content === 'Files from this response')).toHaveLength(1);
+  expect(posts.filter((p) => p.method === 'PATCH' && (p as any).fileFields?.length)).toHaveLength(1);
   expect(uploaded).toHaveLength(3);
 });
 it('keeps fallback text and allowed images when one linked file is refused', async () => {
@@ -2645,7 +2654,7 @@ it('keeps fallback text and allowed images when one linked file is refused', asy
   expect((await b.notify(fallbackImageAlert()))?.ok).toBe(true);
   expect(uploaded.map((f) => f.name)).toEqual(['desktop.png', 'mobile.png']);
   expect(posts.some((p) => visibleText(p.body)?.includes('**Build overview**'))).toBe(true);
-  expect(posts.some((p) => p.body?.content?.includes('Some linked output files could not be attached'))).toBe(true);
+  expect(posts.some((p) => visibleText(p.body)?.includes('Some linked output files could not be attached'))).toBe(true);
 });
 it('respects stream-off for fallback image transfer', async () => {
   const getAttachment = fallbackFiles();
@@ -2674,19 +2683,17 @@ it('does not replay a fallback image upload whose network outcome is uncertain',
   await b.syncSessions();
   artifactPostUncertain = true;
   await b.notify(fallbackImageAlert());
-  const attempts = posts.filter((p) => p.method === 'POST' && p.body?.content === 'Files from this response');
+  const attempts = posts.filter((p) => p.method === 'PATCH' && (p as any).fileFields?.length);
   expect(attempts.length).toBeGreaterThan(0);
-  expect(new Set(attempts.map((p) => p.body.nonce)).size).toBe(1);
-  expect(attempts.every((p) => p.body.enforce_nonce)).toBe(true);
+  expect(new Set(attempts.map((p) => p.path)).size).toBe(1);
+  expect(attempts.every((p) => p.method === 'PATCH' && /\/messages\/\d+$/.test(p.path))).toBe(true);
   b.stop();
   artifactPostUncertain = false;
   const restored = makeBridge(undefined, { getAttachment });
   await restored.reload();
   await restored.syncSessions();
   await restored.notify(fallbackImageAlert());
-  expect(posts.filter((p) => p.method === 'POST' && p.body?.content === 'Files from this response')).toHaveLength(
-    attempts.length
-  );
+  expect(posts.filter((p) => p.method === 'PATCH' && (p as any).fileFields?.length)).toHaveLength(attempts.length);
   expect(sendInput).not.toHaveBeenCalled();
 });
 
@@ -2699,4 +2706,35 @@ it('keeps delivered fallback text when stream preferences cannot be read, withou
   expect((await b.notify(fallbackImageAlert()))?.ok).toBe(true);
   expect(getAttachment).not.toHaveBeenCalled();
   expect(posts.some((p) => visibleText(p.body)?.includes('**Build overview**'))).toBe(true);
+});
+
+it('attaches colliding file basenames to the exact final part of a split response without extra file posts', async () => {
+  let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+  sessions = [{ id: 's1', name: 'one', remote: true }];
+  const b = makeBridge(undefined, {
+    history: async () => ({ conversationId: 'native1', partial: false, turns }),
+    getAttachment: async () => ({ name: 'report.pdf', data: Buffer.from('pdf') }),
+  });
+  await b.reload();
+  await b.syncSessions();
+  turns = [
+    {
+      cursor: 'native1:1',
+      role: 'assistant',
+      timestamp: '',
+      text: 'Summary words. '.repeat(210) + '\n[One](/work/one/report.pdf)\n[Two](/work/two/report.pdf)',
+    },
+  ];
+  await b.pollConversations();
+  const edits = posts.filter((p) => p.method === 'PATCH' && (p as any).fileFields?.length);
+  expect(edits).toHaveLength(1);
+  expect(uploaded.map((f) => f.name)).toEqual(['report.pdf', '1-report.pdf']);
+  const card = edits[0].body.components.find((c: any) => c.type === 17);
+  expect(card.components.filter((c: any) => c.type === 13).map((c: any) => c.file.url)).toEqual([
+    'attachment://report.pdf',
+    'attachment://1-report.pdf',
+  ]);
+  expect(visibleText(edits[0].body)).toContain('One\nTwo');
+  expect(visibleText(edits[0].body)).not.toContain('/work/');
+  expect(posts.filter((p) => p.method === 'POST' && (p as any).fileFields?.length)).toHaveLength(0);
 });
