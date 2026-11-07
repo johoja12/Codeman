@@ -169,3 +169,68 @@ it('removes its pending item when the session closes without touching another se
   await f.services.sessions();
   expect(approvalInbox.listPending().map((p) => p.id)).toEqual([other.id]);
 });
+
+const singleQuestion = `Release canary
+
+│ The agent release is built and scanned.
+│ The image is ready for the last gate.
+│ The canary runs on a customer runner.
+│ It writes to the runner's workspace.
+│ A live batch is still running there.
+│ The canary refuses while a job runs.
+│ How should I run it?
+
+❯ 1. Wait for an idle gap (Recommended)
+     Poll the runner and start when idle.
+     The batch may queue behind it.
+     Waiting takes twenty minutes.
+     Keep the next deployment waiting.
+  2. Skip canary, promote now
+     Publish without the canary.
+     This skips a required safety gate.
+     Only the agent image changed.
+     The toolchain is unchanged.
+  3. Hold the release
+     Do not touch the runner.
+     Keep the image unpublished.
+     Other services keep waiting.
+     No work is performed now.
+  4. Type something.
+─────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+`;
+it('detects a long single-choice question without clipping its beginning or losing wrapped question lines', () => {
+  expect(singleQuestion.split('\n').length).toBeGreaterThan(30);
+  const q = claudeVisibleQuestion(singleQuestion)!;
+  expect(q).toMatch(/^The agent release is built and scanned\./);
+  expect(q).toContain('How should I run it?');
+  expect(q).toContain('1. Wait for an idle gap (Recommended)');
+  expect(q).toContain('2. Skip canary, promote now');
+  expect(q).toContain('3. Hold the release');
+  expect(q).toContain('4. Type something.');
+  expect(q).toContain('5. Chat about this');
+  expect(q).toMatch(/Choose an option in the terminal\.$/);
+});
+it.each([
+  singleQuestion.replace('5. Chat about this', '5. Other prose'),
+  singleQuestion.replace('4. Type something.', '4. Another choice'),
+  singleQuestion.replace('❯ 1.', '  1.'),
+  singleQuestion.replace('2. Skip', '9. Skip'),
+  singleQuestion.replace('2. Skip', '2. [ ] Skip'),
+  singleQuestion + '❯ New composer\n────',
+])('rejects partial, historical and mixed single-choice layouts', (frame) => {
+  expect(claudeVisibleQuestion(frame)).toBeUndefined();
+});
+it('projects a single-choice live question into the inbox and forwards it once without allowing terminal writes', async () => {
+  const f = fixture();
+  f.capture(() => singleQuestion);
+  expect((await f.services.sessions())[0].pending).toBe(true);
+  const q = f.services.question('s')!;
+  expect(q.text).toContain('The agent release is built and scanned.');
+  expect(q.terminalOnly).toBe(true);
+  await expect(f.services.answer('s', q.id, q.revision, '1')).rejects.toThrow();
+  await f.services.sessions();
+  expect(f.notify).toHaveBeenCalledTimes(1);
+});

@@ -186,7 +186,10 @@ const CURSOR_POSITION_PATTERN = /\x1b\[(?:(\d+)(?:;(\d+))?)?[Hf]/g;
  * lines, strip ANSI, right-trim lines, drop trailing blanks, keep the last
  * MAX_CONTEXT_LINES lines.
  */
-export function normalizeCapturedFrame(raw: string | null | undefined): string | undefined {
+export function normalizeCapturedFrame(
+  raw: string | null | undefined,
+  limits: { maxLines: number; maxChars: number } = { maxLines: MAX_CONTEXT_LINES, maxChars: MAX_CONTEXT_CHARS }
+): string | undefined {
   if (!raw) return undefined;
   const rowed = raw.replace(CURSOR_POSITION_PATTERN, (_m, _row, col) => (!col || col === '1' ? '\n' : ' '));
   const lines = stripAnsi(rowed)
@@ -195,8 +198,8 @@ export function normalizeCapturedFrame(raw: string | null | undefined): string |
   while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
   while (lines.length > 0 && lines[0] === '') lines.shift();
   if (lines.length === 0) return undefined;
-  const text = lines.slice(-MAX_CONTEXT_LINES).join('\n');
-  return text.length > MAX_CONTEXT_CHARS ? text.slice(-MAX_CONTEXT_CHARS) : text;
+  const text = lines.slice(-limits.maxLines).join('\n');
+  return text.length > limits.maxChars ? text.slice(-limits.maxChars) : text;
 }
 
 /**
