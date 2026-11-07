@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { hashDiscordPrompt } from '../src/discord-native-execution.js';
 import { readDiscordSessionFile } from '../src/discord-file-transfers.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { discordUiNodes } from '../src/discord-native-ui.js';
 import { DISCORD_SUPPRESS_NOTIFICATIONS } from '../src/discord-response-format.js';
 import { DiscordHistoryReadError } from '../src/discord-history.js';
 import {
@@ -2351,5 +2352,71 @@ it('keeps long streamed updates and files silent with just one notification-elig
   expect(uploaded.map((f) => f.name)).toEqual(expect.arrayContaining(['updates.txt', 'response.txt', 'report.txt']));
   expect(messages.filter((p) => visibleText(p.body)?.includes('Progress detail')).length).toBeGreaterThan(1);
   expect(messages.filter((p) => visibleText(p.body)?.includes('Final detail')).length).toBeGreaterThan(1);
+  expect(sendInput).not.toHaveBeenCalled();
+});
+
+it('links the live Activity row to the final message actually delivered by the bridge', async () => {
+  sessions = [{ id: 's1', name: 'one' }];
+  let now = 100000;
+  let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+  const history = async () => ({
+    conversationId: 'native1',
+    partial: false,
+    turns,
+    executions: [{ userCursor: 'u', promptHash: 'proof', state: 'completed' as const }],
+  });
+  const b = makeBridge(undefined, {
+    history,
+    now: () => now,
+    nativeUi: {
+      enabled: () => true,
+      sessions: async () => [
+        {
+          id: 's1',
+          name: 'one',
+          host: 'test',
+          caseName: 'Test',
+          mode: 'codex',
+          conversation: 'native1',
+          working: false,
+          ready: true,
+          pending: false,
+          exited: false,
+        },
+      ],
+      cases: async () => [],
+      defaults: async () => ({ model: '', effort: '', approval: 'ask' }),
+      saveDefaults: async () => {},
+      question: () => undefined,
+      answer: async () => '',
+      workspace: async () => ({ summary: '', diff: '' }),
+      submitQueued: async () => 'blocked',
+    },
+  });
+  await b.reload();
+  await b.syncSessions();
+  await b.pollConversations();
+  turns = [
+    { role: 'user', cursor: 'u', timestamp: new Date(1000).toISOString(), text: 'Task' },
+    {
+      role: 'assistant',
+      cursor: 'answer',
+      phase: 'final_answer',
+      timestamp: new Date(2000).toISOString(),
+      text: 'Exact delivered final.',
+    },
+  ];
+  now += 21000;
+  await b.pollConversations();
+  const sent = [...remoteMessages.values()].find((m) => visibleText(m) === 'Exact delivered final.');
+  expect(sent).toBeDefined();
+  now += 21000;
+  await b.pollConversations();
+  const dashboard = [...remoteMessages.values()].find((m) =>
+    discordUiNodes(m.components).some((c) => String(c.content ?? '').includes('## Activity'))
+  );
+  expect(dashboard).toBeDefined();
+  const link = discordUiNodes(dashboard.components).find((c) => c.label === 'View reply');
+  expect(link?.url).toBe(`https://discord.com/channels/${cfg.guildId}/${sent.channel_id}/${sent.id}`);
   expect(sendInput).not.toHaveBeenCalled();
 });

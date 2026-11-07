@@ -763,3 +763,22 @@ it('fingerprints embed text and color so a changed card cannot replay an existin
     )
   ).rejects.toThrow('formatting changed');
 });
+
+it('resolves only the exact confirmed outbound response within its session and destination', async () => {
+  const j = new DiscordDeliveryJournal(dir, () => now),
+    scope = { sessionId: 's1', guildId: GUILD, channelId: THREAD };
+  await j.claim({ ...scope, id: 'answer', direction: 'outbound' });
+  await j.annotate('answer', { messageId: MESSAGE });
+  expect(await j.deliveredMessage('answer', scope)).toBeUndefined();
+  await j.update('answer', 'delivered');
+  expect(await j.deliveredMessage('answer', scope)).toBe(MESSAGE);
+  expect(await j.recentForSession('s1')).toEqual([]);
+  for (const altered of [{ sessionId: 'other' }, { guildId: 'other' }, { channelId: 'other' }])
+    expect(await j.deliveredMessage('answer', { ...scope, ...altered })).toBeUndefined();
+  await j.claim({ ...scope, id: 'input', direction: 'inbound' });
+  await j.annotate('input', { messageId: MESSAGE });
+  await j.update('input', 'delivered');
+  expect(await j.deliveredMessage('input', scope)).toBeUndefined();
+  now += 8 * 86400000;
+  expect(await j.deliveredMessage('answer', scope)).toBeUndefined();
+});
