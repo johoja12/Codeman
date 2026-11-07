@@ -2497,6 +2497,22 @@ export class DiscordBridge {
           msg.sessionId,
           `${deliveryKey}:${i + 1}`
         );
+      // Full-text alert fallback must carry the same guarded output files as a native
+      // streamed answer. The version/text key survives restart without replaying an upload.
+      if (this.cfg.mode === 'full' && routine && responseText && posted && msg.sessionId && !msg.file) {
+        try {
+          const progress = await this.conversationProgress.get(this.conversationKey(msg.sessionId, target));
+          if (!progress?.streamOff)
+            await this.deliverArtifacts(
+              msg.sessionId,
+              target,
+              'fallback:' + createHash('sha256').update(posted).digest('hex'),
+              responseText
+            );
+        } catch {
+          // Unreadable stream preferences must fail closed for files without retrying delivered text.
+        }
+      }
       return (this.last = { ok: true, at: this.now() });
     } catch (err) {
       this.lastSent.delete(key);

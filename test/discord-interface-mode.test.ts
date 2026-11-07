@@ -32,13 +32,14 @@ const cfg = {
 let dir: string;
 let sessions: Array<import('../src/discord-activity.js').DiscordActivitySession & { remote?: boolean }>;
 let bridges: DiscordBridge[];
-let posts: Array<{ path: string; method: string; body?: any }>;
+let posts: Array<{ path: string; method: string; body?: any; fileFields?: string[] }>;
 let sendInput: ReturnType<typeof vi.fn>;
 let sequence: number;
 let remoteChannels: Map<string, any>;
 let remoteMessages: Map<string, any>;
 let statusEditRefused: boolean;
 let artifactPostRefused: boolean;
+let artifactPostUncertain: boolean;
 let activityRenameRetryAfter: number | undefined;
 let uploaded: Array<{ name: string; text: string }>;
 /** Assert what a reader sees, across plain text and native response cards. */
@@ -78,7 +79,16 @@ function makeBridge(
           if (key.startsWith('files[') && file instanceof Blob)
             uploaded.push({ name: String((file as { name?: string }).name), text: await file.text() });
       }
-      posts.push({ path, method, body } as any);
+      posts.push({
+        path,
+        method,
+        body,
+        ...(init.body instanceof FormData
+          ? { fileFields: [...init.body.keys()].filter((k) => k.startsWith('files[')) }
+          : {}),
+      } as any);
+      if (artifactPostUncertain && method === 'POST' && init.body instanceof FormData)
+        throw Error('Upload outcome unknown');
       if (artifactPostRefused && method === 'POST' && init.body instanceof FormData)
         return Response.json({}, { status: 403 });
       if (/\/applications\/.*\/commands$/.test(path)) {
@@ -190,6 +200,7 @@ beforeEach(async () => {
   remoteMessages = new Map();
   statusEditRefused = false;
   artifactPostRefused = false;
+  artifactPostUncertain = false;
   activityRenameRetryAfter = undefined;
   uploaded = [];
   sendInput = vi.fn(async () => true);
@@ -2573,3 +2584,119 @@ it.each(['false', 'throw'])(
     expect(record.state).toBe('uncertain');
   }
 );
+
+const fallbackImageText =
+  '**Build overview**\n![Desktop](/work/output/desktop.png)\n![Inspector](/work/output/inspector.png)\n[Mobile mockup](/work/output/mobile.png)';
+const fallbackImageAlert = () => ({
+  sessionId: 's1',
+  sessionName: 'one',
+  event: 'hook:idle_prompt',
+  title: 'Waiting for Input',
+  body: '[one]',
+  urgency: 'warning' as const,
+  fullText: async () => ({ text: fallbackImageText, version: 'original-turn' }),
+});
+function fallbackFiles() {
+  return vi.fn(async (_id: string, path: string) => ({
+    name: path.split('/').at(-1)!,
+    data: Buffer.from('image-fixture'),
+  }));
+}
+it('uploads generated fallback images together after the answer, including remote workspaces', async () => {
+  sessions = [{ id: 's1', name: 'one', remote: true }];
+  const getAttachment = fallbackFiles();
+  const b = makeBridge(undefined, { getAttachment });
+  await b.reload();
+  await b.syncSessions();
+  expect((await b.notify(fallbackImageAlert()))?.ok).toBe(true);
+  expect(uploaded.map((f) => f.name)).toEqual(['desktop.png', 'inspector.png', 'mobile.png']);
+  const batches = posts.filter((p) => p.method === 'POST' && p.body?.content === 'Files from this response');
+  expect(batches).toHaveLength(1);
+  expect(batches[0].fileFields).toHaveLength(3);
+  expect(posts.findIndex((p) => visibleText(p.body)?.includes('**Build overview**'))).toBeLessThan(
+    posts.indexOf(batches[0])
+  );
+  expect(getAttachment).toHaveBeenCalledWith('s1', '/work/output/desktop.png', true);
+  expect(sendInput).not.toHaveBeenCalled();
+});
+it('does not duplicate a fallback image batch on redelivery or restart', async () => {
+  const getAttachment = fallbackFiles();
+  const b = makeBridge(undefined, { getAttachment });
+  await b.reload();
+  await b.syncSessions();
+  await b.notify(fallbackImageAlert());
+  await b.notify(fallbackImageAlert());
+  b.stop();
+  const restored = makeBridge(undefined, { getAttachment });
+  await restored.reload();
+  await restored.syncSessions();
+  await restored.notify(fallbackImageAlert());
+  expect(posts.filter((p) => p.method === 'POST' && p.body?.content === 'Files from this response')).toHaveLength(1);
+  expect(uploaded).toHaveLength(3);
+});
+it('keeps fallback text and allowed images when one linked file is refused', async () => {
+  const getAttachment = vi.fn(async (_id: string, path: string) => {
+    if (path.endsWith('inspector.png')) throw Error('Guard refused');
+    return { name: path.split('/').at(-1)!, data: Buffer.from('image') };
+  });
+  const b = makeBridge(undefined, { getAttachment });
+  await b.reload();
+  await b.syncSessions();
+  expect((await b.notify(fallbackImageAlert()))?.ok).toBe(true);
+  expect(uploaded.map((f) => f.name)).toEqual(['desktop.png', 'mobile.png']);
+  expect(posts.some((p) => visibleText(p.body)?.includes('**Build overview**'))).toBe(true);
+  expect(posts.some((p) => p.body?.content?.includes('Some linked output files could not be attached'))).toBe(true);
+});
+it('respects stream-off for fallback image transfer', async () => {
+  const getAttachment = fallbackFiles();
+  const b = makeBridge(undefined, {
+    getAttachment,
+    history: async () => ({ conversationId: 'native1', turns: [], partial: false }),
+  });
+  await b.reload();
+  await b.syncSessions();
+  const thread = (await readFullMap(dir)).s1;
+  await b.onGatewayMessage({
+    id: '900000000000000001',
+    guild_id: cfg.guildId,
+    channel_id: thread,
+    author: { id: cfg.allowedUserIds[0] },
+    content: '!codeman stream off',
+  });
+  await b.notify(fallbackImageAlert());
+  expect(getAttachment).not.toHaveBeenCalled();
+  expect(uploaded).toHaveLength(0);
+});
+it('does not replay a fallback image upload whose network outcome is uncertain', async () => {
+  const getAttachment = fallbackFiles();
+  const b = makeBridge(undefined, { getAttachment });
+  await b.reload();
+  await b.syncSessions();
+  artifactPostUncertain = true;
+  await b.notify(fallbackImageAlert());
+  const attempts = posts.filter((p) => p.method === 'POST' && p.body?.content === 'Files from this response');
+  expect(attempts.length).toBeGreaterThan(0);
+  expect(new Set(attempts.map((p) => p.body.nonce)).size).toBe(1);
+  expect(attempts.every((p) => p.body.enforce_nonce)).toBe(true);
+  b.stop();
+  artifactPostUncertain = false;
+  const restored = makeBridge(undefined, { getAttachment });
+  await restored.reload();
+  await restored.syncSessions();
+  await restored.notify(fallbackImageAlert());
+  expect(posts.filter((p) => p.method === 'POST' && p.body?.content === 'Files from this response')).toHaveLength(
+    attempts.length
+  );
+  expect(sendInput).not.toHaveBeenCalled();
+});
+
+it('keeps delivered fallback text when stream preferences cannot be read, without sending files', async () => {
+  const getAttachment = fallbackFiles();
+  const b = makeBridge(undefined, { getAttachment });
+  await b.reload();
+  await b.syncSessions();
+  await writeFile(join(dir, 'discord-conversations.json'), 'invalid json');
+  expect((await b.notify(fallbackImageAlert()))?.ok).toBe(true);
+  expect(getAttachment).not.toHaveBeenCalled();
+  expect(posts.some((p) => visibleText(p.body)?.includes('**Build overview**'))).toBe(true);
+});
