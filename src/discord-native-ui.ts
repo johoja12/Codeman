@@ -2,7 +2,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { DiscordUiStore } from './discord-ui-store.js';
 import { discordDisplayText } from './discord-display-text.js';
-import { splitForDiscord } from './discord-response-format.js';
 import type { DiscordInteraction, GatewayMessage, DiscordPost } from './discord-bridge.js';
 import type { DiscordNativeUiHost, DiscordUiPayload, DiscordUiSession } from './discord-native-ui-types.js';
 const hash = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -52,7 +51,6 @@ export class DiscordNativeUi {
   private commands = new Map<string, string>();
   private cardCursor = 0;
   private dashboardDue = 0;
-  private inboxSignature = '';
   private errors = new Map<string, number>();
   private epoch = randomUUID();
   private questionPanels = new Map<
@@ -179,11 +177,7 @@ export class DiscordNativeUi {
         s.cards[storeKey] = {
           channel,
           hash: digest,
-          kind: (key.startsWith('inbox:') ? 'dashboard' : key.split(':')[0]) as
-            | 'session'
-            | 'delivery'
-            | 'result'
-            | 'dashboard',
+          kind: key.split(':')[0] as 'session' | 'delivery' | 'result' | 'dashboard',
           phase: 'posting',
           updated: this.host.now(),
         };
@@ -208,11 +202,7 @@ export class DiscordNativeUi {
         channel,
         message,
         hash: digest,
-        kind: (key.startsWith('inbox:') ? 'dashboard' : key.split(':')[0]) as
-          | 'session'
-          | 'delivery'
-          | 'result'
-          | 'dashboard',
+        kind: key.split(':')[0] as 'session' | 'delivery' | 'result' | 'dashboard',
         phase: 'ready',
         updated: this.host.now(),
       };
@@ -432,96 +422,6 @@ export class DiscordNativeUi {
     return action;
   }
 
-  async refreshInbox(): Promise<void> {
-    const channel = this.host.config().parent;
-    if (!this.host.scope() || !this.host.inbox || !channel || !this.host.ownsChannel(channel)) return;
-    const payload = await this.inboxView({ channel });
-    const signature = hash(JSON.stringify(payload));
-    await this.upsert('inbox:main', channel, payload, true);
-    if (signature !== this.inboxSignature) {
-      this.dashboardDue = 0;
-      this.inboxSignature = signature;
-    }
-  }
-  private async inboxView(ctx: UiContext, page = 0): Promise<DiscordUiPayload> {
-    const entries = ((await this.host.inbox?.list()) ?? [])
-      .filter((e) => e.reviewed === undefined)
-      .sort((a, b) => b.completed - a.completed);
-    const list = entries.slice(page * 4, page * 4 + 4),
-      rows = [];
-    for (const [i, entry] of list.entries()) {
-      const identity = 'completion:' + entry.id;
-      rows.push(
-        row(
-          this.action(
-            ctx,
-            `Open response ${i + 1}`,
-            async () => {
-              if (!(await this.host.inbox!.list()).some((e) => e.id === entry.id))
-                throw new Error('Inbox entry expired');
-              const response = await this.host.inbox!.response(entry.id);
-              await this.host.inbox!.review([entry.id], 'discord');
-              const link = `https://discord.com/channels/${this.host.config().guild}/${entry.channel}${entry.message ? '/' + entry.message : ''}`;
-              return this.payload(
-                `**${safe(entry.name)}**\n${splitForDiscord(response.text, 1400, 1)[0] ?? ''}${response.text.length > 1450 ? '\n\nResponse excerpt; open the original for the full answer.' : ''}\n\n[Open original response](${link})\nMarked read across Codeman and Discord.`
-              );
-            },
-            undefined,
-            2,
-            identity + ':open'
-          ),
-          this.action(
-            ctx,
-            `Mark read ${i + 1}`,
-            async (m) => {
-              await this.host.inbox!.review([entry.id], 'discord');
-              return this.inboxView(this.ctx(m));
-            },
-            undefined,
-            2,
-            identity + ':read'
-          )
-        )
-      );
-    }
-    if (page > 0 || entries.length > (page + 1) * 4)
-      rows.push(
-        row(
-          ...(page > 0
-            ? [
-                this.action(
-                  ctx,
-                  'Previous',
-                  (m) => this.inboxView(this.ctx(m), page - 1),
-                  undefined,
-                  2,
-                  'inbox:prev:' + page
-                ),
-              ]
-            : []),
-          ...(entries.length > (page + 1) * 4
-            ? [
-                this.action(
-                  ctx,
-                  'More',
-                  (m) => this.inboxView(this.ctx(m), page + 1),
-                  undefined,
-                  2,
-                  'inbox:next:' + page
-                ),
-              ]
-            : [])
-        )
-      );
-    return this.payload(
-      `**Ready for review · ${entries.length}**\n` +
-        (list
-          .map((e, i) => `${i + 1}. **${safe(e.name, 90)}** · <t:${Math.floor(e.completed / 1000)}:R>\n<#${e.channel}>`)
-          .join('\n\n') || 'All caught up.') +
-        '\n\nShared inbox: viewing the response in Codeman, opening it here, marking read or replying clears its entry. Discord does not expose passive thread reads.',
-      rows
-    );
-  }
   async poll(): Promise<void> {
     if (this.polls) return this.polls;
     this.polls = this.runPoll()
@@ -601,9 +501,6 @@ export class DiscordNativeUi {
       }
     }
     this.cardCursor += Math.min(3, list.length);
-    await this.refreshInbox().catch(() => {
-      this.lastError = 'Completion inbox unavailable; review tracking paused';
-    });
     if (this.host.now() >= this.dashboardDue) {
       this.dashboardDue = this.host.now() + 90000;
       const channel = this.host.config().parent;
@@ -1348,10 +1245,9 @@ export class DiscordNativeUi {
       ),
       start = page * 8,
       list = filtered.slice(start, start + 8);
-    const unread = ((await this.host.inbox?.list()) ?? []).filter((e) => e.reviewed === undefined).length;
     const text =
       '**Codeman workspace**\n' +
-      `${all.length} sessions · ${all.filter((s) => s.pending).length} need input · ${unread} ready for review\n\n` +
+      `${all.length} sessions · ${all.filter((s) => s.pending).length} need input\n\n` +
       list
         .map(
           (s) =>
@@ -1367,7 +1263,6 @@ export class DiscordNativeUi {
         this.action(ctx, 'New session', (m) => this.launchPicker(m))
       ),
     ];
-    if (this.host.inbox) rows.push(row(this.action(ctx, `Inbox (${unread})`, (m) => this.inboxView(this.ctx(m)))));
     if (list.length)
       rows.push(
         row(
