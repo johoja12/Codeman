@@ -1,3 +1,5 @@
+import { claudeVisibleQuestion, claudeQuestionGone } from './claude-visible-question.js';
+import type { ApprovalItem } from './approval-inbox.js';
 import { claudePromptSuggestion } from '../session-submit-verifier.js';
 import { discordActivityWorking } from '../discord-activity.js';
 import { getCli } from '../config/cli-registry/registry.js';
@@ -19,6 +21,7 @@ interface Deps {
   allowed(): boolean;
   url(): string | undefined;
   capture?(id: string): string | null | undefined | Promise<string | null | undefined>;
+  questionObserved?(item: ApprovalItem): boolean | void | Promise<boolean | void>;
   observed?(id: string): { model: string; effort?: string } | undefined;
 }
 /** Match the native history reader: Claude IDs do not live in Codex resume fields. */
@@ -39,16 +42,24 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       watching: s.watching,
       activityStatus: s.activityProjection?.activityStatus,
     });
+  const observed = new Map<
+    string,
+    { id: string; text: string; conversation: string; revision: string; delivered: boolean }
+  >();
+  const reading = new Set<string>();
   const suggestion = async (s: Session) => {
     if (
       s.mode !== 'claude' ||
-      working(s) ||
+      reading.has(s.id) ||
       s.paneExit ||
       s.guardedInputHeld ||
       s.guardedInputPendingWrites ||
-      approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle')
+      approvalInbox
+        .listPending()
+        .some((p) => p.sessionId === s.id && p.kind !== 'idle' && p.id !== observed.get(s.id)?.id)
     )
       return undefined;
+    reading.add(s.id);
     try {
       const revision = s.discordQueueRevision,
         conversation = conversationFor(s);
@@ -56,24 +67,65 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       if (
         !deps.allowed() ||
         deps.sessions().get(s.id) !== s ||
-        working(s) ||
         s.paneExit ||
         s.guardedInputHeld ||
         s.guardedInputPendingWrites ||
         revision !== s.discordQueueRevision ||
         conversation !== conversationFor(s) ||
-        approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle')
+        approvalInbox
+          .listPending()
+          .some((p) => p.sessionId === s.id && p.kind !== 'idle' && p.id !== observed.get(s.id)?.id)
       )
         return undefined;
-      return frame ? claudePromptSuggestion(frame) : undefined;
+      if (!frame) return undefined;
+      const text = claudeVisibleQuestion(frame);
+      const previous = observed.get(s.id);
+      if (text && conversation && revision !== undefined) {
+        if (!previous || previous.text !== text || previous.conversation !== conversation) {
+          const item = approvalInbox.notePrompt({
+            sessionId: s.id,
+            sessionName: s.name || s.id.slice(0, 8),
+            mode: 'claude',
+            kind: 'question',
+            toolName: 'AskUserQuestion',
+            answerInTerminal: true,
+            message: text,
+            context: frame,
+            cwd: s.workingDir,
+          });
+          observed.set(s.id, { id: item.id, text, conversation, revision, delivered: false });
+        }
+        const current = observed.get(s.id)!;
+        const item = approvalInbox.getById(current.id);
+        if (item && !current.delivered) current.delivered = (await deps.questionObserved?.(item)) !== false;
+        return undefined;
+      }
+      if (
+        previous &&
+        (previous.conversation !== conversation || previous.revision !== revision || claudeQuestionGone(frame))
+      ) {
+        if (approvalInbox.getById(previous.id)) approvalInbox.resolveForSession(s.id, 'superseded');
+        observed.delete(s.id);
+      }
+      return !working(s) && !approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle')
+        ? claudePromptSuggestion(frame)
+        : undefined;
     } catch {
       return undefined;
+    } finally {
+      reading.delete(s.id);
     }
   };
   return {
     enabled: () => deps.allowed(),
     sessions: async () => {
       if (!deps.allowed()) return [];
+      for (const [id, old] of observed) {
+        if (!deps.sessions().has(id)) {
+          if (approvalInbox.getById(old.id)) approvalInbox.resolveForSession(id, 'expired');
+          observed.delete(id);
+        }
+      }
       const cases = await deps.cases();
       return Promise.all(
         [...deps.sessions().values()].map(async (s) => {
