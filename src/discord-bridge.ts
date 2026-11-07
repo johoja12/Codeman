@@ -1551,7 +1551,10 @@ export class DiscordBridge {
       if (user) this.uiPrompts.set(sessionId, { conversation: history.conversationId, text: user.text.slice(0, 400) });
       if (history.conversationId !== progress.conversationId)
         throw new BridgeProblem('Conversation changed; synchronize history first');
-      await this.deliveries.reconcileNative(sessionId, history);
+      const includeTools = progress.verbose;
+      await this.deliveries.reconcileNative(sessionId, history, (after) =>
+        this.deps.history!(sessionId, { includeTools, after })
+      );
       if (progress.streamOff) return;
       const discordPrompts = await this.deliveries.submittedUserCursors(sessionId, channel, history.conversationId);
       const at = progress.cursor ? history.turns.findIndex((t) => t.cursor === progress!.cursor) : -1;
