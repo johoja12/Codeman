@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { hashDiscordPrompt } from '../src/discord-native-execution.js';
 import { readDiscordSessionFile } from '../src/discord-file-transfers.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { DiscordHistoryReadError } from '../src/discord-history.js';
 import {
   DEFAULT_DISCORD_CONFIG,
   DiscordBridge,
@@ -257,6 +258,19 @@ describe('Discord interface mode', () => {
       content: warning,
       author: { id: cfg.allowedUserIds[0] },
     });
+    const reconnect = '988888888888888883';
+    remoteMessages.set(reconnect, {
+      id: reconnect,
+      channel_id: thread,
+      author: { id: BOT },
+      components: [
+        { type: 17, components: [{ type: 10, content: '**Reconnecting to this conversation**' }] },
+        {
+          type: 10,
+          content: 'Your response is available in Codeman. I’m restoring the connection so replies can appear here.',
+        },
+      ],
+    });
     appended = true;
     await b.pollConversations();
     expect(history).toHaveBeenCalledWith('s1', expect.objectContaining({ after: 'native1:old' }));
@@ -274,6 +288,7 @@ describe('Discord interface mode', () => {
     expect(responses()).toHaveLength(1);
     expect(remoteMessages.get(botWarning).content).toBe('History reconnected. Live replies are synchronized.');
     expect(remoteMessages.get(userWarning).content).toBe(warning);
+    expect(remoteMessages.get(reconnect).components[0].components[0].content).toBe('**Conversation reconnected**');
     now += 20000;
     await again.pollConversations();
     expect(responses()).toHaveLength(1);
@@ -1934,4 +1949,30 @@ it('does not show a reconnect notice for a connected session with no assistant r
     posts.some((p) => p.body?.components?.[0]?.components?.[0]?.content === '**Reconnecting to this conversation**')
   ).toBe(false);
   expect(posts.some((p) => JSON.stringify(p.body ?? {}).includes('Ask Codex to do anything'))).toBe(false);
+});
+
+it('reports an unverified profile as actionable history attention instead of promising automatic reconnection', async () => {
+  const error = new DiscordHistoryReadError('profile_unverified');
+  const b = makeBridge(undefined, {
+    history: async () => {
+      throw error;
+    },
+  });
+  await b.reload();
+  await b.syncSessions();
+  await b.notify({
+    sessionId: 's1',
+    event: 'hook:idle_prompt',
+    title: 'Waiting for Input',
+    body: 'idle',
+    urgency: 'warning',
+    fullText: async () => {
+      throw error;
+    },
+  });
+  const bodies = posts.map((p) => JSON.stringify(p.body ?? {})).join('\n');
+  expect(bodies).toContain('Reply history needs attention');
+  expect(bodies).toContain('CODEX_HOME');
+  expect(bodies).not.toContain('I’m restoring the connection');
+  expect(sendInput).not.toHaveBeenCalled();
 });

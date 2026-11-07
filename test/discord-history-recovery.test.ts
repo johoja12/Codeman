@@ -1,6 +1,9 @@
 import { beforeEach, expect, it, vi } from 'vitest';
-vi.mock('../src/discord-history.js', () => ({ readDiscordSessionHistory: vi.fn(), readDiscordHistory: vi.fn() }));
-import { readDiscordSessionHistory, readDiscordHistory } from '../src/discord-history.js';
+vi.mock('../src/discord-history.js', async (original) => ({
+  ...(await original<typeof import('../src/discord-history.js')>()),
+  readDiscordSessionHistory: vi.fn(),
+}));
+import { readDiscordSessionHistory, DiscordHistoryReadError } from '../src/discord-history.js';
 import { readDiscordCanonicalHistory } from '../src/discord-history-recovery.js';
 import type { Session } from '../src/session.js';
 const id = '019a6ac0-1234-7123-a123-123456789abc';
@@ -41,18 +44,15 @@ beforeEach(() => {
       run({ current, capture: async () => screen, write, cancelMenu: vi.fn() })
     ),
   } as unknown as Session;
-  vi.mocked(readDiscordSessionHistory).mockImplementation(async () => {
-    if (session.nativeResumeId) return history;
+  vi.mocked(readDiscordSessionHistory).mockImplementation(async (_s, _o, recovered) => {
+    if (recovered || session.nativeResumeId) return history;
     throw new Error('identity unavailable');
   });
-  vi.mocked(readDiscordHistory).mockResolvedValue(history);
 });
 it('recovers exact remote identity through a guarded local status command and verified transcript header', async () => {
   expect(await readDiscordCanonicalHistory(session, {}, () => allowed)).toEqual(history);
   expect(write).toHaveBeenCalledExactlyOnceWith('/status\r');
-  expect(readDiscordHistory).toHaveBeenCalledWith(
-    expect.objectContaining({ conversationId: id, remote: session.remote })
-  );
+  expect(readDiscordSessionHistory).toHaveBeenCalledWith(session, {}, id);
   expect(session.setNativeResumeId).toHaveBeenCalledExactlyOnceWith(id);
   await readDiscordCanonicalHistory(session, {}, () => allowed);
   expect(write).toHaveBeenCalledTimes(1);
@@ -66,17 +66,24 @@ it.each(['busy', 'draft', 'not-permitted'] as const)('sends no command when %s',
   expect(session.setNativeResumeId).not.toHaveBeenCalled();
 });
 it('does not adopt a status ID when its exact transcript is unavailable and backs off retries', async () => {
-  vi.mocked(readDiscordHistory).mockRejectedValue(new Error('header unavailable'));
+  vi.mocked(readDiscordSessionHistory).mockRejectedValue(new Error('header unavailable'));
   await expect(readDiscordCanonicalHistory(session, {}, () => allowed)).rejects.toThrow('header unavailable');
   await expect(readDiscordCanonicalHistory(session, {}, () => allowed)).rejects.toThrow('header unavailable');
   expect(write).toHaveBeenCalledTimes(1);
   expect(session.setNativeResumeId).not.toHaveBeenCalled();
 });
 it('rejects a pane/input revision change while the verified transcript is being read', async () => {
-  vi.mocked(readDiscordHistory).mockImplementation(async () => {
+  vi.mocked(readDiscordSessionHistory).mockImplementation(async (_s, _o, recovered) => {
+    if (!recovered) throw new Error('identity unavailable');
     Object.assign(session, { nativeModelSettingsRevision: 'changed' });
     return history;
   });
   await expect(readDiscordCanonicalHistory(session, {}, () => allowed)).rejects.toThrow('changed');
   expect(session.setNativeResumeId).not.toHaveBeenCalled();
+});
+
+it.each(['profile_unverified', 'profile_changed'])('does not issue status commands for a %s error', async (code) => {
+  vi.mocked(readDiscordSessionHistory).mockRejectedValue(new DiscordHistoryReadError(code));
+  await expect(readDiscordCanonicalHistory(session, {}, () => true)).rejects.toThrow(/profile/);
+  expect(write).not.toHaveBeenCalled();
 });
