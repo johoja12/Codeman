@@ -17,6 +17,8 @@ Codeman can post to a private Discord server when a session needs you, group ses
 - Saves files you attach in a thread into that tab's working folder and tells the CLI the path. A CLI can send a file back with `codeman notify "message" --file <path>`.
 - Tells each CLI about `codeman notify` (see [Telling the CLIs](#telling-the-clis)).
 
+Streamed commentary, progress status, mirrored prompts, tool output and supplemental chunks/files are silent: they remain visible and may show an unread badge, but do not trigger push or desktop notifications. The first final-response card remains eligible for normal notifications; permission and needs-input alerts retain their existing notification and mention policy. Discord server/thread mute settings and per-user notification preferences still apply.
+
 ## Setup
 
 Do these once, in order. Never paste the bot token into a chat or a session.

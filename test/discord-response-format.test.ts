@@ -4,6 +4,7 @@ import {
   discordResponsePosts,
   formatDiscordResponseText,
   DISCORD_COMPONENTS_V2,
+  DISCORD_SUPPRESS_NOTIFICATIONS,
   discordProgressPost,
 } from '../src/discord-response-format.js';
 const body = (post: ReturnType<typeof discordResponsePosts>[number]) =>
@@ -139,10 +140,20 @@ it('bounds prose-formatting CPU on steerable punctuation and long path-like inpu
   expect((used.user + used.system) / 1000).toBeLessThan(300);
 });
 
-it('keeps completion evidence separate from progress prose', () => {
+it('keeps completion evidence separate from silent progress prose', () => {
   const post = discordProgressPost('Working', 'The checks passed.\nStill building.', 2);
-  expect(post.flags).toBe(DISCORD_COMPONENTS_V2 | 4);
+  expect(post.flags).toBe(DISCORD_COMPONENTS_V2 | 4 | DISCORD_SUPPRESS_NOTIFICATIONS);
   expect(post.components?.[0].content).toBe('-# Working · 2 progress updates');
   expect(post.components?.[1].content).toBe('The checks passed. Still building.');
   expect(post.components?.some((c) => c.type === 17)).toBe(false);
+});
+
+it('silences every update chunk and only allows the first final chunk to notify', () => {
+  const text = 'Update with details.\n'.repeat(350);
+  const updates = discordResponsePosts(text, { silent: true });
+  expect(updates.length).toBeGreaterThan(1);
+  expect(updates.every((p) => !!(p.flags! & DISCORD_SUPPRESS_NOTIFICATIONS))).toBe(true);
+  const final = discordResponsePosts(text);
+  expect(final[0].flags! & DISCORD_SUPPRESS_NOTIFICATIONS).toBe(0);
+  expect(final.slice(1).every((p) => !!(p.flags! & DISCORD_SUPPRESS_NOTIFICATIONS))).toBe(true);
 });

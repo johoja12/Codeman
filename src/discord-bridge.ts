@@ -28,6 +28,7 @@ import {
   discordResponsePosts,
   discordProgressPost,
   DISCORD_COMPONENTS_V2,
+  DISCORD_SUPPRESS_NOTIFICATIONS,
   splitForDiscord,
   DISCORD_WARNING_COLOR,
   DISCORD_CRITICAL_COLOR,
@@ -1381,12 +1382,19 @@ export class DiscordBridge {
         }
         if (turn.cursor === latestReply?.cursor) {
           // The newest answer is the user's current context, not a clipped history preview.
-          for (const [part, post] of discordResponsePosts(visible, { title: 'Latest response' }).entries())
+          for (const [part, post] of discordResponsePosts(visible, {
+            title: 'Latest response',
+            silent: true,
+          }).entries())
             await this.deliverPost(channel, post, undefined, sessionId, `history:${turn.cursor}:full:${part}`);
           if (visible.length > 12000)
             await this.deliverPost(
               channel,
-              { content: 'Full user-visible response', allowed_mentions: { parse: [], users: [] } },
+              {
+                content: 'Full user-visible response',
+                flags: DISCORD_SUPPRESS_NOTIFICATIONS,
+                allowed_mentions: { parse: [], users: [] },
+              },
               { name: 'response.txt', data: Buffer.from(discordDisplayText(turn.text)) },
               sessionId,
               `history:${turn.cursor}:full:overflow`
@@ -1400,7 +1408,7 @@ export class DiscordBridge {
             '\n`!codeman history` / `!codeman transcript` for more';
           await this.deliverPost(
             channel,
-            { content: text, allowed_mentions: { parse: [], users: [] } },
+            { content: text, flags: DISCORD_SUPPRESS_NOTIFICATIONS, allowed_mentions: { parse: [], users: [] } },
             undefined,
             sessionId,
             `history:${turn.cursor}`
@@ -1487,6 +1495,7 @@ export class DiscordBridge {
       await this.deliverPost(
         channel,
         {
+          flags: DISCORD_SUPPRESS_NOTIFICATIONS,
           content: files.length ? 'Files from this response' + (skipped ? '\n' + note : '') : note,
           allowed_mentions: { parse: [], users: [] },
         },
@@ -1501,6 +1510,7 @@ export class DiscordBridge {
         await this.deliverPost(
           channel,
           {
+            flags: DISCORD_SUPPRESS_NOTIFICATIONS,
             content:
               'Output file delivery could not be confirmed. Check the thread before downloading again through Results & files or !codeman file.',
             allowed_mentions: { parse: [], users: [] },
@@ -1680,13 +1690,18 @@ export class DiscordBridge {
             .join('\n\n');
           for (const [part, post] of discordResponsePosts(text, {
             title: group.length > 1 ? `Updates (${group.length})` : 'Update',
+            silent: true,
             color: 0x99aab5,
           }).entries())
             await this.deliverPost(channel, post, undefined, sessionId, `native:${turn.cursor}:updates:${part}`);
           if (text.length > 12000)
             await this.deliverPost(
               channel,
-              { content: 'Full assistant updates', allowed_mentions: { parse: [], users: [] } },
+              {
+                content: 'Full assistant updates',
+                flags: DISCORD_SUPPRESS_NOTIFICATIONS,
+                allowed_mentions: { parse: [], users: [] },
+              },
               { name: 'updates.txt', data: Buffer.from(text) },
               sessionId,
               `native:${turn.cursor}:updates:overflow`
@@ -1703,13 +1718,18 @@ export class DiscordBridge {
         if (turn.role === 'user' && !discordPrompts.has(turn.cursor) && turn.text.trim()) {
           for (const [part, post] of discordResponsePosts(turn.text, {
             title: 'User prompt',
+            silent: true,
             color: 0x99aab5,
           }).entries())
             await this.deliverPost(channel, post, undefined, sessionId, `native:${turn.cursor}:prompt:${part}`);
           if (turn.text.length > 12000)
             await this.deliverPost(
               channel,
-              { content: 'Full user prompt', allowed_mentions: { parse: [], users: [] } },
+              {
+                content: 'Full user prompt',
+                flags: DISCORD_SUPPRESS_NOTIFICATIONS,
+                allowed_mentions: { parse: [], users: [] },
+              },
               { name: 'prompt.txt', data: Buffer.from(turn.text) },
               sessionId,
               `native:${turn.cursor}:prompt:overflow`
@@ -1739,13 +1759,21 @@ export class DiscordBridge {
                   subtitle: label ? clip(label.replace(/[@`*_~<>\r\n]/g, ''), 120) : undefined,
                   controls,
                 })
-              : splitForDiscord(formatted).map((content) => ({ content, allowed_mentions: { parse: [], users: [] } }));
+              : splitForDiscord(formatted).map((content) => ({
+                  content,
+                  flags: DISCORD_SUPPRESS_NOTIFICATIONS,
+                  allowed_mentions: { parse: [], users: [] },
+                }));
           for (const [i, post] of responsePosts.entries())
             await this.deliverPost(channel, post, undefined, sessionId, `native:${turn.cursor}:${i}`);
           if (visible.length > 12000 || formatted.length > 12000)
             await this.deliverPost(
               channel,
-              { content: 'Full user-visible response', allowed_mentions: { parse: [], users: [] } },
+              {
+                content: 'Full user-visible response',
+                flags: DISCORD_SUPPRESS_NOTIFICATIONS,
+                allowed_mentions: { parse: [], users: [] },
+              },
               { name: 'response.txt', data: Buffer.from(visible) },
               sessionId,
               `native:${turn.cursor}:overflow`
