@@ -96,7 +96,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
             promptSuggestion,
             lastPromptAt: s.lastRealPromptAt || undefined,
             pendingAt: pending?.createdAt,
-            pendingRevision: pending?.id,
+            pendingRevision: pending ? discordApprovalRevision(pending) : undefined,
             pending: approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle'),
             exited: !!s.paneExit,
             ready: !working(s) && !s.paneExit && !s.guardedInputHeld && !s.guardedInputPendingWrites,
