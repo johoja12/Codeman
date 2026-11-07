@@ -1534,7 +1534,7 @@ it('renders the approved five-row activity layout using actual session events', 
   f.host.responseMessage = async (id) => String(777777777777777777n + BigInt(Number(id.slice(1))));
   const ages = [22, 76, 194, 357, 528, 741];
   const summaries = [
-    'Silent updates deployed. All 25 sessions preserved.',
+    'Reverted and deployed [176](https://github.com/johoja12/Codeman/pull/176). Titles are plain bold again.',
     'Checking preview generation across the library.',
     'Waiting for your approval to continue.',
     'Health checks passed. Services are responding.',
@@ -1604,5 +1604,34 @@ it('keeps a plain session heading and a clickable preview without making Review 
   expect(text).toContain('**🟡 w1-Codeman**');
   expect(text).not.toContain(`[🟡 w1-Codeman](${target})`);
   expect(text).toContain(`[Work is in progress.](${target})`);
+  expect(f.host.submit).not.toHaveBeenCalled();
+});
+
+it('renders saved URL-bearing previews as one valid thread link while keeping titles plain', async () => {
+  const f = await fixture();
+  f.sessions[0].working = false;
+  await f.ui.observeHistory('s1', {
+    conversationId: 'conversation-one',
+    partial: false,
+    turns: [
+      {
+        role: 'assistant',
+        cursor: 'a',
+        timestamp: new Date(900000).toISOString(),
+        text: 'Reverted and deployed [176](https://github.com/johoja12/Codeman/pull/176). Titles are plain bold again.',
+      },
+    ],
+  });
+  const stored = (await f.ui.store.snapshot()).activities;
+  expect(Object.values(stored)[0].summary).toContain('https://github.com/');
+  const view = await f.command('codeman');
+  const section = discordUiNodes(view.components).find((n) => n.type === 9)!;
+  const text = String((section.components as Array<{ content: string }>)[0].content);
+  const line = text.split('\n').find((l) => l.startsWith('-# ['))!;
+  expect(text).toContain('**⚫ w1-Codeman**');
+  expect(line).toBe(
+    `-# [Reverted and deployed 176. Titles are plain bold again.](https://discord.com/channels/${guild}/${channel})`
+  );
+  expect((await f.ui.store.snapshot()).activities).toEqual(stored);
   expect(f.host.submit).not.toHaveBeenCalled();
 });

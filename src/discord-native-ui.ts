@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   activityFromHistory,
   activityText,
+  activityPreviewText,
   newerActivity,
   DISCORD_ACTIVITY_VIEWS,
   type DiscordActivityEvent,
@@ -1804,7 +1805,7 @@ export class DiscordNativeUi {
           disabled: true,
         };
       const heading = `${icon} ${activityText(s.name, 60)}`;
-      const preview = activityText(summary, 120);
+      const preview = activityPreviewText(summary, 120) || 'Open the thread for the latest update.';
       body.push({
         type: 9,
         components: [

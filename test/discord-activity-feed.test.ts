@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { activityFromHistory, activityText, newerActivity } from '../src/discord-activity-feed.js';
+import { activityFromHistory, activityText, activityPreviewText, newerActivity } from '../src/discord-activity-feed.js';
 import { nativeExecutions } from '../src/discord-native-execution.js';
 describe('meaningful Discord activity', () => {
   it('ignores invalid times, tools and internal display annotations', () => {
@@ -57,4 +57,30 @@ describe('meaningful Discord activity', () => {
     )!;
     expect(event.summary).toBe('New prompt submitted.');
   });
+});
+
+it.each([
+  [
+    'Reverted and deployed [176](https://github.com/johoja12/Codeman/pull/176). Titles are plain bold again.',
+    'Reverted and deployed 176. Titles are plain bold again.',
+  ],
+  [
+    'The fault matches an OpenSSL bug (https://github.com/openssl/openssl/pull/33481): this is fixed.',
+    'The fault matches an OpenSSL bug: this is fixed.',
+  ],
+  ['See https://example.test/a?x=1&y=2 for details.', 'See for details.'],
+  ['Read <https://example.test/path> and www.example.test/docs.', 'Read and.'],
+  [
+    'The response has (balanced notes) and https://example.test/path(with-parentheses). More detail.',
+    'The response has balanced notes and. More detail.',
+  ],
+  ['A restored preview ending (https://github.com/johoja12/Code', 'A restored preview ending'],
+])('normalizes nested URL labels: %s', (input, expected) => {
+  const label = activityPreviewText(input, 180);
+  expect(label).toBe(expected);
+  expect(label).not.toMatch(/:\/\/|www\.|[\[\]<>]/i);
+});
+it('bounds long labels and leaves URL-only labels empty for the UI fallback', () => {
+  expect(activityPreviewText('x'.repeat(9000))).toHaveLength(120);
+  expect(activityPreviewText('https://example.test')).toBe('');
 });
