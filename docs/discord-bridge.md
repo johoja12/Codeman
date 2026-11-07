@@ -340,3 +340,8 @@ This is resumable delivery, not a permanent transcript backup. The native host/p
 ### Names for Discord-created sessions
 
 Case-channel launches use the same numbered names as web launches: `w1-flux-player`, `w2-flux-player`, and so on (`sN-case` for shell sessions). The next number follows existing instances of that case. Concurrent Discord confirmations reserve distinct names before creating their sessions. The name is passed to the existing creation service before the agent and thread start, so Codeman and Discord show the same case-based name instead of a short UUID. Existing explicitly named sessions are left unchanged.
+
+
+### Oversized tool records during native catch-up
+
+Conversation and Quiet readers can pass over bounded Codex `function_call_output`, `custom_tool_call_output` and image-generation Extension events that contain no chat messages. The original record hash is verified and retained as the next cursor; their contents are not posted. This prevents large image/tool payloads from blocking later user prompts, progress or final answers. The 2 MB visible-history page budget and 16 MB individual-record scan cap remain enforced. Oversized visible, unknown, malformed or ambiguous records still pause rather than being silently discarded. Tools mode retains the stricter behavior for oversized requested output; use Conversation/Quiet or the web transcript for that case.
