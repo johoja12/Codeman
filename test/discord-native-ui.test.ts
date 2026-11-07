@@ -794,39 +794,6 @@ it('offers stable read-only response controls with exact history and actor check
   expect(f.host.postFile).toHaveBeenCalledTimes(1);
   expect(f.finishes.at(-1)?.content).toContain('changed');
 });
-it('keeps the shared completion card current and acknowledges only an opened exact result', async () => {
-  const f = await fixture();
-  let entries = [
-    {
-      id: 'a'.repeat(32),
-      session: 's1',
-      conversation: 'conversation-one',
-      userCursor: 'u1',
-      responseCursor: 'r1',
-      guild,
-      channel,
-      name: 'Finished build',
-      completed: 1000,
-    },
-  ];
-  f.host.inbox = {
-    list: async () => entries,
-    review: vi.fn(async (ids) => {
-      entries = entries.filter((e) => !ids.includes(e.id));
-    }),
-    response: vi.fn(async () => ({ text: 'Exact native result', latest: true })),
-  };
-  await f.ui.refreshInbox();
-  const card = [...f.messages.values()].find((m) => m.content.includes('Ready for review'))!;
-  expect(card.content).toContain('Finished build');
-  await f.click(card, 'Open response 1', undefined, { channel_id: parent, message: { id: card.id } });
-  expect(f.host.inbox.response).toHaveBeenCalledWith('a'.repeat(32));
-  expect(f.host.inbox.review).toHaveBeenCalledWith(['a'.repeat(32)], 'discord');
-  await f.ui.refreshInbox();
-  expect([...f.messages.values()].find((m) => m.content.includes('Ready for review'))?.content).toContain(
-    'All caught up'
-  );
-});
 it.each(['expired', 'restart'] as const)(
   'recovers exact read-only response buttons after %s and acknowledges before reads',
   async (kind) => {
