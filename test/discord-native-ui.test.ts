@@ -979,3 +979,68 @@ it('does not upload a response when its conversation changes during the final hi
   expect(f.host.postFile).not.toHaveBeenCalled();
   expect(f.finishes.at(-1)?.content).toContain('changed');
 });
+
+it.each(['send', 'edited', 'changed', 'busy', 'revision', 'conversation', 'unauthorized', 'duplicate'] as const)(
+  'reviews a native Claude suggestion and guards %s submission',
+  async (kind) => {
+    const f = await fixture();
+    Object.assign(f.sessions[0], { mode: 'claude', working: false, promptSuggestion: 'Run the focused tests' });
+    await f.ui.poll();
+    const card = f.findCard();
+    expect(card.content).toContain('Claude suggests:');
+    await f.click(card, 'Use suggestion');
+    expect(f.host.submit).not.toHaveBeenCalled();
+    const modal = f.responses.at(-1) as {
+      type: number;
+      data: { custom_id: string; components: Array<{ components: Array<{ value: string }> }> };
+    };
+    expect(modal.type).toBe(9);
+    expect(modal.data.components[0].components[0].value).toBe('Run the focused tests');
+    if (kind === 'changed') f.sessions[0].promptSuggestion = 'Different suggestion';
+    if (kind === 'busy') f.sessions[0].working = true;
+    if (kind === 'revision') f.sessions[0].inputRevision = 'new-input';
+    if (kind === 'conversation') f.sessions[0].conversation = 'replacement';
+    const text = kind === 'edited' ? 'Run tests and review the diff' : 'Run the focused tests';
+    const event = f.event(
+      { custom_id: modal.data.custom_id },
+      {
+        type: 5,
+        data: {
+          custom_id: modal.data.custom_id,
+          components: [{ type: 1, components: [{ type: 4, custom_id: 'prompt', value: text }] }],
+        },
+        ...(kind === 'unauthorized' ? { member: { user: { id: '999999999999999999' } } } : {}),
+      }
+    );
+    await f.ui.interaction(event);
+    if (['send', 'edited', 'duplicate'].includes(kind)) {
+      expect(f.host.submit).toHaveBeenCalledWith(
+        's1',
+        channel,
+        actor,
+        'suggestion:' + event.id,
+        text,
+        'conversation-one',
+        true,
+        'input-one'
+      );
+      if (kind === 'duplicate') await f.ui.interaction(event);
+      expect(f.host.submit).toHaveBeenCalledTimes(1);
+    } else expect(f.host.submit).not.toHaveBeenCalled();
+  }
+);
+it.each([{ working: true }, { pending: true }, { ready: false }, { mode: 'codex' }])(
+  'hides native suggestions when unavailable: %j',
+  async (state) => {
+    const f = await fixture();
+    Object.assign(f.sessions[0], { mode: 'claude', working: false, promptSuggestion: 'Run the tests' }, state);
+    await f.ui.poll();
+    expect(f.findCard().content).not.toContain('Claude suggests:');
+    expect(
+      f
+        .findCard()
+        .components?.flatMap((r) => r.components)
+        .some((c) => c.label === 'Use suggestion')
+    ).toBe(false);
+  }
+);

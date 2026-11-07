@@ -11,14 +11,20 @@ export interface DiscordActivitySession {
   exited?: boolean;
 }
 
-/** Background work is observable activity, but never foreground typing or a question. */
+/** All observed work shares one Discord state, avoiding rename notices between work types. */
+export function discordActivityWorking(session: DiscordActivitySession): boolean {
+  return !!(
+    session.working ||
+    session.watching?.trim() ||
+    session.activityStatus === 'waiting_agents' ||
+    session.activityStatus === 'checking_agents'
+  );
+}
+
 function activityLabel(session: DiscordActivitySession): string {
   if (session.exited) return '⚫ Offline';
   if (session.waiting) return '🔴 Needs input';
-  if (session.working) return '🟡 Working';
-  if (session.activityStatus === 'waiting_agents') return '🟡 Waiting for agents';
-  if (session.activityStatus === 'checking_agents') return '🟡 Checking agents';
-  if (session.watching?.trim()) return '🟡 Background work';
+  if (discordActivityWorking(session)) return '🟡 Working';
   return '⚫ Idle';
 }
 
@@ -119,7 +125,7 @@ export class DiscordActivity {
       this.progress.set(id, progress);
     }
     const now = this.deps.now();
-    if (session.working || session.waiting || session.exited) progress.idleSince = undefined;
+    if (discordActivityWorking(session) || session.waiting || session.exited) progress.idleSince = undefined;
     else progress.idleSince ??= now;
     if ((progress.verifyRetryAt ?? 0) > now) return;
     const needsRename = () => {
@@ -142,7 +148,8 @@ export class DiscordActivity {
     const needsTyping = () => {
       const s = current();
       return (
-        s?.working &&
+        s &&
+        discordActivityWorking(s) &&
         !s.waiting &&
         !s.exited &&
         (progress.typingRetryAt ?? 0) <= now &&
@@ -168,7 +175,7 @@ export class DiscordActivity {
       try {
         await this.deps.typing(destination, () => {
           const s = current();
-          return !!s?.working && !s.waiting && !s.exited;
+          return !!s && discordActivityWorking(s) && !s.waiting && !s.exited;
         });
       } catch (error) {
         progress.typingRetryAt = this.deps.now() + retryAfter(error);

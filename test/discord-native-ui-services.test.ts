@@ -46,3 +46,40 @@ describe('native Discord server services', () => {
     );
   });
 });
+
+it('projects background work as busy and captures only ready Claude suggestions', async () => {
+  const s = {
+    id: 's1',
+    name: 'Claude',
+    mode: 'claude',
+    nativeResumeId: 'conversation',
+    discordQueueRevision: 'revision',
+    isWorking: false,
+    watching: null,
+    activityProjection: { activityStatus: 'idle' },
+    workingDir: '/tmp',
+  } as unknown as Session;
+  let captures = 0;
+  const services = createDiscordNativeUiServices({
+    sessions: () => new Map([['s1', s]]),
+    cases: async () => [],
+    allowed: () => true,
+    url: () => undefined,
+    capture: () => {
+      captures++;
+      return '────────\n❯ \x1b[2mWrite regression tests\x1b[0m\n────────';
+    },
+  });
+  expect((await services.sessions())[0]).toMatchObject({
+    working: false,
+    ready: true,
+    promptSuggestion: 'Write regression tests',
+  });
+  Object.assign(s, { watching: '1 background task' });
+  expect((await services.sessions())[0]).toMatchObject({ working: true, ready: false, promptSuggestion: undefined });
+  Object.assign(s, { watching: null, activityProjection: { activityStatus: 'waiting_agents' } });
+  expect((await services.sessions())[0]).toMatchObject({ working: true, ready: false, promptSuggestion: undefined });
+  Object.assign(s, { mode: 'codex', activityProjection: { activityStatus: 'idle' } });
+  expect((await services.sessions())[0].promptSuggestion).toBeUndefined();
+  expect(captures).toBe(1);
+});

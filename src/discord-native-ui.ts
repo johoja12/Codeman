@@ -276,11 +276,70 @@ export class DiscordNativeUi {
         this.action(ctx, 'Delivery status', (m) => this.delivery(m, s.id))
       ),
     ];
+    const suggestion =
+      s.mode === 'claude' && s.ready && !s.working && !s.pending && !s.exited ? s.promptSuggestion : undefined;
+    const conversation = s.conversation,
+      inputRevision = s.inputRevision;
+    if (suggestion && conversation && inputRevision) {
+      controls.push(
+        row(
+          this.action(
+            ctx,
+            'Use suggestion',
+            async (m, fields) => {
+              const fresh = await this.target(s.id, conversation);
+              if (
+                !fresh.ready ||
+                fresh.working ||
+                fresh.pending ||
+                fresh.promptSuggestion !== suggestion ||
+                fresh.inputRevision !== inputRevision
+              )
+                throw new Error('The suggestion or session changed. Reopen the session card.');
+              const text = fields.prompt?.trim();
+              if (!text || text.length > 1000) throw new Error('Enter a prompt of up to 1000 characters.');
+              const actor = m.member?.user?.id ?? m.user?.id;
+              if (!actor) throw new Error('Discord user unavailable');
+              const result = await this.host.submit(
+                s.id,
+                this.host.channelForSession(s.id)!,
+                actor,
+                'suggestion:' + m.id,
+                text,
+                conversation,
+                true,
+                inputRevision
+              );
+              return this.payload(
+                result === 'accepted'
+                  ? 'Prompt delivered. Native submission is not yet confirmed.'
+                  : result === 'blocked'
+                    ? 'Session changed or is busy. Nothing was sent.'
+                    : 'Submission unconfirmed; inspect the session before retrying.'
+              );
+            },
+            {
+              title: 'Review Claude suggestion',
+              fields: [
+                {
+                  id: 'prompt',
+                  label: 'Edit the prompt, then Submit to send',
+                  value: suggestion,
+                  multiline: true,
+                  max: 1000,
+                },
+              ],
+            },
+            1
+          )
+        )
+      );
+    }
     if (s.url && /^https?:\/\//.test(s.url))
       controls[1].components.push({ type: 2, style: 5, label: 'Open Codeman', url: s.url });
     const task = this.host.latestPrompt?.(s.id, s.conversation) ?? '';
     return this.payload(
-      `**${safe(s.caseName)} · ${safe(s.host)}**\n${status} · ${safe(s.mode)}\n\n**Model:** ${safe(s.model || 'Not reported')}\n**Effort:** ${safe(s.effort || 'Not reported')}\n**Launch approvals:** ${safe(s.approval || 'CLI default / not reported')}\n**Conversation:** ${safe(s.conversation || 'Not yet identified')}\n${task ? '\n**Latest prompt:** ' + safe(task, 240) + '\n' : ''}${last ? '\n**Latest delivery:** ' + (stateLabels[last.state] ?? safe(last.state)) : ''}${q.some((p) => p.state === 'uncertain') ? '\n⚠ A queued submission is unconfirmed; it will not replay.' : ''}`,
+      `**${safe(s.caseName)} · ${safe(s.host)}**\n${status} · ${safe(s.mode)}\n${suggestion ? '\n**Claude suggests:** ' + safe(suggestion, 600) + '\n' : ''}\n**Model:** ${safe(s.model || 'Not reported')}\n**Effort:** ${safe(s.effort || 'Not reported')}\n**Launch approvals:** ${safe(s.approval || 'CLI default / not reported')}\n**Conversation:** ${safe(s.conversation || 'Not yet identified')}\n${task ? '\n**Latest prompt:** ' + safe(task, 240) + '\n' : ''}${last ? '\n**Latest delivery:** ' + (stateLabels[last.state] ?? safe(last.state)) : ''}${q.some((p) => p.state === 'uncertain') ? '\n⚠ A queued submission is unconfirmed; it will not replay.' : ''}`,
       controls
     );
   }
