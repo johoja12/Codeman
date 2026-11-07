@@ -1,8 +1,7 @@
 /** Canonical Discord history, with one guarded native status read for an unbound remote Codex pane. */
-import { posix } from 'node:path';
 import type { Session } from './session.js';
 import { getCli } from './config/cli-registry/registry.js';
-import { readDiscordHistory, readDiscordSessionHistory, type DiscordHistory } from './discord-history.js';
+import { readDiscordSessionHistory, DiscordHistoryReadError, type DiscordHistory } from './discord-history.js';
 import { readCodexModelStatus, nativeModelComposerReady } from './discord-model-controls.js';
 import { stripAnsi } from './utils/regex-patterns.js';
 const attempts = new WeakMap<Session, { retryAt: number; run: Promise<DiscordHistory> }>();
@@ -16,6 +15,8 @@ export async function readDiscordCanonicalHistory(
   } catch (original) {
     const cli = getCli(session.mode);
     if (
+      (original instanceof DiscordHistoryReadError &&
+        ['profile_unverified', 'profile_changed'].includes(original.code)) ||
       !permitted() ||
       !session.remote ||
       session.nativeResumeId ||
@@ -56,17 +57,7 @@ export async function readDiscordCanonicalHistory(
             .replace(/\s*[│┃]\s*$/gm, '');
           const status = readCodexModelStatus(text);
           if (status && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(status.session)) {
-            let configHome = session.envOverrideValue('CODEX_HOME');
-            if (configHome && !configHome.startsWith('~/') && !posix.isAbsolute(configHome))
-              configHome = posix.resolve(remote.remotePath, configHome);
-            const history = await readDiscordHistory({
-              mode: session.mode,
-              conversationId: status.session,
-              remote,
-              configHome,
-              includeTools: options.includeTools,
-              after: options.after,
-            });
+            const history = await readDiscordSessionHistory(session, options, status.session);
             if (!allowed() || !lease.current() || history.conversationId !== status.session)
               throw new Error('Conversation changed during transcript recovery');
             session.setNativeResumeId(status.session);

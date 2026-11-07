@@ -40,7 +40,7 @@ import { DiscordCaseThreads, type DiscordStarter } from './discord-case-threads.
 import type { DiscordCaseIdentity } from './discord-case-identity.js';
 import { hashDiscordPrompt } from './discord-native-execution.js';
 import { DiscordConversationProgressStore } from './discord-conversation-progress.js';
-import { renderHistory, discordHistoryFailureReason } from './discord-history.js';
+import { renderHistory, discordHistoryFailureReason, DiscordHistoryReadError } from './discord-history.js';
 import { existsSync, mkdirSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
@@ -570,7 +570,9 @@ export class DiscordApi {
   getMessage(parent: string, id: string): Promise<DiscordStarter | null> {
     return this.request('GET', `/channels/${parent}/messages/${id}`);
   }
-  channelMessages(parent: string): Promise<Array<DiscordStarter & { content?: string }> | null> {
+  channelMessages(
+    parent: string
+  ): Promise<Array<DiscordStarter & { content?: string; components?: DiscordPost['components'] }> | null> {
     return this.request('GET', `/channels/${parent}/messages?limit=100`);
   }
   createThreadFromMessage(parent: string, id: string, name: string): Promise<DiscordManagedChannel | null> {
@@ -1522,8 +1524,34 @@ export class DiscordBridge {
       const bot = await this.api.botUserId();
       if (!bot?.id || !current()) return;
       const messages = await this.api.channelMessages(channel);
+      const displays = (nodes: unknown, depth = 0): string[] => {
+        if (!Array.isArray(nodes) || depth > 5) return [];
+        return nodes.flatMap((node) =>
+          !node || typeof node !== 'object'
+            ? []
+            : node.type === 10 && typeof node.content === 'string'
+              ? [node.content]
+              : displays(node.components, depth + 1)
+        );
+      };
       for (const message of messages ?? []) {
         if (!current()) return;
+        const text = displays(message.components);
+        if (
+          message.author?.id === bot.id &&
+          text[0] === '**Reconnecting to this conversation**' &&
+          text.includes(
+            'Your response is available in Codeman. I’m restoring the connection so replies can appear here.'
+          )
+        ) {
+          await this.api.editMessage(
+            channel,
+            message.id,
+            discordResponsePosts('Live replies are connected to this conversation.', {
+              title: 'Conversation reconnected',
+            })[0]
+          );
+        }
         if (
           message.author?.id === bot.id &&
           message.content ===
@@ -2086,6 +2114,7 @@ export class DiscordBridge {
     await this.ensureLoaded();
     if (!shouldSendDiscord(this.cfg, msg.urgency)) return null;
     const key = `${msg.event}:${msg.sessionId ?? ''}`;
+    let profileReadFailure = false;
     const t = this.now();
     const prev = this.lastSent.get(key);
     // A deliberate post (an agent's own `codeman notify`) is never deduped: a second, different message is real.
@@ -2125,7 +2154,8 @@ export class DiscordBridge {
           )
             return { ok: true, deduped: true, at: this.now() };
         }
-      } catch {
+      } catch (error) {
+        profileReadFailure = error instanceof DiscordHistoryReadError && error.code.startsWith('profile_');
         /* preserve the ordinary alert when native delivery is unavailable */
       }
     }
@@ -2162,7 +2192,8 @@ export class DiscordBridge {
             return { ok: true, deduped: true, at: this.now() };
           } // Notifications keeps its legacy header behavior.
         }
-      } catch {
+      } catch (error) {
+        profileReadFailure ||= error instanceof DiscordHistoryReadError && error.code.startsWith('profile_');
         // no transcript to read: the screen tail stands in
       }
     }
@@ -2215,9 +2246,11 @@ export class DiscordBridge {
       if (!progress?.streamOff) {
         if (this.unavailableNotices.has(noticeKey)) return { ok: true, deduped: true, at: this.now() };
         const notice = discordResponsePosts(
-          'Your response is available in Codeman. I’m restoring the connection so replies can appear here.',
+          profileReadFailure
+            ? 'I couldn’t verify this session’s Codex profile. Check its launch profile or CODEX_HOME setting, then retry history. The session remains available in Codeman.'
+            : 'Your response is available in Codeman. I’m restoring the connection so replies can appear here.',
           {
-            title: 'Reconnecting to this conversation',
+            title: profileReadFailure ? 'Reply history needs attention' : 'Reconnecting to this conversation',
             color: DISCORD_WARNING_COLOR,
             users: [],
           }

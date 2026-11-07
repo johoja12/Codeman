@@ -1,5 +1,9 @@
 import { discordDisplayText } from './discord-display-text.js';
-import { probeRemoteDiscordConversation } from './discord-remote-conversation.js';
+import {
+  probeRemoteDiscordConversation,
+  probeRemoteDiscordRuntime,
+  type RemoteDiscordRuntime,
+} from './discord-remote-conversation.js';
 import { getCli } from './config/cli-registry/registry.js';
 import { nativeExecutions, type DiscordNativeExecution } from './discord-native-execution.js';
 /** Read-only, exact-conversation history. No cwd guesses, model turns, tool results or reasoning. */
@@ -98,7 +102,11 @@ export class DiscordHistoryReadError extends Error {
           ? 'Saved history record changed; live replay paused for safety'
           : code === 'record_too_large'
             ? 'A transcript record exceeds the bounded recovery size'
-            : 'History recovery is unavailable'
+            : code === 'profile_unverified'
+              ? 'Remote Codex profile could not be verified; check its launch profile'
+              : code === 'profile_changed'
+                ? 'Remote Codex profile or process changed during history read; retry after reconnecting'
+                : 'History recovery is unavailable'
     );
   }
 }
@@ -398,10 +406,36 @@ export function historyPage(
   return { turns: history.turns.slice(start, end), older: start > 0 ? history.turns[start].cursor : undefined };
 }
 
+const remoteRuntimeHomes = new WeakMap<
+  import('./session.js').Session,
+  { scope: string; runtime: RemoteDiscordRuntime }
+>();
+function remoteHistoryScope(
+  session: import('./session.js').Session,
+  resumeId: string | null = session.nativeResumeId
+): string {
+  const remote = session.remote;
+  return JSON.stringify([
+    session.mode,
+    remote?.hostId,
+    remote?.host,
+    remote?.username,
+    remote?.port,
+    remote?.remotePath,
+    remote?.codexCommandProfileId,
+    remote?.commands?.codex,
+    resumeId,
+    session.codexConfig?.resumeSessionId,
+    session.envOverrideValue('CODEX_HOME'),
+    session.nativeModelSettingsRevision,
+  ]);
+}
+
 /** Adapts live Session metadata; never guesses by shared directory or falls back to terminal redraws. */
 export async function readDiscordSessionHistory(
   session: import('./session.js').Session,
-  options?: { includeTools?: boolean; after?: string }
+  options?: { includeTools?: boolean; after?: string },
+  recoveredRemoteId?: string
 ): Promise<DiscordHistory> {
   const format = getCli(session.mode)?.capabilities.transcript;
   let id =
@@ -431,24 +465,64 @@ export async function readDiscordSessionHistory(
   }
   if (session.docker) throw new Error('Container history is not available through this reader');
   const remote = session.remote;
-  const discovered =
-    format === 'codex-rollout' && remote && !id
-      ? await probeRemoteDiscordConversation(remote, session.id).catch(() => undefined)
-      : undefined;
-  id ??= discovered;
-  const history = await readDiscordHistory({
-    mode: session.mode,
-    conversationId: id,
-    remote: session.remote,
-    configHome,
-    includeTools: options?.includeTools,
-    after: options?.after,
-  });
-  // Publish only after the exact transcript header was verified, and never overwrite a concurrent adoption.
-  if (discovered && (session.remote !== remote || (session.nativeResumeId && session.nativeResumeId !== discovered)))
-    throw new Error('Native conversation changed during history discovery');
-  if (discovered && !session.nativeResumeId) session.setNativeResumeId(discovered);
-  return history;
+  const resumeIdBefore = session.nativeResumeId;
+  const scope = remoteHistoryScope(session);
+  if (recoveredRemoteId) {
+    if (!remote || format !== 'codex-rollout' || (id && id !== recoveredRemoteId))
+      throw new DiscordHistoryReadError('profile_changed');
+    id = recoveredRemoteId;
+  }
+  let runtime: RemoteDiscordRuntime | undefined;
+  let discovered: string | undefined;
+  try {
+    if (format === 'codex-rollout' && remote && !configHome) {
+      const cached = remoteRuntimeHomes.get(session);
+      runtime =
+        cached?.scope === scope
+          ? cached.runtime
+          : await probeRemoteDiscordRuntime(remote, session.id).catch(() => undefined);
+      if (!runtime && !(session.paneExit && id)) throw new DiscordHistoryReadError('profile_unverified');
+      if (runtime?.id && id && runtime.id !== id) throw new DiscordHistoryReadError('profile_changed');
+      if (runtime) {
+        configHome = runtime.configHome;
+        if (!id) discovered = runtime.id;
+      }
+    } else if (format === 'codex-rollout' && remote && !id) {
+      discovered = await probeRemoteDiscordConversation(remote, session.id).catch(() => undefined);
+    }
+    id ??= discovered;
+    const history = await readDiscordHistory({
+      mode: session.mode,
+      conversationId: id,
+      remote,
+      configHome,
+      includeTools: options?.includeTools,
+      after: options?.after,
+    });
+    if (remote) {
+      if (runtime) {
+        const fresh = await probeRemoteDiscordRuntime(remote, session.id).catch(() => undefined);
+        if (
+          !(session.paneExit && !fresh) &&
+          (!fresh ||
+            fresh.fingerprint !== runtime.fingerprint ||
+            fresh.configHome !== runtime.configHome ||
+            fresh.id !== runtime.id)
+        )
+          throw new DiscordHistoryReadError('profile_changed');
+      }
+      const compatibleAdoption = session.nativeResumeId === id && remoteHistoryScope(session, resumeIdBefore) === scope;
+      if (session.remote !== remote || (remoteHistoryScope(session) !== scope && !compatibleAdoption))
+        throw new DiscordHistoryReadError('profile_changed');
+    }
+    // The exact native file/header and current owned runtime must both confirm the binding first.
+    if (discovered && !session.nativeResumeId) session.setNativeResumeId(discovered);
+    if (runtime) remoteRuntimeHomes.set(session, { scope: remoteHistoryScope(session), runtime });
+    return history;
+  } catch (error) {
+    remoteRuntimeHomes.delete(session);
+    throw error;
+  }
 }
 export function renderHistory(turns: DiscordHistoryTurn[], options: { includeTimestamps?: boolean } = {}): string {
   return turns
