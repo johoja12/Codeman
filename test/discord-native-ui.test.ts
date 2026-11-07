@@ -1253,3 +1253,36 @@ it('never substitutes a newer response when selected historical output is missin
   expect(f.finishes.at(-1)?.content).toContain('outside the available history');
   expect(f.host.file).not.toHaveBeenCalled();
 });
+
+it.each(['missing identity', 'ownership failure', 'Discord post failure'])(
+  'reports busy-control preparation failure as unsent: %s',
+  async (kind) => {
+    const f = await fixture();
+    if (kind === 'missing identity') f.sessions[0].conversation = undefined;
+    if (kind === 'ownership failure')
+      f.host.verify = vi.fn(async () => {
+        throw Error('Ownership unavailable');
+      });
+    if (kind === 'Discord post failure') {
+      const request = f.host.request;
+      let first = true;
+      f.host.request = vi.fn(async (...args) => {
+        if (args[0] === 'POST' && first) {
+          first = false;
+          throw Error('Discord unavailable');
+        }
+        return request(...args);
+      });
+    }
+    await f.ui.offerBusy(
+      's1',
+      channel,
+      { id: snow(), guild_id: guild, channel_id: channel, author: { id: actor }, content: 'Follow up' },
+      'source-one'
+    );
+    expect(f.host.note).toHaveBeenCalledWith('source-one', 'cancelled');
+    expect([...f.messages.values()].some((m) => m.content.includes('This follow-up was not sent.'))).toBe(true);
+    expect(f.host.submit).not.toHaveBeenCalled();
+    expect(f.host.prepare).not.toHaveBeenCalled();
+  }
+);

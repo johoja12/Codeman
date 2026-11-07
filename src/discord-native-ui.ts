@@ -1085,6 +1085,24 @@ export class DiscordNativeUi {
     );
   }
   async offerBusy(id: string, channel: string, message: GatewayMessage, source: string): Promise<void> {
+    // Preparing buttons never writes to the terminal. Failures here are known unsent input,
+    // unlike a transport exception after an actual submit attempt.
+    try {
+      await this.offerBusyChoice(id, channel, message, source);
+    } catch {
+      await this.host.note(source, 'cancelled');
+      await this.host
+        .request(
+          'POST',
+          `/channels/${channel}/messages`,
+          this.payload(
+            'This follow-up was not sent. Its send/queue controls could not be prepared. Check the session, then send it as a new message.'
+          )
+        )
+        .catch(() => undefined);
+    }
+  }
+  private async offerBusyChoice(id: string, channel: string, message: GatewayMessage, source: string): Promise<void> {
     const s = await this.target(id);
     if (!s.conversation) throw new Error('Exact conversation unavailable; nothing was submitted');
     const ctx: UiContext = {

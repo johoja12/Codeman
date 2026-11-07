@@ -52,7 +52,8 @@ it('projects background work as busy and captures only ready Claude suggestions'
     id: 's1',
     name: 'Claude',
     mode: 'claude',
-    nativeResumeId: 'conversation',
+    nativeResumeId: 'stale-codex-id',
+    claudeSessionId: 'conversation',
     discordQueueRevision: 'revision',
     isWorking: false,
     watching: null,
@@ -82,4 +83,82 @@ it('projects background work as busy and captures only ready Claude suggestions'
   Object.assign(s, { mode: 'codex', activityProjection: { activityStatus: 'idle' } });
   expect((await services.sessions())[0].promptSuggestion).toBeUndefined();
   expect(captures).toBe(1);
+});
+
+it.each([
+  ['claude', 'claude-conversation', 'stale-codex-id', undefined, 'claude-conversation'],
+  ['codex', 'unrelated-claude-id', 'codex-conversation', undefined, 'codex-conversation'],
+  ['codex', 'unrelated-claude-id', undefined, 'resume-conversation', 'resume-conversation'],
+  ['claude', undefined, 'stale-codex-id', undefined, undefined],
+  ['claude', null, 'stale-codex-id', undefined, undefined],
+])(
+  'projects %s conversation using its native protocol',
+  async (mode, claudeSessionId, nativeResumeId, resumeSessionId, expected) => {
+    const s = {
+      id: 's1',
+      mode,
+      claudeSessionId,
+      nativeResumeId,
+      codexConfig: { resumeSessionId },
+      isWorking: true,
+      activityProjection: { activityStatus: 'busy' },
+    } as unknown as Session;
+    const services = createDiscordNativeUiServices({
+      sessions: () => new Map([['s1', s]]),
+      cases: async () => [],
+      allowed: () => true,
+      url: () => undefined,
+    });
+    expect((await services.sessions())[0].conversation).toBe(expected);
+  }
+);
+it('guards Claude queued submission with the real Claude conversation, revision and idle state', async () => {
+  const attempts: boolean[] = [];
+  const s = {
+    id: 's1',
+    mode: 'claude',
+    claudeSessionId: 'claude-one',
+    nativeResumeId: undefined,
+    discordQueueRevision: 'revision',
+    isWorking: false,
+    activityProjection: { activityStatus: 'idle' },
+    submitDiscordFollowup: async (_text: string, current: () => boolean) => {
+      const ok = current();
+      attempts.push(ok);
+      return ok ? 'accepted' : 'blocked';
+    },
+  } as unknown as Session;
+  const services = createDiscordNativeUiServices({
+    sessions: () => new Map([['s1', s]]),
+    cases: async () => [],
+    allowed: () => true,
+    url: () => undefined,
+  });
+  expect(await services.submitQueued('s1', 'Follow up\r', 'claude-one', () => true, 'revision')).toBe('accepted');
+  expect(await services.submitQueued('s1', 'Follow up\r', 'stale', () => true, 'revision')).toBe('blocked');
+  expect(await services.submitQueued('s1', 'Follow up\r', 'claude-one', () => true, 'old-revision')).toBe('blocked');
+  Object.assign(s, { isWorking: true });
+  expect(await services.submitQueued('s1', 'Follow up\r', 'claude-one', () => true, 'revision')).toBe('blocked');
+  expect(attempts).toEqual([true, false, false, false]);
+});
+it('refuses a Claude suggestion if its real conversation changes during capture', async () => {
+  const s = {
+    id: 's1',
+    mode: 'claude',
+    claudeSessionId: 'before',
+    isWorking: false,
+    discordQueueRevision: 'revision',
+    activityProjection: { activityStatus: 'idle' },
+  } as unknown as Session;
+  const services = createDiscordNativeUiServices({
+    sessions: () => new Map([['s1', s]]),
+    cases: async () => [],
+    allowed: () => true,
+    url: () => undefined,
+    capture: () => {
+      Object.assign(s, { claudeSessionId: 'after' });
+      return '────────\n❯ \x1b[2mWrite tests\x1b[0m\n────────';
+    },
+  });
+  expect((await services.sessions())[0].promptSuggestion).toBeUndefined();
 });
