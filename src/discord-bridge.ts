@@ -21,7 +21,7 @@ import { DiscordHistoryWarnings } from './discord-history-warnings.js';
  * @module discord-bridge
  */
 import { discordArtifactPaths, DISCORD_ARTIFACT_COUNT } from './discord-artifacts.js';
-import { DiscordNativeUi } from './discord-native-ui.js';
+import { DiscordNativeUi, uiV2Payload } from './discord-native-ui.js';
 import type { DiscordNativeUiServices } from './discord-native-ui-types.js';
 import { registerDiscordLaunchCommands } from './discord-launch-commands.js';
 import {
@@ -297,7 +297,7 @@ export interface DiscordInteraction {
   };
   member?: { user?: { id: string } };
   user?: { id: string };
-  message?: { id: string };
+  message?: { id: string; flags?: number };
 }
 interface DiscordBoundAction {
   sessionId: string;
@@ -1046,10 +1046,13 @@ export class DiscordBridge {
           await this.api.respondInteraction(m.id, m.token, body);
         },
         finish: async (m, body) => {
+          if ((m.message?.flags ?? 0) & DISCORD_COMPONENTS_V2) body = uiV2Payload(body);
           await this.api.request(
             'PATCH',
             `/webhooks/${encodeURIComponent(m.application_id)}/${encodeURIComponent(m.token)}/messages/@original`,
-            body
+            body.flags && body.flags & DISCORD_COMPONENTS_V2
+              ? { ...discordWirePost(body), flags: body.flags | 64, content: null, embeds: [] }
+              : body
           );
         },
         control: async (id, command) => this.deps.control?.(id, command) ?? { text: 'Session controls unavailable' },
@@ -1109,6 +1112,21 @@ export class DiscordBridge {
         locate: async (id) => {
           const result = await this.threadFor(id, undefined);
           return typeof result === 'string' ? result : undefined;
+        },
+        responseMessage: async (id, cursor) => {
+          const channel = this.channels.channelForSession(this.cfg, id);
+          if (!channel) return undefined;
+          const keys = [`native:${cursor}:0`, `history:${cursor}:full:0`].map((key) =>
+            createHash('sha256').update(`${this.cfg.guildId}:${channel}:${key}`).digest('hex')
+          );
+          const record = (await this.deliveries.recentForSession(id)).find(
+            (r) =>
+              keys.includes(r.id) &&
+              r.guildId === this.cfg.guildId &&
+              r.channelId === channel &&
+              r.state === 'delivered'
+          );
+          return record?.messageId;
         },
         botId: () => (this.activityBot ??= this.api.botUserId().then((me) => me?.id)),
       });
@@ -1360,6 +1378,7 @@ export class DiscordBridge {
         };
         await this.conversationProgress.set(key, progress);
       }
+      await this.nativeUi?.observeHistory(sessionId, history).catch(() => undefined);
       if (progress.seeded) return;
       const latestReply = [...history.turns]
         .reverse()
@@ -1646,6 +1665,7 @@ export class DiscordBridge {
         this.deps.history!(sessionId, { includeTools, after })
       );
       if (!attributed) return;
+      await this.nativeUi?.observeHistory(sessionId, history).catch(() => undefined);
       if (progress.streamOff) return;
       const discordPrompts = await this.deliveries.submittedUserCursors(sessionId, channel, history.conversationId);
       const at = progress.cursor ? history.turns.findIndex((t) => t.cursor === progress!.cursor) : -1;
@@ -1788,6 +1808,7 @@ export class DiscordBridge {
         };
         await this.conversationProgress.set(key, progress);
       }
+      await this.nativeUi?.observeHistory(sessionId, history).catch(() => undefined);
       // Raw tool/metadata pages still make durable progress after all visible turns were delivered.
       if (history.verifiedAfter && history.scannedCursor && history.turns.length - (at + 1) <= 20) {
         progress = { ...progress, cursor: history.scannedCursor };

@@ -1,0 +1,28 @@
+[
+  {
+    "viewport": {
+      "width": 1440,
+      "height": 1280
+    },
+    "rows": 5,
+    "components": 35,
+    "renderedActualImplementationPayload": true,
+    "recentDefault": true,
+    "navigationVisible": true,
+    "horizontalOverflow": false,
+    "pageErrors": []
+  },
+  {
+    "viewport": {
+      "width": 390,
+      "height": 844
+    },
+    "rows": 5,
+    "components": 35,
+    "renderedActualImplementationPayload": true,
+    "recentDefault": true,
+    "navigationVisible": true,
+    "horizontalOverflow": false,
+    "pageErrors": []
+  }
+]

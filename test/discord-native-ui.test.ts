@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm, readFile, writeFile, symlink, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DiscordNativeUi } from '../src/discord-native-ui.js';
+import { DiscordNativeUi, discordUiNodes, uiV2Payload, uiWirePayload } from '../src/discord-native-ui.js';
 import { DiscordUiStore } from '../src/discord-ui-store.js';
 import type {
   DiscordNativeUiHost,
@@ -153,9 +153,9 @@ async function fixture() {
     botId: async () => bot,
   };
   const ui = new DiscordNativeUi(host);
-  const findCard = () => [...messages.values()].find((m) => m.content.includes('Launch approvals'))!;
+  const findCard = () => [...messages.values()].find((m) => (m.content ?? '').includes('Launch approvals'))!;
   const component = (view: DiscordUiPayload, label: string) =>
-    view.components!.flatMap((r) => r.components).find((c) => c.label === label || c.placeholder === label)!;
+    discordUiNodes(view.components).find((c) => c.label === label || c.placeholder === label)!;
   const event = (
     c: Record<string, unknown>,
     extra: Partial<DiscordInteraction> = {},
@@ -258,7 +258,7 @@ describe('native Discord UI', () => {
     const f = await fixture();
     f.host.receipts = async () => [{ id: 'completed-input', state: 'completed', updated: 1 }];
     await f.ui.poll();
-    expect([...f.messages.values()].some((m) => m.content.startsWith('**Results & files'))).toBe(false);
+    expect([...f.messages.values()].some((m) => (m.content ?? '').startsWith('**Results & files'))).toBe(false);
     expect(f.host.verify).not.toHaveBeenCalled();
   });
   it('recreates a deleted owned card and refuses a message now owned by someone else', async () => {
@@ -552,9 +552,17 @@ describe('native Discord UI', () => {
       ])
     );
     const dashboard = await f.command('codeman');
-    expect(dashboard.content).toContain('1 sessions');
-    const filtered = await f.click(dashboard, 'Needs input', undefined, { channel_id: parent });
-    expect(filtered.content).not.toContain('w1-Codeman');
+    expect(
+      discordUiNodes(dashboard.components)
+        .map((n) => n.content)
+        .join('\n')
+    ).toContain('1 sessions');
+    const filtered = await f.click(dashboard, 'Choose activity view', ['attention'], { channel_id: parent });
+    expect(
+      discordUiNodes(filtered.components)
+        .map((n) => n.content)
+        .join('\n')
+    ).not.toContain('w1-Codeman');
     expect(f.host.request).not.toHaveBeenCalledWith('PUT', expect.stringContaining('/commands'), expect.anything());
   });
   it('creates a source-based session from another channel without posting a management reply there', async () => {
@@ -684,7 +692,7 @@ it('uses reactions/journal state without creating a delivery card at any normal 
     await f.ui.receipt('s1', 'input-one');
     await f.ui.poll();
   }
-  expect([...f.messages.values()].some((m) => m.content.includes('**Prompt delivery**'))).toBe(false);
+  expect([...f.messages.values()].some((m) => (m.content ?? '').includes('**Prompt delivery**'))).toBe(false);
   expect((await f.host.receipts('s1'))[0].state).toBe('completed');
   expect(f.host.submit).not.toHaveBeenCalled();
   expect(f.host.note).not.toHaveBeenCalled();
@@ -757,10 +765,10 @@ it('cleans up at most three legacy cards per poll and never recreates them after
   await f.ui.poll();
   expect(vi.mocked(f.host.request).mock.calls.filter(([method]) => method === 'DELETE')).toHaveLength(3);
   await f.ui.poll();
-  expect([...f.messages.values()].some((m) => m.content.includes('**Prompt delivery**'))).toBe(false);
+  expect([...f.messages.values()].some((m) => (m.content ?? '').includes('**Prompt delivery**'))).toBe(false);
   const restored = new DiscordNativeUi(f.host);
   await restored.poll();
-  expect([...f.messages.values()].some((m) => m.content.includes('**Prompt delivery**'))).toBe(false);
+  expect([...f.messages.values()].some((m) => (m.content ?? '').includes('**Prompt delivery**'))).toBe(false);
 });
 it('offers stable read-only response controls with exact history and actor checks', async () => {
   const f = await fixture();
@@ -1270,7 +1278,7 @@ it.each(['missing identity', 'ownership failure'])(
       'source-one'
     );
     expect(f.host.note).toHaveBeenCalledWith('source-one', 'cancelled');
-    expect([...f.messages.values()].some((m) => m.content.includes('This follow-up was not sent.'))).toBe(true);
+    expect([...f.messages.values()].some((m) => (m.content ?? '').includes('This follow-up was not sent.'))).toBe(true);
     expect(f.host.submit).not.toHaveBeenCalled();
     expect(f.host.prepare).not.toHaveBeenCalled();
   }
@@ -1291,4 +1299,284 @@ it('keeps unconfirmed control-card publication ambiguous rather than claiming un
   ).rejects.toThrow('POST outcome unknown');
   expect(f.host.note).not.toHaveBeenCalled();
   expect(f.host.submit).not.toHaveBeenCalled();
+});
+
+const activityBody = (payload: DiscordUiPayload) =>
+  discordUiNodes(payload.components)
+    .filter((n) => n.type === 10)
+    .map((n) => n.content)
+    .join('\n');
+it('replaces a legacy dashboard in place, pins it and always keeps its shared view Recent', async () => {
+  const f = await fixture();
+  const key = createHash('sha256')
+    .update(guild + ':' + parent + ':dashboard:main')
+    .digest('hex');
+  const id = snow();
+  f.messages.set(id, {
+    id,
+    channel: parent,
+    author: { id: bot },
+    content: '**Codeman workspace**\n-# Codeman · dashboard · ' + key.slice(0, 10),
+    components: [],
+  });
+  await f.ui.store.edit((s) => {
+    s.cards[key] = { kind: 'dashboard', phase: 'ready', channel: parent, message: id, hash: 'old', updated: 1 };
+  });
+  await f.ui.poll();
+  const shared = f.messages.get(id)!;
+  expect(shared.flags! & 32768).toBeTruthy();
+  expect(shared.flags! & 4096).toBeTruthy();
+  expect(shared.content).toBeNull();
+  expect(activityBody(shared)).toContain('## Activity');
+  expect(f.host.request).toHaveBeenCalledWith('PUT', `/channels/${parent}/messages/pins/${id}`);
+  expect([...f.messages.values()].filter((m) => m.channel === parent)).toHaveLength(1);
+  const menu = f.component(shared, 'Choose activity view');
+  await f.ui.interaction(f.event(menu, { channel_id: parent, message: { id } }, ['finished']));
+  expect(f.responses.at(-1)).toMatchObject({ type: 5, data: { flags: 64 } });
+  expect(activityBody(f.finishes.at(-1)!)).toContain('**Finished**');
+  expect(activityBody(f.messages.get(id)!)).toContain('**Recent activity**');
+  expect(discordUiNodes(shared.components).length).toBeLessThanOrEqual(40);
+  expect(JSON.stringify(shared.allowed_mentions)).toBe(JSON.stringify({ parse: [], users: [] }));
+  f.advance(21000);
+  await f.ui.poll();
+  expect([...f.messages.values()].filter((m) => m.channel === parent)).toHaveLength(1);
+  const restored = new DiscordNativeUi(f.host);
+  await restored.poll();
+  expect([...f.messages.values()].filter((m) => m.channel === parent)).toHaveLength(1);
+});
+it('orders durable native activity by event time, keeps completion proof and exact response links across restarts', async () => {
+  const f = await fixture();
+  f.sessions[0].working = false;
+  f.host.responseMessage = async () => '777777777777777777';
+  const history = {
+    conversationId: 'conversation-one',
+    partial: false,
+    turns: [
+      {
+        role: 'user' as const,
+        cursor: 'u',
+        timestamp: new Date(800000).toISOString(),
+        text: 'Private prompt must not be previewed',
+      },
+      {
+        role: 'assistant' as const,
+        cursor: 'r',
+        phase: 'final_answer' as const,
+        timestamp: new Date(900000).toISOString(),
+        text: 'Deployment verified.',
+      },
+    ],
+    executions: [
+      {
+        userCursor: 'u',
+        promptHash: 'x',
+        state: 'completed' as const,
+        timestamp: new Date(910000).toISOString(),
+        cursor: 'done',
+      },
+    ],
+  };
+  await f.ui.observeHistory('s1', history);
+  await f.ui.poll();
+  let dashboard = [...f.messages.values()].find((m) => m.channel === parent)!;
+  expect(activityBody(dashboard)).toContain('Turn finished · <t:910:R>');
+  expect(activityBody(dashboard)).toContain('Deployment verified.');
+  expect(activityBody(dashboard)).not.toContain('Private prompt');
+  expect(discordUiNodes(dashboard.components).find((n) => n.label === 'View reply')?.url).toBe(
+    `https://discord.com/channels/${guild}/${channel}/777777777777777777`
+  );
+  const raw = await readFile(join(f.dir, 'discord-native-ui.json'), 'utf8');
+  f.advance(21000);
+  await f.ui.observeHistory('s1', history);
+  expect(await readFile(join(f.dir, 'discord-native-ui.json'), 'utf8')).toBe(raw);
+  const restarted = new DiscordNativeUi(f.host);
+  await restarted.poll();
+  dashboard = [...f.messages.values()].find((m) => m.channel === parent)!;
+  expect(activityBody(dashboard)).toContain('Turn finished · <t:910:R>');
+  f.advance(3600001);
+  await restarted.poll();
+  const privateView = await f.command('codeman');
+  const finished = await f.click(privateView, 'Choose activity view', ['finished'], { channel_id: parent });
+  expect(activityBody(finished)).not.toContain('w1-Codeman');
+});
+it('does not infer completion from idle or prose and clears old conversation activity', async () => {
+  const f = await fixture();
+  f.sessions[0].working = false;
+  await f.ui.observeHistory('s1', {
+    conversationId: 'conversation-one',
+    partial: false,
+    turns: [
+      {
+        role: 'assistant',
+        cursor: 'r',
+        phase: 'final_answer',
+        timestamp: new Date(900000).toISOString(),
+        text: 'Everything is complete.',
+      },
+    ],
+  });
+  const view = await f.command('codeman');
+  expect(activityBody(view)).toContain('Response received');
+  expect(activityBody(view)).not.toContain('Turn finished');
+  f.sessions[0].conversation = 'new-conversation';
+  const fresh = await f.command('codeman');
+  expect(activityBody(fresh)).not.toContain('Everything is complete');
+  f.setScope('different-scope');
+  const scoped = await f.command('codeman');
+  expect(activityBody(scoped)).not.toContain('Everything is complete');
+});
+it('retains event timestamps across refreshes and moves newly updated sessions to the top with private pagination', async () => {
+  const f = await fixture();
+  f.sessions.push(
+    ...Array.from({ length: 6 }, (_, i) => ({
+      ...f.sessions[0],
+      id: 's' + (i + 2),
+      name: 'Session ' + (i + 2),
+      working: false,
+      lastPromptAt: 800000 + i * 1000,
+    }))
+  );
+  f.sessions[0].lastPromptAt = 700000;
+  f.host.channelForSession = (id) => String(222222222222222222n + BigInt(Number(id.slice(1)) - 1));
+  f.host.sessionForChannel = (c) => f.sessions.find((s) => f.host.channelForSession(s.id) === c)?.id;
+  const first = await f.command('codeman');
+  expect(discordUiNodes(first.components).find((n) => n.type === 9)?.components).toEqual(
+    expect.arrayContaining([expect.objectContaining({ content: expect.stringContaining('Session 7') })])
+  );
+  const page = await f.click(first, 'Next', undefined, { channel_id: parent });
+  expect(activityBody(page)).toContain('w1-Codeman');
+  await f.ui.observeHistory('s1', {
+    conversationId: 'conversation-one',
+    partial: false,
+    turns: [
+      {
+        role: 'assistant',
+        cursor: 'new',
+        phase: 'commentary',
+        timestamp: new Date(990000).toISOString(),
+        text: 'Fresh activity.',
+      },
+    ],
+  });
+  const newer = await f.command('codeman');
+  expect(discordUiNodes(newer.components).find((n) => n.type === 9)?.components).toEqual(
+    expect.arrayContaining([expect.objectContaining({ content: expect.stringContaining('w1-Codeman') })])
+  );
+  expect(discordUiNodes(newer.components).length).toBeLessThanOrEqual(40);
+});
+
+it('keeps the last observed rows and successful sync timestamp during a session-service outage', async () => {
+  const f = await fixture();
+  await f.ui.poll();
+  const old = [...f.messages.values()].find((m) => m.channel === parent)!;
+  const text = activityBody(old);
+  f.advance(21000);
+  f.host.services.sessions = async () => {
+    throw new Error('offline');
+  };
+  await expect(f.ui.poll()).rejects.toThrow('offline');
+  const stale = [...f.messages.values()].find((m) => m.channel === parent)!;
+  expect(activityBody(stale)).toContain('Connection interrupted');
+  expect(activityBody(stale)).toContain('w1-Codeman');
+  const stamp = /<t:(\d+):R>/.exec(text)![1];
+  expect(activityBody(stale)).toContain('Last synced <t:' + stamp + ':R>');
+});
+it('keeps a resolved question from looking pending and does not reorder it on reads', async () => {
+  const f = await fixture();
+  Object.assign(f.sessions[0], { pending: true, pendingAt: 900000, pendingRevision: 'question-1' });
+  const question = await f.command('codeman');
+  expect(activityBody(question)).toContain('Needs your answer');
+  const recorded = (await f.ui.store.snapshot()).activities;
+  f.sessions[0].pending = false;
+  f.advance(1000);
+  const resolved = await f.command('codeman');
+  expect(activityBody(resolved)).toContain('Question resolved');
+  expect((await f.ui.store.snapshot()).activities).toEqual(recorded);
+});
+
+it('keeps legacy question and launch panels valid when editing a V2 ephemeral message', () => {
+  const converted = uiV2Payload({
+    content: 'Which case?',
+    components: [{ type: 1, components: [{ type: 2, style: 2, label: 'Choose', custom_id: 'cmui:test' }] }],
+  });
+  expect(converted.flags! & 32768).toBeTruthy();
+  expect(activityBody(converted)).toBe('Which case?');
+  expect(discordUiNodes(converted.components).find((n) => n.label === 'Choose')).toBeDefined();
+  expect(uiWirePayload(converted, true)).toMatchObject({ content: null, embeds: [] });
+  expect(uiWirePayload(converted)).not.toHaveProperty('content');
+});
+
+it('renders the approved five-row activity layout using actual session events', async () => {
+  const f = await fixture();
+  const names = ['w4-Codeman', 'w1-Plex', 'w2-brain', 'w3-home-mon', 'w1-Coffee', 'w2-Cards'];
+  f.sessions.splice(
+    0,
+    f.sessions.length,
+    ...names.map((name, i) => ({
+      id: 's' + (i + 1),
+      name,
+      host: i === 2 || i === 4 ? 'remote' : 'beelink',
+      caseName: ['Codeman', 'Plex previews', 'brain', 'home-mon', 'Third Culture Coffee', 'Card benefits'][i],
+      mode: 'codex',
+      conversation: 'c' + i,
+      working: i === 1 || i >= 4,
+      pending: i === 2,
+      pendingAt: i === 2 ? Date.now() - 194000 : undefined,
+      pendingRevision: i === 2 ? 'q1' : undefined,
+      ready: true,
+      exited: false,
+      url: 'https://example.test/#session=s' + i,
+    }))
+  );
+  f.host.channelForSession = (id) => String(222222222222222222n + BigInt(Number(id.slice(1)) - 1));
+  f.host.sessionForChannel = (c) => f.sessions.find((s) => f.host.channelForSession(s.id) === c)?.id;
+  f.advance(Date.now() - f.host.now());
+  f.host.responseMessage = async (id) => String(777777777777777777n + BigInt(Number(id.slice(1))));
+  const ages = [22, 76, 194, 357, 528, 741];
+  const summaries = [
+    'Silent updates deployed. All 25 sessions preserved.',
+    'Checking preview generation across the library.',
+    'Waiting for your approval to continue.',
+    'Health checks passed. Services are responding.',
+    'Validating the updated store ordering flow.',
+    'Comparing the latest issuer benefit terms.',
+  ];
+  for (const [i, s] of f.sessions.entries())
+    await f.ui.observeHistory(s.id, {
+      conversationId: s.conversation!,
+      partial: false,
+      turns: [
+        {
+          role: 'user',
+          cursor: 'u' + i,
+          timestamp: new Date(f.host.now() - (ages[i] + 100) * 1000).toISOString(),
+          text: 'Private task',
+        },
+        {
+          role: 'assistant',
+          cursor: 'a' + i,
+          phase: i === 0 || i === 3 ? 'final_answer' : 'commentary',
+          timestamp: new Date(f.host.now() - ages[i] * 1000).toISOString(),
+          text: summaries[i],
+        },
+      ],
+      executions: i === 0 || i === 3 ? [{ userCursor: 'u' + i, promptHash: 'proof', state: 'completed' }] : [],
+    });
+  await f.ui.poll();
+  const actual = [...f.messages.values()].find((m) => m.channel === parent)!;
+  expect(discordUiNodes(actual.components).filter((n) => n.type === 9)).toHaveLength(5);
+  expect(discordUiNodes(actual.components).length).toBeLessThanOrEqual(40);
+  expect(
+    discordUiNodes(actual.components)
+      .filter((n) => n.type === 10)
+      .map((n) => String(n.content ?? ''))
+      .join('').length
+  ).toBeLessThan(4000);
+  for (const node of discordUiNodes(actual.components)) {
+    if (node.type === 17) expect((node.components as unknown[]).length).toBeLessThanOrEqual(10);
+  }
+  if (process.env.ACTIVITY_ARTIFACT_DIR) {
+    const { id: _id, channel: _channel, author: _author, ...payload } = actual;
+    await writeFile(join(process.env.ACTIVITY_ARTIFACT_DIR, 'payload.json'), JSON.stringify(payload, null, 2));
+  }
 });

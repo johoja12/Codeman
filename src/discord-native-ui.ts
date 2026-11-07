@@ -1,13 +1,64 @@
 /** Native Discord controls. Tokens bind actor, origin, configuration and exact conversation. */
 import { createHash, randomUUID } from 'node:crypto';
+import {
+  activityFromHistory,
+  activityText,
+  newerActivity,
+  DISCORD_ACTIVITY_VIEWS,
+  type DiscordActivityEvent,
+  type DiscordActivityRecord,
+  type DiscordActivityView,
+} from './discord-activity-feed.js';
+import type { DiscordHistory } from './discord-history.js';
 import { DiscordUiStore } from './discord-ui-store.js';
 import { posix } from 'node:path';
 import { discordArtifactPaths, DISCORD_ARTIFACT_COUNT } from './discord-artifacts.js';
-import { discordDetailPages, formatDiscordResponseText } from './discord-response-format.js';
+import {
+  DISCORD_COMPONENTS_V2,
+  DISCORD_SUPPRESS_NOTIFICATIONS,
+  discordDetailPages,
+  formatDiscordResponseText,
+} from './discord-response-format.js';
 import { readDiscordTaskUpdates, renderDiscordTaskUpdates, type DiscordTaskUpdates } from './discord-task-updates.js';
 import { discordDisplayText } from './discord-display-text.js';
 import type { DiscordInteraction, GatewayMessage, DiscordPost } from './discord-bridge.js';
 import type { DiscordNativeUiHost, DiscordUiPayload, DiscordUiSession } from './discord-native-ui-types.js';
+/** Walk both legacy rows and V2 sections, including their accessory controls. */
+export function discordUiNodes(nodes: unknown, depth = 0): Array<Record<string, unknown>> {
+  if (!Array.isArray(nodes) || depth > 6) return [];
+  return nodes.flatMap((node) =>
+    node && typeof node === 'object'
+      ? [
+          node,
+          ...discordUiNodes(node.components, depth + 1),
+          ...discordUiNodes(node.accessory ? [node.accessory] : [], depth + 1),
+        ]
+      : []
+  );
+}
+/** V2 messages cannot revert to legacy content, including ephemeral follow-up panels. */
+export function uiV2Payload(payload: DiscordUiPayload): DiscordUiPayload {
+  if ((payload.flags ?? 0) & DISCORD_COMPONENTS_V2) return payload;
+  return {
+    content: '',
+    flags: DISCORD_COMPONENTS_V2 | DISCORD_SUPPRESS_NOTIFICATIONS,
+    allowed_mentions: payload.allowed_mentions ?? { parse: [], users: [] },
+    components: [{ type: 10, content: payload.content || 'Done.' }, ...(payload.components ?? [])],
+  };
+}
+export function uiWirePayload(payload: DiscordUiPayload, edit = false): Record<string, unknown> {
+  if (!((payload.flags ?? 0) & DISCORD_COMPONENTS_V2)) return { ...payload };
+  const { content: _content, ...rest } = payload;
+  return { ...rest, ...(edit ? { content: null, embeds: [] } : {}) };
+}
+const ownsUiMarker = (message: { content?: string; components?: unknown }, marker: string) =>
+  !!message.content?.endsWith(marker) ||
+  discordUiNodes(message.components)
+    .filter((n) => n.type === 10)
+    .map((n) => n.content)
+    .join('\n')
+    .endsWith(marker);
+
 const hash = (s: string) => createHash('sha256').update(s).digest('hex');
 const sourceSignature = (m: GatewayMessage) =>
   hash(JSON.stringify([m.content, (m.attachments ?? []).map((a) => [a.id, a.filename, a.size])]));
@@ -55,6 +106,7 @@ export class DiscordNativeUi {
   private commands = new Map<string, string>();
   private cardCursor = 0;
   private dashboardDue = 0;
+  private activitySnapshot?: { scope?: string; sessions: DiscordUiSession[]; at: number };
   private errors = new Map<string, number>();
   private epoch = randomUUID();
   private questionPanels = new Map<
@@ -136,7 +188,10 @@ export class DiscordNativeUi {
     if (!scope) return;
     const storeKey = hash(this.host.config().guild + ':' + channel + ':' + key),
       marker = `\n-# Codeman · ${key.split(':')[0]} · ${storeKey.slice(0, 10)}`;
-    payload = { ...payload, content: payload.content.slice(0, 1880) + marker };
+    payload =
+      (payload.flags ?? 0) & DISCORD_COMPONENTS_V2
+        ? { ...payload, components: [...(payload.components ?? []), { type: 10, content: marker }] }
+        : { ...payload, content: payload.content.slice(0, 1880) + marker };
     const digest = hash(JSON.stringify(payload));
     const old = (await this.store.snapshot()).cards[storeKey];
     const current = () => this.host.scope() === scope && this.host.ownsChannel(channel);
@@ -147,12 +202,11 @@ export class DiscordNativeUi {
       const recent = (await this.host.request('GET', `/channels/${channel}/messages?limit=50`)) as Array<{
         id: string;
         content?: string;
+        components?: unknown;
         author?: { id: string };
       }>;
       const bot = await this.host.botId();
-      const found = Array.isArray(recent)
-        ? recent.filter((m) => m.author?.id === bot && m.content?.endsWith(marker))
-        : [];
+      const found = Array.isArray(recent) ? recent.filter((m) => m.author?.id === bot && ownsUiMarker(m, marker)) : [];
       if (found.length !== 1)
         throw new Error('Previous control-card creation is unconfirmed; inspect Discord before retrying');
       message = found[0].id;
@@ -171,11 +225,12 @@ export class DiscordNativeUi {
       const existing = (await this.host.request('GET', `/channels/${channel}/messages/${message}`)) as {
         author?: { id: string };
         content?: string;
+        components?: unknown;
       };
-      if (existing.author?.id !== (await this.host.botId()) || !existing.content?.endsWith(marker))
+      if (existing.author?.id !== (await this.host.botId()) || !ownsUiMarker(existing, marker))
         throw new Error('Control-card ownership changed');
       if (!current()) return;
-      await this.host.request('PATCH', `/channels/${channel}/messages/${message}`, payload);
+      await this.host.request('PATCH', `/channels/${channel}/messages/${message}`, uiWirePayload(payload, true));
     } else {
       await this.store.edit((s) => {
         s.cards[storeKey] = {
@@ -188,7 +243,7 @@ export class DiscordNativeUi {
       });
       try {
         const posted = (await this.host.request('POST', `/channels/${channel}/messages`, {
-          ...payload,
+          ...uiWirePayload(payload),
           nonce: storeKey.slice(0, 24),
           enforce_nonce: true,
         })) as { id?: string };
@@ -211,11 +266,10 @@ export class DiscordNativeUi {
         updated: this.host.now(),
       };
     });
-    for (const r of payload.components ?? [])
-      for (const component of r.components) {
-        const action = this.actions.get(component.custom_id as string);
-        if (action) action.message = message;
-      }
+    for (const component of discordUiNodes(payload.components)) {
+      const action = this.actions.get(component.custom_id as string);
+      if (action) action.message = message;
+    }
     if (pin && current()) {
       // Pin permission is optional: the durable card remains usable without it.
       await this.host.request('PUT', `/channels/${channel}/messages/pins/${message}`).catch(() => undefined);
@@ -614,7 +668,14 @@ export class DiscordNativeUi {
     await this.refreshQuestionPanels();
     await this.register();
     await this.retireLegacyCards();
-    const sessions = await this.host.services.sessions();
+    let sessions: DiscordUiSession[];
+    try {
+      sessions = await this.host.services.sessions();
+    } catch (error) {
+      await this.publishDashboard();
+      throw error;
+    }
+    await this.observeSessionActivity(sessions);
     const list = sessions.filter((s) => this.host.channelForSession(s.id));
     for (let i = 0; i < Math.min(3, list.length); i++) {
       const s = list[(this.cardCursor + i) % list.length];
@@ -654,11 +715,30 @@ export class DiscordNativeUi {
       }
     }
     this.cardCursor += Math.min(3, list.length);
+    await this.publishDashboard(sessions);
+  }
+  private async publishDashboard(sessions?: DiscordUiSession[]): Promise<void> {
     if (this.host.now() >= this.dashboardDue) {
-      this.dashboardDue = this.host.now() + 90000;
+      this.dashboardDue = this.host.now() + 20000;
       const channel = this.host.config().parent;
       if (channel && this.host.ownsChannel(channel))
-        await this.upsert('dashboard:main', channel, await this.dashboard({ channel })).catch(() => undefined);
+        try {
+          const key = 'dashboard:main',
+            before = new Set(this.actions.keys());
+          await this.upsert(
+            key,
+            channel,
+            await this.dashboard({ channel }, 'recent', 0, sessions),
+            !this.cardActions.has(key)
+          );
+          for (const token of this.cardActions.get(key) ?? []) this.actions.delete(token);
+          this.cardActions.set(
+            key,
+            [...this.actions.keys()].filter((k) => !before.has(k))
+          );
+        } catch (error) {
+          this.lastError = error instanceof Error ? error.message : 'Activity dashboard update failed';
+        }
     }
   }
   /** Receipt state stays in reactions/the journal; retire only our legacy per-prompt cards. */
@@ -908,7 +988,7 @@ export class DiscordNativeUi {
             : command === 'results'
               ? await this.results(m, id)
               : await this.sessionCard(await this.target(id));
-    await this.host.request('POST', `/channels/${channel}/messages`, result);
+    await this.host.request('POST', `/channels/${channel}/messages`, uiWirePayload(result));
     return true;
   }
   private async settings(m: DiscordInteraction, id: string): Promise<DiscordUiPayload> {
@@ -1107,7 +1187,7 @@ export class DiscordNativeUi {
     // concurrent explicit button click may already have submitted native input.
     const posted = (await this.host.request('POST', `/channels/${channel}/messages`, payload)) as { id?: string };
     for (const r of payload.components ?? [])
-      for (const c of r.components) {
+      for (const c of r.components ?? []) {
         const a = this.actions.get(c.custom_id as string);
         if (a) a.message = posted?.id;
       }
@@ -1525,60 +1605,233 @@ export class DiscordNativeUi {
       ]
     );
   }
-  private async dashboard(ctx: UiContext, filter = 'all', page = 0): Promise<DiscordUiPayload> {
-    const all = await this.host.services.sessions(),
-      filtered = all.filter((s) =>
-        filter === 'all' || filter === 'attention'
-          ? filter === 'all' || s.pending
-          : filter === 'working'
-            ? s.working
-            : !s.working && !s.pending && !s.exited
-      ),
-      start = page * 8,
-      list = filtered.slice(start, start + 8);
-    const text =
-      '**Codeman workspace**\n' +
-      `${all.length} sessions · ${all.filter((s) => s.pending).length} need input\n\n` +
-      list
-        .map(
-          (s) =>
-            `${s.pending ? '🔴' : s.exited ? '⚫' : s.working ? '🟡' : '⚫'} **${safe(s.name)}** · ${safe(s.host)}\n${safe(s.caseName)} · ${safe(s.mode)}${this.host.channelForSession(s.id) ? ' · <#' + this.host.channelForSession(s.id) + '>' : ' · destination unavailable'}`
-        )
-        .join('\n\n');
-    const rows = [
-      row(
-        this.action(ctx, 'All', (m) => this.dashboard(this.ctx(m), 'all')),
-        this.action(ctx, 'Working', (m) => this.dashboard(this.ctx(m), 'working')),
-        this.action(ctx, 'Needs input', (m) => this.dashboard(this.ctx(m), 'attention')),
-        this.action(ctx, 'Idle', (m) => this.dashboard(this.ctx(m), 'idle')),
-        this.action(ctx, 'New session', (m) => this.launchPicker(m))
+  private activityKey(id: string): string {
+    return hash(JSON.stringify([this.host.scope(), this.host.channelForSession(id), id]));
+  }
+  /** The event time comes from native evidence, never from a dashboard refresh. */
+  async observeHistory(id: string, history: DiscordHistory): Promise<void> {
+    const event = activityFromHistory(history, this.host.now());
+    if (!event || event.at < this.host.now() - 30 * 86400000) return;
+    const scope = this.host.scope(),
+      channel = this.host.channelForSession(id);
+    if (!scope || !channel) return;
+    if (this.host.sessionForChannel(channel) !== id) return;
+    const message = event.responseCursor ? await this.host.responseMessage?.(id, event.responseCursor) : undefined;
+    if (this.host.scope() !== scope || this.host.channelForSession(id) !== channel) return;
+    const key = this.activityKey(id),
+      old = (await this.store.snapshot()).activities[key];
+    const same = old?.conversation === event.conversation && old.cursor === event.cursor && old.kind === event.kind;
+    if (!newerActivity(old, event) && !(same && message && old.message !== message)) return;
+    await this.store.edit((state) => {
+      const prior = state.activities[key];
+      if (newerActivity(prior, event) || (same && message))
+        state.activities[key] = { scope, session: id, channel, ...event, ...(message ? { message } : {}) };
+    });
+  }
+  private async observeSessionActivity(sessions: DiscordUiSession[]): Promise<void> {
+    const scope = this.host.scope();
+    if (!scope) return;
+    const snapshot = await this.store.snapshot();
+    const changes: Array<[string, DiscordActivityRecord]> = [];
+    for (const s of sessions) {
+      const channel = this.host.channelForSession(s.id);
+      if (!channel) continue;
+      const key = this.activityKey(s.id),
+        old = snapshot.activities[key];
+      let event: DiscordActivityEvent | undefined;
+      if (s.lastPromptAt && s.lastPromptAt <= this.host.now())
+        event = {
+          conversation: s.conversation ?? '',
+          kind: 'prompt',
+          cursor: 'prompt:' + s.lastPromptAt,
+          at: s.lastPromptAt,
+          summary: 'New prompt submitted.',
+        };
+      if (s.pending) {
+        const cursor = 'question:' + (s.pendingRevision ?? 'observed');
+        const at = s.pendingAt ?? (old?.kind === 'question' && old.cursor === cursor ? old.at : this.host.now());
+        const question: DiscordActivityEvent = {
+          conversation: s.conversation ?? '',
+          kind: 'question',
+          cursor,
+          at: Math.min(at, this.host.now()),
+          summary: 'Waiting for your answer to continue.',
+        };
+        if (newerActivity(event, question)) event = question;
+      }
+      if (event && event.at >= this.host.now() - 30 * 86400000 && newerActivity(old, event))
+        changes.push([key, { scope, session: s.id, channel, ...event }]);
+    }
+    if (changes.length && this.host.scope() === scope)
+      await this.store.edit((state) => {
+        for (const [key, event] of changes)
+          if (newerActivity(state.activities[key], event)) state.activities[key] = event;
+      });
+  }
+  private async dashboard(
+    ctx: UiContext,
+    view: DiscordActivityView = 'recent',
+    page = 0,
+    observed?: DiscordUiSession[]
+  ): Promise<DiscordUiPayload> {
+    const scope = this.host.scope();
+    let all: DiscordUiSession[],
+      stale = false;
+    try {
+      all = observed ?? (await this.host.services.sessions());
+      this.activitySnapshot = { scope, sessions: all, at: this.host.now() };
+    } catch (error) {
+      if (!this.activitySnapshot || this.activitySnapshot.scope !== scope) throw error;
+      all = this.activitySnapshot.sessions;
+      stale = true;
+    }
+    await this.observeSessionActivity(all);
+    const stored = (await this.store.snapshot()).activities;
+    const entries = all
+      .map((s) => {
+        const record = stored[this.activityKey(s.id)];
+        const activity =
+          record?.scope === scope &&
+          record.channel === this.host.channelForSession(s.id) &&
+          (!s.conversation || record.conversation === s.conversation)
+            ? record
+            : undefined;
+        const finished =
+          !s.working &&
+          !s.pending &&
+          !s.exited &&
+          activity?.kind === 'completed' &&
+          activity.at >= this.host.now() - 3600000;
+        const error = activity?.kind === 'error' && activity.at >= this.host.now() - 3600000;
+        return { s, activity, finished, error };
+      })
+      .sort((a, b) => (b.activity?.at ?? 0) - (a.activity?.at ?? 0) || a.s.name.localeCompare(b.s.name));
+    const filtered = entries.filter(
+      (e) =>
+        view === 'recent' ||
+        (view === 'working'
+          ? e.s.working && !e.s.pending && !e.s.exited
+          : view === 'finished'
+            ? e.finished
+            : e.s.pending || e.error)
+    );
+    const last = Math.max(0, Math.ceil(filtered.length / 5) - 1);
+    page = Math.max(0, Math.min(page, last));
+    const visible = filtered.slice(page * 5, page * 5 + 5);
+    const text = (content: string) => ({ type: 10, content });
+    const header: Array<Record<string, unknown>> = [
+      text('-# CODEMAN · WORKSPACE\n## Activity\nPick up where the work is happening.'),
+      text(
+        `🟡 **${entries.filter((e) => e.s.working && !e.s.pending && !e.s.exited).length} working** · ✅ **${entries.filter((e) => e.finished).length} done** · 🔴 **${entries.filter((e) => e.s.pending || e.error).length} needs you**\n-# ${all.length} sessions`
       ),
     ];
-    if (list.length)
-      rows.push(
-        row(
-          this.select(
-            ctx,
-            'Open session controls',
-            list.map((s) => ({ label: s.name, value: s.id, description: s.caseName + ' · ' + s.host })),
-            async (_m, value) => {
-              const channel = this.host.channelForSession(value);
-              await this.target(value);
-              return this.payload('Open <#' + channel + '> for the exact session.');
-            }
-          )
+    if (stale) header.push(text('⚠️ **Connection interrupted**\nShowing the last known activity.'));
+    const select = this.select(
+      ctx,
+      'Choose activity view',
+      Object.entries(DISCORD_ACTIVITY_VIEWS).map(([value, [label, description]]) => ({ value, label, description })),
+      (m, value) => this.dashboard(this.ctx(m), value as DiscordActivityView)
+    );
+    for (const option of select.options as Array<Record<string, unknown>>) option.default = option.value === view;
+    header.push(row(select));
+    const body: Array<Record<string, unknown>> = [
+      text(
+        `**${view === 'recent' ? 'Recent activity' : DISCORD_ACTIVITY_VIEWS[view][0]}**\n-# ${DISCORD_ACTIVITY_VIEWS[view][1]}.`
+      ),
+    ];
+    if (!visible.length)
+      body.push(
+        text(
+          view === 'attention'
+            ? '✅ **You’re all caught up**\nNo sessions need your answer.'
+            : '**Nothing here yet**\nNew activity will appear automatically.'
         )
       );
-    if (page > 0 || start + 8 < filtered.length)
-      rows.push(
-        row(
-          ...(page > 0 ? [this.action(ctx, 'Previous', (m) => this.dashboard(this.ctx(m), filter, page - 1))] : []),
-          ...(start + 8 < filtered.length
-            ? [this.action(ctx, 'Next', (m) => this.dashboard(this.ctx(m), filter, page + 1))]
-            : [])
-        )
-      );
-    return this.payload(text || 'No sessions available.', rows);
+    for (const [i, { s, activity, finished, error }] of visible.entries()) {
+      if (i) body.push({ type: 14, divider: true, spacing: 1 });
+      const channel = this.host.channelForSession(s.id);
+      const icon = s.pending || error ? '🔴' : s.exited ? '⚫' : s.working ? '🟡' : finished ? '✅' : '⚫';
+      const labels = {
+        prompt: 'Prompt submitted',
+        update: 'Progress update',
+        response: 'Response received',
+        completed: 'Turn finished',
+        question: 'Needs your answer',
+        error: 'Task failed',
+        interrupted: 'Interrupted',
+      };
+      const label = s.pending
+        ? 'Needs your answer'
+        : s.exited
+          ? 'Offline'
+          : activity
+            ? activity.kind === 'question'
+              ? 'Question resolved'
+              : labels[activity.kind]
+            : s.working
+              ? 'Working'
+              : 'Idle';
+      const time = activity ? ` · <t:${Math.floor(activity.at / 1000)}:R>` : '';
+      const summary = activity?.summary || (s.working ? 'Work is in progress.' : 'Ready for your next message.');
+      let accessory: Record<string, unknown>;
+      if (s.pending)
+        accessory = this.action(
+          ctx,
+          'Review',
+          async (m) => {
+            await this.target(s.id, s.conversation);
+            return this.question(m, s.id);
+          },
+          undefined,
+          1
+        );
+      else if (channel)
+        accessory = {
+          type: 2,
+          style: 5,
+          label: activity?.message && !s.working ? 'View reply' : 'Open thread',
+          url: `https://discord.com/channels/${this.host.config().guild}/${channel}${activity?.message && !s.working ? '/' + activity.message : ''}`,
+        };
+      else
+        accessory = {
+          ...this.action(ctx, 'Unavailable', async () =>
+            this.payload('This session has no current Discord destination.')
+          ),
+          disabled: true,
+        };
+      body.push({
+        type: 9,
+        components: [
+          text(
+            `**${icon} ${activityText(s.name, 60)}**\n${label}${time}\n-# ${safe(summary, 120)}\n-# ${activityText(s.caseName, 40)} · ${activityText(s.host, 30)}`
+          ),
+        ],
+        accessory,
+      });
+    }
+    const refresh = (m: DiscordInteraction, p = page) => this.dashboard(this.ctx(m), view, p);
+    const actions = row(
+      { ...this.action(ctx, 'Previous', (m) => refresh(m, page - 1)), disabled: page === 0 },
+      { ...this.action(ctx, 'Next', (m) => refresh(m, page + 1)), disabled: page >= last },
+      this.action(ctx, 'Refresh', (m) => refresh(m))
+    );
+    const launch = row(this.action(ctx, '+ New session', (m) => this.launchPicker(m), undefined, 1));
+    const url = all.find((s) => s.url)?.url;
+    if (url) launch.components.push({ type: 2, style: 5, label: 'Open Codeman', url });
+    return {
+      content: '',
+      flags: DISCORD_COMPONENTS_V2 | DISCORD_SUPPRESS_NOTIFICATIONS,
+      allowed_mentions: noMentions,
+      components: [
+        { type: 17, accent_color: stale ? 0xf0b35b : 0x9b8afb, components: header },
+        { type: 17, components: body },
+        text(
+          `-# ${filtered.length ? `${page * 5 + 1}–${Math.min((page + 1) * 5, filtered.length)} of ${filtered.length}` : '0 sessions'} · ${stale ? 'Last synced' : 'Synced'} <t:${Math.floor((this.activitySnapshot?.at ?? this.host.now()) / 1000)}:R> · Updates silently`
+        ),
+        actions,
+        launch,
+      ],
+    };
   }
   private async launchPicker(m: DiscordInteraction, source?: GatewayMessage, page = 0): Promise<DiscordUiPayload> {
     const cases = await this.host.services.cases(),
