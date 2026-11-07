@@ -1055,9 +1055,9 @@ export class DiscordBridge {
           const cached = this.uiPrompts.get(id);
           return cached?.conversation === conversation ? cached?.text : undefined;
         },
-        history: async (id) => {
+        history: async (id, options) => {
           if (!this.deps.history) throw new Error('History unavailable');
-          const h = await this.deps.history(id);
+          const h = await this.deps.history(id, options);
           await this.deliveries.reconcileNative(id, h);
           return h;
         },
@@ -1092,8 +1092,13 @@ export class DiscordBridge {
           if (!this.deps.getAttachment) throw new Error('File service unavailable');
           return this.deps.getAttachment(id, path);
         },
-        postFile: async (channel, file, text) => {
-          await this.api.postWithFile(channel, { content: text, allowed_mentions: { parse: [], users: [] } }, file);
+        postFile: async (channel, file, text, current) => {
+          await this.api.postWithFiles(
+            channel,
+            { content: text, allowed_mentions: { parse: [], users: [] } },
+            [file],
+            current
+          );
         },
         launch: async (scope, key, mode) => this.deps.launch?.(scope, key, mode) ?? { text: 'Launch unavailable' },
         modes: () => this.deps.launchModes?.() ?? [],
@@ -1356,6 +1361,7 @@ export class DiscordBridge {
           seed: history.turns.slice(-6).map((t) => t.cursor),
           seedIndex: 0,
           seeded: false,
+          activeUser: history.turns.filter((t) => t.role === 'user').at(-1)?.cursor,
           cursor: history.turns.at(-1)?.cursor,
         };
         await this.conversationProgress.set(key, progress);
@@ -1580,12 +1586,13 @@ export class DiscordBridge {
     const run = (async () => {
       let progress = await this.conversationProgress.get(key);
       if (!progress?.seeded) return;
-      const history = await this.deps.history!(sessionId, { includeTools: progress.verbose, after: progress.cursor });
+      const view = progress.view ?? (progress.verbose ? 'tools' : 'conversation');
+      const history = await this.deps.history!(sessionId, { includeTools: view === 'tools', after: progress.cursor });
       const user = history.turns.filter((t) => t.role === 'user').at(-1);
       if (user) this.uiPrompts.set(sessionId, { conversation: history.conversationId, text: user.text.slice(0, 400) });
       if (history.conversationId !== progress.conversationId)
         throw new BridgeProblem('Conversation changed; synchronize history first');
-      const includeTools = progress.verbose;
+      const includeTools = view === 'tools';
       const attributed = await this.deliveries.reconcileNative(sessionId, history, (after) =>
         this.deps.history!(sessionId, { includeTools, after })
       );
@@ -1595,7 +1602,9 @@ export class DiscordBridge {
       const at = progress.cursor ? history.turns.findIndex((t) => t.cursor === progress!.cursor) : -1;
       if (progress.cursor && at < 0 && history.verifiedAfter !== progress.cursor)
         throw new BridgeProblem('Live boundary expired; request history');
-      for (const turn of history.turns.slice(at + 1, at + 21)) {
+      const batch = history.turns.slice(at + 1, at + 21);
+      for (let index = 0; index < batch.length; index++) {
+        const turn = batch[index];
         if (
           this.stopped ||
           !this.cfg.enabled ||
@@ -1603,6 +1612,55 @@ export class DiscordBridge {
           !this.destinationMatches(sessionId, channel)
         )
           throw new BridgeProblem('Session changed');
+        if (turn.role === 'assistant' && turn.phase === 'commentary' && (view !== 'quiet' || progress.pendingUpdates)) {
+          let group: typeof history.turns;
+          if (progress.pendingUpdates) {
+            group = progress.pendingUpdates.map((cursor) => history.turns.find((t) => t.cursor === cursor)!);
+            const between = history.turns
+              .slice(history.turns.indexOf(turn), history.turns.indexOf(group.at(-1)!) + 1)
+              .filter((t) => t.role !== 'tool');
+            if (
+              group.some((t) => !t || t.role !== 'assistant' || t.phase !== 'commentary') ||
+              group[0]?.cursor !== turn.cursor ||
+              between.length !== group.length ||
+              between.some((t, i) => t.cursor !== group[i].cursor)
+            )
+              throw new BridgeProblem('Pending update group changed; output paused');
+          } else {
+            group = [];
+            for (const candidate of batch.slice(index)) {
+              if (candidate.role !== 'assistant' || candidate.phase !== 'commentary') break;
+              group.push(candidate);
+            }
+            progress = { ...progress, pendingUpdates: group.map((t) => t.cursor) };
+            await this.conversationProgress.set(key, progress);
+          }
+          const text = group
+            .map((t) => discordDisplayText(t.text))
+            .filter((t) => t.trim())
+            .join('\n\n');
+          for (const [part, post] of discordResponsePosts(text, {
+            title: group.length > 1 ? `Updates (${group.length})` : 'Update',
+            color: 0x99aab5,
+          }).entries())
+            await this.deliverPost(channel, post, undefined, sessionId, `native:${turn.cursor}:updates:${part}`);
+          if (text.length > 12000)
+            await this.deliverPost(
+              channel,
+              { content: 'Full assistant updates', allowed_mentions: { parse: [], users: [] } },
+              { name: 'updates.txt', data: Buffer.from(text) },
+              sessionId,
+              `native:${turn.cursor}:updates:overflow`
+            );
+          for (const update of group)
+            await this.deliverArtifacts(sessionId, channel, update.cursor, discordDisplayText(update.text));
+          const end = group.at(-1)!.cursor;
+          progress = { ...progress, cursor: end, pendingUpdates: undefined };
+          await this.conversationProgress.set(key, progress);
+          index = batch.findIndex((t) => t.cursor === end);
+          if (index < 0) break;
+          continue;
+        }
         if (turn.role === 'user' && !discordPrompts.has(turn.cursor) && turn.text.trim()) {
           for (const [part, post] of discordResponsePosts(turn.text, {
             title: 'User prompt',
@@ -1618,19 +1676,20 @@ export class DiscordBridge {
               `native:${turn.cursor}:prompt:overflow`
             );
         }
-        if ((turn.role === 'assistant' && turn.phase !== 'commentary') || (turn.role === 'tool' && progress.verbose)) {
+        if ((turn.role === 'assistant' && turn.phase !== 'commentary') || (turn.role === 'tool' && view === 'tools')) {
           const visible = turn.role === 'assistant' ? discordDisplayText(turn.text) : turn.text;
           const formatted = formatDiscordTables((turn.role === 'tool' ? '**Tool output**\n' : '') + visible);
           const position = history.turns.findIndex((t) => t.cursor === turn.cursor);
-          const owner = history.turns
-            .slice(0, position)
-            .filter((t) => t.role === 'user')
-            .at(-1);
-          const proof = owner && history.executions?.find((e) => e.userCursor === owner.cursor);
+          const owner =
+            history.turns
+              .slice(0, position)
+              .filter((t) => t.role === 'user')
+              .at(-1)?.cursor ?? progress.activeUser;
+          const proof = owner ? history.executions?.find((e) => e.userCursor === owner) : undefined;
           const confirmed = proof?.state === 'completed';
           const controls =
             turn.role === 'assistant' && owner && this.nativeUi
-              ? await this.nativeUi.responseControls(sessionId, channel, owner.cursor, turn.cursor).catch(() => [])
+              ? await this.nativeUi.responseControls(sessionId, channel, owner, turn.cursor).catch(() => [])
               : [];
           const label = this.deps.sessions?.().find((s) => s.id === sessionId)?.name;
           const responsePosts =
@@ -1653,9 +1712,13 @@ export class DiscordBridge {
               `native:${turn.cursor}:overflow`
             );
         }
-        if (turn.role === 'assistant')
+        if (turn.role === 'assistant' && turn.phase !== 'commentary')
           await this.deliverArtifacts(sessionId, channel, turn.cursor, discordDisplayText(turn.text));
-        progress = { ...progress, cursor: turn.cursor };
+        progress = {
+          ...progress,
+          cursor: turn.cursor,
+          activeUser: turn.role === 'user' ? turn.cursor : progress.activeUser,
+        };
         await this.conversationProgress.set(key, progress);
       }
       // Raw tool/metadata pages still make durable progress after all visible turns were delivered.
@@ -1687,16 +1750,12 @@ export class DiscordBridge {
         lastUserAt >= 0
           ? history.turns.slice(lastUserAt + 1).filter((t) => t.role === 'assistant' && t.phase === 'commentary')
           : [];
+      const updatesUser = progress.activeUser ?? user?.cursor;
       const progressControls =
-        user && updates.length && this.nativeUi
-          ? await this.nativeUi.responseControls(sessionId, channel, user.cursor).catch(() => [])
+        updatesUser && this.nativeUi
+          ? await this.nativeUi.responseControls(sessionId, channel, updatesUser).catch(() => [])
           : [];
-      const progressPost = discordProgressPost(
-        status,
-        updates.at(-1) ? discordDisplayText(updates.at(-1)!.text) : '',
-        updates.length,
-        progressControls
-      );
+      const progressPost = discordProgressPost(status, '', updates.length, progressControls);
       const hash = createHash('sha256').update(JSON.stringify(progressPost)).digest('hex');
 
       if (progress.statusHash !== hash) {
@@ -3034,16 +3093,18 @@ export class DiscordBridge {
           await this.deliveries.update(id, 'delivered');
           return;
         }
-        const stream = /^stream (responses|verbose|off)$/.exec(command);
+        const stream = /^stream (conversation|quiet|tools|responses|verbose|off)$/.exec(command);
         if (stream && this.cfg.mode === 'full') {
           await this.seedConversation(sessionId, m.channel_id);
           const key = this.conversationKey(sessionId, m.channel_id);
           const progress = await this.conversationProgress.get(key);
           if (!progress) throw new BridgeProblem('History unavailable');
+          const selected = stream[1] === 'responses' ? 'quiet' : stream[1] === 'verbose' ? 'tools' : stream[1];
           await this.conversationProgress.set(key, {
             ...progress,
-            verbose: stream[1] === 'verbose',
-            streamOff: stream[1] === 'off',
+            view: selected === 'off' ? progress.view : (selected as 'conversation' | 'quiet' | 'tools'),
+            verbose: selected === 'off' ? progress.verbose : selected === 'tools',
+            streamOff: selected === 'off',
           });
           await this.deliverPost(
             m.channel_id,

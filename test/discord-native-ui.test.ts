@@ -782,7 +782,8 @@ it('offers stable read-only response controls with exact history and actor check
   expect(f.host.postFile).toHaveBeenCalledWith(
     channel,
     { name: 'response.txt', data: Buffer.from('Visible answer') },
-    'Requested assistant response'
+    'Requested assistant response',
+    expect.any(Function)
   );
   const fresh = new DiscordNativeUi(f.host);
   expect(await fresh.responseControls('s1', channel, 'u1', 'r1')).toEqual(controls);
@@ -844,7 +845,8 @@ it.each(['expired', 'restart'] as const)(
     expect(f.host.postFile).toHaveBeenCalledWith(
       channel,
       { name: 'response.txt', data: Buffer.from('Original response') },
-      'Requested assistant response'
+      'Requested assistant response',
+      expect.any(Function)
     );
     expect(f.finishes.some((v) => v.content.includes('Compiling'))).toBe(true);
     expect(f.finishes.at(-1)?.content).toContain('Results & files');
@@ -920,7 +922,7 @@ it('does not revive an expired cached response when its native history is gone',
     f.event(f.component({ content: '', components: controls }, 'Download response'), { message: { id } })
   );
   expect(f.host.postFile).not.toHaveBeenCalled();
-  expect(f.finishes.at(-1)?.content).toContain('no longer available');
+  expect(f.finishes.at(-1)?.content).toContain('unavailable');
 });
 it('keeps state-changing session controls expired instead of recovering them', async () => {
   const f = await fixture();
@@ -1044,3 +1046,80 @@ it.each([{ working: true }, { pending: true }, { ready: false }, { mode: 'codex'
     ).toBe(false);
   }
 );
+
+it('pages and downloads full original-task updates after the recent history window moves', async () => {
+  const f = await fixture();
+  f.host.history = vi.fn(async (_id, options) =>
+    options?.after === 'u1'
+      ? {
+          conversationId: 'conversation-one',
+          partial: false,
+          verifiedAfter: 'u1',
+          turns: [
+            ...Array.from({ length: 12 }, (_, i) => ({
+              cursor: 'p' + i,
+              role: 'assistant' as const,
+              phase: 'commentary' as const,
+              text: 'Progress ' + i + ' ' + 'z'.repeat(550),
+              timestamp: '',
+            })),
+            { cursor: 'u2', role: 'user' as const, text: 'Later task', timestamp: '' },
+            {
+              cursor: 'p-other',
+              role: 'assistant' as const,
+              phase: 'commentary' as const,
+              text: 'Exclude later progress',
+              timestamp: '',
+            },
+          ],
+        }
+      : { conversationId: 'conversation-one', partial: true, turns: [] }
+  );
+  const controls = await f.ui.responseControls('s1', channel, 'u1', 'r1');
+  const refState = await new DiscordUiStore(f.dir).snapshot();
+  expect(JSON.stringify(refState.responses)).not.toContain('Progress');
+  const first = await f.click({ content: '', components: controls }, 'Show updates');
+  expect(first.content).toContain('12');
+  expect(first.content).toContain('Progress 0');
+  const second = await f.click(first, 'Next');
+  expect(second.content).toContain('page 2/');
+  expect((await f.click(second, 'Previous')).content).toContain('Progress 0');
+  await f.click(second, 'Download updates');
+  const call = vi.mocked(f.host.postFile).mock.calls.at(-1)!;
+  expect(call[1].data.toString()).toContain('Progress 11 ' + 'z'.repeat(550));
+  expect(call[1].data.toString()).not.toContain('Exclude later progress');
+  expect(call[1].name).toBe('updates.txt');
+});
+it('recovers stored read-only task buttons after restart outside the recent history window', async () => {
+  const f = await fixture();
+  const controls = await f.ui.responseControls('s1', channel, 'u1', 'r1');
+  const id = snow();
+  f.messages.set(id, {
+    id,
+    channel,
+    channel_id: channel,
+    author: { id: bot },
+    content: 'Old response',
+    components: controls,
+  } as any);
+  f.host.history = vi.fn(async (_id, options) =>
+    options?.after === 'u1'
+      ? {
+          conversationId: 'conversation-one',
+          partial: false,
+          verifiedAfter: 'u1',
+          turns: [
+            { cursor: 'p1', role: 'assistant', phase: 'commentary', text: 'Older task full progress', timestamp: '' },
+            { cursor: 'r1', role: 'assistant', text: 'Older answer', timestamp: '' },
+            { cursor: 'u2', role: 'user', text: 'Later task', timestamp: '' },
+          ],
+        }
+      : { conversationId: 'conversation-one', partial: true, turns: [] }
+  );
+  const restored = new DiscordNativeUi(f.host);
+  await restored.interaction(
+    f.event(f.component({ content: '', components: controls }, 'Show updates'), { message: { id } })
+  );
+  expect(f.finishes.at(-1)?.content).toContain('Older task full progress');
+  expect(f.host.submit).not.toHaveBeenCalled();
+});
