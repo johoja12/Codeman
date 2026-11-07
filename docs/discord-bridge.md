@@ -298,18 +298,6 @@ Menus are bound to the allowed actor, origin channel, current configuration and 
 
 The bot needs the existing guild application-command scope for slash/context actions. Command registration is guild-scoped and never bulk-overwrites unrelated commands. Pinning is optional; no Administrator permission is required.
 
-## Shared completion inbox
-
-The pinned **Ready for review** card in the Codeman parent channel lists newly observed native task completions, newest first. The workspace dashboard links to the inbox and shows its unread count. The web header has a matching checkmark/count button. Review state is shared across authorized users and devices. Opening one completion never clears a newer completion from that session.
-
-- In Discord, **Open response** displays the exact native answer privately and marks that completion read; **Mark read** explicitly acknowledges it. A normal reply in the owned session thread acknowledges only completions observed before that Discord message was sent. Commands, duplicate deliveries and unauthorized users do not acknowledge items. Discord bots do not receive other users’ passive read receipts, so simply opening a thread or clicking a direct Discord link is not detectable.
-- In Codeman, opening the exact answer from the inbox marks it read once visible in a focused page. The primary terminal also acknowledges the latest completed response when an identifiable answer line unique to that response is actually rendered in its visible viewport, at the bottom, with no loading, pending writes, tile overview or modal overlay. Hidden/background pages and overview cards do not count. Short, repeated or ambiguous terminal answers remain unread until explicitly opened or acknowledged.
-- Ordinary idle, approvals, interruptions and failures do not create completion items. The first observation establishes a baseline rather than flooding the inbox with old finished work. Native cursor identities and review state survive restarts. Tracking also runs when the thread’s response stream is off. After enabling Full mode, reload an already-open Codeman page once to load the inbox UI.
-
-Instance-scoped `completion-inbox.json` is written atomically with mode 0600 and bounded to 512 completion entries, 1,024 session observation records, 2 MB and 30 days. It persists metadata only, never prompt or answer bodies. Entries whose exact native history has expired can still be explicitly marked read or opened through their original Discord link. In multi-user mode shared Discord inbox access is admin-only; ordinary users receive a disabled empty inbox and cannot read or acknowledge its entries.
-
-The additive API routes are `GET /api/discord/inbox`, `GET /api/discord/inbox/:id/response` and `POST /api/discord/inbox/:id/read`. Responses are not cached. Each read POST identifies one immutable completion, not “whatever task is newest now.”
-
 ### Automatic output attachments
 
 In Full mode, new Claude/Codex assistant responses that link a workspace image, PDF, office document, CSV, archive or media output also upload the actual file beneath the answer. For example, `![Mockup](./output/mockup.png)` and `[Report](./output/report.pdf)` produce Discord attachments. Relative paths resolve against that exact local or SSH session workspace. Absolute paths, local `file:///` links and `sandbox:/` paths also work when the file is inside the workspace. Files generated elsewhere must first be saved/copied into that workspace.
