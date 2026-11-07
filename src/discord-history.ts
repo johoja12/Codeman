@@ -153,8 +153,15 @@ try:
   def ignored_large(line):
    try:v=json.loads(line)
    except Exception:return False
-   # Only native metadata that the visible-message parser never exports may be skipped.
-   return mode=='codex-rollout' and isinstance(v,dict) and v.get('type') in ('compacted','turn_context')
+   # Keep chat/unknown records fail-closed. Only known non-chat rows can advance
+   # the exact hashed checkpoint without exporting their potentially huge body.
+   if mode!='codex-rollout' or not isinstance(v,dict):return False
+   if v.get('type') in ('compacted','turn_context'):return True
+   p=v.get('payload')
+   if s.get('tools') or not isinstance(p,dict) or p.get('role') in ('user','assistant'):return False
+   if v.get('type')=='response_item':return p.get('type') in ('function_call_output','custom_tool_call_output')
+   i=p.get('item')
+   return v.get('type')=='event_msg' and p.get('type')=='item_completed' and isinstance(i,dict) and i.get('role') not in ('user','assistant') and i.get('type')=='Extension' and i.get('kind')=='image_gen.generation'
   with os.fdopen(os.dup(f),'rb') as stream:
    stream.seek(offset);anchor=stream.readline(16*1024*1024+1)
    if len(anchor)>16*1024*1024:fail('record_too_large')
@@ -206,7 +213,15 @@ export function discordHistoryCommand(source: DiscordHistorySource): string {
     'python3 -c ' +
       shellescape(HISTORY_SCRIPT) +
       ' ' +
-      shellescape(JSON.stringify({ format, id: source.conversationId, home: source.configHome, after: source.after }))
+      shellescape(
+        JSON.stringify({
+          format,
+          id: source.conversationId,
+          home: source.configHome,
+          after: source.after,
+          tools: source.includeTools === true,
+        })
+      )
   );
 }
 export function parseDiscordHistory(source: DiscordHistorySource, raw: string): DiscordHistory {
