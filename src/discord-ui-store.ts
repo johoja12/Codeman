@@ -4,6 +4,7 @@ import { constants } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
+import { DiscordActivityRecordSchema } from './discord-activity-feed.js';
 const Card = z
   .object({
     kind: z.enum(['session', 'delivery', 'result', 'dashboard']).optional(),
@@ -48,13 +49,14 @@ const State = z
     version: z.literal(1),
     cards: z.record(z.string().max(200), Card),
     queue: z.array(Prompt).max(50),
+    activities: z.record(z.string().max(200), DiscordActivityRecordSchema).default({}),
     responses: z.record(z.string().max(200), ResponseRef).default({}),
   })
   .strict();
 export type DiscordQueuedPrompt = z.infer<typeof Prompt>;
 export type DiscordUiState = z.infer<typeof State>;
 export class DiscordUiStore {
-  private state: DiscordUiState = { version: 1, cards: {}, queue: [], responses: {} };
+  private state: DiscordUiState = { version: 1, cards: {}, queue: [], responses: {}, activities: {} };
   private loaded?: Promise<void>;
   private chain: Promise<unknown> = Promise.resolve();
   constructor(
@@ -77,6 +79,7 @@ export class DiscordUiStore {
         } finally {
           await f.close();
         }
+        if (Object.keys(raw.activities).length > 1024) throw new Error('Too many activity records');
         if (Object.keys(raw.responses).length > 1024) throw new Error('Too many response references');
         if (Object.keys(raw.cards).length > 4096) throw new Error('Too many UI cards');
         this.state = raw;
@@ -104,6 +107,9 @@ export class DiscordUiStore {
         if (ref.updated < this.now() - 30 * 86400000) delete next.responses[key];
       const refs = Object.entries(next.responses).sort((a, b) => b[1].updated - a[1].updated);
       for (const [key] of refs.slice(1024)) delete next.responses[key];
+      const activities = Object.entries(next.activities).sort((a, b) => b[1].at - a[1].at);
+      for (const [key, value] of activities) if (value.at < this.now() - 30 * 86400000) delete next.activities[key];
+      for (const [key] of activities.slice(1024)) delete next.activities[key];
       State.parse(next);
       if (Object.keys(next.cards).length > 4096) throw new Error('UI card capacity reached');
       await fs.mkdir(this.dir, { recursive: true });

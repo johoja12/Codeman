@@ -78,6 +78,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       return Promise.all(
         [...deps.sessions().values()].map(async (s) => {
           const promptSuggestion = await suggestion(s);
+          const pending = approvalInbox.listPending().find((p) => p.sessionId === s.id && p.kind !== 'idle');
           return {
             id: s.id,
             name: s.name || s.id.slice(0, 8),
@@ -93,6 +94,9 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
             inputRevision: s.discordQueueRevision,
             working: working(s),
             promptSuggestion,
+            lastPromptAt: s.lastRealPromptAt || undefined,
+            pendingAt: pending?.createdAt,
+            pendingRevision: pending?.id,
             pending: approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle'),
             exited: !!s.paneExit,
             ready: !working(s) && !s.paneExit && !s.guardedInputHeld && !s.guardedInputPendingWrites,

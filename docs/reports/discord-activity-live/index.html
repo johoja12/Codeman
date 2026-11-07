@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Codeman Activity · Discord design preview</title>
+    <link rel="stylesheet" href="preview.css" />
+  </head>
+  <body>
+    <div class="labbar">
+      <div>
+        <span class="labdot"></span><strong>Codeman Activity</strong><span class="labtag">IMPLEMENTATION PREVIEW</span>
+      </div>
+      <div class="labactions">
+        <button id="simulate" disabled>Simulate update</button><button id="scenario" disabled>Connection: live</button
+        ><button id="inspect">Design notes</button>
+      </div>
+    </div>
+    <div class="discord">
+      <aside class="guildrail" aria-hidden="true">
+        <div class="guild">C</div>
+        <div class="guildline"></div>
+        <div class="otherguild">⌘</div>
+        <div class="otherguild">+</div>
+      </aside>
+      <aside class="channels" aria-hidden="true">
+        <div class="servername">Codeman <span>⌄</span></div>
+        <div class="channelgroup">⌄ WORKSPACE</div>
+        <div class="channel selected"># <strong>codeman-cli</strong></div>
+        <div class="channeldesc">Your workspace at a glance</div>
+        <div class="channelgroup">⌄ CASES</div>
+        <div class="channel"># codeman</div>
+        <div class="thread">└ ⚫ Idle · w4-Codeman</div>
+        <div class="channel"># plex-previews</div>
+        <div class="thread">└ 🟡 Working · w1-Plex</div>
+        <div class="channel"># brain</div>
+        <div class="thread">└ 🔴 Needs input · w2-brain</div>
+        <div class="channel"># home-mon</div>
+        <div class="channel"># third-culture-coffee</div>
+        <div class="userbar">
+          <div class="useravatar">S</div>
+          <div><strong>Saqeb</strong><small>Online</small></div>
+        </div>
+      </aside>
+      <main>
+        <header class="channelheader">
+          <span class="hash">#</span><strong>codeman-cli</strong><span class="headsep"></span
+          ><span class="headhint">Your workspace, in motion.</span><span class="pin" aria-hidden="true">⋯</span>
+        </header>
+        <div class="scroll">
+          <div class="datebreak"><span>Today</span></div>
+          <article class="message">
+            <div class="botavatar">C</div>
+            <div class="messagebody">
+              <div class="author">
+                <strong>codeman</strong><span class="appbadge">✓ APP</span><time>Today at 10:02</time
+                ><span class="pinned">Pinned</span>
+              </div>
+              <div id="payload" aria-live="polite"></div>
+            </div>
+          </article>
+          <div class="bottomnote">
+            Interactive mockup · Sample activity · Discord controls final fonts, spacing and layout<br />Emoji graphics:
+            <a href="https://github.com/jdecked/twemoji">Twemoji</a> ·
+            <a href="https://creativecommons.org/licenses/by/4.0/">CC BY 4.0</a>
+          </div>
+        </div>
+      </main>
+    </div>
+    <dialog id="detail">
+      <form method="dialog"><button class="close" aria-label="Close">✕</button></form>
+      <div id="detailbody"></div>
+    </dialog>
+    <div id="toast" role="status"></div>
+    <script type="module" src="preview.mjs"></script>
+  </body>
+</html>

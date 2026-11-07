@@ -1,5 +1,11 @@
 /** Narrow ports: native Discord UI reuses existing session, input and file services. */
-import type { DiscordControlReply, DiscordFile, GatewayMessage, DiscordInteraction } from './discord-bridge.js';
+import type {
+  DiscordControlReply,
+  DiscordFile,
+  GatewayMessage,
+  DiscordInteraction,
+  DiscordPost,
+} from './discord-bridge.js';
 import type { DiscordHistory } from './discord-history.js';
 export interface DiscordUiSession {
   id: string;
@@ -17,6 +23,9 @@ export interface DiscordUiSession {
   effort?: string;
   approval?: string;
   promptSuggestion?: string;
+  lastPromptAt?: number;
+  pendingAt?: number;
+  pendingRevision?: string;
   url?: string;
 }
 export interface DiscordUiQuestion {
@@ -52,7 +61,8 @@ export interface DiscordNativeUiServices {
 }
 export interface DiscordUiPayload {
   content: string;
-  components?: Array<{ type: number; components: Array<Record<string, unknown>> }>;
+  flags?: number;
+  components?: DiscordPost['components'];
   allowed_mentions?: { parse: string[]; users: string[] };
 }
 export interface DiscordNativeUiHost {
@@ -93,6 +103,7 @@ export interface DiscordNativeUiHost {
   launch(scope: string, caseKey: string, mode: string): Promise<DiscordControlReply>;
   modes(): string[];
   locate(id: string): Promise<string | undefined>;
+  responseMessage?(id: string, cursor: string): Promise<string | undefined>;
   botId(): Promise<string | undefined>;
   now(): number;
   services: DiscordNativeUiServices;

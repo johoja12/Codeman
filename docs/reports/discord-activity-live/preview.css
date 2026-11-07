@@ -1,0 +1,715 @@
+:root {
+  color-scheme: dark;
+  font-family:
+    'gg sans',
+    'Noto Sans',
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    sans-serif;
+  color: #eeeef0;
+  background: #1d1d21;
+  font-synthesis: none;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+button,
+select {
+  font: inherit;
+}
+button {
+  cursor: pointer;
+}
+button:focus-visible,
+select:focus-visible {
+  outline: 2px solid #b6a7ff;
+  outline-offset: 3px;
+}
+.labbar {
+  min-height: 58px;
+  padding: 12px 26px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: #121215;
+  border-bottom: 1px solid #323238;
+  font-size: 13px;
+}
+.labbar > div {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.labdot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #a997fa;
+}
+.labtag {
+  color: #aaaab5;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+}
+.labactions {
+  flex-wrap: wrap;
+}
+.labactions button {
+  padding: 7px 12px;
+  border: 1px solid #42424b;
+  border-radius: 5px;
+  background: transparent;
+  color: #d1d1da;
+  font-size: 12px;
+}
+.labactions button:hover {
+  background: #29292f;
+}
+.discord {
+  display: grid;
+  grid-template-columns: 72px 238px minmax(0, 1fr);
+  min-height: calc(100vh - 58px);
+}
+.guildrail {
+  padding: 16px 12px;
+  background: #131316;
+  display: flex;
+  align-items: center;
+  flex-direction: column;
+  gap: 14px;
+}
+.guild {
+  height: 46px;
+  width: 46px;
+  border-radius: 15px;
+  background: #6557d7;
+  display: grid;
+  place-items: center;
+  font-size: 23px;
+  font-weight: 800;
+}
+.guildline {
+  height: 2px;
+  width: 28px;
+  background: #33333c;
+}
+.otherguild {
+  height: 44px;
+  width: 44px;
+  display: grid;
+  place-items: center;
+  background: #25252c;
+  border-radius: 50%;
+  font-size: 22px;
+  color: #a1a1ad;
+}
+.channels {
+  position: relative;
+  min-height: 100%;
+  background: #19191d;
+  color: #96969f;
+}
+.servername {
+  height: 55px;
+  padding: 17px 18px;
+  color: #f5f5fa;
+  font-size: 15px;
+  font-weight: 700;
+  border-bottom: 1px solid #111114;
+  display: flex;
+  justify-content: space-between;
+}
+.channelgroup {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  margin: 28px 16px 10px;
+  color: #8c8c99;
+}
+.channel {
+  font-size: 15px;
+  margin: 4px 8px;
+  padding: 8px 12px;
+  border-radius: 5px;
+}
+.selected {
+  background: #35333f;
+  color: #f3efff;
+}
+.channeldesc {
+  font-size: 11px;
+  margin: 10px 20px 25px;
+  color: #8b8a96;
+}
+.thread {
+  font-size: 11px;
+  padding: 3px 18px 8px 28px;
+  color: #aaa8b5;
+}
+.userbar {
+  position: absolute;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px;
+  width: 100%;
+  background: #141417;
+  font-size: 12px;
+}
+.useravatar {
+  width: 32px;
+  height: 32px;
+  background: #53575d;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-weight: 700;
+}
+.userbar small {
+  display: block;
+  color: #93939e;
+}
+main {
+  min-width: 0;
+  background: #202024;
+}
+.channelheader {
+  height: 55px;
+  border-bottom: 1px solid #121215;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 28px;
+  font-size: 15px;
+}
+.hash {
+  font-size: 24px;
+  color: #91919c;
+  font-weight: 400;
+}
+.headsep {
+  width: 1px;
+  height: 18px;
+  background: #46464e;
+  margin: 0 6px;
+}
+.headhint {
+  color: #9898a3;
+  font-size: 12px;
+}
+.pin {
+  margin-left: auto;
+  color: #aaa7ba;
+  font-size: 21px;
+}
+.scroll {
+  padding: 32px 36px 18px;
+  max-width: 1120px;
+}
+.channelintro {
+  margin-bottom: 24px;
+}
+.channelicon {
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  background: #33333a;
+  display: grid;
+  place-items: center;
+  font-size: 33px;
+  color: #d4d4dc;
+}
+.channelintro h1 {
+  font-size: 26px;
+  margin: 13px 0 4px;
+  letter-spacing: -0.6px;
+}
+.channelintro p {
+  color: #9f9fa9;
+  font-size: 13px;
+  margin: 0;
+}
+.datebreak {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 25px 0 23px;
+  font-size: 10px;
+  color: #9696a2;
+}
+.datebreak:before,
+.datebreak:after {
+  content: '';
+  height: 1px;
+  background: #35353b;
+  flex: 1;
+}
+.message {
+  display: flex;
+  gap: 15px;
+  align-items: flex-start;
+}
+.botavatar {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: #6557d7;
+  font-size: 21px;
+  font-weight: 750;
+}
+.messagebody {
+  width: min(100%, 690px);
+  min-width: 0;
+}
+.author {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  margin: 0 0 10px;
+}
+.author time {
+  font-size: 10px;
+  color: #92929f;
+  margin-left: 4px;
+}
+.appbadge {
+  font-size: 9px;
+  background: #5865f2;
+  color: #fff;
+  line-height: 16px;
+  border-radius: 3px;
+  padding: 0 4px;
+  font-weight: 600;
+}
+.pinned {
+  font-size: 10px;
+  color: #a9a2c1;
+  margin-left: auto;
+}
+.container {
+  background: #28282e;
+  border: 1px solid #3a3a43;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 10px;
+  position: relative;
+  overflow: hidden;
+}
+.container.accent {
+  border-left: 4px solid var(--accent);
+}
+.textdisplay {
+  font-size: 15px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.textdisplay + .textdisplay {
+  margin-top: 13px;
+}
+.textdisplay h2 {
+  font-size: 25px;
+  letter-spacing: -0.45px;
+  line-height: 1.2;
+  margin: 8px 0;
+}
+.textdisplay small {
+  display: block;
+  font-size: 11px;
+  color: #a6a6b2;
+  line-height: 1.5;
+}
+.textdisplay > small:first-child:last-child {
+  font-size: 11px;
+}
+.textdisplay p {
+  margin: 0;
+}
+.textdisplay strong {
+  font-weight: 650;
+}
+.relative {
+  background: #3d3b49;
+  color: #d0cbdf;
+  border-radius: 3px;
+  padding: 1px 3px;
+  font-size: 0.93em;
+  white-space: nowrap;
+}
+.actionrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+.selectwrap {
+  width: 100%;
+  position: relative;
+}
+.native-select {
+  appearance: none;
+  width: 100%;
+  border-radius: 5px;
+  border: 1px solid #4b4a56;
+  padding: 11px 34px 11px 12px;
+  background: #1d1d22;
+  color: #eeeef3;
+  font-size: 14px;
+  cursor: pointer;
+}
+.selectwrap:after {
+  position: absolute;
+  right: 13px;
+  top: 9px;
+  content: '⌄';
+  pointer-events: none;
+  color: #aaa7b8;
+}
+.section {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 1px 0;
+}
+.section > .textdisplay {
+  min-width: 0;
+  flex: 1;
+}
+.section .textdisplay {
+  font-size: 14px;
+  line-height: 1.6;
+}
+.section .textdisplay strong {
+  font-size: 15px;
+}
+.section .textdisplay small {
+  line-height: 1.45;
+  margin-top: 3px;
+  font-size: 11px;
+}
+.section .textdisplay small + small {
+  margin-top: 4px;
+  color: #898994;
+  font-size: 10px;
+}
+.section .nativebutton {
+  flex-shrink: 0;
+  min-width: 94px;
+}
+.nativebutton {
+  border: 1px solid #4b4b56;
+  background: #3b3b44;
+  color: #f3f3f7;
+  border-radius: 5px;
+  min-height: 34px;
+  padding: 7px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 18px;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  white-space: nowrap;
+}
+.nativebutton:hover {
+  background: #484853;
+}
+.nativebutton.primary {
+  background: #5865f2;
+  border-color: #5865f2;
+}
+.nativebutton.primary:hover {
+  background: #4752c4;
+}
+.nativebutton:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+.nativebutton.link:after {
+  content: '↗';
+  font-size: 12px;
+  color: #c7c6d2;
+}
+.separator {
+  border: 0;
+  height: 1px;
+  background: #42424a;
+  margin: 13px 0;
+}
+.container > .textdisplay:first-child + .section {
+  margin-top: 17px;
+}
+#payload > .textdisplay {
+  margin: 13px 0 0;
+  color: #a5a5b1;
+}
+#payload > .actionrow {
+  margin-top: 10px;
+}
+.bottomnote {
+  padding: 25px 0 0 55px;
+  font-size: 10px;
+  color: #85838e;
+}
+dialog {
+  border: 1px solid #4c495e;
+  background: #25252d;
+  color: #eeeaf9;
+  max-width: 540px;
+  width: calc(100% - 32px);
+  border-radius: 12px;
+  padding: 28px;
+  box-shadow: 0 24px 80px #0008;
+}
+dialog::backdrop {
+  background: #0009;
+}
+dialog h2 {
+  font-size: 23px;
+  margin: 0 0 15px;
+}
+dialog p,
+dialog li {
+  color: #bdbacb;
+  font-size: 14px;
+  line-height: 1.65;
+}
+dialog a {
+  color: #b4a5ff;
+}
+.close {
+  position: absolute;
+  right: 14px;
+  top: 12px;
+  background: none;
+  border: 0;
+  font-size: 19px;
+  color: #aaa6b8;
+}
+#toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translate(-50%, 20px);
+  background: #4d4465;
+  color: #fff;
+  border: 1px solid #9d8bbd;
+  border-radius: 7px;
+  padding: 11px 18px;
+  font-size: 13px;
+  opacity: 0;
+  pointer-events: none;
+  transition: 0.18s;
+  z-index: 4;
+  width: max-content;
+  max-width: calc(100vw - 24px);
+  text-align: center;
+}
+#toast.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+@media (min-width: 1500px) {
+  .scroll {
+    padding-left: 60px;
+  }
+}
+@media (max-width: 1000px) {
+  .discord {
+    grid-template-columns: 60px 190px minmax(0, 1fr);
+  }
+  .channels .thread {
+    font-size: 10px;
+    padding-left: 17px;
+  }
+  .scroll {
+    padding: 25px 20px;
+  }
+  .channelheader {
+    padding: 0 20px;
+  }
+  .labtag {
+    display: none;
+  }
+  .headhint {
+    display: none;
+  }
+  .labbar {
+    padding: 12px 18px;
+  }
+  .nativebutton {
+    padding: 7px 10px;
+  }
+  .section {
+    gap: 12px;
+  }
+}
+@media (max-width: 720px) {
+  .discord {
+    display: block;
+  }
+  .guildrail,
+  .channels {
+    display: none;
+  }
+  .labbar {
+    padding: 10px 14px;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 9px;
+  }
+  .labactions {
+    gap: 6px !important;
+  }
+  .labactions button {
+    font-size: 11px;
+    padding: 6px 9px;
+  }
+  .labtag {
+    display: inline;
+    font-size: 9px;
+  }
+  .channelheader {
+    height: 48px;
+    padding: 0 16px;
+  }
+  .headsep {
+    display: none;
+  }
+  .scroll {
+    padding: 20px 12px;
+  }
+  .channelintro {
+    margin: 0 6px 17px;
+  }
+  .channelintro h1 {
+    font-size: 22px;
+  }
+  .channelicon {
+    width: 40px;
+    height: 40px;
+    font-size: 27px;
+  }
+  .datebreak {
+    margin: 18px 0;
+  }
+  .message {
+    gap: 9px;
+  }
+  .botavatar {
+    width: 28px;
+    height: 28px;
+    font-size: 16px;
+  }
+  .author {
+    font-size: 12px;
+    gap: 4px;
+  }
+  .author time {
+    font-size: 9px;
+  }
+  .pinned {
+    font-size: 9px;
+  }
+  .messagebody {
+    width: calc(100% - 37px);
+  }
+  .container {
+    padding: 12px;
+  }
+  .textdisplay {
+    font-size: 13px;
+  }
+  .textdisplay h2 {
+    font-size: 24px;
+  }
+  .textdisplay small {
+    font-size: 10px;
+  }
+  .section {
+    gap: 8px;
+    align-items: center;
+  }
+  .section .nativebutton {
+    min-width: 78px;
+    font-size: 10px;
+    padding: 6px 8px;
+    min-height: 32px;
+  }
+  .section .textdisplay {
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .section .textdisplay strong {
+    font-size: 13px;
+  }
+  .section .textdisplay small {
+    font-size: 10px;
+  }
+  .section .textdisplay small + small {
+    font-size: 9px;
+  }
+  .relative {
+    font-size: 0.9em;
+  }
+  .native-select {
+    font-size: 12px;
+    padding: 10px 27px 10px 10px;
+  }
+  .separator {
+    margin: 12px 0;
+  }
+  .nativebutton {
+    font-size: 11px;
+    min-height: 33px;
+  }
+  .bottomnote {
+    padding: 22px 0 0 37px;
+    line-height: 1.6;
+  }
+  .container > .textdisplay:first-child + .section {
+    margin-top: 15px;
+  }
+  .appbadge {
+    font-size: 8px;
+    line-height: 14px;
+  }
+  #payload > .textdisplay {
+    line-height: 1.7;
+  }
+}
+
+.emoji {
+  display: inline-block;
+  width: 1em;
+  height: 1em;
+  vertical-align: -0.13em;
+  object-fit: contain;
+  margin-right: 1px;
+}
+.thread .emoji {
+  width: 11px;
+  height: 11px;
+}
+.scroll {
+  padding-top: 12px;
+}
+
+.bottomnote a {
+  color: inherit;
+}
