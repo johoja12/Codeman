@@ -21,6 +21,11 @@ interface Deps {
   capture?(id: string): string | null | undefined | Promise<string | null | undefined>;
   observed?(id: string): { model: string; effort?: string } | undefined;
 }
+/** Match the native history reader: Claude IDs do not live in Codex resume fields. */
+const conversationFor = (s: Session): string | undefined =>
+  getCli(s.mode)?.capabilities.transcript === 'claude-jsonl'
+    ? (s.claudeSessionId ?? undefined)
+    : (s.nativeResumeId ?? s.codexConfig?.resumeSessionId);
 export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServices {
   const session = (id: string) => {
     const s = deps.sessions().get(id);
@@ -46,7 +51,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       return undefined;
     try {
       const revision = s.discordQueueRevision,
-        conversation = s.nativeResumeId;
+        conversation = conversationFor(s);
       const frame = await deps.capture?.(s.id);
       if (
         !deps.allowed() ||
@@ -56,7 +61,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
         s.guardedInputHeld ||
         s.guardedInputPendingWrites ||
         revision !== s.discordQueueRevision ||
-        conversation !== s.nativeResumeId ||
+        conversation !== conversationFor(s) ||
         approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle')
       )
         return undefined;
@@ -84,7 +89,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
                   ? c.remote?.hostId === s.remote.hostId && c.remote.path === s.remote.remotePath
                   : !c.remote && c.path === s.workingDir
               )?.name || 'Unlinked workspace',
-            conversation: s.nativeResumeId ?? s.codexConfig?.resumeSessionId,
+            conversation: conversationFor(s),
             inputRevision: s.discordQueueRevision,
             working: working(s),
             promptSuggestion,
@@ -187,7 +192,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
           s.discordQueueRevision === inputRevision &&
           allowed() &&
           deps.sessions().get(id) === s &&
-          (s.nativeResumeId ?? s.codexConfig?.resumeSessionId) === conversation &&
+          conversationFor(s) === conversation &&
           !approvalInbox.listPending().some((p) => p.sessionId === id && p.kind !== 'idle')
       );
     },

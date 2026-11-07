@@ -1085,6 +1085,39 @@ export class DiscordNativeUi {
     );
   }
   async offerBusy(id: string, channel: string, message: GatewayMessage, source: string): Promise<void> {
+    // Preparing buttons never writes to the terminal. Failures here are known unsent input,
+    // unlike a transport exception after an actual submit attempt.
+    let payload: DiscordUiPayload;
+    try {
+      payload = await this.offerBusyChoice(id, channel, message, source);
+    } catch {
+      await this.host.note(source, 'cancelled');
+      await this.host
+        .request(
+          'POST',
+          `/channels/${channel}/messages`,
+          this.payload(
+            'This follow-up was not sent. Its send/queue controls could not be prepared. Check the session, then send it as a new message.'
+          )
+        )
+        .catch(() => undefined);
+      return;
+    }
+    // Once controls may be visible, keep an unconfirmed Discord POST ambiguous: a
+    // concurrent explicit button click may already have submitted native input.
+    const posted = (await this.host.request('POST', `/channels/${channel}/messages`, payload)) as { id?: string };
+    for (const r of payload.components ?? [])
+      for (const c of r.components) {
+        const a = this.actions.get(c.custom_id as string);
+        if (a) a.message = posted?.id;
+      }
+  }
+  private async offerBusyChoice(
+    id: string,
+    channel: string,
+    message: GatewayMessage,
+    source: string
+  ): Promise<DiscordUiPayload> {
     const s = await this.target(id);
     if (!s.conversation) throw new Error('Exact conversation unavailable; nothing was submitted');
     const ctx: UiContext = {
@@ -1149,12 +1182,7 @@ export class DiscordNativeUi {
       ]
     );
     // All three choices share one source; submitting and enqueueing also dedupe the source ID.
-    const posted = (await this.host.request('POST', `/channels/${channel}/messages`, payload)) as { id?: string };
-    for (const r of payload.components ?? [])
-      for (const c of r.components) {
-        const a = this.actions.get(c.custom_id as string);
-        if (a) a.message = posted?.id;
-      }
+    return payload;
   }
   private async queueView(m: DiscordInteraction, id: string): Promise<DiscordUiPayload> {
     const s = await this.target(id),
