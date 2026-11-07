@@ -89,3 +89,12 @@ print(json.dumps(darwin_environment(data)))
   expect(JSON.parse(output)).toEqual({ HOME: '/Users/test', CODEX_HOME: '/Users/test/personal account' });
   expect(output).not.toContain('SECRET');
 });
+
+it('reads only the main interactive profile with nested app-server helpers present', async () => {
+  const rows = `100 1 /bin/sh\n101 100 codex resume ${id}\n102 101 /bin/sh\n103 102 codex app-server`;
+  expect(JSON.parse(await probe('HOME=/home/test\0CODEX_HOME=/account\0', rows))).toMatchObject({
+    id,
+    configHome: '/account',
+    fingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+  });
+});
