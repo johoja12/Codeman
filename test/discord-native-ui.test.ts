@@ -1580,3 +1580,17 @@ it('renders the approved five-row activity layout using actual session events', 
     await writeFile(join(process.env.ACTIVITY_ARTIFACT_DIR, 'payload.json'), JSON.stringify(payload, null, 2));
   }
 });
+
+it('does not bump an unchanged pending question when the hook registry is restored', async () => {
+  const f = await fixture();
+  Object.assign(f.sessions[0], { pending: true, pendingAt: 900000, pendingRevision: 'same-native-question' });
+  await f.command('codeman');
+  const initial = (await f.ui.store.snapshot()).activities;
+  f.advance(30000);
+  f.sessions[0].pendingAt = f.host.now();
+  await f.command('codeman');
+  expect((await f.ui.store.snapshot()).activities).toEqual(initial);
+  f.sessions[0].pendingRevision = 'different-native-question';
+  await f.command('codeman');
+  expect(Object.values((await f.ui.store.snapshot()).activities)[0].at).toBe(f.host.now());
+});

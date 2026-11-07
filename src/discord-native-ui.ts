@@ -1649,7 +1649,10 @@ export class DiscordNativeUi {
         };
       if (s.pending) {
         const cursor = 'question:' + (s.pendingRevision ?? 'observed');
-        const at = s.pendingAt ?? (old?.kind === 'question' && old.cursor === cursor ? old.at : this.host.now());
+        const at =
+          old?.kind === 'question' && old.cursor === cursor && old.conversation === (s.conversation ?? '')
+            ? old.at
+            : (s.pendingAt ?? this.host.now());
         const question: DiscordActivityEvent = {
           conversation: s.conversation ?? '',
           kind: 'question',
