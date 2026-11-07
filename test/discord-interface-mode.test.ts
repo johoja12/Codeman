@@ -2801,3 +2801,86 @@ it('posts a selectable native question as one V2 card and binds buttons to that 
     posts.filter((p) => p.method === 'PATCH').some((p) => visibleText(p.body)?.includes('Which test color?'))
   ).toBe(true);
 });
+
+it('delivers native generated-image events as silent inline galleries without a prose file link and deduplicates restart', async () => {
+  sessions = [{ id: 's1', name: 'one' }];
+  let now = 100000;
+  let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+  let images: import('../src/discord-history.js').DiscordGeneratedImage[] = [];
+  const history = async (_id: string, options?: { after?: string }) => ({
+    conversationId: 'native1',
+    partial: false,
+    turns,
+    generatedImages: images,
+    verifiedAfter: options?.after,
+    scannedCursor: turns.at(-1)?.cursor,
+  });
+  const getGeneratedImage = vi.fn(async () => ({ name: 'native.png', data: Buffer.from('generated PNG fixture') }));
+  const getAttachment = vi.fn();
+  const b = makeBridge(undefined, { history, now: () => now, getGeneratedImage, getAttachment });
+  await b.reload();
+  await b.syncSessions();
+  posts = [];
+  turns = [
+    { cursor: 'native1:10:user', role: 'user', text: 'Create a mockup', timestamp: '' },
+    {
+      cursor: 'native1:100:answer',
+      role: 'assistant',
+      phase: 'final_answer',
+      text: 'Concept complete.',
+      timestamp: '',
+    },
+  ];
+  images = [{ id: 'exec-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', cursor: 'native1:50:image', timestamp: '' }];
+  await b.pollConversations();
+  const gallery = posts.filter(
+    (p) => p.method === 'POST' && JSON.stringify(p.body?.components).includes('attachment://native.png')
+  );
+  expect(gallery).toHaveLength(1);
+  expect(gallery[0].body.flags & 4096).toBeTruthy();
+  expect(discordUiNodes(gallery[0].body.components).some((n) => n.type === 12)).toBe(true);
+  expect(discordUiNodes(gallery[0].body.components).some((n) => n.type === 13)).toBe(false);
+  expect(uploaded.some((f) => f.name === 'native.png')).toBe(true);
+  expect(getAttachment).not.toHaveBeenCalled();
+  const answer = posts.find((p) => visibleText(p.body) === 'Concept complete.')!;
+  expect(posts.indexOf(gallery[0])).toBeLessThan(posts.indexOf(answer));
+  b.stop();
+  const restored = makeBridge(undefined, { history, now: () => now, getGeneratedImage });
+  await restored.reload();
+  await restored.syncSessions();
+  now += 60001;
+  await restored.pollConversations();
+  expect(
+    posts.filter((p) => p.method === 'POST' && JSON.stringify(p.body?.components).includes('attachment://native.png'))
+  ).toHaveLength(1);
+  expect(sendInput).not.toHaveBeenCalled();
+});
+it('delivers a metadata-only generated-image page before advancing its native checkpoint', async () => {
+  sessions = [{ id: 's1', name: 'one' }];
+  let now = 100000;
+  let generated = false;
+  const history = async (_id: string, options?: { after?: string }) => ({
+    conversationId: 'native1',
+    partial: false,
+    turns: generated ? [] : [{ cursor: 'native1:10:user', role: 'user' as const, text: 'Generate', timestamp: '' }],
+    verifiedAfter: options?.after,
+    scannedCursor: generated ? 'native1:50:image' : 'native1:10:user',
+    generatedImages: generated
+      ? [{ id: 'exec-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', cursor: 'native1:50:image', timestamp: '' }]
+      : [],
+  });
+  const b = makeBridge(undefined, {
+    history,
+    now: () => now,
+    getGeneratedImage: async () => ({ name: 'native.png', data: Buffer.from('image') }),
+  });
+  await b.reload();
+  await b.syncSessions();
+  generated = true;
+  now += 60001;
+  await b.pollConversations();
+  const progress = JSON.parse(await readFile(join(dir, 'discord-conversations.json'), 'utf8'));
+  expect(progress.some(([, p]: any) => p.cursor === 'native1:50:image')).toBe(true);
+  expect(uploaded.some((f) => f.name === 'native.png')).toBe(true);
+  expect(sendInput).not.toHaveBeenCalled();
+});

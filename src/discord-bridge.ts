@@ -21,7 +21,7 @@ import { DiscordHistoryWarnings } from './discord-history-warnings.js';
  * @module discord-bridge
  */
 import { discordArtifactPaths, discordAttachedFileLabels, DISCORD_ARTIFACT_COUNT } from './discord-artifacts.js';
-import { DiscordNativeUi, uiV2Payload } from './discord-native-ui.js';
+import { DiscordNativeUi, uiV2Payload, discordUiNodes } from './discord-native-ui.js';
 import type { DiscordNativeUiServices } from './discord-native-ui-types.js';
 import { registerDiscordLaunchCommands } from './discord-launch-commands.js';
 import {
@@ -635,10 +635,17 @@ export class DiscordApi {
     files: DiscordFile[],
     current?: () => boolean
   ): Promise<{ id: string } | null> {
-    const fileNodes = files.map((file) => ({
-      type: 13,
-      file: { url: 'attachment://' + safeAttachmentName(file.name) },
-    }));
+    const galleryFiles = new Set(
+      discordUiNodes(p.components).flatMap((node) =>
+        node.type === 12 && Array.isArray(node.items) ? node.items.map((item) => item?.media?.url) : []
+      )
+    );
+    const fileNodes = files
+      .filter((file) => !galleryFiles.has('attachment://' + safeAttachmentName(file.name)))
+      .map((file) => ({
+        type: 13,
+        file: { url: 'attachment://' + safeAttachmentName(file.name) },
+      }));
     const card = p.components?.length === 1 && p.components[0].type === 17 ? p.components[0] : undefined;
     const components =
       card && Array.isArray(card.components) && card.components.length + fileNodes.length <= 10
@@ -974,6 +981,10 @@ export interface DiscordBridgeDeps {
     options?: { includeTools?: boolean; after?: string }
   ) => Promise<import('./discord-history.js').DiscordHistory>;
   saveRemoteAttachment?: (sessionId: string, name: string, bytes: Uint8Array) => Promise<string>;
+  getGeneratedImage?: (
+    sessionId: string,
+    image: import('./discord-history.js').DiscordGeneratedImage
+  ) => Promise<DiscordFile>;
   getAttachment?: (sessionId: string, path: string, relativeToWorkspace?: boolean) => Promise<DiscordFile>;
   /** Snapshot only: never discovers or starts agents. Called after restoration is released. */
   sessions?: () => Array<DiscordActivitySession & { remote?: boolean }>;
@@ -1507,6 +1518,65 @@ export class DiscordBridge {
     }
     await Promise.all(reads);
   }
+  private async deliverGeneratedImages(
+    sessionId: string,
+    channel: string,
+    images: import('./discord-history.js').DiscordGeneratedImage[]
+  ): Promise<void> {
+    if (!this.deps.getGeneratedImage) return;
+    const scope = this.controlScope;
+    const current = () =>
+      !this.stopped &&
+      !this.held &&
+      this.acceptsControls &&
+      this.controlScope === scope &&
+      this.destinationMatches(sessionId, channel);
+    for (const image of images.slice(0, 4)) {
+      if (!current()) return;
+      let file: DiscordFile;
+      try {
+        file = await this.deps.getGeneratedImage(sessionId, image);
+      } catch {
+        await this.deliverPost(
+          channel,
+          {
+            content: 'The agent generated an image, but it could not be attached safely. Open the session in Codeman.',
+            flags: DISCORD_SUPPRESS_NOTIFICATIONS,
+            allowed_mentions: { parse: [], users: [] },
+          },
+          undefined,
+          sessionId,
+          `native-image:${image.cursor}:unavailable`,
+          current
+        ).catch(() => undefined);
+        continue;
+      }
+      if (!current()) return;
+      if (file.data.byteLength > DISCORD_FILE_LIMIT) throw new BridgeProblem('Generated image exceeds 8 MB');
+      await this.deliverPost(
+        channel,
+        {
+          content: '',
+          flags: DISCORD_COMPONENTS_V2 | DISCORD_SUPPRESS_NOTIFICATIONS | 4,
+          allowed_mentions: { parse: [], users: [] },
+          components: [
+            {
+              type: 17,
+              components: [
+                { type: 10, content: '**Generated image**' },
+                { type: 12, items: [{ media: { url: 'attachment://' + safeAttachmentName(file.name) } }] },
+              ],
+            },
+          ],
+        },
+        file,
+        sessionId,
+        `native-image:${image.cursor}`,
+        current
+      );
+    }
+  }
+
   private async deliverArtifacts(
     sessionId: string,
     channel: string,
@@ -1722,8 +1792,22 @@ export class DiscordBridge {
       if (progress.cursor && at < 0 && history.verifiedAfter !== progress.cursor)
         throw new BridgeProblem('Live boundary expired; request history');
       const batch = history.turns.slice(at + 1, at + 21);
+      const imageOffset = (cursor: string) => Number(cursor.split(':')[1]);
+      const afterImage = progress.cursor ? imageOffset(progress.cursor) : -1;
+      const pendingImages = (history.generatedImages ?? [])
+        .filter(
+          (image) => image.cursor.startsWith(history.conversationId + ':') && imageOffset(image.cursor) > afterImage
+        )
+        .sort((a, b) => imageOffset(a.cursor) - imageOffset(b.cursor));
+      const sendImagesThrough = async (cursor?: string) => {
+        const end = cursor ? imageOffset(cursor) : Infinity;
+        const ready = pendingImages.filter((image) => imageOffset(image.cursor) <= end);
+        await this.deliverGeneratedImages(sessionId, channel, ready);
+        for (const image of ready) pendingImages.splice(pendingImages.indexOf(image), 1);
+      };
       for (let index = 0; index < batch.length; index++) {
         const turn = batch[index];
+        await sendImagesThrough(turn.cursor);
         if (
           this.stopped ||
           !this.cfg.enabled ||
@@ -1749,6 +1833,11 @@ export class DiscordBridge {
             group = [];
             for (const candidate of batch.slice(index)) {
               if (candidate.role !== 'assistant' || candidate.phase !== 'commentary') break;
+              if (
+                group.length &&
+                pendingImages.some((image) => imageOffset(image.cursor) <= imageOffset(candidate.cursor))
+              )
+                break;
               group.push(candidate);
             }
             progress = { ...progress, pendingUpdates: group.map((t) => t.cursor) };
@@ -1876,6 +1965,7 @@ export class DiscordBridge {
         await this.conversationProgress.set(key, progress);
       }
       await this.nativeUi?.observeHistory(sessionId, history).catch(() => undefined);
+      if (history.turns.length - (at + 1) <= 20) await sendImagesThrough(history.scannedCursor);
       // Raw tool/metadata pages still make durable progress after all visible turns were delivered.
       if (history.verifiedAfter && history.scannedCursor && history.turns.length - (at + 1) <= 20) {
         progress = { ...progress, cursor: history.scannedCursor };

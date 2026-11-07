@@ -8,7 +8,7 @@ import { activeSessionRecoveryActions } from './session-recovery-service.js';
 import { isRecoveryDismissed } from '../session-recovery-fence.js';
 import { discordTaskControl, discordControlCurrent } from '../discord-task-controls.js';
 import { readDiscordCanonicalHistory } from '../discord-history-recovery.js';
-import { discordHistoryControl } from '../discord-history.js';
+import { discordHistoryControl, readDiscordSessionGeneratedImage } from '../discord-history.js';
 import { readDiscordSessionFile, writeDiscordRemoteAttachment } from '../discord-file-transfers.js';
 /**
  * @fileoverview Codeman web server — central hub coordinating all subsystems.
@@ -910,6 +910,15 @@ export class WebServer extends EventEmitter {
           () => current() && this.sessions.get(id) === session && !isMultiUserMode()
         )) ?? discordHistoryControl(session, command)
       );
+    },
+    getGeneratedImage: async (id, image) => {
+      if (isMultiUserMode() || !this.discordBridge.acceptsControls)
+        throw new Error('Generated image delivery is unavailable');
+      const session = this.sessions.get(id);
+      if (!session) throw new Error('Session unavailable');
+      const file = await readDiscordSessionGeneratedImage(session, image);
+      if (this.sessions.get(id) !== session) throw new Error('Session changed');
+      return file;
     },
     getAttachment: async (id, path, relativeToWorkspace) => {
       const session = this.sessions.get(id);
