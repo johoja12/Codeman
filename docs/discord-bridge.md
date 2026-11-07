@@ -306,6 +306,10 @@ For other types, use an explicit `[artifact: ./output/data.json]` declaration or
 
 Up to four unique linked files are grouped into one attachment message, with an 8 MB combined limit. Files reuse the existing bounded local/SSH reads, workspace boundaries and sensitive-path checks. Missing/refused/over-limit files produce one concise note while the answer and subsequent responses continue. Uploads use durable delivery tracking; uncertain uploads are not automatically replayed. No new model turn is run and attachments do not ping users. Discord previews supported image formats and offers downloads for other files.
 
+### Long transcript recovery
+
+Live output resumes from its durable native cursor even when that position is older than the recent 2 MiB history window. Recovery verifies the conversation ID, byte position and row hash, reads bounded forward pages and persists delivery progress. Tool-only pages advance without exposing tool text. Large Codex compaction/turn-context records are verified and skipped as internal metadata (16 MiB record ceiling); oversized visible records, replaced anchors and truncated transcripts pause safely rather than guessing a new position. Catch-up is rate-limited and does not submit prompts or restart the CLI. Once synchronized, bot-owned stale history warnings are edited to show recovery. `!codeman history` still shows a bounded recent-history page; automatic catch-up independently repairs live streaming.
+
 ### Prompts submitted outside Discord
 
 In Full mode, newly observed native user prompts also appear in the session thread as **User prompt**, before their assistant response. This includes prompts submitted from the web UI or terminal once the CLI records them; drafts and keystrokes are not mirrored. The bridge does not guess whether a prompt came specifically from the web UI. Prompts already attributed to a Discord submission in that exact session, thread and conversation are not echoed again, including queued submissions when native correlation is available. Identical text alone is not used to suppress a prompt.
