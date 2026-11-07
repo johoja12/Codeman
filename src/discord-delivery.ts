@@ -242,16 +242,19 @@ export class DiscordDeliveryJournal {
     sessionId: string,
     history: import('./discord-history.js').DiscordHistory,
     readAfter?: (cursor: string) => Promise<import('./discord-history.js').DiscordHistory>
-  ): Promise<void> {
+  ): Promise<boolean> {
     const run = this.reconciliation.then(() => this.reconcile(sessionId, history, readAfter));
-    this.reconciliation = run.catch(() => undefined);
+    this.reconciliation = run.then(
+      () => undefined,
+      () => undefined
+    );
     return run;
   }
   private async reconcile(
     sessionId: string,
     history: import('./discord-history.js').DiscordHistory,
     readAfter?: (cursor: string) => Promise<import('./discord-history.js').DiscordHistory>
-  ): Promise<void> {
+  ): Promise<boolean> {
     await this.load();
     const records = [...this.records.values()]
       .filter(
@@ -290,10 +293,14 @@ export class DiscordDeliveryJournal {
             evidence.turns.findIndex((t) => t.cursor === e.userCursor) > baseline
       );
       if (!execution) continue;
+      // The native turn can appear while the terminal write is still returning. Defer
+      // mirroring without claiming its origin until the transport outcome is recorded.
+      if (record.state === 'submitting') return false;
       claimed.add(execution.userCursor);
       await this.annotate(record.id, { native: { ...meta, userCursor: execution.userCursor } });
       if (record.state !== execution.state) await this.update(record.id, execution.state);
     }
+    return true;
   }
   /** Exact native turns already submitted through this Discord destination, including queued input. */
   async submittedUserCursors(sessionId: string, channelId: string, conversationId: string): Promise<Set<string>> {

@@ -134,7 +134,12 @@ describe('delivery journal', () => {
         executions: [{ userCursor: 'native:user', promptHash: 'a'.repeat(64), state: 'running' as const }],
       };
       const readAfter = vi.fn(async () => ({ ...history, verifiedAfter: 'native:old' }));
-      await journal.reconcileNative('s1', history, readAfter);
+      if (state === 'submitting') {
+        expect(await journal.reconcileNative('s1', history, readAfter)).toBe(false);
+        expect((await journal.submittedUserCursors('s1', THREAD, 'native')).size).toBe(0);
+        await journal.update(meta.id, 'input_accepted');
+      }
+      expect(await journal.reconcileNative('s1', history, readAfter)).toBe(true);
       expect(readAfter).toHaveBeenCalledWith('native:old');
       expect(await journal.submittedUserCursors('s1', THREAD, 'native')).toEqual(new Set(['native:user']));
       const restored = new DiscordDeliveryJournal(dir, () => now);
