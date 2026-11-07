@@ -4371,7 +4371,7 @@ export class WebServer extends EventEmitter {
    * segmented into turns for the CLIs that keep none); undefined for a shell, which has no turns, and the
    * screen tail stands in whenever the reader finds nothing.
    */
-  private async discordCanonicalHistory(session: Session, options?: { includeTools?: boolean }) {
+  private async discordCanonicalHistory(session: Session, options?: { includeTools?: boolean; after?: string }) {
     const before = session.nativeResumeId;
     const history = await readDiscordCanonicalHistory(
       session,
