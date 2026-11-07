@@ -893,7 +893,7 @@ export class WebServer extends EventEmitter {
         (!!session && discordControlCurrent(session, validity))
       );
     },
-    control: async (id, command) => {
+    control: async (id, command, current = () => true) => {
       const settings = await this.discordModelControls.control(id, command);
       if (settings) return settings;
       const managed = await this.discordSessionManager.control(id, command);
@@ -903,7 +903,13 @@ export class WebServer extends EventEmitter {
         return {
           text: 'Use a session thread for task/history commands; !codeman help lists management commands.',
         };
-      return (await discordTaskControl(session, command)) ?? discordHistoryControl(session, command);
+      return (
+        (await discordTaskControl(
+          session,
+          command,
+          () => current() && this.sessions.get(id) === session && !isMultiUserMode()
+        )) ?? discordHistoryControl(session, command)
+      );
     },
     getGeneratedImage: async (id, image) => {
       if (isMultiUserMode() || !this.discordBridge.acceptsControls)

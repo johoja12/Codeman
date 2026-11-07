@@ -1090,6 +1090,7 @@ export class DiscordNativeUi {
     const s = await this.target(id),
       q = this.host.services.question(id),
       ctx = this.ctx(m, s);
+    const questionScope = this.host.scope();
     if (!q) return this.payload('No pending question or permission request.');
     if (q.terminalOnly)
       return this.payload(
@@ -1109,7 +1110,17 @@ export class DiscordNativeUi {
       const fresh = this.host.services.question(id);
       if (!fresh || fresh.id !== q.id || fresh.revision !== q.revision)
         throw new Error('This question was answered elsewhere or changed');
-      const result = await this.host.services.answer(id, q.id, q.revision, value);
+      const result = await this.host.services.answer(
+        id,
+        q.id,
+        q.revision,
+        value,
+        () =>
+          questionScope === this.host.scope() &&
+          this.host.channelForSession(id) === ctx.channel &&
+          !!ctx.actor &&
+          this.host.config().allowed.includes(ctx.actor)
+      );
       const label =
         q.kind === 'idle'
           ? value

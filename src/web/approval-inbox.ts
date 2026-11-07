@@ -1,3 +1,4 @@
+import type { ClaudeVisibleQuestion } from './claude-visible-question.js';
 /**
  * @fileoverview Approvals Inbox: server-side registry of prompts waiting on a human.
  *
@@ -53,6 +54,12 @@ export interface ApprovalOption {
   label: string;
 }
 
+export interface NativeQuestionControl {
+  conversation: string;
+  inputRevision: string;
+  dialog: ClaudeVisibleQuestion;
+  state: 'pending' | 'answering' | 'uncertain' | 'answered';
+}
 export interface ApprovalItem {
   /** `${sessionId}:${seq}`, stable across re-captures, unique per prompt. */
   id: string;
@@ -100,6 +107,7 @@ export interface ApprovalItem {
    * Deny actions, and the UI offers "Open session" instead of answer buttons.
    */
   answerInTerminal?: boolean;
+  nativeQuestion?: NativeQuestionControl;
 }
 
 export interface ApprovalResolvedInfo {
@@ -132,6 +140,7 @@ interface NotePromptArgs {
    * `ApprovalItem.answerInTerminal`.
    */
   answerInTerminal?: boolean;
+  nativeQuestion?: NativeQuestionControl;
   /**
    * An idle prompt that should open ALREADY acknowledged for a reason other than
    * `watching`, e.g. `cache keep-alive` when the turn that just ended was Codeman's own
@@ -304,6 +313,9 @@ export class ApprovalInbox {
       message: args.message,
       cwd: args.cwd,
       ...(args.answerInTerminal ? { answerInTerminal: true } : {}),
+      ...(args.nativeQuestion
+        ? { nativeQuestion: args.nativeQuestion, options: args.nativeQuestion.dialog.choices }
+        : {}),
     };
     if (args.kind === 'idle' && (args.preAcknowledged || args.watching)) {
       item.acknowledgedAt = item.createdAt;

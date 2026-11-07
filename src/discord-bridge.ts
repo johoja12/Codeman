@@ -272,6 +272,7 @@ export function isDiscordCdnUrl(raw: string): boolean {
 }
 
 export interface DiscordControlReply {
+  questionCard?: boolean;
   verifiedSettings?: { model: string; effort?: string };
   text: string;
   locateSessionId?: string;
@@ -300,6 +301,7 @@ export interface DiscordInteraction {
   message?: { id: string; flags?: number };
 }
 interface DiscordBoundAction {
+  questionCard?: boolean;
   sessionId: string;
   channel: string;
   command: string;
@@ -970,7 +972,7 @@ export interface DiscordBridgeDeps {
   /** A session's working folder, where received files are saved. Undefined when it is gone or remote. */
   sessionDir?: (sessionId: string) => string | undefined;
   caseForSession?: (sessionId: string) => Promise<DiscordCaseIdentity | undefined>;
-  control?: (sessionId: string, command: string) => Promise<DiscordControlReply>;
+  control?: (sessionId: string, command: string, current?: () => boolean) => Promise<DiscordControlReply>;
   controlCurrent?: (sessionId: string, validity: string) => boolean;
   launchModes?: () => string[];
   launch?: (scope: string, caseKey: string, mode: string) => Promise<DiscordControlReply>;
@@ -2509,7 +2511,9 @@ export class DiscordBridge {
               msg.sessionId,
               channel,
               prompt,
-              `pending:${msg.sessionId}:${createHash('sha256').update(prompt.text).digest('hex')}`,
+              `pending:${msg.sessionId}:${createHash('sha256')
+                .update(prompt.questionCard ? JSON.stringify([prompt.text, prompt.actions]) : prompt.text)
+                .digest('hex')}`,
               shouldPing(this.cfg.pingMode, msg.urgency, explicitUrgent)
             );
             return { ok: true, at: this.now() };
@@ -2893,7 +2897,13 @@ export class DiscordBridge {
           .digest('hex')
           .slice(0, 32);
       ids.push(id);
-      this.actions.set(id, { ...action, sessionId, channel, expiresAt: this.now() + 10 * 60 * 1000 });
+      this.actions.set(id, {
+        ...action,
+        sessionId,
+        channel,
+        expiresAt: this.now() + 10 * 60 * 1000,
+        ...(result.questionCard ? { questionCard: true } : {}),
+      });
     }
     const components = ids.length
       ? [
@@ -2908,38 +2918,61 @@ export class DiscordBridge {
           },
         ]
       : undefined;
-    for (const [i, content] of splitForDiscord(formatDiscordTables(result.text), 1900 - mentions.length).entries()) {
-      const posted = (await this.deliverPost(
-        channel,
-        {
+    const posts: DiscordPost[] = result.questionCard
+      ? discordResponsePosts(result.text, { title: 'Question', users, controls: components })
+      : splitForDiscord(formatDiscordTables(result.text), 1900 - mentions.length).map((content, i) => ({
           content: (i === 0 ? mentions : '') + content,
           allowed_mentions: { parse: [], users: i === 0 ? users : [] },
           components: i === 0 ? components : undefined,
-        },
+        }));
+    for (const [i, post] of posts.entries()) {
+      const posted = (await this.deliverPost(
+        channel,
+        post,
         i === 0 ? result.file : undefined,
         sessionId,
         key + ':' + i
       )) as { id?: string };
-      if (i === 0)
+      if (post.components && ids.some((id) => JSON.stringify(post.components).includes(id)))
         for (const id of ids) {
           const action = this.actions.get(id);
           if (action) action.messageId = posted?.id;
         }
     }
   }
+  private async retireControlCard(channel: string, id: string): Promise<void> {
+    const message = (await this.api.getMessage(channel, id)) as {
+      author?: { id?: string };
+      flags?: number;
+      components?: DiscordPost['components'];
+    } | null;
+    if (!message || message.author?.id !== (await this.api.botUserId())?.id) return;
+    if ((message.flags ?? 0) & DISCORD_COMPONENTS_V2) {
+      const components = structuredClone(message.components ?? []);
+      for (const node of components)
+        if (Array.isArray(node.components)) {
+          node.components = node.components.filter((c) => c.type !== 1);
+          if (node.type === 17)
+            node.components.push({
+              type: 10,
+              content: '-# These controls have been used or resolved. Open current controls if needed.',
+            });
+        }
+      await this.api.editMessage(channel, id, { flags: message.flags, components });
+    } else await this.api.editMessage(channel, id, { components: [] });
+  }
   private async refreshControls(): Promise<void> {
     const disabled = new Set<string>();
     for (const [id, action] of this.actions) {
-      if (
-        action.expiresAt > this.now() &&
+      const current =
         this.destinationMatches(action.sessionId, action.channel) &&
-        this.deps.controlCurrent?.(action.sessionId, action.validity)
-      )
-        continue;
+        this.deps.controlCurrent?.(action.sessionId, action.validity);
+      if (action.questionCard && current) action.expiresAt = this.now() + 10 * 60 * 1000;
+      if (current && action.expiresAt > this.now()) continue;
       this.actions.delete(id);
       if (action.messageId && !disabled.has(action.messageId)) {
         disabled.add(action.messageId);
-        await this.api.editMessage(action.channel, action.messageId, { components: [] }).catch(() => undefined);
+        await this.retireControlCard(action.channel, action.messageId).catch(() => undefined);
       }
     }
   }
@@ -3068,6 +3101,7 @@ export class DiscordBridge {
       await reply('This control expired, changed or was already resolved. Use !codeman pending again.');
       return;
     }
+    const scope = this.controlScope;
     // Consume every button for this prompt before any await; the shared answer service also takes atomically.
     for (const [id, bound] of this.actions)
       if (bound.sessionId === action.sessionId && bound.validity === action.validity) this.actions.delete(id);
@@ -3102,13 +3136,23 @@ export class DiscordBridge {
           await this.channels.assertCaseOwned(this.cfg, action.sessionId.slice(9), key);
         else if (action.sessionId !== '__management__')
           await this.channels.assertOwned(this.cfg, action.sessionId, key);
-        const result = await this.deps.control!(action.sessionId, action.command);
+        const result = await this.deps.control!(
+          action.sessionId,
+          action.command,
+          () =>
+            this.controlScope === scope &&
+            !this.stopped &&
+            this.cfg.enabled &&
+            this.cfg.mode === 'full' &&
+            this.cfg.guildId === m.guild_id &&
+            this.cfg.allowedUserIds.includes(user) &&
+            this.destinationMatches(action.sessionId, key)
+        );
         if (result.locateSessionId)
           await this.postControlReply(action.sessionId, key, result, `interaction-result:${m.id}`);
         await this.deliveries.update(id, 'delivered');
         await this.api.finishInteraction(m.application_id, m.token, clip(result.text, 1800));
-        if (action.messageId)
-          await this.api.editMessage(key, action.messageId, { components: [] }).catch(() => undefined);
+        if (action.messageId) await this.retireControlCard(key, action.messageId).catch(() => undefined);
       })
       .catch(async () => {
         await this.api
@@ -3411,7 +3455,19 @@ export class DiscordBridge {
           return;
         }
         if (!/^file(?:\s|$)/i.test(command) && this.deps.control && this.cfg.mode === 'full') {
-          const result = await this.deps.control(sessionId, command);
+          const commandScope = this.controlScope;
+          const result = await this.deps.control(
+            sessionId,
+            command,
+            () =>
+              this.controlScope === commandScope &&
+              !this.stopped &&
+              this.cfg.enabled &&
+              this.cfg.mode === 'full' &&
+              this.cfg.guildId === m.guild_id &&
+              this.cfg.allowedUserIds.includes(m.author.id) &&
+              this.destinationMatches(sessionId, m.channel_id)
+          );
           if (!this.destinationMatches(sessionId, m.channel_id)) throw new BridgeProblem('Session changed');
           await this.postControlReply(sessionId, m.channel_id, result, `control:${m.id}`);
           await this.deliveries.update(id, 'delivered');
