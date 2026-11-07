@@ -16,6 +16,7 @@ export interface DiscordUiSession {
   model?: string;
   effort?: string;
   approval?: string;
+  promptSuggestion?: string;
   url?: string;
 }
 export interface DiscordUiQuestion {

@@ -1,3 +1,5 @@
+import { claudePromptSuggestion } from '../session-submit-verifier.js';
+import { discordActivityWorking } from '../discord-activity.js';
 import { getCli } from '../config/cli-registry/registry.js';
 /** Server adapters for native Discord UI. Reuses settings, approval and file/SSH guards. */
 import { approvalInbox } from './approval-inbox.js';
@@ -16,6 +18,7 @@ interface Deps {
   cases(): Promise<CaseInfo[]>;
   allowed(): boolean;
   url(): string | undefined;
+  capture?(id: string): string | null | undefined | Promise<string | null | undefined>;
   observed?(id: string): { model: string; effort?: string } | undefined;
 }
 export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServices {
@@ -24,44 +27,88 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
     if (!deps.allowed() || !s) throw new Error('Session unavailable');
     return s;
   };
+  const working = (s: Session) =>
+    discordActivityWorking({
+      id: s.id,
+      working: s.isWorking,
+      watching: s.watching,
+      activityStatus: s.activityProjection?.activityStatus,
+    });
+  const suggestion = async (s: Session) => {
+    if (
+      s.mode !== 'claude' ||
+      working(s) ||
+      s.paneExit ||
+      s.guardedInputHeld ||
+      s.guardedInputPendingWrites ||
+      approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle')
+    )
+      return undefined;
+    try {
+      const revision = s.discordQueueRevision,
+        conversation = s.nativeResumeId;
+      const frame = await deps.capture?.(s.id);
+      if (
+        !deps.allowed() ||
+        deps.sessions().get(s.id) !== s ||
+        working(s) ||
+        s.paneExit ||
+        s.guardedInputHeld ||
+        s.guardedInputPendingWrites ||
+        revision !== s.discordQueueRevision ||
+        conversation !== s.nativeResumeId ||
+        approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle')
+      )
+        return undefined;
+      return frame ? claudePromptSuggestion(frame) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
   return {
     enabled: () => deps.allowed(),
     sessions: async () => {
       if (!deps.allowed()) return [];
       const cases = await deps.cases();
-      return [...deps.sessions().values()].map((s) => ({
-        id: s.id,
-        name: s.name || s.id.slice(0, 8),
-        mode: s.mode,
-        host: s.remote?.label || 'local',
-        caseName:
-          cases.find((c) =>
-            s.remote
-              ? c.remote?.hostId === s.remote.hostId && c.remote.path === s.remote.remotePath
-              : !c.remote && c.path === s.workingDir
-          )?.name || 'Unlinked workspace',
-        conversation: s.nativeResumeId ?? s.codexConfig?.resumeSessionId,
-        inputRevision: s.discordQueueRevision,
-        working: s.isWorking,
-        pending: approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle'),
-        exited: !!s.paneExit,
-        ready: !s.isWorking && !s.paneExit && !s.guardedInputHeld && !s.guardedInputPendingWrites,
-        model: deps.observed?.(s.id)?.model
-          ? deps.observed(s.id)!.model + ' (native verified)'
-          : s.displayModel
-            ? `${s.displayModel.model} (${s.displayModel.source})`
-            : undefined,
-        effort: deps.observed?.(s.id)?.effort, // launch effort is not proof of a current setting
-        approval:
-          getCli(s.mode)?.launch.legacyConfigField === 'codexConfig'
-            ? s.codexConfig?.baseCommand
-              ? 'Custom command authority'
-              : s.codexConfig?.dangerouslyBypassApprovals
-                ? 'Approve all (launch flag)'
-                : 'CLI default / ask'
-            : 'CLI-controlled',
-        url: deps.url() ? `${deps.url()!.replace(/\/$/, '')}/#session=${encodeURIComponent(s.id)}` : undefined,
-      }));
+      return Promise.all(
+        [...deps.sessions().values()].map(async (s) => {
+          const promptSuggestion = await suggestion(s);
+          return {
+            id: s.id,
+            name: s.name || s.id.slice(0, 8),
+            mode: s.mode,
+            host: s.remote?.label || 'local',
+            caseName:
+              cases.find((c) =>
+                s.remote
+                  ? c.remote?.hostId === s.remote.hostId && c.remote.path === s.remote.remotePath
+                  : !c.remote && c.path === s.workingDir
+              )?.name || 'Unlinked workspace',
+            conversation: s.nativeResumeId ?? s.codexConfig?.resumeSessionId,
+            inputRevision: s.discordQueueRevision,
+            working: working(s),
+            promptSuggestion,
+            pending: approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle'),
+            exited: !!s.paneExit,
+            ready: !working(s) && !s.paneExit && !s.guardedInputHeld && !s.guardedInputPendingWrites,
+            model: deps.observed?.(s.id)?.model
+              ? deps.observed(s.id)!.model + ' (native verified)'
+              : s.displayModel
+                ? `${s.displayModel.model} (${s.displayModel.source})`
+                : undefined,
+            effort: deps.observed?.(s.id)?.effort, // launch effort is not proof of a current setting
+            approval:
+              getCli(s.mode)?.launch.legacyConfigField === 'codexConfig'
+                ? s.codexConfig?.baseCommand
+                  ? 'Custom command authority'
+                  : s.codexConfig?.dangerouslyBypassApprovals
+                    ? 'Approve all (launch flag)'
+                    : 'CLI default / ask'
+                : 'CLI-controlled',
+            url: deps.url() ? `${deps.url()!.replace(/\/$/, '')}/#session=${encodeURIComponent(s.id)}` : undefined,
+          };
+        })
+      );
     },
     cases: async () =>
       deps.allowed()
@@ -131,6 +178,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
         text,
         () =>
           deps.allowed() &&
+          !working(s) &&
           inputRevision !== undefined &&
           s.discordQueueRevision === inputRevision &&
           allowed() &&

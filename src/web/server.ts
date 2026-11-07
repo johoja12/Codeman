@@ -815,6 +815,10 @@ export class WebServer extends EventEmitter {
   });
   private discordBridge: DiscordBridge = new DiscordBridge({
     nativeUi: createDiscordNativeUiServices({
+      capture: (id) => {
+        const s = this.sessions.get(id);
+        return s?.muxName ? this.mux.capturePaneTextAsync?.(s.muxName, { ansi: true }) : null;
+      },
       sessions: () => this.sessions,
       observed: (id) => this.discordModelControls.observed(id),
       cases: async () => this.discordCases?.() ?? [],

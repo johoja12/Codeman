@@ -273,7 +273,7 @@ describe('Discord interface mode', () => {
     expect(sendInput).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])('preserves Claude background titles over sync and restart (remote=%s)', async (remote) => {
+  it.each([false, true])('keeps background work under Working over sync and restart (remote=%s)', async (remote) => {
     let now = 100000;
     sessions = [
       { id: 's1', name: 'w29-buildmesh', remote, working: false, watching: '1 shell', activityStatus: 'idle' },
@@ -282,26 +282,26 @@ describe('Discord interface mode', () => {
     await b.reload();
     await b.syncSessions();
     const thread = (await readFullMap(dir)).s1;
-    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · w29-buildmesh');
     await b.pollActivity();
     const typing = () => posts.filter((p) => p.path.endsWith('/typing'));
-    expect(typing()).toHaveLength(0);
+    expect(typing()).toHaveLength(1);
     await b.syncSessions();
-    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · w29-buildmesh');
     b.stop();
     const restarted = makeBridge(undefined, { now: () => now });
     await restarted.reload();
     await restarted.syncSessions();
     await restarted.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · w29-buildmesh');
     sessions[0].watching = null;
     now += 4000;
     await restarted.pollActivity();
-    expect(remoteChannels.get(thread).name).toBe('🟡 Background work · w29-buildmesh');
+    expect(remoteChannels.get(thread).name).toBe('🟡 Working · w29-buildmesh');
     now += 30000;
     await restarted.pollActivity();
     expect(remoteChannels.get(thread).name).toBe('⚫ Idle · w29-buildmesh');
-    expect(typing()).toHaveLength(0);
+    expect(typing()).toHaveLength(2);
     expect(sendInput).not.toHaveBeenCalled();
   });
 

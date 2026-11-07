@@ -207,18 +207,12 @@ describe('Discord live activity', () => {
     expect(rename).toHaveBeenCalledTimes(4);
   });
   it.each(['waiting_agents', 'checking_agents', 'idle'] as const)(
-    'separates %s background evidence from foreground typing and input',
+    'treats %s background evidence as work while preserving input and exit precedence',
     async (activityStatus) => {
       sessions[0] = { id: 's1', name: 'hs-lab', working: false, watching: '1 shell', activityStatus };
-      const label =
-        activityStatus === 'waiting_agents'
-          ? 'Waiting for agents'
-          : activityStatus === 'checking_agents'
-            ? 'Checking agents'
-            : 'Background work';
       await activity.poll();
-      expect(rename).toHaveBeenLastCalledWith('thread', `🟡 ${label} · hs-lab`, expect.any(Function));
-      expect(typing).not.toHaveBeenCalled();
+      expect(rename).toHaveBeenLastCalledWith('thread', '🟡 Working · hs-lab', expect.any(Function));
+      expect(typing).toHaveBeenCalledTimes(1);
       sessions[0].waiting = true;
       now += 4000;
       await activity.poll();
@@ -235,12 +229,13 @@ describe('Discord live activity', () => {
     sessions[0].watching = '1 shell';
     now += 4000;
     await activity.poll();
-    expect(rename).toHaveBeenLastCalledWith('thread', '🟡 Background work · hs-lab', expect.any(Function));
+    expect(rename).toHaveBeenCalledTimes(1);
+    expect(rename).toHaveBeenLastCalledWith('thread', '🟡 Working · hs-lab', expect.any(Function));
     const typed = typing.mock.calls.length;
     sessions[0].watching = null;
     now += 4000;
     await activity.poll();
-    expect(rename).toHaveBeenCalledTimes(2);
+    expect(rename).toHaveBeenCalledTimes(1);
     now += 30000;
     await activity.poll();
     expect(rename).toHaveBeenLastCalledWith('thread', '⚫ Idle · hs-lab', expect.any(Function));
