@@ -8,7 +8,7 @@ import { discordApprovalRevision } from '../discord-task-controls.js';
 import { readJsonConfig, SETTINGS_PATH } from './route-helpers.js';
 import { SettingsUpdateSchema } from './schemas.js';
 import { mutateSettingsFile } from './settings-writer.js';
-import { discordWorkspaceResults } from '../discord-workspace-results.js';
+import { discordWorkspaceResults, discordWorkspaceHasChanges } from '../discord-workspace-results.js';
 import { configuredDiscordCaseKey } from '../discord-case-identity.js';
 import type { DiscordNativeUiServices } from '../discord-native-ui-types.js';
 import type { Session } from '../session.js';
@@ -167,6 +167,10 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       const result = await answerPendingApproval(s, question, answer);
       if (!result.success) throw new Error('Native approval service refused the answer');
       return 'Answer sent to the exact pending prompt.';
+    },
+    workspaceHasChanges: async (id) => {
+      const s = session(id);
+      return discordWorkspaceHasChanges({ workingDir: s.workingDir, remote: s.remote });
     },
     workspace: async (id) => {
       const s = session(id);

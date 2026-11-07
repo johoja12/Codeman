@@ -6,21 +6,29 @@ import { readDiscordSessionFile, runDiscordRemoteRead } from './discord-file-tra
 import { shellescape, withRemotePathBootstrap } from './remote-hosts.js';
 import type { DiscordFileScope } from './discord-file-transfers.js';
 const exec = promisify(execFile);
+async function workspaceGit(scope: DiscordFileScope, args: string[]): Promise<string> {
+  const argv = ['--no-pager', '-c', 'core.fsmonitor=false', '--literal-pathspecs', ...args];
+  if (scope.remote) {
+    const cwd = scope.remote.remotePath;
+    return (
+      await runDiscordRemoteRead(
+        scope.remote,
+        withRemotePathBootstrap(`cd ${shellescape(cwd)} && git ${argv.map(shellescape).join(' ')}`)
+      )
+    ).toString('utf8');
+  }
+  return (await exec('git', argv, { cwd: scope.workingDir, timeout: 8000, maxBuffer: 256 * 1024, encoding: 'utf8' }))
+    .stdout;
+}
+
+/** Names only: rendering a results menu must not download every changed remote file. */
+export async function discordWorkspaceHasChanges(scope: DiscordFileScope): Promise<boolean> {
+  return !!(await workspaceGit(scope, ['diff', '--no-ext-diff', '--no-textconv', '--name-only', '-z', 'HEAD', '--']))
+    .length;
+}
+
 export async function discordWorkspaceResults(scope: DiscordFileScope): Promise<{ summary: string; diff: string }> {
-  const run = async (args: string[]): Promise<string> => {
-    const argv = ['--no-pager', '-c', 'core.fsmonitor=false', '--literal-pathspecs', ...args];
-    if (scope.remote) {
-      const cwd = scope.remote.remotePath;
-      return (
-        await runDiscordRemoteRead(
-          scope.remote,
-          withRemotePathBootstrap(`cd ${shellescape(cwd)} && git ${argv.map(shellescape).join(' ')}`)
-        )
-      ).toString('utf8');
-    }
-    return (await exec('git', argv, { cwd: scope.workingDir, timeout: 8000, maxBuffer: 256 * 1024, encoding: 'utf8' }))
-      .stdout;
-  };
+  const run = (args: string[]) => workspaceGit(scope, args);
   const names = (await run(['diff', '--no-ext-diff', '--no-textconv', '--name-only', '-z', 'HEAD', '--']))
     .split('\0')
     .filter(Boolean);

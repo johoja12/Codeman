@@ -1,7 +1,9 @@
 /** Native Discord controls. Tokens bind actor, origin, configuration and exact conversation. */
 import { createHash, randomUUID } from 'node:crypto';
 import { DiscordUiStore } from './discord-ui-store.js';
-import { discordDetailPages } from './discord-response-format.js';
+import { posix } from 'node:path';
+import { discordArtifactPaths, DISCORD_ARTIFACT_COUNT } from './discord-artifacts.js';
+import { discordDetailPages, formatDiscordResponseText } from './discord-response-format.js';
 import { readDiscordTaskUpdates, renderDiscordTaskUpdates, type DiscordTaskUpdates } from './discord-task-updates.js';
 import { discordDisplayText } from './discord-display-text.js';
 import type { DiscordInteraction, GatewayMessage, DiscordPost } from './discord-bridge.js';
@@ -226,7 +228,7 @@ export class DiscordNativeUi {
     );
     const receipts = await this.host.receipts(s.id);
     const last = receipts[0];
-    const status = s.exited ? '⚫ Agent exited' : s.pending ? '🔴 Needs input' : s.working ? '🟡 Working' : '🟢 Idle';
+    const status = s.exited ? '⚫ Agent exited' : s.pending ? '🔴 Needs input' : s.working ? '🟡 Working' : '⚫ Idle';
     const stateLabels: Record<string, string> = {
       received: 'Received',
       awaiting_choice: 'Waiting for send/queue choice',
@@ -407,7 +409,7 @@ export class DiscordNativeUi {
           );
           return this.payload('Response file posted in this session thread.');
         }),
-        bind('Results & files', (m) => this.results(m, id))
+        bind('Results & files', (m) => this.results(m, id, { userCursor, responseCursor }))
       );
     }
     if (s.url && /^https?:\/\//.test(s.url))
@@ -611,7 +613,7 @@ export class DiscordNativeUi {
     this.prune();
     await this.refreshQuestionPanels();
     await this.register();
-    await this.retireDeliveryCards();
+    await this.retireLegacyCards();
     const sessions = await this.host.services.sessions();
     const list = sessions.filter((s) => this.host.channelForSession(s.id));
     for (let i = 0; i < Math.min(3, list.length); i++) {
@@ -645,27 +647,6 @@ export class DiscordNativeUi {
           );
           this.cardActions.set(key + ':signature', [signature]);
         }
-        const receipts = await this.host.receipts(s.id);
-        const completed = receipts.find((r) => r.state === 'completed');
-        const resultKey = 'result:' + s.id,
-          resultSignature = completed
-            ? completed.id + ':' + this.host.scope() + ':' + Math.floor(this.host.now() / 120000) + ':' + this.epoch
-            : '';
-        if (completed && this.cardActions.get(resultKey + ':signature')?.[0] !== resultSignature) {
-          const old = this.cardActions.get(resultKey) ?? [],
-            before = new Set(this.actions.keys());
-          await this.upsert(
-            resultKey,
-            channel,
-            await this.results({ channel_id: channel } as DiscordInteraction, s.id, s)
-          );
-          old.forEach((id) => this.actions.delete(id));
-          this.cardActions.set(
-            resultKey,
-            [...this.actions.keys()].filter((k) => !before.has(k))
-          );
-          this.cardActions.set(resultKey + ':signature', [resultSignature]);
-        }
         await this.dispatchQueue(s);
       } catch (e) {
         this.lastError = e instanceof Error ? e.message : 'Session card update failed';
@@ -685,15 +666,15 @@ export class DiscordNativeUi {
     const scope = this.host.scope(),
       channel = this.host.channelForSession(id);
     if (!scope || !channel) return;
-    await this.retireDeliveryCards(new Set([hash(scope + ':' + channel + ':delivery:' + receiptId)]));
+    await this.retireLegacyCards(new Set([hash(scope + ':' + channel + ':delivery:' + receiptId)]));
   }
-  private async retireDeliveryCards(keys?: Set<string>): Promise<void> {
+  private async retireLegacyCards(keys?: Set<string>): Promise<void> {
     const scope = this.host.scope();
     if (!scope) return;
     const cards = Object.entries((await this.store.snapshot()).cards)
       .filter(
         ([key, card]) =>
-          card.kind === 'delivery' &&
+          (card.kind === 'delivery' || card.kind === 'result') &&
           card.phase === 'ready' &&
           card.message &&
           (!keys || keys.has(key)) &&
@@ -720,11 +701,11 @@ export class DiscordNativeUi {
         try {
           const message = (await this.host.request('GET', path)) as { author?: { id: string }; content?: string };
           const bot = await this.host.botId();
-          const marker = `\n-# Codeman · delivery · ${key.slice(0, 10)}`;
+          const marker = `\n-# Codeman · ${card.kind} · ${key.slice(0, 10)}`;
           if (
             !bot ||
             message.author?.id !== bot ||
-            !message.content?.startsWith('**Prompt delivery**') ||
+            !message.content?.startsWith(card.kind === 'result' ? '**Results & files · ' : '**Prompt delivery**') ||
             !message.content.endsWith(marker)
           )
             throw new Error('Legacy delivery-card ownership changed');
@@ -1335,8 +1316,118 @@ export class DiscordNativeUi {
       else state.queue[at].state = result === 'blocked' ? 'queued' : 'uncertain';
     });
   }
-  private async results(m: DiscordInteraction, id: string, snapshot?: DiscordUiSession): Promise<DiscordUiPayload> {
-    const s = snapshot ?? (await this.target(id)),
+  /** Explicit results view; output controls stay bound to the chosen native response. */
+  private async results(
+    m: DiscordInteraction,
+    id: string,
+    selected?: { userCursor: string; responseCursor: string }
+  ): Promise<DiscordUiPayload> {
+    const s = await this.target(id),
+      ctx = this.ctx(m, s),
+      scope = this.host.scope();
+    const history = await this.host.history(id);
+    await this.target(id, ctx.conversation);
+    if (history.conversationId !== ctx.conversation || scope !== this.host.scope())
+      throw new Error('Result conversation changed. Reopen its controls.');
+    let answer = selected
+      ? history.turns.find((t) => t.cursor === selected.responseCursor && t.role === 'assistant')
+      : [...history.turns].reverse().find((t) => t.role === 'assistant' && t.phase !== 'commentary');
+    if (selected && !answer) {
+      let task: DiscordTaskUpdates | undefined;
+      for (let page = 0; page < 4; page++) {
+        task = await readDiscordTaskUpdates(
+          this.taskReader(ctx, scope),
+          ctx.conversation!,
+          selected.userCursor,
+          task,
+          selected.responseCursor
+        );
+        if (task.response || task.complete) break;
+      }
+      answer = task?.response;
+      if (!answer)
+        throw new Error('This response is outside the available history. Use Show updates to load the original task.');
+    }
+    const text = answer ? discordDisplayText(answer.text) : '';
+    const paths = discordArtifactPaths(text).slice(0, DISCORD_ARTIFACT_COUNT);
+    const controls: Array<Record<string, unknown>> = paths.map((path) =>
+      this.action(ctx, 'Download ' + safe(posix.basename(path), 65), async () => {
+        await this.target(id, ctx.conversation);
+        const file = await this.host.file(id, path);
+        await this.target(id, ctx.conversation);
+        await this.host.postFile(
+          ctx.channel,
+          file,
+          'File from this answer · ' + safe(file.name),
+          () => scope === this.host.scope() && this.host.channelForSession(id) === ctx.channel
+        );
+        return this.payload('File uploaded. Discord previews supported formats.');
+      })
+    );
+    let changed = false;
+    try {
+      if (this.host.services.workspaceHasChanges) changed = await this.host.services.workspaceHasChanges(id);
+      else {
+        const changes = await this.host.services.workspace(id);
+        changed = !!changes.diff.trim() && !changes.diff.startsWith('No exportable tracked diff.');
+      }
+    } catch {
+      /* Non-Git or unavailable workspace: the answer still works. */
+    }
+    if (changed)
+      controls.push(
+        this.action(ctx, 'View changes', async () => {
+          const current = await this.host.services.workspace(id);
+          return this.payload(
+            '**Workspace changes**\n' +
+              current.summary.slice(0, 1400) +
+              '\n\nIncludes changes from other sessions using this workspace.'
+          );
+        })
+      );
+    const pages = discordDetailPages(formatDiscordResponseText(text));
+    if (pages.length > 1)
+      controls.push(
+        this.action(ctx, 'Download answer', async () => {
+          await this.target(id, ctx.conversation);
+          await this.host.postFile(
+            ctx.channel,
+            { name: 'response.txt', data: Buffer.from(text) },
+            'Full answer',
+            () => scope === this.host.scope() && this.host.channelForSession(id) === ctx.channel
+          );
+          return this.payload('Full answer uploaded.');
+        })
+      );
+    controls.push(this.action(ctx, 'More', (x) => this.resultDetails(x, id)));
+    await this.target(id, ctx.conversation);
+    if (scope !== this.host.scope()) throw new Error('Discord configuration changed. Reopen results.');
+    const answerIndex = answer ? history.turns.findIndex((t) => t.cursor === answer.cursor) : -1;
+    const userCursor =
+      selected?.userCursor ??
+      (answerIndex >= 0
+        ? history.turns
+            .slice(0, answerIndex)
+            .reverse()
+            .find((t) => t.role === 'user')?.cursor
+        : undefined);
+    const state = history.executions?.find((e) => e.userCursor === userCursor)?.state;
+    const status =
+      state === 'completed'
+        ? '✓ Completed'
+        : state === 'running'
+          ? 'Working'
+          : state === 'interrupted'
+            ? 'Interrupted'
+            : '';
+    const preview = pages[0];
+    return this.payload(
+      `**${safe(s.name)}**${status ? ' · ' + status : ''}\n\n${preview || 'No answer is available yet.'}${pages.length > 1 ? '\n\nChoose Download answer for the full response.' : ''}`,
+      controls.length ? [row(...controls.slice(0, 5)), ...(controls.length > 5 ? [row(...controls.slice(5))] : [])] : []
+    );
+  }
+  private async resultDetails(m: DiscordInteraction, id: string): Promise<DiscordUiPayload> {
+    const s = await this.target(id),
       ctx = this.ctx(m, s);
     let execution = 'Not available';
     try {
@@ -1345,7 +1436,7 @@ export class DiscordNativeUi {
       /* Explicit unknown. */
     }
     return this.payload(
-      `**Results & files · ${safe(s.name)}**\nNative execution: ${safe(execution)}\n\nWorkspace changes are a shared-worktree snapshot, not automatically attributed to this task. Verification results are not inferred from assistant prose. Use History for the agent’s report and inspect the actual evidence.`,
+      `**More · ${safe(s.name)}**\nNative execution: ${safe(execution)}\n\nWorkspace changes are a shared-worktree snapshot, not automatically attributed to this task. Verification results are not inferred from assistant prose. Use History for the agent’s report and inspect the actual evidence.`,
       [
         row(
           this.action(ctx, 'Workspace changes', async () => {
@@ -1423,7 +1514,7 @@ export class DiscordNativeUi {
       list
         .map(
           (s) =>
-            `${s.pending ? '🔴' : s.exited ? '⚫' : s.working ? '🟡' : '🟢'} **${safe(s.name)}** · ${safe(s.host)}\n${safe(s.caseName)} · ${safe(s.mode)}${this.host.channelForSession(s.id) ? ' · <#' + this.host.channelForSession(s.id) + '>' : ' · destination unavailable'}`
+            `${s.pending ? '🔴' : s.exited ? '⚫' : s.working ? '🟡' : '⚫'} **${safe(s.name)}** · ${safe(s.host)}\n${safe(s.caseName)} · ${safe(s.mode)}${this.host.channelForSession(s.id) ? ' · <#' + this.host.channelForSession(s.id) + '>' : ' · destination unavailable'}`
         )
         .join('\n\n');
     const rows = [
