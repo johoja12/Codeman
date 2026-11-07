@@ -8,7 +8,14 @@ import {
 } from '../src/discord-response-format.js';
 const body = (post: ReturnType<typeof discordResponsePosts>[number]) =>
   post.components
-    ?.filter((c) => c.type === 10 && !c.content?.startsWith('-#'))
+    ?.flatMap((c) =>
+      c.type === 17
+        ? (c.components as { type: number; content?: string }[]).filter(
+            (n, i) => i !== 0 || !/^\*\*[^\n*]+\*\*(?:\n-# [^\n]*)?$/.test(n.content ?? '')
+          )
+        : [c]
+    )
+    .filter((c) => c.type === 10 && !c.content?.startsWith('-#'))
     .map((c) => c.content)
     .join('\n') ?? '';
 describe('readable Discord responses', () => {
@@ -36,15 +43,38 @@ describe('readable Discord responses', () => {
     const body = '1. **Spread:** details\n   - nested bullet\n   - next bullet\n\n2. **Shared:** details';
     expect(formatDiscordResponseText(body)).toBe(body);
   });
-  it('uses chat-width text and suppresses URL previews rather than narrow embeds', () => {
+  it('keeps the heading and body together in one native card and suppresses URL previews', () => {
     const posts = discordResponsePosts('1. Spread: details\n2. Shared: details\n\nhttps://example.test/demo');
     expect(posts).toHaveLength(1);
     expect(body(posts[0])).toBe('1. **Spread:** details\n\n2. **Shared:** details\n\nhttps://example.test/demo');
     expect(posts[0].embeds).toBeUndefined();
     expect(posts[0].flags).toBe(DISCORD_COMPONENTS_V2 | 4);
-    expect(posts[0].components?.[0]).toMatchObject({ type: 17, components: [{ type: 10, content: '**Response**' }] });
-    expect(posts[0].components?.[1].type).toBe(10);
+    expect(posts[0].components?.[0]).toMatchObject({ type: 17 });
+    expect((posts[0].components?.[0].components as { type: number; content?: string }[])[0]).toEqual({
+      type: 10,
+      content: '**Response**',
+    });
+    expect(posts[0].components).toHaveLength(1);
+    expect((posts[0].components?.[0].components as { type: number; content?: string }[])[1]).toMatchObject({
+      type: 10,
+      content: body(posts[0]),
+    });
     expect(posts[0].allowed_mentions).toEqual({ parse: [], users: [] });
+  });
+  it.each(['User prompt', 'Response received'])('keeps %s text and response actions inside the same card', (title) => {
+    const controls = [
+      { type: 1, components: [{ type: 2, style: 5, label: 'Open session', url: 'https://example.test' }] },
+    ];
+    const post = discordResponsePosts('First line\nSecond line', { title, controls })[0];
+    expect(post.components).toHaveLength(1);
+    const card = post.components![0];
+    expect(card.type).toBe(17);
+    expect(card.components).toEqual([
+      { type: 10, content: `**${title}**` },
+      { type: 10, content: 'First line\nSecond line' },
+      { type: 14, divider: true, spacing: 1 },
+      ...controls,
+    ]);
   });
   it('keeps long responses within message limits, numbers continuations and pings only the first part', () => {
     const text = Array.from({ length: 80 }, (_, i) => `Paragraph ${i}: ` + 'detail '.repeat(15)).join('\n\n');
@@ -53,7 +83,11 @@ describe('readable Discord responses', () => {
     expect(posts.length).toBeLessThanOrEqual(8);
     expect(posts.every((p) => body(p).length <= 2000)).toBe(true);
     expect(body(posts[0])).toContain('<@333333333333333333>');
-    expect(posts[0].components?.some((c) => c.content?.includes(`1 / ${posts.length}`))).toBe(true);
+    expect(
+      (posts[0].components?.[0].components as { content?: string }[]).some((c) =>
+        c.content?.includes(`1 / ${posts.length}`)
+      )
+    ).toBe(true);
     expect(
       posts
         .slice(1)
