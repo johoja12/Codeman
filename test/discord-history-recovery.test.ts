@@ -87,3 +87,34 @@ it.each(['profile_unverified', 'profile_changed'])('does not issue status comman
   await expect(readDiscordCanonicalHistory(session, {}, () => true)).rejects.toThrow(/profile/);
   expect(write).not.toHaveBeenCalled();
 });
+
+it('recovers an unbound local custom-profile conversation through the same guarded lease', async () => {
+  Object.assign(session, {
+    remote: undefined,
+    workingDir: '/work',
+    envOverrideValue: () => '/home/test/custom-profile',
+  });
+  expect(await readDiscordCanonicalHistory(session, {}, () => allowed)).toEqual(history);
+  expect(write).toHaveBeenCalledExactlyOnceWith('/status\r');
+  expect(readDiscordSessionHistory).toHaveBeenCalledWith(session, {}, id);
+  expect(session.setNativeResumeId).toHaveBeenCalledExactlyOnceWith(id);
+});
+it.each([{ watching: '1 shell' }, { blocksIdleAutomation: true }, { docker: {} }])(
+  'leaves an unavailable local pane untouched for %j',
+  async (state) => {
+    Object.assign(session, { remote: undefined }, state);
+    await expect(readDiscordCanonicalHistory(session, {}, () => true)).rejects.toThrow();
+    expect(write).not.toHaveBeenCalled();
+  }
+);
+it('rejects a local profile change before adopting status identity', async () => {
+  let home = '/first';
+  Object.assign(session, { remote: undefined, envOverrideValue: () => home });
+  vi.mocked(readDiscordSessionHistory).mockImplementation(async (_s, _o, recovered) => {
+    if (!recovered) throw new Error('unbound');
+    home = '/second';
+    return history;
+  });
+  await expect(readDiscordCanonicalHistory(session, {}, () => true)).rejects.toThrow('changed');
+  expect(session.setNativeResumeId).not.toHaveBeenCalled();
+});

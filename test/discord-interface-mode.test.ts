@@ -198,6 +198,45 @@ afterEach(async () => {
 });
 
 describe('Discord interface mode', () => {
+  it('keeps unresolved history warnings through journal pruning/restart and edits them after recovery', async () => {
+    let readable = false;
+    let now = 100000;
+    const history = async (_id: string, options?: { after?: string }) => {
+      if (!readable) throw new Error('unbound');
+      return {
+        conversationId: 'native1',
+        partial: false,
+        verifiedAfter: options?.after,
+        turns: [{ cursor: 'native1:answer', role: 'assistant' as const, text: 'Recovered result', timestamp: '' }],
+      };
+    };
+    sessions = [{ id: 's1', name: 'one' }];
+    const b = makeBridge(undefined, { history, now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    const warnings = () =>
+      posts.filter((p) => p.method === 'POST' && p.body?.content?.startsWith('History is unavailable'));
+    expect(warnings()).toHaveLength(1);
+    b.stop();
+    const ledger = JSON.parse(await readFile(join(dir, 'discord-delivery.json'), 'utf8'));
+    await writeFile(
+      join(dir, 'discord-delivery.json'),
+      JSON.stringify(ledger.filter((r: { direction: string }) => r.direction === 'inbound'))
+    );
+    const again = makeBridge(undefined, { history, now: () => now });
+    await again.reload();
+    await again.syncSessions();
+    expect(warnings()).toHaveLength(1);
+    readable = true;
+    now += 20000;
+    await again.syncSessions();
+    await again.pollConversations();
+    expect(
+      [...remoteMessages.values()].some((m) => m.content === 'History reconnected. Live replies are synchronized.')
+    ).toBe(true);
+    expect(JSON.parse(await readFile(join(dir, 'discord-history-warnings.json'), 'utf8'))).toEqual([]);
+  });
+
   it('recovers a saved boundary outside the tail through a tool-only page, restart and warning cleanup', async () => {
     let now = 100000;
     let appended = false;
@@ -2084,8 +2123,8 @@ it('reports a missing canonical response once instead of sending cursor-painted 
   await b.notify(msg);
   now += 10000;
   await b.notify(msg);
-  const notices = posts.filter(
-    (p) => p.body?.components?.[0]?.components?.[0]?.content === '**Reconnecting to this conversation**'
+  const notices = [...remoteMessages.values()].filter(
+    (m) => m.components?.[0]?.components?.[0]?.content === '**Reconnecting to this conversation**'
   );
   expect(notices).toHaveLength(1);
   expect(posts.some((p) => JSON.stringify(p.body ?? {}).includes('happen between these recorded'))).toBe(false);
@@ -2130,7 +2169,9 @@ it('reports an unverified profile as actionable history attention instead of pro
       throw error;
     },
   });
-  const bodies = posts.map((p) => JSON.stringify(p.body ?? {})).join('\n');
+  const bodies = [...posts.map((p) => p.body), ...remoteMessages.values()]
+    .map((p) => JSON.stringify(p ?? {}))
+    .join('\n');
   expect(bodies).toContain('Reply history needs attention');
   expect(bodies).toContain('CODEX_HOME');
   expect(bodies).not.toContain('I’m restoring the connection');

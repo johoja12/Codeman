@@ -149,7 +149,7 @@ describe('server mux restore remote metadata', () => {
     expect(JSON.stringify(session.getCodexProviderIdentityForPersist())).not.toContain('live-openai-secret');
   });
 
-  it('treats a successful live read as authoritative over a stale saved Codex home', () => {
+  it('preserves a saved profile when tmux has no profile evidence', () => {
     expect(
       resolveRestoredCodexProviderRecovery(
         'codex',
@@ -163,8 +163,8 @@ describe('server mux restore remote metadata', () => {
         {}
       )
     ).toEqual({
-      identity: { version: 1, credentialSource: 'restorable' },
-      environment: {},
+      identity: { version: 1, credentialSource: 'restorable', codexHome: '/tmp/stale-saved-home' },
+      environment: { CODEX_HOME: '/tmp/stale-saved-home' },
     });
   });
 

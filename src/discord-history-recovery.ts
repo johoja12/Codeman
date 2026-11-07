@@ -1,4 +1,4 @@
-/** Canonical Discord history, with one guarded native status read for an unbound remote Codex pane. */
+/** Canonical Discord history, with one guarded native status read for an unbound Codex pane. */
 import type { Session } from './session.js';
 import { getCli } from './config/cli-registry/registry.js';
 import { readDiscordSessionHistory, DiscordHistoryReadError, type DiscordHistory } from './discord-history.js';
@@ -18,7 +18,9 @@ export async function readDiscordCanonicalHistory(
       (original instanceof DiscordHistoryReadError &&
         ['profile_unverified', 'profile_changed'].includes(original.code)) ||
       !permitted() ||
-      !session.remote ||
+      !!session.docker ||
+      session.blocksIdleAutomation ||
+      !!session.watching?.trim() ||
       session.nativeResumeId ||
       session.codexConfig?.resumeSessionId ||
       cli?.capabilities.transcript !== 'codex-rollout' ||
@@ -34,10 +36,14 @@ export async function readDiscordCanonicalHistory(
       return readDiscordSessionHistory(session, options);
     }
     const remote = session.remote,
-      revision = session.nativeModelSettingsRevision;
+      revision = session.nativeModelSettingsRevision,
+      home = session.envOverrideValue('CODEX_HOME');
     const allowed = () =>
       permitted() &&
       session.remote === remote &&
+      session.envOverrideValue('CODEX_HOME') === home &&
+      !session.blocksIdleAutomation &&
+      !session.watching?.trim() &&
       session.nativeModelSettingsRevision === revision &&
       !session.isWorking &&
       !session.paneExit &&

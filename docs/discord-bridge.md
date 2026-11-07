@@ -320,3 +320,11 @@ Prompt messages preserve Markdown/code, use a distinct neutral header, never pin
 ### Remote Codex profile history
 
 When an SSH Codex launcher selects a profile with its own `CODEX_HOME`, the bridge reads the exact owned native process's profile directory rather than assuming `~/.codex`. macOS and Linux process metadata is decoded on the host; only the effective home, native resume ID and a process fingerprint are returned, not arbitrary environment values. The transcript header must match the native conversation ID, and a fresh process check fences every read. A verified home is cached for that live Session only and invalidated by process, profile, identity or input-generation changes. Explicit session `CODEX_HOME` overrides retain their existing precedence. History controls and guarded native-status recovery share the same resolver. Unverifiable profiles produce an actionable history notice instead of repeated status commands or a promise of automatic reconnection.
+
+### Restored local Codex profiles and history recovery
+
+When a surviving local Codex process selects its own `CODEX_HOME`, recovery reads the exact owned pane's runtime profile as well as tmux's environment. Only the effective profile path, optional native resume ID and a process fingerprint leave that read-only probe. A saved profile is preserved when tmux has no replacement profile evidence; a verified live profile takes precedence. Credentials remain subject to the existing closed recovery allowlist.
+
+An unbound local or remote Codex session can recover its exact conversation with a guarded CLI-local `/status` read while idle with an empty composer. Busy/background tasks, drafts, pending dialogs, containers and changed input/profile context refuse recovery. The exact transcript header is verified before adopting the ID; no latest-file or shared-folder guess is used.
+
+Unresolved history warnings are tracked privately in `discord-history-warnings.json`, separately from the bounded delivery journal. Restarts, concurrent idle hooks and receipt pruning do not create a new warning for the same unresolved session/thread. Existing owned warnings are updated and cleared after verified recovery. No prompt/response bodies or credentials are saved in warning state.

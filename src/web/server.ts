@@ -296,7 +296,8 @@ export function resolveRestoredCodexProviderRecovery(
     if (typeof value === 'string' && value) environment[key] = value;
   }
   const hasSessionKey = Boolean(environment.OPENAI_API_KEY || environment.CODEX_API_KEY);
-  const codexHome = environment.CODEX_HOME;
+  const codexHome = environment.CODEX_HOME ?? savedIdentity?.codexHome;
+  if (codexHome) environment.CODEX_HOME = codexHome;
   return {
     identity: {
       version: 1,

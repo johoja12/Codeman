@@ -435,7 +435,7 @@ function remoteHistoryScope(
 export async function readDiscordSessionHistory(
   session: import('./session.js').Session,
   options?: { includeTools?: boolean; after?: string },
-  recoveredRemoteId?: string
+  recoveredId?: string
 ): Promise<DiscordHistory> {
   const format = getCli(session.mode)?.capabilities.transcript;
   let id =
@@ -450,7 +450,12 @@ export async function readDiscordSessionHistory(
         ? configHome
         : posix.resolve(session.remote.remotePath, configHome)
       : resolve(session.workingDir, configHome);
-  if (format === 'codex-rollout' && !session.remote) {
+  if (recoveredId && !session.remote) {
+    if (format !== 'codex-rollout' || session.docker || (id && id !== recoveredId))
+      throw new DiscordHistoryReadError('profile_changed');
+    id = recoveredId;
+  }
+  if (format === 'codex-rollout' && !session.remote && !recoveredId) {
     const { findOwnedCodexConversation, resolveEffectiveCodexHome } =
       await import('./checkpoint-conversation-identity.js');
     id =
@@ -467,10 +472,10 @@ export async function readDiscordSessionHistory(
   const remote = session.remote;
   const resumeIdBefore = session.nativeResumeId;
   const scope = remoteHistoryScope(session);
-  if (recoveredRemoteId) {
-    if (!remote || format !== 'codex-rollout' || (id && id !== recoveredRemoteId))
+  if (recoveredId && remote) {
+    if (!remote || format !== 'codex-rollout' || (id && id !== recoveredId))
       throw new DiscordHistoryReadError('profile_changed');
-    id = recoveredRemoteId;
+    id = recoveredId;
   }
   let runtime: RemoteDiscordRuntime | undefined;
   let discovered: string | undefined;
