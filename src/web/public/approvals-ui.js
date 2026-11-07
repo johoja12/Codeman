@@ -213,11 +213,14 @@ Object.assign(CodemanApp.prototype, {
     this._approvalAnswersInFlight.add(id);
     const card = document.querySelector(`[data-approval-id="${CSS.escape(id)}"]`);
     const buttons = card ? [...card.querySelectorAll('.approval-actions button')] : [];
-    buttons.forEach(button => { button.disabled = true; });
+    buttons.forEach((button) => {
+      button.disabled = true;
+    });
     try {
       const body = option !== undefined ? { action, option } : { action };
       const data = await this._apiJson(`/api/approvals/${encodeURIComponent(id)}/answer`, {
-        method: 'POST', body,
+        method: 'POST',
+        body,
       });
       if (data) {
         this.showToast(action === 'deny' ? 'Denied' : 'Answer sent', 'success');
@@ -229,8 +232,14 @@ Object.assign(CodemanApp.prototype, {
     } finally {
       this._approvalAnswersInFlight.delete(id);
       const current = this.approvals?.get(id);
-      if (current && !current.answerInTerminal && (!current.nativeQuestion || current.nativeQuestion.state === 'pending'))
-        buttons.forEach(button => { if (button.isConnected) button.disabled = false; });
+      if (
+        current &&
+        !current.answerInTerminal &&
+        (!current.nativeQuestion || current.nativeQuestion.state === 'pending')
+      )
+        buttons.forEach((button) => {
+          if (button.isConnected) button.disabled = false;
+        });
     }
   },
 
@@ -360,9 +369,11 @@ Object.assign(CodemanApp.prototype, {
         : item.kind === 'idle' && item.mode === 'claude'
           ? 'Claude is waiting for your input'
           : '';
-    const summary = item.nativeQuestion ? item.message : item.toolName
-      ? `${item.toolName}${item.toolSummary ? ': ' + item.toolSummary : ''}`
-      : item.message || generatedIdleLabel;
+    const summary = item.nativeQuestion
+      ? item.message
+      : item.toolName
+        ? `${item.toolName}${item.toolSummary ? ': ' + item.toolSummary : ''}`
+        : item.message || generatedIdleLabel;
     const age = this._approvalAge(item.createdAt);
     let actions = '';
     if (item.kind === 'idle') {
