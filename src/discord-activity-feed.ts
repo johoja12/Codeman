@@ -35,6 +35,15 @@ export const activityText = (text: string, max = 160): string =>
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, max);
+/** Discord cannot mask a URL inside another masked link's label. Normalize only the preview. */
+export function activityPreviewText(text: string, max = 120): string {
+  const prose = discordDisplayText(text.slice(0, 4000))
+    .replace(/(?:[a-z][a-z0-9+.-]{0,20}:\/\/|www\.)[^\s<>]*/gi, (url) => /[.!?,;:]+$/.exec(url)?.[0] ?? '')
+    .replace(/[()]/g, ' ')
+    .replace(/\s+([.!?,;:])/g, '$1');
+  const label = activityText(prose, max).replace(/\s+([.!?,;:])/g, '$1');
+  return /[\p{L}\p{N}]/u.test(label) ? label : '';
+}
 const rank = { prompt: 0, update: 1, response: 2, interrupted: 3, question: 4, error: 5, completed: 6 };
 export function newerActivity(old: DiscordActivityEvent | undefined, next: DiscordActivityEvent): boolean {
   return !old || next.at > old.at || (next.at === old.at && rank[next.kind] > rank[old.kind]);
