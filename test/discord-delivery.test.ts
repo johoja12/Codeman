@@ -110,6 +110,27 @@ describe('delivery journal', () => {
     const restored = new DiscordDeliveryJournal(dir, () => now);
     expect((await restored.recent())[0].native?.userCursor).toBe(user);
   });
+  it('finds exact Discord-origin native cursors across the full durable ledger and scoped destination', async () => {
+    const journal = new DiscordDeliveryJournal(dir, () => now);
+    for (let i = 0; i < 15; i++) {
+      await journal.claim({ ...meta, id: 'input:' + i });
+      await journal.annotate('input:' + i, {
+        native: { conversationId: 'native', promptHash: 'a'.repeat(64), userCursor: 'user:' + i },
+      });
+    }
+    await journal.claim({ ...meta, id: 'hash-only' });
+    await journal.annotate('hash-only', { native: { conversationId: 'native', promptHash: 'a'.repeat(64) } });
+    await journal.claim({ ...meta, id: 'out', direction: 'outbound' });
+    await journal.annotate('out', {
+      native: { conversationId: 'native', promptHash: 'a'.repeat(64), userCursor: 'foreign' },
+    });
+    expect((await journal.submittedUserCursors('s1', THREAD, 'native')).size).toBe(15);
+    expect(await journal.submittedUserCursors('other', THREAD, 'native')).toEqual(new Set());
+    expect(await journal.submittedUserCursors('s1', PARENT, 'native')).toEqual(new Set());
+    expect(await journal.submittedUserCursors('s1', THREAD, 'other-conversation')).toEqual(new Set());
+    const restored = new DiscordDeliveryJournal(dir, () => now);
+    expect(await restored.submittedUserCursors('s1', THREAD, 'native')).toContain('user:0');
+  });
   it('fails closed on corruption, oversized metadata and symlinks', async () => {
     const path = join(dir, 'discord-delivery.json');
     for (const contents of ['not JSON', '{}', 'x'.repeat(2 * 1024 * 1024 + 1)]) {

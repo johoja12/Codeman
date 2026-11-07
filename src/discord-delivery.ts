@@ -268,6 +268,23 @@ export class DiscordDeliveryJournal {
       if (record.state !== execution.state) await this.update(record.id, execution.state);
     }
   }
+  /** Exact native turns already submitted through this Discord destination, including queued input. */
+  async submittedUserCursors(sessionId: string, channelId: string, conversationId: string): Promise<Set<string>> {
+    await this.load();
+    await this.chain;
+    return new Set(
+      [...this.records.values()].flatMap((r) =>
+        r.direction === 'inbound' &&
+        r.sessionId === sessionId &&
+        r.channelId === channelId &&
+        r.native?.conversationId === conversationId &&
+        r.native.userCursor
+          ? [r.native.userCursor]
+          : []
+      )
+    );
+  }
+
   async recentForSession(sessionId: string): Promise<DiscordDelivery[]> {
     await this.load();
     await this.chain;

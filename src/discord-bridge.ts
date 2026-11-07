@@ -1553,6 +1553,7 @@ export class DiscordBridge {
         });
       if (discovered) await this.nativeUi?.refreshInbox().catch(() => undefined);
       if (progress.streamOff) return;
+      const discordPrompts = await this.deliveries.submittedUserCursors(sessionId, channel, history.conversationId);
       const at = progress.cursor ? history.turns.findIndex((t) => t.cursor === progress!.cursor) : -1;
       if (progress.cursor && at < 0) throw new BridgeProblem('Live boundary expired; request history');
       for (const turn of history.turns.slice(at + 1, at + 21)) {
@@ -1563,6 +1564,21 @@ export class DiscordBridge {
           !this.destinationMatches(sessionId, channel)
         )
           throw new BridgeProblem('Session changed');
+        if (turn.role === 'user' && !discordPrompts.has(turn.cursor) && turn.text.trim()) {
+          for (const [part, post] of discordResponsePosts(turn.text, {
+            title: 'User prompt',
+            color: 0x99aab5,
+          }).entries())
+            await this.deliverPost(channel, post, undefined, sessionId, `native:${turn.cursor}:prompt:${part}`);
+          if (turn.text.length > 12000)
+            await this.deliverPost(
+              channel,
+              { content: 'Full user prompt', allowed_mentions: { parse: [], users: [] } },
+              { name: 'prompt.txt', data: Buffer.from(turn.text) },
+              sessionId,
+              `native:${turn.cursor}:prompt:overflow`
+            );
+        }
         if ((turn.role === 'assistant' && turn.phase !== 'commentary') || (turn.role === 'tool' && progress.verbose)) {
           const visible = turn.role === 'assistant' ? discordDisplayText(turn.text) : turn.text;
           const formatted = formatDiscordTables((turn.role === 'tool' ? '**Tool output**\n' : '') + visible);
