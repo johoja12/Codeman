@@ -41,7 +41,7 @@ import { DiscordCaseThreads, type DiscordStarter } from './discord-case-threads.
 import type { DiscordCaseIdentity } from './discord-case-identity.js';
 import { hashDiscordPrompt } from './discord-native-execution.js';
 import { DiscordConversationProgressStore } from './discord-conversation-progress.js';
-import { renderHistory } from './discord-history.js';
+import { renderHistory, discordHistoryFailureReason } from './discord-history.js';
 import { existsSync, mkdirSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
@@ -571,7 +571,7 @@ export class DiscordApi {
   getMessage(parent: string, id: string): Promise<DiscordStarter | null> {
     return this.request('GET', `/channels/${parent}/messages/${id}`);
   }
-  channelMessages(parent: string): Promise<DiscordStarter[] | null> {
+  channelMessages(parent: string): Promise<Array<DiscordStarter & { content?: string }> | null> {
     return this.request('GET', `/channels/${parent}/messages?limit=100`);
   }
   createThreadFromMessage(parent: string, id: string, name: string): Promise<DiscordManagedChannel | null> {
@@ -936,7 +936,7 @@ export interface DiscordBridgeDeps {
   launch?: (scope: string, caseKey: string, mode: string) => Promise<DiscordControlReply>;
   history?: (
     sessionId: string,
-    options?: { includeTools?: boolean }
+    options?: { includeTools?: boolean; after?: string }
   ) => Promise<import('./discord-history.js').DiscordHistory>;
   saveRemoteAttachment?: (sessionId: string, name: string, bytes: Uint8Array) => Promise<string>;
   getAttachment?: (sessionId: string, path: string, relativeToWorkspace?: boolean) => Promise<DiscordFile>;
@@ -1001,6 +1001,7 @@ export class DiscordBridge {
   private uiPrompts = new Map<string, { conversation: string; text: string }>();
   private outputDue = new Map<string, number>();
   private unavailableNotices = new Set<string>();
+  private historyWarningsChecked = new Set<string>();
   private readonly api: DiscordApi;
   private readonly now: () => number;
   private readonly deliveries: DiscordDeliveryJournal;
@@ -1304,11 +1305,9 @@ export class DiscordBridge {
           this.syncState.ready++;
           try {
             await this.seedConversation(session.id, result);
-          } catch {
+          } catch (error) {
             this.syncState.failed++;
-            this.last = this.fail(
-              new BridgeProblem('History unavailable; retry synchronization or use !codeman history')
-            );
+            this.last = this.fail(new BridgeProblem('History unavailable: ' + discordHistoryFailureReason(error)));
             if (this.destinationMatches(session.id, result))
               await this.deliverPost(
                 result,
@@ -1444,12 +1443,8 @@ export class DiscordBridge {
         this.now() + (remote ? (session.working ? 10000 : 60000) : session.working ? 3000 : 15000)
       );
       const run = this.observeConversation(session.id, channel)
-        .catch(() => {
-          this.last = this.fail(
-            new BridgeProblem(
-              'Live output paused: transcript/delivery boundary unavailable; use status/history or retry synchronization'
-            )
-          );
+        .catch((error) => {
+          this.last = this.fail(new BridgeProblem('Live output paused: ' + discordHistoryFailureReason(error)));
         })
         .finally(() => {
           if (this.outputReads.get(session.id)?.run === run) this.outputReads.delete(session.id);
@@ -1519,6 +1514,35 @@ export class DiscordBridge {
     }
   }
 
+  private async clearRecoveredHistoryWarning(sessionId: string, channel: string): Promise<void> {
+    const key = `${sessionId}:${channel}`;
+    if (this.historyWarningsChecked.has(key)) return;
+    const current = () => !this.stopped && this.cfg.enabled && this.destinationMatches(sessionId, channel);
+    if (!current()) return;
+    try {
+      await this.channels.assertOwned(this.cfg, sessionId, channel);
+      const bot = await this.api.botUserId();
+      if (!bot?.id || !current()) return;
+      const messages = await this.api.channelMessages(channel);
+      for (const message of messages ?? []) {
+        if (!current()) return;
+        if (
+          message.author?.id === bot.id &&
+          message.content ===
+            'History is unavailable or partial. Use !codeman history to retry; this session channel remains available.'
+        )
+          await this.api.editMessage(channel, message.id, {
+            content: 'History reconnected. Live replies are synchronized.',
+            allowed_mentions: { parse: [], users: [] },
+          });
+      }
+      if (this.historyWarningsChecked.size >= 1024) this.historyWarningsChecked.clear();
+      this.historyWarningsChecked.add(key);
+    } catch {
+      /* Cosmetic recovery notice retries later; never rewinds delivery. */
+    }
+  }
+
   private async observeConversation(sessionId: string, channel: string): Promise<void> {
     await this.seedConversation(sessionId, channel);
     const key = this.conversationKey(sessionId, channel);
@@ -1530,7 +1554,7 @@ export class DiscordBridge {
     const run = (async () => {
       let progress = await this.conversationProgress.get(key);
       if (!progress?.seeded) return;
-      const history = await this.deps.history!(sessionId, { includeTools: progress.verbose });
+      const history = await this.deps.history!(sessionId, { includeTools: progress.verbose, after: progress.cursor });
       const user = history.turns.filter((t) => t.role === 'user').at(-1);
       if (user) this.uiPrompts.set(sessionId, { conversation: history.conversationId, text: user.text.slice(0, 400) });
       if (history.conversationId !== progress.conversationId)
@@ -1554,7 +1578,8 @@ export class DiscordBridge {
       if (discovered) await this.nativeUi?.refreshInbox().catch(() => undefined);
       if (progress.streamOff) return;
       const at = progress.cursor ? history.turns.findIndex((t) => t.cursor === progress!.cursor) : -1;
-      if (progress.cursor && at < 0) throw new BridgeProblem('Live boundary expired; request history');
+      if (progress.cursor && at < 0 && history.verifiedAfter !== progress.cursor)
+        throw new BridgeProblem('Live boundary expired; request history');
       for (const turn of history.turns.slice(at + 1, at + 21)) {
         if (
           this.stopped ||
@@ -1612,6 +1637,15 @@ export class DiscordBridge {
         progress = { ...progress, cursor: turn.cursor };
         await this.conversationProgress.set(key, progress);
       }
+      // Raw tool/metadata pages still make durable progress after all visible turns were delivered.
+      if (history.verifiedAfter && history.scannedCursor && history.turns.length - (at + 1) <= 20) {
+        progress = { ...progress, cursor: history.scannedCursor };
+        await this.conversationProgress.set(key, progress);
+      }
+      if (history.verifiedAfter && (history.hasMore || history.turns.length - (at + 1) > 20))
+        this.outputDue.set(sessionId, this.now() + 4000);
+      if (history.verifiedAfter && !history.hasMore && history.turns.length - (at + 1) <= 20)
+        await this.clearRecoveredHistoryWarning(sessionId, channel);
       const added = await this.completionInbox
         .observe({
           session: sessionId,
@@ -1977,6 +2011,7 @@ export class DiscordBridge {
     this.activityTimer = undefined;
     this.actions.clear();
     this.unavailableNotices.clear();
+    this.historyWarningsChecked.clear();
     this.syncQueued = false;
     clearInterval(this.outputTimer);
     this.outputTimer = undefined;

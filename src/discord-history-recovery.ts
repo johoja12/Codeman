@@ -8,7 +8,7 @@ import { stripAnsi } from './utils/regex-patterns.js';
 const attempts = new WeakMap<Session, { retryAt: number; run: Promise<DiscordHistory> }>();
 export async function readDiscordCanonicalHistory(
   session: Session,
-  options: { includeTools?: boolean } = {},
+  options: { includeTools?: boolean; after?: string } = {},
   permitted: () => boolean = () => false
 ): Promise<DiscordHistory> {
   try {
@@ -65,6 +65,7 @@ export async function readDiscordCanonicalHistory(
               remote,
               configHome,
               includeTools: options.includeTools,
+              after: options.after,
             });
             if (!allowed() || !lease.current() || history.conversationId !== status.session)
               throw new Error('Conversation changed during transcript recovery');

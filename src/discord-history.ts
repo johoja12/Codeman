@@ -77,6 +77,9 @@ export interface DiscordHistory {
   partial: boolean;
   executions?: DiscordNativeExecution[];
   notice?: string;
+  verifiedAfter?: string;
+  scannedCursor?: string;
+  hasMore?: boolean;
 }
 export interface DiscordHistorySource {
   mode: string;
@@ -84,12 +87,34 @@ export interface DiscordHistorySource {
   remote?: SessionRemote;
   configHome?: string;
   includeTools?: boolean;
+  after?: string;
+}
+export class DiscordHistoryReadError extends Error {
+  constructor(readonly code: string) {
+    super(
+      code === 'cursor_missing'
+        ? 'Saved history position is beyond the transcript; reconnect requires review'
+        : code === 'cursor_changed'
+          ? 'Saved history record changed; live replay paused for safety'
+          : code === 'record_too_large'
+            ? 'A transcript record exceeds the bounded recovery size'
+            : 'History recovery is unavailable'
+    );
+  }
+}
+export function discordHistoryFailureReason(error: unknown): string {
+  if (error instanceof DiscordHistoryReadError) return error.message;
+  if (error instanceof Error && error.message === 'Exact Claude/Codex conversation identity is unavailable')
+    return 'Native conversation identity is not verified';
+  return 'Transcript read or delivery failed';
 }
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Bounded inventory and bounded tail. Exact UUID only; ambiguous copies are unavailable. */
 const HISTORY_SCRIPT = String.raw`
-import os,sys,json,stat,base64
+import os,sys,json,stat,base64,hashlib
 s=json.loads(sys.argv[1]);mode=s['format'];ident=s['id'];limit=2*1024*1024
+def fail(code):
+ print(json.dumps({'error':code}));sys.exit(0)
 root=os.path.expanduser(s.get('home') or os.environ.get('CLAUDE_CONFIG_DIR' if mode=='claude-jsonl' else 'CODEX_HOME') or ('~/.claude' if mode=='claude-jsonl' else '~/.codex'))
 root=os.path.join(root,'projects' if mode=='claude-jsonl' else 'sessions');found=[];count=0
 for parent,dirs,files in os.walk(root,followlinks=False):
@@ -113,14 +138,48 @@ try:
  if mode=='codex-rollout':
   meta=json.loads(head)
   if meta.get('type')!='session_meta' or meta.get('payload',{}).get('id')!=ident: raise Exception('identity mismatch')
- offset=max(0,info.st_size-limit);os.lseek(f,offset,0);data=os.read(f,limit)
- if offset:
-  end=data.find(b'\n')
-  if end<0: raise Exception('oversize row')
-  offset+=end+1;data=data[end+1:]
- # Ignore an incomplete final row; it will be included on the next read.
- end=data.rfind(b'\n');data=data[:end+1] if end>=0 else b''
- print(json.dumps({'offset':offset,'data':base64.b64encode(data).decode(),'partial':offset>0}))
+ after=s.get('after');scanned=None
+ if after:
+  parts=after.split(':');offset=int(parts[1])
+  if offset>=info.st_size:fail('cursor_missing')
+  def ignored_large(line):
+   try:v=json.loads(line)
+   except Exception:return False
+   # Only native metadata that the visible-message parser never exports may be skipped.
+   return mode=='codex-rollout' and isinstance(v,dict) and v.get('type') in ('compacted','turn_context')
+  with os.fdopen(os.dup(f),'rb') as stream:
+   stream.seek(offset);anchor=stream.readline(16*1024*1024+1)
+   if len(anchor)>16*1024*1024:fail('record_too_large')
+   if not anchor.endswith(b'\n') or hashlib.sha256(anchor[:-1]).hexdigest()[:16]!=parts[2]:fail('cursor_changed')
+   if len(anchor)>limit:
+    if not ignored_large(anchor):fail('record_too_large')
+    offset+=len(anchor)
+   stream.seek(offset);chunks=[];size=0;budget=limit+(len(anchor) if len(anchor)<=limit else 0)
+   scanned=after;skipped_end=None
+   while True:
+    at=stream.tell();line=stream.readline(16*1024*1024+1)
+    if len(line)>16*1024*1024:fail('record_too_large')
+    if not line or not line.endswith(b'\n'):break
+    cursor=ident+':'+str(at)+':'+hashlib.sha256(line[:-1]).hexdigest()[:16]
+    if len(line)>limit:
+     if not ignored_large(line):fail('record_too_large')
+     scanned=cursor;skipped_end=at+len(line)
+     break
+    if size+len(line)>budget:break
+    chunks.append(line);size+=len(line);scanned=cursor
+   data=b''.join(chunks)
+   # A skipped metadata row is itself the next verified anchor, never a guessed offset.
+   read_end=skipped_end if skipped_end is not None else offset+len(data)
+   more=read_end<info.st_size
+ else:
+  offset=max(0,info.st_size-limit);os.lseek(f,offset,0);data=os.read(f,limit)
+  if offset:
+   end=data.find(b'\n')
+   if end<0:fail('record_too_large')
+   offset+=end+1;data=data[end+1:]
+  end=data.rfind(b'\n');data=data[:end+1] if end>=0 else b''
+  more=offset+len(data)<info.st_size
+ print(json.dumps({'offset':offset,'data':base64.b64encode(data).decode(),'partial':offset>0,'verifiedAfter':after,'hasMore':more,'scannedCursor':scanned}))
 finally: os.close(f)
 `;
 export function discordHistoryCommand(source: DiscordHistorySource): string {
@@ -131,23 +190,45 @@ export function discordHistoryCommand(source: DiscordHistorySource): string {
     !['claude-jsonl', 'codex-rollout'].includes(format ?? '')
   )
     throw new Error('Exact Claude/Codex conversation identity is unavailable');
+  if (source.after && !new RegExp(`^${source.conversationId}:[0-9]{1,16}:[a-f0-9]{16}$`).test(source.after))
+    throw new Error('Invalid history recovery cursor');
+  if (source.after && !Number.isSafeInteger(Number(source.after.split(':')[1])))
+    throw new Error('Invalid history recovery offset');
   return withRemotePathBootstrap(
     'python3 -c ' +
       shellescape(HISTORY_SCRIPT) +
       ' ' +
-      shellescape(JSON.stringify({ format, id: source.conversationId, home: source.configHome }))
+      shellescape(JSON.stringify({ format, id: source.conversationId, home: source.configHome, after: source.after }))
   );
 }
 export function parseDiscordHistory(source: DiscordHistorySource, raw: string): DiscordHistory {
   const format = getCli(source.mode)?.capabilities.transcript;
-  const packet = JSON.parse(raw) as { offset: number; data: string; partial: boolean };
+  const packet = JSON.parse(raw) as {
+    offset: number;
+    data: string;
+    partial: boolean;
+    error?: string;
+    verifiedAfter?: string;
+    hasMore?: boolean;
+    scannedCursor?: string;
+  };
+  if (packet.error) throw new DiscordHistoryReadError(packet.error);
+  if (source.after && packet.verifiedAfter !== source.after) throw new DiscordHistoryReadError('cursor_changed');
   if (
     !Number.isSafeInteger(packet.offset) ||
     packet.offset < 0 ||
     typeof packet.data !== 'string' ||
-    packet.data.length > 3 * 1024 * 1024
+    packet.data.length > 6 * 1024 * 1024
   )
     throw new Error('Invalid history packet');
+  if (
+    packet.scannedCursor &&
+    (!source.after ||
+      !new RegExp(`^${source.conversationId}:[0-9]{1,16}:[a-f0-9]{16}$`).test(packet.scannedCursor) ||
+      !Number.isSafeInteger(Number(packet.scannedCursor.split(':')[1])) ||
+      Number(packet.scannedCursor.split(':')[1]) < Number(source.after.split(':')[1]))
+  )
+    throw new DiscordHistoryReadError('cursor_changed');
   const content = Buffer.from(packet.data, 'base64');
   let offset = packet.offset;
   const rows: Array<{ value: NativeHistoryRow; offset: number; raw: string }> = [];
@@ -280,13 +361,30 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
     })),
     turns
   );
-  return { conversationId: source.conversationId!, turns, partial: packet.partial === true, executions };
+  const last = rows.at(-1);
+  return {
+    conversationId: source.conversationId!,
+    turns,
+    partial: packet.partial === true,
+    executions,
+    ...(source.after
+      ? {
+          verifiedAfter: packet.verifiedAfter,
+          hasMore: packet.hasMore === true,
+          scannedCursor:
+            packet.scannedCursor ??
+            (last
+              ? `${source.conversationId}:${last.offset}:${createHash('sha256').update(last.raw).digest('hex').slice(0, 16)}`
+              : undefined),
+        }
+      : {}),
+  };
 }
 export async function readDiscordHistory(source: DiscordHistorySource): Promise<DiscordHistory> {
   const command = discordHistoryCommand(source);
   const raw = source.remote
     ? await runDiscordRemoteRead(source.remote, command)
-    : (await exec('sh', ['-c', command], { timeout: 30000, maxBuffer: 4 * 1024 * 1024 })).stdout;
+    : (await exec('sh', ['-c', command], { timeout: 30000, maxBuffer: 8 * 1024 * 1024 })).stdout;
   return parseDiscordHistory(source, String(raw));
 }
 export function historyPage(
@@ -303,7 +401,7 @@ export function historyPage(
 /** Adapts live Session metadata; never guesses by shared directory or falls back to terminal redraws. */
 export async function readDiscordSessionHistory(
   session: import('./session.js').Session,
-  options?: { includeTools?: boolean }
+  options?: { includeTools?: boolean; after?: string }
 ): Promise<DiscordHistory> {
   const format = getCli(session.mode)?.capabilities.transcript;
   let id =
@@ -344,6 +442,7 @@ export async function readDiscordSessionHistory(
     remote: session.remote,
     configHome,
     includeTools: options?.includeTools,
+    after: options?.after,
   });
   // Publish only after the exact transcript header was verified, and never overwrite a concurrent adoption.
   if (discovered && (session.remote !== remote || (session.nativeResumeId && session.nativeResumeId !== discovered)))

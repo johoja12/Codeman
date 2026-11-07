@@ -189,6 +189,89 @@ afterEach(async () => {
 });
 
 describe('Discord interface mode', () => {
+  it('recovers a saved boundary outside the tail through a tool-only page, restart and warning cleanup', async () => {
+    let now = 100000;
+    let appended = false;
+    sessions = [{ id: 's1', name: 'one' }];
+    const history = vi.fn(async (_id: string, options?: { after?: string }) => {
+      if (!options?.after)
+        return {
+          conversationId: 'native1',
+          partial: appended,
+          turns: [
+            {
+              cursor: appended ? 'native1:answer' : 'native1:old',
+              role: 'assistant' as const,
+              text: appended ? 'Recovered answer' : 'Already delivered',
+              timestamp: '',
+            },
+          ],
+        };
+      if (options.after === 'native1:old')
+        return {
+          conversationId: 'native1',
+          partial: true,
+          turns: [],
+          verifiedAfter: options.after,
+          scannedCursor: 'native1:tool',
+          hasMore: true,
+        };
+      if (options.after === 'native1:tool')
+        return {
+          conversationId: 'native1',
+          partial: true,
+          turns: [{ cursor: 'native1:answer', role: 'assistant' as const, text: 'Recovered answer', timestamp: '' }],
+          verifiedAfter: options.after,
+          scannedCursor: 'native1:end',
+          hasMore: false,
+        };
+      return {
+        conversationId: 'native1',
+        partial: true,
+        turns: [],
+        verifiedAfter: options.after,
+        scannedCursor: options.after,
+        hasMore: false,
+      };
+    });
+    const b = makeBridge(undefined, { history, now: () => now });
+    await b.reload();
+    await b.syncSessions();
+    const thread = (await readFullMap(dir)).s1;
+    const warning =
+      'History is unavailable or partial. Use !codeman history to retry; this session channel remains available.';
+    const botWarning = '988888888888888881',
+      userWarning = '988888888888888882';
+    remoteMessages.set(botWarning, { id: botWarning, channel_id: thread, content: warning, author: { id: BOT } });
+    remoteMessages.set(userWarning, {
+      id: userWarning,
+      channel_id: thread,
+      content: warning,
+      author: { id: cfg.allowedUserIds[0] },
+    });
+    appended = true;
+    await b.pollConversations();
+    expect(history).toHaveBeenCalledWith('s1', expect.objectContaining({ after: 'native1:old' }));
+    const stored = JSON.parse(await readFile(join(dir, 'discord-conversations.json'), 'utf8'));
+    expect(stored.some(([, p]: any) => p.cursor === 'native1:tool')).toBe(true);
+    expect(remoteMessages.get(botWarning).content).toBe(warning);
+    b.stop();
+    const again = makeBridge(undefined, { history, now: () => now });
+    await again.reload();
+    await again.syncSessions();
+    await again.pollConversations();
+    expect(history).toHaveBeenCalledWith('s1', expect.objectContaining({ after: 'native1:tool' }));
+    const responses = () =>
+      posts.filter((p) => visibleText(p.body)?.includes('Recovered answer') && p.method === 'POST');
+    expect(responses()).toHaveLength(1);
+    expect(remoteMessages.get(botWarning).content).toBe('History reconnected. Live replies are synchronized.');
+    expect(remoteMessages.get(userWarning).content).toBe(warning);
+    now += 20000;
+    await again.pollConversations();
+    expect(responses()).toHaveLength(1);
+    expect(sendInput).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])('preserves Claude background titles over sync and restart (remote=%s)', async (remote) => {
     let now = 100000;
     sessions = [
