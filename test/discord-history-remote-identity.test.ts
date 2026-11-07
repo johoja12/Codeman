@@ -63,6 +63,14 @@ describe('verified remote history identity adoption', () => {
     await expect(readDiscordSessionHistory(session)).rejects.toThrow(/changed/);
     expect(session.setNativeResumeId).not.toHaveBeenCalled();
   });
+  it('accepts a concurrent adoption of the same verified native conversation', async () => {
+    vi.mocked(runDiscordRemoteRead).mockImplementation(async () => {
+      Object.assign(session, { nativeResumeId: id });
+      return packet;
+    });
+    await expect(readDiscordSessionHistory(session)).resolves.toHaveProperty('conversationId', id);
+    expect(session.setNativeResumeId).not.toHaveBeenCalled();
+  });
   it('uses an explicit home override without reading process environment', async () => {
     Object.assign(session, { envOverrideValue: () => './account' });
     await readDiscordSessionHistory(session);

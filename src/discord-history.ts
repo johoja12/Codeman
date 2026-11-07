@@ -410,7 +410,10 @@ const remoteRuntimeHomes = new WeakMap<
   import('./session.js').Session,
   { scope: string; runtime: RemoteDiscordRuntime }
 >();
-function remoteHistoryScope(session: import('./session.js').Session): string {
+function remoteHistoryScope(
+  session: import('./session.js').Session,
+  resumeId: string | null = session.nativeResumeId
+): string {
   const remote = session.remote;
   return JSON.stringify([
     session.mode,
@@ -421,7 +424,7 @@ function remoteHistoryScope(session: import('./session.js').Session): string {
     remote?.remotePath,
     remote?.codexCommandProfileId,
     remote?.commands?.codex,
-    session.nativeResumeId,
+    resumeId,
     session.codexConfig?.resumeSessionId,
     session.envOverrideValue('CODEX_HOME'),
     session.nativeModelSettingsRevision,
@@ -462,6 +465,7 @@ export async function readDiscordSessionHistory(
   }
   if (session.docker) throw new Error('Container history is not available through this reader');
   const remote = session.remote;
+  const resumeIdBefore = session.nativeResumeId;
   const scope = remoteHistoryScope(session);
   if (recoveredRemoteId) {
     if (!remote || format !== 'codex-rollout' || (id && id !== recoveredRemoteId))
@@ -507,7 +511,8 @@ export async function readDiscordSessionHistory(
         )
           throw new DiscordHistoryReadError('profile_changed');
       }
-      if (session.remote !== remote || remoteHistoryScope(session) !== scope)
+      const compatibleAdoption = session.nativeResumeId === id && remoteHistoryScope(session, resumeIdBefore) === scope;
+      if (session.remote !== remote || (remoteHistoryScope(session) !== scope && !compatibleAdoption))
         throw new DiscordHistoryReadError('profile_changed');
     }
     // The exact native file/header and current owned runtime must both confirm the binding first.
