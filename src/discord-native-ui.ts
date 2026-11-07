@@ -1,6 +1,8 @@
 /** Native Discord controls. Tokens bind actor, origin, configuration and exact conversation. */
 import { createHash, randomUUID } from 'node:crypto';
 import { DiscordUiStore } from './discord-ui-store.js';
+import { discordDetailPages } from './discord-response-format.js';
+import { readDiscordTaskUpdates, renderDiscordTaskUpdates, type DiscordTaskUpdates } from './discord-task-updates.js';
 import { discordDisplayText } from './discord-display-text.js';
 import type { DiscordInteraction, GatewayMessage, DiscordPost } from './discord-bridge.js';
 import type { DiscordNativeUiHost, DiscordUiPayload, DiscordUiSession } from './discord-native-ui-types.js';
@@ -365,39 +367,43 @@ export class DiscordNativeUi {
         throw new Error('Response conversation or Discord configuration changed.');
       return h;
     };
+    if (!scope || !ctx.conversation) throw new Error('Native conversation is unavailable.');
     const anchor = responseCursor ?? userCursor;
     const bind = (label: string, run: UiAction['run']) =>
       this.action(ctx, label, run, undefined, 2, anchor + ':' + label);
     const controls: Array<Record<string, unknown>> = [
-      bind('Show updates', async () => {
-        const h = await responseHistory();
-        const start = h.turns.findIndex((t) => t.cursor === userCursor && t.role === 'user');
-        if (start < 0) throw new Error('Progress history expired; use the session History control.');
-        const after = h.turns.slice(start + 1);
-        const end = after.findIndex((t) => t.role === 'user');
-        const updates = (end < 0 ? after : after.slice(0, end)).filter(
-          (t) => t.role === 'assistant' && t.phase === 'commentary'
-        );
-        return this.payload(
-          '**Progress updates**\n' +
-            (updates
-              .slice(-6)
-              .map((t) => `${safe(t.timestamp, 30)}\n${discordDisplayText(t.text).slice(0, 250)}`)
-              .join('\n\n') || 'No explicitly identified progress updates are available.') +
-            (updates.length > 6 ? '\n\nLatest six shown. Use History for earlier updates.' : '')
-        );
+      bind('Show updates', async (m) => {
+        const panel = { ...ctx, actor: m.member?.user?.id ?? m.user?.id };
+        const state = await readDiscordTaskUpdates(this.taskReader(panel, scope), ctx.conversation!, userCursor);
+        return this.updatesView(panel, userCursor, state, 0, scope);
       }),
     ];
     if (responseCursor) {
       controls.push(
         bind('Download response', async () => {
           const h = await responseHistory();
-          const turn = h.turns.find((t) => t.cursor === responseCursor && t.role === 'assistant');
-          if (!turn) throw new Error('Response history expired; use History instead.');
+          let turn = h.turns.find((t) => t.cursor === responseCursor && t.role === 'assistant');
+          if (!turn) {
+            let task: DiscordTaskUpdates | undefined;
+            for (let i = 0; i < 4; i++) {
+              task = await readDiscordTaskUpdates(
+                this.taskReader(ctx, scope),
+                ctx.conversation!,
+                userCursor,
+                task,
+                responseCursor
+              );
+              if (task.response || task.complete) break;
+            }
+            turn = task?.response;
+          }
+          if (!turn)
+            throw new Error('Response is outside this bounded read. Use Updates to load more original task history.');
           await this.host.postFile(
             channel,
             { name: 'response.txt', data: Buffer.from(discordDisplayText(turn.text)) },
-            'Requested assistant response'
+            'Requested assistant response',
+            () => scope === this.host.scope() && this.host.channelForSession(id) === channel
           );
           return this.payload('Response file posted in this session thread.');
         }),
@@ -406,8 +412,99 @@ export class DiscordNativeUi {
     }
     if (s.url && /^https?:\/\//.test(s.url))
       controls.unshift({ type: 2, style: 5, label: 'Open in Codeman', url: s.url });
+    const ref = {
+      scope: scope!,
+      session: id,
+      channel,
+      conversation: ctx.conversation!,
+      userCursor,
+      ...(responseCursor ? { responseCursor } : {}),
+      updated: this.host.now(),
+    };
+    const key = hash(JSON.stringify([scope, ctx, anchor]));
+    const saved = (await this.store.snapshot()).responses[key];
+    if (!saved)
+      await this.store.edit((state) => {
+        state.responses[key] = ref;
+      });
     return [row(...controls)];
   }
+  private taskReader(
+    ctx: UiContext,
+    scope: string | undefined
+  ): (after: string) => Promise<import('./discord-history.js').DiscordHistory> {
+    const current = () =>
+      scope === this.host.scope() &&
+      this.host.channelForSession(ctx.session!) === ctx.channel &&
+      (!ctx.actor || this.host.config().allowed.includes(ctx.actor));
+    return async (after) => {
+      if (!current()) throw new Error('Discord configuration changed.');
+      const h = await this.host.history(ctx.session!, { after });
+      await this.target(ctx.session!, ctx.conversation);
+      if (!current() || h.conversationId !== ctx.conversation) throw new Error('Original task conversation changed.');
+      return h;
+    };
+  }
+  private updatesView(
+    ctx: UiContext,
+    userCursor: string,
+    state: DiscordTaskUpdates,
+    page: number,
+    scope: string | undefined
+  ): DiscordUiPayload {
+    const text = renderDiscordTaskUpdates(state.updates),
+      pages = discordDetailPages(text);
+    const body = pages[page] ?? 'No assistant progress updates in the loaded task history.';
+    const actions: Array<Record<string, unknown>> = [];
+    if (page > 0)
+      actions.push(this.action(ctx, 'Previous', async () => this.updatesView(ctx, userCursor, state, page - 1, scope)));
+    if (page + 1 < pages.length)
+      actions.push(this.action(ctx, 'Next', async () => this.updatesView(ctx, userCursor, state, page + 1, scope)));
+    if (!state.complete)
+      actions.push(
+        this.action(ctx, 'Load more', async () => {
+          const next = await readDiscordTaskUpdates(this.taskReader(ctx, scope), ctx.conversation!, userCursor, state);
+          return this.updatesView(ctx, userCursor, next, page, scope);
+        })
+      );
+    actions.push(
+      this.action(ctx, 'Download updates', async () => {
+        let full = state;
+        for (let i = 0; i < 4 && !full.complete; i++)
+          full = await readDiscordTaskUpdates(this.taskReader(ctx, scope), ctx.conversation!, userCursor, full);
+        if (!full.complete) return this.updatesView(ctx, userCursor, full, page, scope);
+        await this.target(ctx.session!, ctx.conversation);
+        const current = () =>
+          scope === this.host.scope() &&
+          this.host.channelForSession(ctx.session!) === ctx.channel &&
+          (!ctx.actor || this.host.config().allowed.includes(ctx.actor));
+        if (!current()) throw new Error('Discord configuration changed.');
+        const output = renderDiscordTaskUpdates(full.updates);
+        if (Buffer.byteLength(output) > 8 * 1024 * 1024)
+          throw new Error('Updates export exceeds the 8 MB Discord limit.');
+        await this.host.postFile(
+          ctx.channel,
+          { name: 'updates.txt', data: Buffer.from(output || 'No assistant progress updates for this task.') },
+          'Requested task updates',
+          current
+        );
+        return this.payload(`Downloaded all ${full.updates.length} updates for this task.`);
+      })
+    );
+    actions.push(
+      this.action(ctx, 'Refresh', async () => {
+        const refreshed = await readDiscordTaskUpdates(this.taskReader(ctx, scope), ctx.conversation!, userCursor);
+        return this.updatesView(ctx, userCursor, refreshed, 0, scope);
+      })
+    );
+    const rows = [];
+    for (let i = 0; i < actions.length; i += 5) rows.push(row(...actions.slice(i, i + 5)));
+    return this.payload(
+      `**Updates · ${state.updates.length}${state.complete ? '' : ' loaded · more history available'}** · page ${Math.min(page + 1, Math.max(1, pages.length))}/${Math.max(1, pages.length)}\n\n${body}`,
+      rows
+    );
+  }
+
   /** Reconstruct only response readers; never revive transient approval/queue/settings actions. */
   private async recoverResponseAction(
     m: DiscordInteraction,
@@ -446,6 +543,22 @@ export class DiscordNativeUi {
       !contains(message.components)
     )
       return undefined;
+    const refs = Object.values((await this.store.snapshot()).responses);
+    for (const ref of refs) {
+      if (ref.scope !== scope || ref.session !== id || ref.channel !== channel || ref.conversation !== conversation)
+        continue;
+      const ctx: UiContext = { channel, session: id, conversation };
+      const anchor = ref.responseCursor ?? ref.userCursor;
+      const match = ['Show updates', 'Download response', 'Results & files'].some(
+        (label) => custom === 'cmui:' + hash(JSON.stringify([scope, ctx, anchor + ':' + label])).slice(0, 40)
+      );
+      if (!match) continue;
+      await this.responseControls(id, channel, ref.userCursor, ref.responseCursor);
+      if (!current()) return undefined;
+      const restored = this.actions.get(custom);
+      if (restored) restored.message = m.message.id;
+      return restored;
+    }
     const h = await this.host.history(id);
     if (!current() || h.conversationId !== conversation) return undefined;
     await this.target(id, conversation);

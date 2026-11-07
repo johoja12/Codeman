@@ -778,7 +778,7 @@ describe('Discord interface mode', () => {
       });
       now += 20000;
       await b.pollConversations();
-      expect(history).toHaveBeenCalledWith('s1', { includeTools: undefined, after: baseline.cursor });
+      expect(history).toHaveBeenCalledWith('s1', { includeTools: false, after: baseline.cursor });
       expect(
         posts.filter((p) => p.method === 'POST' && JSON.stringify(p.body ?? {}).includes('User prompt'))
       ).toHaveLength(0);
@@ -2006,7 +2006,7 @@ it('launches from owned case channels and threads with a confirmation, never ter
   expect(launch).toHaveBeenCalledTimes(2);
   expect(sendInput).not.toHaveBeenCalled();
 });
-it('coalesces explicit commentary into one editable status and delivers the native final once', async () => {
+it('streams explicit commentary as conversation cards and delivers the native final once', async () => {
   sessions = [{ id: 's1', name: 'one' }];
   let now = 100000;
   let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
@@ -2037,7 +2037,7 @@ it('coalesces explicit commentary into one editable status and delivers the nati
     posts
       .find((p) => p.method === 'POST' && visibleText(p.body)?.includes('Checks passed'))!
       .body.components.some((c: any) => c.type === 17)
-  ).toBe(false);
+  ).toBe(true);
   turns.push({
     role: 'assistant',
     cursor: 'native1:p2',
@@ -2047,10 +2047,10 @@ it('coalesces explicit commentary into one editable status and delivers the nati
   });
   now += 60001;
   await b.pollConversations();
-  expect(posts.filter((p) => p.method === 'PATCH' && visibleText(p.body)?.includes('Exporting artifact'))).toHaveLength(
+  expect(posts.filter((p) => p.method === 'POST' && visibleText(p.body)?.includes('Exporting artifact'))).toHaveLength(
     1
   );
-  expect(posts.filter((p) => p.method === 'POST' && visibleText(p.body)?.includes('Exporting artifact'))).toHaveLength(
+  expect(posts.filter((p) => p.method === 'PATCH' && visibleText(p.body)?.includes('Exporting artifact'))).toHaveLength(
     0
   );
   turns.push({
@@ -2175,5 +2175,89 @@ it('reports an unverified profile as actionable history attention instead of pro
   expect(bodies).toContain('Reply history needs attention');
   expect(bodies).toContain('CODEX_HOME');
   expect(bodies).not.toContain('I’m restoring the connection');
+  expect(sendInput).not.toHaveBeenCalled();
+});
+
+it('groups adjacent commentary by default, preserves final order and supports Quiet and Tools', async () => {
+  sessions = [{ id: 's1', name: 'one' }];
+  let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+  const history = async () => ({ conversationId: 'native1', partial: false, turns });
+  let now = 100000;
+  const b = makeBridge(undefined, { history, now: () => now });
+  await b.reload();
+  await b.syncSessions();
+  posts = [];
+  turns = [
+    { cursor: 'native1:u', role: 'user', text: 'Task', timestamp: '' },
+    { cursor: 'native1:p1', role: 'assistant', phase: 'commentary', text: 'First progress', timestamp: '' },
+    { cursor: 'native1:p2', role: 'assistant', phase: 'commentary', text: 'Second progress', timestamp: '' },
+    { cursor: 'native1:r', role: 'assistant', phase: 'final_answer', text: 'Final answer', timestamp: '' },
+  ];
+  now += 60001;
+  await b.pollConversations();
+  const cards = posts.filter((p) => p.method === 'POST');
+  const update = cards.find((p) => visibleText(p.body)?.includes('First progress'))!;
+  expect(visibleText(update.body)).toContain('Second progress');
+  expect(cards.indexOf(update)).toBeLessThan(cards.findIndex((p) => visibleText(p.body)?.includes('Final answer')));
+  now += 60001;
+  await b.pollConversations();
+  expect(posts.filter((p) => p.method === 'POST' && visibleText(p.body)?.includes('First progress'))).toHaveLength(1);
+  const map = await readFullMap(dir);
+  const msg = {
+    id: '900000000000000098',
+    channel_id: map.s1,
+    guild_id: cfg.guildId,
+    author: { id: cfg.allowedUserIds[0] },
+    content: '!codeman stream quiet',
+  };
+  await b.onGatewayMessage(msg);
+  turns.push({ cursor: 'native1:p3', role: 'assistant', phase: 'commentary', text: 'Quiet hidden', timestamp: '' });
+  now += 60001;
+  await b.pollConversations();
+  expect(posts.some((p) => visibleText(p.body)?.includes('Quiet hidden'))).toBe(false);
+  await b.onGatewayMessage({ ...msg, id: '900000000000000099', content: '!codeman stream tools' });
+  turns.push({ cursor: 'native1:t', role: 'tool', text: 'Tool visible', timestamp: '' });
+  now += 60001;
+  await b.pollConversations();
+  expect(posts.some((p) => visibleText(p.body)?.includes('Tool visible'))).toBe(true);
+  expect(sendInput).not.toHaveBeenCalled();
+});
+it('replays a reserved update group without changing its payload when more progress arrives', async () => {
+  sessions = [{ id: 's1', name: 'one' }];
+  let now = 100000;
+  let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+  const history = async () => ({ conversationId: 'native1', partial: false, turns });
+  const b = makeBridge(undefined, { history, now: () => now });
+  await b.reload();
+  await b.syncSessions();
+  posts = [];
+  turns = [
+    { cursor: 'native1:u', role: 'user', text: 'Task', timestamp: '' },
+    { cursor: 'native1:p1', role: 'assistant', phase: 'commentary', text: 'Reserved first', timestamp: '' },
+    { cursor: 'native1:p2', role: 'assistant', phase: 'commentary', text: 'Reserved second', timestamp: '' },
+  ];
+  await b.pollConversations();
+  const path = join(dir, 'discord-conversations.json');
+  const saved = JSON.parse(await readFile(path, 'utf8'));
+  saved[0][1].cursor = 'native1:u';
+  saved[0][1].pendingUpdates = ['native1:p1', 'native1:p2'];
+  await writeFile(path, JSON.stringify(saved));
+  b.stop();
+  now += 60001;
+  turns.push({
+    cursor: 'native1:p3',
+    role: 'assistant',
+    phase: 'commentary',
+    text: 'New separate progress',
+    timestamp: '',
+  });
+  const restarted = makeBridge(undefined, { history, now: () => now });
+  await restarted.reload();
+  await restarted.syncSessions();
+  await restarted.pollConversations();
+  expect(posts.filter((p) => p.method === 'POST' && visibleText(p.body)?.includes('Reserved first'))).toHaveLength(1);
+  expect(
+    posts.filter((p) => p.method === 'POST' && visibleText(p.body)?.includes('New separate progress'))
+  ).toHaveLength(1);
   expect(sendInput).not.toHaveBeenCalled();
 });

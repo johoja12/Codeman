@@ -69,7 +69,7 @@ export interface DiscordNativeUiHost {
   control(id: string, command: string): Promise<DiscordControlReply>;
   current(id: string, validity: string): boolean;
   postControl(id: string, channel: string, result: DiscordControlReply, key: string): Promise<void>;
-  history(id: string): Promise<DiscordHistory>;
+  history(id: string, options?: { after?: string; includeTools?: boolean }): Promise<DiscordHistory>;
   latestPrompt?(id: string, conversation?: string): string | undefined;
   prepare(id: string, message: GatewayMessage): Promise<string>;
   submit(
@@ -88,7 +88,7 @@ export interface DiscordNativeUiHost {
   ): Promise<Array<{ id: string; state: string; reason?: string; updated: number; message?: string }>>;
   claim(m: DiscordInteraction): Promise<boolean>;
   file(id: string, path: string): Promise<DiscordFile>;
-  postFile(channel: string, file: DiscordFile, text: string): Promise<void>;
+  postFile(channel: string, file: DiscordFile, text: string, current?: () => boolean): Promise<void>;
   launch(scope: string, caseKey: string, mode: string): Promise<DiscordControlReply>;
   modes(): string[];
   locate(id: string): Promise<string | undefined>;

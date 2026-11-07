@@ -21,16 +21,36 @@ for _ in range(16):
  if new==owned:break
  owned=new
 if len(owned)>64:raise Exception('ambiguous process tree')
+# Locate the command, not command-like words in prompts or option values.
+value_options={'-c','--config','-m','--model','-p','--profile','-s','--sandbox','-a','--ask-for-approval','-C','--cd','-i','--image','--add-dir','--enable','--disable','--local-provider','--remote','--remote-auth-token-env'}
+flag_options={'--oss','--full-auto','--dangerously-bypass-approvals-and-sandbox','--no-alt-screen','--search','--help','-h','--version','-V'}
+auxiliary={'exec','e','review','app-server','mcp-server','exec-server','login','logout','mcp','plugin','remote-control','completion','update','doctor','sandbox','debug','apply','a','queue','archive','delete','migrate-rollouts','migrate-nfs-db','unarchive','features','help'}
+def command_at(argv):
+ i=1
+ while i<len(argv):
+  arg=argv[i]
+  if arg=='--':return None
+  if arg in value_options:
+   i+=2;continue
+  if arg.startswith('--') and '=' in arg and arg.split('=',1)[0] in value_options:
+   i+=1;continue
+  if len(arg)>2 and arg[:2] in value_options and not arg.startswith('--'):
+   i+=1;continue
+  if arg in flag_options:
+   i+=1;continue
+  if arg.startswith('-'):return None
+  return i
+ return None
 ids=[];native=0;native_pids=[]
 for pid in owned:
  try:argv=shlex.split(procs[pid][1])
  except Exception:continue
  if not argv or os.path.basename(argv[0]) not in ('codex','codx'):continue
- if 'exec' in argv[1:]:continue
+ command=command_at(argv)
+ if command is not None and argv[command] in auxiliary:continue
  native+=1;native_pids.append(pid)
- positions=[i for i,a in enumerate(argv) if a=='resume']
- if len(positions)!=1:continue
- i=positions[0]+1
+ if command is None or argv[command]!='resume':continue
+ i=command+1
  if i<len(argv) and re.fullmatch(uuid,argv[i],re.I):ids.append(argv[i])
 print(json.dumps({'id':ids[0] if native==1 and len(ids)==1 else None}))
 `;
