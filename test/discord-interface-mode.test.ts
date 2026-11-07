@@ -235,6 +235,33 @@ describe('Discord interface mode', () => {
       [...remoteMessages.values()].some((m) => m.content === 'History reconnected. Live replies are synchronized.')
     ).toBe(true);
     expect(JSON.parse(await readFile(join(dir, 'discord-history-warnings.json'), 'utf8'))).toEqual([]);
+    readable = false;
+    now += 20000;
+    await again.notify({
+      sessionId: 's1',
+      event: 'hook:idle_prompt',
+      title: 'Waiting for Input',
+      body: 'idle',
+      urgency: 'warning',
+      fullText: async () => {
+        throw new Error('temporary read failure');
+      },
+    });
+    expect(
+      [...remoteMessages.values()].some((m) =>
+        JSON.stringify(m.components ?? []).includes('**Reconnecting to this conversation**')
+      )
+    ).toBe(true);
+    readable = true;
+    now += 20000;
+    await again.syncSessions();
+    await again.pollConversations();
+    expect(
+      [...remoteMessages.values()].some((m) =>
+        JSON.stringify(m.components ?? []).includes('**Reconnecting to this conversation**')
+      )
+    ).toBe(false);
+    expect(JSON.parse(await readFile(join(dir, 'discord-history-warnings.json'), 'utf8'))).toEqual([]);
   });
 
   it('recovers a saved boundary outside the tail through a tool-only page, restart and warning cleanup', async () => {

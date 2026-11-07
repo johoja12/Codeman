@@ -2342,6 +2342,7 @@ export class DiscordBridge {
       const noticeKey = `${msg.sessionId}:${channel}`;
       const progress = await this.conversationProgress.get(this.conversationKey(msg.sessionId, channel));
       if (!progress?.streamOff) {
+        this.historyWarningsChecked.delete(noticeKey);
         if (this.unavailableNotices.has(noticeKey)) return { ok: true, deduped: true, at: this.now() };
         const notice = discordResponsePosts(
           profileReadFailure
