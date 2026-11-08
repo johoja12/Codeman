@@ -461,3 +461,55 @@ describe('discord-notify with a file', () => {
     bridge.stop();
   });
 });
+
+it('exposes content-free profiling without making bridge requests', async () => {
+  const { app, bridge } = await harness();
+  const before = fetchImpl.mock.calls.length;
+  const response = await app.inject({ method: 'GET', url: '/api/discord/profiling' });
+  expect(response.statusCode).toBe(200);
+  expect(response.json().data).toMatchObject({
+    operations: [],
+    bridge: { enabled: false, activeRemoteReads: 0 },
+    nodeProcessContext: { attribution: expect.stringContaining('Entire Node') },
+  });
+  expect(response.body).not.toContain(TOKEN);
+  expect(fetchImpl.mock.calls.length).toBe(before);
+  bridge.stop();
+});
+it('restricts diagnostics and captures to administrators in multi-user mode', async () => {
+  process.env.CODEMAN_MULTIUSER = '1';
+  const { app, bridge } = await harness({ username: 'user', role: 'user' });
+  const capture = vi.spyOn(bridge, 'captureProfile');
+  expect((await app.inject({ method: 'GET', url: '/api/discord/profiling' })).statusCode).toBe(403);
+  expect(
+    (await app.inject({ method: 'POST', url: '/api/discord/profiling/capture', payload: { durationMs: 1000 } }))
+      .statusCode
+  ).toBe(403);
+  expect(capture).not.toHaveBeenCalled();
+  bridge.stop();
+});
+it('validates duration bounds and reports capture conflicts without exposing errors', async () => {
+  const { app, bridge } = await harness();
+  for (const durationMs of [0, 999, 15001, '5000', null])
+    expect(
+      (await app.inject({ method: 'POST', url: '/api/discord/profiling/capture', payload: { durationMs } })).statusCode
+    ).toBe(400);
+  const { DiscordProfileBusy } = await import('../../src/discord-profile-capture.js');
+  vi.spyOn(bridge, 'captureProfile')
+    .mockRejectedValueOnce(new DiscordProfileBusy('A profile is already active'))
+    .mockRejectedValueOnce(new Error('private token error'));
+  const conflict = await app.inject({
+    method: 'POST',
+    url: '/api/discord/profiling/capture',
+    payload: { durationMs: 1000 },
+  });
+  expect(conflict.statusCode).toBe(409);
+  const failed = await app.inject({
+    method: 'POST',
+    url: '/api/discord/profiling/capture',
+    payload: { durationMs: 1000 },
+  });
+  expect(failed.statusCode).toBe(503);
+  expect(failed.body).not.toContain('private token error');
+  bridge.stop();
+});

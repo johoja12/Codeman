@@ -1,3 +1,4 @@
+import { DiscordProfiling } from './discord-profiling.js';
 import { DiscordHistoryWarnings } from './discord-history-warnings.js';
 /**
  * @fileoverview Two-way Discord bridge: one thread per tab, alerts out, replies typed back in.
@@ -995,6 +996,7 @@ export interface DiscordBridgeDeps {
 }
 
 export class DiscordBridge {
+  private readonly profiler = new DiscordProfiling();
   private cfg: DiscordConfig = { ...DEFAULT_DISCORD_CONFIG };
   private threads: Record<string, string> = {};
   private loaded = false;
@@ -1057,12 +1059,78 @@ export class DiscordBridge {
   private readonly conversationProgress: DiscordConversationProgressStore;
   private readonly conversationRuns = new Map<string, Promise<void>>();
 
+  profiling() {
+    const sessions = this.deps.sessions?.() ?? [];
+    const eligible = sessions.filter((s) => !!this.channels.channelForSession(this.cfg, s.id));
+    const now = this.now();
+    const bytes = (values: Iterable<string>) => [...values].reduce((sum, value) => sum + Buffer.byteLength(value), 0);
+    return {
+      ...this.profiler.snapshot(),
+      bridge: {
+        enabled: this.cfg.enabled,
+        mode: this.cfg.mode,
+        gateway: this.gatewayState,
+        sessions: sessions.length,
+        remoteSessions: sessions.filter((s) => s.remote).length,
+        eligibleSessions: eligible.length,
+        dueSessions: eligible.filter((s) => !this.outputReads.has(s.id) && (this.outputDue.get(s.id) ?? 0) <= now)
+          .length,
+        activeRemoteReads: [...this.outputReads.values()].filter((r) => r.remote).length,
+        activeLocalReads: [...this.outputReads.values()].filter((r) => !r.remote).length,
+        inboundQueues: this.inbound.size,
+        outboundQueues: this.outbound.size,
+        pendingNotifications: this.pendingNotifications,
+        pendingThreads: this.pending.size,
+        activeConversations: this.conversationRuns.size,
+        syncQueued: this.syncQueued,
+        sessionSync: this.sessionSync,
+        cacheEntries: {
+          actions: this.actions.size,
+          prompts: this.uiPrompts.size,
+          responses: this.lastFull.size,
+          names: this.names.size,
+        },
+        cachedTextPayloadBytes: bytes(this.lastFull.values()) + bytes([...this.uiPrompts.values()].map((p) => p.text)),
+        memoryNote:
+          'UTF-8 size of known cached text payloads only; excludes JS object/closure overhead, other bridge stores and shared allocations',
+      },
+    };
+  }
+  captureProfile(durationMs: number) {
+    return this.profiler.capture(durationMs);
+  }
+
   constructor(private readonly deps: DiscordBridgeDeps) {
+    // Wrap only bridge-owned entry points, without mutating the caller's dependencies.
+    this.deps = {
+      ...deps,
+      fetchImpl: (...args) =>
+        this.profiler.http(String(args[1]?.method ?? 'GET').toUpperCase(), () => deps.fetchImpl(...args)),
+      history: deps.history
+        ? (...args) => {
+            const session = deps.sessions?.().find((s) => s.id === args[0]);
+            return this.profiler.measure(
+              session ? (session.remote ? 'history.remote' : 'history.local') : 'history.unknown',
+              () => deps.history!(...args)
+            );
+          }
+        : undefined,
+      getAttachment: deps.getAttachment
+        ? (...args) => this.profiler.measure('files.read', () => deps.getAttachment!(...args))
+        : undefined,
+      getGeneratedImage: deps.getGeneratedImage
+        ? (...args) => this.profiler.measure('images.read', () => deps.getGeneratedImage!(...args))
+        : undefined,
+      saveRemoteAttachment: deps.saveRemoteAttachment
+        ? (...args) => this.profiler.measure('files.write', () => deps.saveRemoteAttachment!(...args))
+        : undefined,
+      control: deps.control ? (...args) => this.profiler.measure('control', () => deps.control!(...args)) : undefined,
+    };
     this.now = deps.now ?? Date.now;
     this.historyWarnings = new DiscordHistoryWarnings(deps.configDir);
     this.conversationProgress = new DiscordConversationProgressStore(deps.configDir);
     this.deliveries = new DiscordDeliveryJournal(deps.configDir, this.now);
-    this.api = new DiscordApi(() => this.cfg.token, deps.fetchImpl, deps.sleep);
+    this.api = new DiscordApi(() => this.cfg.token, this.deps.fetchImpl, deps.sleep);
     if (deps.nativeUi)
       this.nativeUi = new DiscordNativeUi({
         dir: deps.configDir,
@@ -1253,7 +1321,7 @@ export class DiscordBridge {
   }
   /** Cosmetic status only: safe to call without a native transcript or a working agent. */
   pollActivity(): Promise<void> {
-    return this.activity.poll();
+    return this.profiler.measure('poll.activity', () => this.activity.poll());
   }
 
   async provisionCategory(config: DiscordConfig): Promise<string> {
@@ -1339,6 +1407,9 @@ export class DiscordBridge {
   }
 
   private async runSessionSync(): Promise<DiscordSessionSync> {
+    return this.profiler.measure('sync.sessions', () => this.runSessionSyncNow());
+  }
+  private async runSessionSyncNow(): Promise<DiscordSessionSync> {
     await this.ensureLoaded();
     if (this.stopped || this.held || !this.cfg.enabled || !this.cfg.token || this.cfg.mode !== 'full')
       return this.sessionSync;
@@ -1485,9 +1556,12 @@ export class DiscordBridge {
 
   /** Bounded round-robin polling: only native text, never redraw/scrollback snapshots. */
   async pollConversations(): Promise<void> {
+    return this.profiler.measure('poll.conversations', () => this.pollConversationsNow());
+  }
+  private async pollConversationsNow(): Promise<void> {
     if (this.stopped || this.held || !this.cfg.enabled || this.cfg.mode !== 'full' || !this.deps.history) return;
-    await this.refreshControls();
-    await this.nativeUi?.poll().catch(() => undefined);
+    await this.profiler.measure('ui.controls', () => this.refreshControls());
+    await this.profiler.measure('ui.poll', async () => this.nativeUi?.poll()).catch(() => undefined);
     const sessions = this.deps.sessions?.() ?? [];
     if (!sessions.length) return;
     const batch = Array.from(
@@ -1497,11 +1571,24 @@ export class DiscordBridge {
     this.outputIndex = (this.outputIndex + batch.length) % sessions.length;
     const reads: Promise<void>[] = [];
     for (const session of batch) {
-      if (this.outputReads.has(session.id) || (this.outputDue.get(session.id) ?? 0) > this.now()) continue;
+      if (this.outputReads.has(session.id)) {
+        this.profiler.count('poll.inFlight');
+        continue;
+      }
+      if ((this.outputDue.get(session.id) ?? 0) > this.now()) {
+        this.profiler.count('poll.notDue');
+        continue;
+      }
       const remote = !!session.remote;
-      if ([...this.outputReads.values()].filter((r) => r.remote === remote).length >= (remote ? 2 : 4)) continue;
+      if ([...this.outputReads.values()].filter((r) => r.remote === remote).length >= (remote ? 2 : 4)) {
+        this.profiler.count(remote ? 'poll.remoteLimit' : 'poll.localLimit');
+        continue;
+      }
       const channel = this.channels.channelForSession(this.cfg, session.id);
-      if (!channel) continue;
+      if (!channel) {
+        this.profiler.count('poll.noDestination');
+        continue;
+      }
       this.outputDue.set(
         session.id,
         this.now() + (remote ? (session.working ? 10000 : 60000) : session.working ? 3000 : 15000)
@@ -1764,6 +1851,9 @@ export class DiscordBridge {
   }
 
   private async observeConversation(sessionId: string, channel: string): Promise<void> {
+    return this.profiler.measure('observe.conversation', () => this.observeConversationNow(sessionId, channel));
+  }
+  private async observeConversationNow(sessionId: string, channel: string): Promise<void> {
     await this.seedConversation(sessionId, channel);
     const key = this.conversationKey(sessionId, channel);
     const active = this.conversationRuns.get(key);

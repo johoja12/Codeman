@@ -2934,3 +2934,25 @@ it.each(['short', 'progress', 'long'])('uses contextual controls on a real strea
     .map((n) => n.label);
   expect(labels).toEqual(kind === 'long' ? ['Download response'] : kind === 'progress' ? ['Show updates'] : []);
 });
+
+it('profiles real bridge local/remote history and HTTP work without exporting session or message contents', async () => {
+  sessions = [
+    { id: 's1', name: 'PRIVATE_SESSION_NAME' },
+    { id: 's2', name: 'PRIVATE_REMOTE_NAME', remote: true },
+  ];
+  const history = vi.fn(async () => ({
+    conversationId: 'native1',
+    partial: false,
+    turns: [{ cursor: 'u1', role: 'user' as const, text: 'PRIVATE_PROMPT_BODY', timestamp: '' }],
+  }));
+  const b = makeBridge(undefined, { history });
+  await b.reload();
+  await b.syncSessions();
+  await b.pollConversations();
+  const stats = b.profiling();
+  expect(stats.operations.find((o) => o.name === 'history.local')!.calls).toBeGreaterThan(0);
+  expect(stats.operations.find((o) => o.name === 'history.remote')!.calls).toBeGreaterThan(0);
+  expect(stats.operations.some((o) => o.name.startsWith('http.'))).toBe(true);
+  expect(stats.bridge).toMatchObject({ sessions: 2, remoteSessions: 1, eligibleSessions: 2 });
+  expect(JSON.stringify(stats)).not.toMatch(/PRIVATE_|native1|u1/);
+});

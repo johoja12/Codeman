@@ -1,3 +1,5 @@
+import { z } from 'zod';
+import { DiscordProfileBusy } from '../../discord-profile-capture.js';
 import { DiscordCategoryProblem } from '../../discord-case-categories.js';
 /**
  * @fileoverview Discord bridge settings and the deliberate-post route (src/discord-bridge.ts).
@@ -123,6 +125,31 @@ export function registerDiscordRoutes(app: FastifyInstance, deps: DiscordRouteDe
     const no = denied(req, reply);
     if (no) return no;
     return { success: true, data: await status() };
+  });
+
+  app.get('/api/discord/profiling', async (req, reply) => {
+    const no = denied(req, reply);
+    if (no) return no;
+    return { success: true, data: deps.bridge.profiling() };
+  });
+  app.post('/api/discord/profiling/capture', async (req, reply) => {
+    const no = denied(req, reply);
+    if (no) return no;
+    const { durationMs } = parseBody(
+      z.object({ durationMs: z.number().int().min(1000).max(15000).default(5000) }).strict(),
+      req.body ?? {},
+      'Invalid capture duration'
+    );
+    try {
+      return { success: true, data: await deps.bridge.captureProfile(durationMs) };
+    } catch (error) {
+      if (error instanceof DiscordProfileBusy) {
+        reply.code(409);
+        return createErrorResponse(ApiErrorCode.CONFLICT, error.message);
+      }
+      reply.code(503);
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Profiling unavailable; the capture did not complete');
+    }
   });
 
   app.get('/api/discord/deliveries', async (req, reply) => {
