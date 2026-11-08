@@ -41,6 +41,7 @@ const ResponseRef = z
     conversation: z.string().max(100),
     userCursor: z.string().max(200),
     responseCursor: z.string().max(200).optional(),
+    controls: z.object({ updates: z.boolean(), download: z.boolean() }).strict().optional(),
     updated: z.number(),
   })
   .strict();
