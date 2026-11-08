@@ -1671,6 +1671,7 @@ export function registerSessionRoutes(
       workingDir,
       mode,
       name: body.name || '',
+      suppressNotifications: body.suppressNotifications,
       mux: ctx.mux,
       useMux: true,
       niceConfig: globalNice,
@@ -4397,6 +4398,7 @@ export function registerSessionRoutes(
     const {
       caseName = 'testcase',
       sessionName,
+      suppressNotifications,
       mode = 'claude',
       modelOverride,
       openCodeConfig,
@@ -5078,6 +5080,7 @@ export function registerSessionRoutes(
 
     const qsSessionOptions: ConstructorParameters<typeof Session>[0] = {
       id: qsCustomModelSessionId,
+      suppressNotifications,
       workingDir: workspacePath,
       name: sessionName ? sessionName.slice(0, MAX_SESSION_NAME_LENGTH) : '',
       mux: ctx.mux,

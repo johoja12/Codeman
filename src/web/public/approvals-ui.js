@@ -317,7 +317,9 @@ Object.assign(CodemanApp.prototype, {
   pendingApprovalsCount() {
     if (!this.approvals) return 0;
     let count = 0;
-    for (const item of this.approvals.values()) if (!item.acknowledgedAt) count++;
+    for (const item of this.approvals.values()) {
+      if (!item.acknowledgedAt && !this.sessions?.get(item.sessionId)?.suppressNotifications) count++;
+    }
     return count;
   },
 

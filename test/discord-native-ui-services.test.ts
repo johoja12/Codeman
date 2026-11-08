@@ -164,3 +164,17 @@ it('refuses a Claude suggestion if its real conversation changes during capture'
   });
   expect((await services.sessions())[0].promptSuggestion).toBeUndefined();
 });
+
+it('excludes notification-suppressed sessions before inspecting their screen or publishing controls', async () => {
+  const capture = vi.fn();
+  const s = { id: 'quiet', suppressNotifications: true } as unknown as Session;
+  const services = createDiscordNativeUiServices({
+    sessions: () => new Map([['quiet', s]]),
+    cases: async () => [],
+    allowed: () => true,
+    url: () => undefined,
+    capture,
+  });
+  expect(await services.sessions()).toEqual([]);
+  expect(capture).not.toHaveBeenCalled();
+});

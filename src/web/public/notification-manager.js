@@ -214,7 +214,7 @@ class NotificationManager {
   }
 
   notify({ urgency, category, sessionId, sessionName, title, message }) {
-    if (!this.preferences.enabled) return;
+    if (!this.preferences.enabled || this.app.sessions?.get(sessionId)?.suppressNotifications) return;
 
     // Map notification categories to eventType preference keys
     const categoryToEventType = {

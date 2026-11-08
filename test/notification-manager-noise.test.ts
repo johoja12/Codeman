@@ -201,3 +201,40 @@ describe('notification display time', () => {
     expect(clamp(undefined)).toBe(3000);
   });
 });
+
+it('suppresses all web UI notification layers for opted-out sessions while normal sessions still notify', () => {
+  const { manager } = loadManager(
+    undefined,
+    {},
+    {
+      sessions: new Map([
+        ['quiet', { suppressNotifications: true }],
+        ['normal', {}],
+      ]),
+    }
+  );
+  const m = manager as any;
+  m.preferences.enabled = true;
+  m.preferences.browserNotifications = true;
+  m.preferences.audioAlerts = true;
+  m.isTabVisible = false;
+  m.sendBrowserNotif = vi.fn();
+  m.playAudioAlert = vi.fn();
+  m.updateTabTitle = vi.fn();
+  const message = {
+    urgency: 'critical',
+    category: 'test-critical',
+    title: 'Needs input',
+    message: 'Permission required',
+  };
+  manager.notify({ ...message, sessionId: 'quiet' });
+  expect(manager.notifications).toHaveLength(0);
+  expect(m.sendBrowserNotif).not.toHaveBeenCalled();
+  expect(m.playAudioAlert).not.toHaveBeenCalled();
+  expect(m.updateTabTitle).not.toHaveBeenCalled();
+  manager.notify({ ...message, sessionId: 'normal' });
+  expect(manager.notifications).toHaveLength(1);
+  expect(m.sendBrowserNotif).toHaveBeenCalledOnce();
+  expect(m.playAudioAlert).toHaveBeenCalledOnce();
+  expect(m.updateTabTitle).toHaveBeenCalledOnce();
+});

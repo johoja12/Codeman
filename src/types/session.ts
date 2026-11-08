@@ -945,6 +945,8 @@ export interface SessionState {
    * prompt-cache keep-warm default (`keepWarmOn`), though its own switch still works.
    */
   parentSessionId?: string;
+  /** Opt-in session-wide suppression of Discord, web UI, push and webhook notifications. */
+  suppressNotifications?: boolean;
   /** ID of currently assigned task, null if none */
   currentTaskId: string | null;
   /** Timestamp when session was created */

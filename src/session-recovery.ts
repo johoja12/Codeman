@@ -64,6 +64,7 @@ export function createRecoveryRecord(
         }
       : {}),
     ...(session.owner ? { owner: session.owner } : {}),
+    ...(session.suppressNotifications ? { suppressNotifications: true } : {}),
     mode: session.mode ?? 'shell',
     workingDir: session.workingDir,
     transport,
