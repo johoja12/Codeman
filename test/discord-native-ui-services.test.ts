@@ -178,3 +178,38 @@ it('excludes notification-suppressed sessions before inspecting their screen or 
   expect(await services.sessions()).toEqual([]);
   expect(capture).not.toHaveBeenCalled();
 });
+
+it('rechecks live panes and guards even when suggestion frames repeat', async () => {
+  const s = {
+    id: 'repeat',
+    name: 'Claude',
+    mode: 'claude',
+    claudeSessionId: 'conversation',
+    discordQueueRevision: 'revision',
+    isWorking: false,
+    workingDir: '/tmp',
+  } as unknown as Session;
+  let text = 'First suggestion';
+  let allowed = true;
+  let captures = 0;
+  const services = createDiscordNativeUiServices({
+    sessions: () => new Map([[s.id, s]]),
+    cases: async () => [],
+    allowed: () => allowed,
+    url: () => undefined,
+    capture: () => {
+      captures++;
+      return `────────\n❯ \x1b[2m${text}\x1b[0m\n────────`;
+    },
+  });
+  expect((await services.sessions())[0].promptSuggestion).toBe(text);
+  expect((await services.sessions())[0].promptSuggestion).toBe(text);
+  expect(captures).toBe(2);
+  text = 'Changed suggestion';
+  expect((await services.sessions())[0].promptSuggestion).toBe(text);
+  Object.assign(s, { guardedInputHeld: true });
+  expect((await services.sessions())[0].promptSuggestion).toBeUndefined();
+  expect(captures).toBe(3);
+  allowed = false;
+  expect(await services.sessions()).toEqual([]);
+});

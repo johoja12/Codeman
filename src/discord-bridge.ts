@@ -1046,6 +1046,7 @@ export class DiscordBridge {
   private outputIndex = 0;
   private actions = new Map<string, DiscordBoundAction>();
   private nativeUi?: DiscordNativeUi;
+  private uiRefresh?: Promise<void>;
   private uiPrompts = new Map<string, { conversation: string; text: string }>();
   private outputDue = new Map<string, number>();
   private unavailableNotices = new Set<string>();
@@ -1561,7 +1562,18 @@ export class DiscordBridge {
   private async pollConversationsNow(): Promise<void> {
     if (this.stopped || this.held || !this.cfg.enabled || this.cfg.mode !== 'full' || !this.deps.history) return;
     await this.profiler.measure('ui.controls', () => this.refreshControls());
-    await this.profiler.measure('ui.poll', async () => this.nativeUi?.poll()).catch(() => undefined);
+    // Card refresh must not gate native response delivery. One UI sweep stays
+    // in flight, including its guarded queue dispatch and ownership checks.
+    if (this.nativeUi && !this.uiRefresh) {
+      const ui = this.nativeUi;
+      const run = this.profiler
+        .measure('ui.poll', () => ui.poll())
+        .catch(() => undefined)
+        .finally(() => {
+          if (this.uiRefresh === run) this.uiRefresh = undefined;
+        });
+      this.uiRefresh = run;
+    }
     const sessions = this.deps.sessions?.() ?? [];
     if (!sessions.length) return;
     const batch = Array.from(

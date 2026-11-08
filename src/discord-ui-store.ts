@@ -56,6 +56,12 @@ const State = z
   .strict();
 export type DiscordQueuedPrompt = z.infer<typeof Prompt>;
 export type DiscordUiState = z.infer<typeof State>;
+type ReadonlyTree<T> = T extends readonly (infer Item)[]
+  ? readonly ReadonlyTree<Item>[]
+  : T extends object
+    ? { readonly [Key in keyof T]: ReadonlyTree<T[Key]> }
+    : T;
+
 export class DiscordUiStore {
   private state: DiscordUiState = { version: 1, cards: {}, queue: [], responses: {}, activities: {} };
   private loaded?: Promise<void>;
@@ -95,6 +101,12 @@ export class DiscordUiStore {
     await this.load();
     await this.chain;
     return structuredClone(this.state);
+  }
+  /** Clone only the selected data; callers cannot mutate the store through this view. */
+  async read<T>(select: (state: ReadonlyTree<DiscordUiState>) => T): Promise<T> {
+    await this.load();
+    await this.chain;
+    return structuredClone(select(this.state));
   }
   edit<T>(fn: (state: DiscordUiState) => T): Promise<T> {
     const run = this.chain.then(async () => {

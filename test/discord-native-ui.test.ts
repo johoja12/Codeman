@@ -254,6 +254,31 @@ describe('native Discord UI', () => {
     expect(f.messages.size).toBe(2);
     expect((await restored.store.snapshot()).cards).toBeDefined();
   });
+  it('uses one fresh ownership read per card edit and rejects a removed ownership marker', async () => {
+    const f = await fixture();
+    await f.ui.poll();
+    const card = f.findCard();
+    vi.mocked(f.host.request).mockClear();
+    f.sessions[0].name = 'Renamed session';
+    await f.ui.poll();
+    expect(
+      vi
+        .mocked(f.host.request)
+        .mock.calls.filter(([method, path]) => method === 'GET' && path === `/channels/${channel}/messages/${card.id}`)
+    ).toHaveLength(1);
+    card.content = 'Manually replaced';
+    card.components = [];
+    f.messages.set(card.id, card);
+    f.sessions[0].name = 'Renamed again';
+    vi.mocked(f.host.request).mockClear();
+    await f.ui.poll();
+    expect(f.ui.lastError).toContain('ownership');
+    expect(
+      vi
+        .mocked(f.host.request)
+        .mock.calls.some(([method, path]) => method === 'PATCH' && path === `/channels/${channel}/messages/${card.id}`)
+    ).toBe(false);
+  });
   it('does not post duplicate results cards when a task completes', async () => {
     const f = await fixture();
     f.host.receipts = async () => [{ id: 'completed-input', state: 'completed', updated: 1 }];

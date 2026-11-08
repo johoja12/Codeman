@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { parseClaudeVisibleQuestion, claudeQuestionGone } from './claude-visible-question.js';
 import type { ApprovalItem } from './approval-inbox.js';
 import { claudePromptSuggestion } from '../session-submit-verifier.js';
@@ -54,6 +55,18 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
     }
   >();
   const reading = new Set<string>();
+  // Pure parse results only: every caller still captures and validates the live pane.
+  // Hashes avoid retaining raw terminal frames, and a fixed cap bounds this cache.
+  const parsedFrames = new Map<
+    string,
+    {
+      signature: string;
+      dialog: ReturnType<typeof parseClaudeVisibleQuestion>;
+      gone?: boolean;
+      suggestionRead: boolean;
+      promptSuggestion?: string;
+    }
+  >();
   const suggestion = async (s: Session) => {
     if (
       s.mode !== 'claude' ||
@@ -85,7 +98,14 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       )
         return undefined;
       if (!frame) return undefined;
-      const dialog = parseClaudeVisibleQuestion(frame);
+      const signature = createHash('sha256').update(frame).digest('hex');
+      let parsed = parsedFrames.get(s.id);
+      if (!parsed || parsed.signature !== signature) {
+        parsed = { signature, dialog: parseClaudeVisibleQuestion(frame), suggestionRead: false };
+        if (!parsedFrames.has(s.id) && parsedFrames.size >= 256) parsedFrames.delete(parsedFrames.keys().next().value!);
+        parsedFrames.set(s.id, parsed);
+      }
+      const dialog = parsed.dialog;
       const text = dialog?.text;
       const previous = observed.get(s.id);
       if (text && dialog && conversation && revision !== undefined) {
@@ -132,14 +152,20 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       }
       if (
         previous &&
-        (previous.conversation !== conversation || previous.revision !== revision || claudeQuestionGone(frame))
+        (previous.conversation !== conversation ||
+          previous.revision !== revision ||
+          (parsed.gone ??= claudeQuestionGone(frame)))
       ) {
         if (approvalInbox.getById(previous.id)) approvalInbox.resolveForSession(s.id, 'superseded');
         observed.delete(s.id);
       }
-      return !working(s) && !approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle')
-        ? claudePromptSuggestion(frame)
-        : undefined;
+      if (working(s) || approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle'))
+        return undefined;
+      if (!parsed.suggestionRead) {
+        parsed.promptSuggestion = claudePromptSuggestion(frame);
+        parsed.suggestionRead = true;
+      }
+      return parsed.promptSuggestion;
     } catch {
       return undefined;
     } finally {
@@ -150,6 +176,10 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
     enabled: () => deps.allowed(),
     sessions: async () => {
       if (!deps.allowed()) return [];
+      for (const id of parsedFrames.keys()) {
+        const s = deps.sessions().get(id);
+        if (!s || s.suppressNotifications) parsedFrames.delete(id);
+      }
       for (const [id, old] of observed) {
         if (!deps.sessions().has(id)) {
           if (approvalInbox.getById(old.id)) approvalInbox.resolveForSession(id, 'expired');
