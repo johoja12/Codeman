@@ -1666,3 +1666,35 @@ it.each(['conversation', 'scope', 'actor', 'source'])('refuses table controls af
   );
   expect(f.host.postFile).not.toHaveBeenCalled();
 });
+
+it.each([1, 2, 3])('renders a %i-row table with unique controls and usable exports', async (count) => {
+  const f = await fixture();
+  const text =
+    'Current runs\n\n| PR | Ticket | Gate |\n|---|---|---|\n' +
+    Array.from({ length: count }, (_, i) => `| #${1560 + i} | Ticket ${i} | Running |`).join('\n') +
+    '\n\nMore work is running.';
+  f.host.history = vi.fn(async () => ({
+    conversationId: 'conversation-one',
+    partial: false,
+    turns: [
+      { role: 'user' as const, text: 'Show runs', cursor: 'u1', timestamp: '' },
+      { role: 'assistant' as const, text, cursor: 'r1', timestamp: '', phase: 'final_answer' as const },
+    ],
+  }));
+  const controls = await f.ui.responseControls('s1', channel, 'u1', 'r1');
+  const posts = (await f.ui.tableResponsePosts('s1', channel, 'u1', 'r1', text, { controls }))!;
+  for (const post of posts) {
+    const ids = discordUiNodes(post.components).flatMap((n) => (typeof n.custom_id === 'string' ? [n.custom_id] : []));
+    expect(new Set(ids).size).toBe(ids.length);
+  }
+  const card = posts.find((p) => JSON.stringify(p).includes('Showing 1–'))!;
+  const labels = discordUiNodes(card.components).map((n) => n.label);
+  expect(labels).not.toContain('Previous');
+  expect(labels).not.toContain('Next');
+  expect(labels).toContain('View table');
+  expect(labels).toContain('Download CSV');
+  await f.click(card, 'Download CSV');
+  expect(f.host.postFile).toHaveBeenCalledOnce();
+  const file = (f.host.postFile as any).mock.calls[0][1];
+  expect(file.data.toString()).toContain('#1560');
+});

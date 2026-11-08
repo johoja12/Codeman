@@ -643,17 +643,18 @@ export class DiscordNativeUi {
       return b;
     };
     const components = discordTablePage(table, page);
-    components.push(
-      row(
-        button('Previous', Math.max(0, page - 1), 'page', page === 0),
-        button(
-          'Next',
-          Math.min(Math.ceil(table.rows.length / 3) - 1, page + 1),
-          'page',
-          (page + 1) * 3 >= table.rows.length
+    if (table.rows.length > 3)
+      components.push(
+        row(
+          button('Previous', Math.max(0, page - 1), 'page', page === 0),
+          button(
+            'Next',
+            Math.min(Math.ceil(table.rows.length / 3) - 1, page + 1),
+            'page',
+            (page + 1) * 3 >= table.rows.length
+          )
         )
-      )
-    );
+      );
     components.push(row(button('View table', page, 'png'), button('Download CSV', page, 'csv')));
     return {
       content: '',
