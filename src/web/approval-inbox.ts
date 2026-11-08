@@ -188,6 +188,10 @@ const MAX_OPTION_LABEL_CHARS = 120;
  * newline; a mid-row jump becomes a space so adjacent words don't merge.
  */
 // eslint-disable-next-line no-control-regex
+const CHARACTER_SET_PATTERN = /\x1b[()][0-2A-Z]/g;
+// eslint-disable-next-line no-control-regex
+const CURSOR_FORWARD_PATTERN = /\x1b\[(\d*)C/g;
+// eslint-disable-next-line no-control-regex
 const CURSOR_POSITION_PATTERN = /\x1b\[(?:(\d+)(?:;(\d+))?)?[Hf]/g;
 
 /**
@@ -200,7 +204,10 @@ export function normalizeCapturedFrame(
   limits: { maxLines: number; maxChars: number } = { maxLines: MAX_CONTEXT_LINES, maxChars: MAX_CONTEXT_CHARS }
 ): string | undefined {
   if (!raw) return undefined;
-  const rowed = raw.replace(CURSOR_POSITION_PATTERN, (_m, _row, col) => (!col || col === '1' ? '\n' : ' '));
+  const rowed = raw
+    .replace(CHARACTER_SET_PATTERN, '')
+    .replace(CURSOR_FORWARD_PATTERN, (_m, count) => ' '.repeat(Math.min(256, Number(count || 1))))
+    .replace(CURSOR_POSITION_PATTERN, (_m, _row, col) => (!col || col === '1' ? '\n' : ' '));
   const lines = stripAnsi(rowed)
     .split('\n')
     .map((line) => line.replace(/\s+$/, ''));

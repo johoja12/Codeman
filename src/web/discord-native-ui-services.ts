@@ -1,4 +1,8 @@
-import { parseClaudeVisibleQuestion, claudeQuestionGone } from './claude-visible-question.js';
+import {
+  parseClaudeVisibleQuestion,
+  parseClaudeHookConfirmation,
+  claudeQuestionGone,
+} from './claude-visible-question.js';
 import type { ApprovalItem } from './approval-inbox.js';
 import { claudePromptSuggestion } from '../session-submit-verifier.js';
 import { discordActivityWorking } from '../discord-activity.js';
@@ -50,6 +54,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       conversation: string;
       revision: string;
       delivered: boolean;
+      kind: 'question' | 'permission';
       control?: ApprovalItem['nativeQuestion'];
     }
   >();
@@ -86,30 +91,35 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
         return undefined;
       if (!frame) return undefined;
       const dialog = parseClaudeVisibleQuestion(frame);
-      const text = dialog?.text;
+      const permission = dialog ? undefined : parseClaudeHookConfirmation(frame);
+      const text = dialog?.text ?? permission?.text;
+      const kind = permission ? 'permission' : 'question';
       const previous = observed.get(s.id);
-      if (text && dialog && conversation && revision !== undefined) {
+      if (text && (dialog || permission) && conversation && revision !== undefined) {
         if (
           !previous ||
           previous.text !== text ||
+          previous.kind !== kind ||
+          (kind === 'permission' && previous.revision !== revision) ||
           previous.conversation !== conversation ||
           (previous.control &&
             (previous.control.state === 'answered' ||
               previous.revision !== revision ||
-              previous.control.dialog.identity !== dialog.identity))
+              previous.control.dialog.identity !== dialog?.identity))
         ) {
           const item = approvalInbox.notePrompt({
             sessionId: s.id,
             sessionName: s.name || s.id.slice(0, 8),
             mode: 'claude',
-            kind: 'question',
-            toolName: 'AskUserQuestion',
-            answerInTerminal: dialog.multiSelect || typeof s.withNativeQuestionInput !== 'function',
+            kind,
+            toolName: permission?.toolName ?? 'AskUserQuestion',
+            answerInTerminal: !dialog || dialog.multiSelect || typeof s.withNativeQuestionInput !== 'function',
             nativeQuestion:
-              !dialog.multiSelect && typeof s.withNativeQuestionInput === 'function'
+              dialog && !dialog.multiSelect && typeof s.withNativeQuestionInput === 'function'
                 ? { conversation, inputRevision: revision, dialog, state: 'pending' }
                 : undefined,
-            message: !dialog.multiSelect && typeof s.withNativeQuestionInput === 'function' ? dialog.question : text,
+            message:
+              dialog && !dialog.multiSelect && typeof s.withNativeQuestionInput === 'function' ? dialog.question : text,
             context: frame,
             cwd: s.workingDir,
           });
@@ -119,12 +129,17 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
             conversation,
             revision,
             delivered: false,
+            kind,
             control: item.nativeQuestion,
           });
         }
         const current = observed.get(s.id)!;
         const item = approvalInbox.getById(current.id);
-        if (item?.nativeQuestion?.state === 'pending' && item.nativeQuestion.dialog.identity === dialog.identity) {
+        if (
+          dialog &&
+          item?.nativeQuestion?.state === 'pending' &&
+          item.nativeQuestion.dialog.identity === dialog.identity
+        ) {
           item.nativeQuestion.dialog = dialog;
         }
         if (item && !current.delivered) current.delivered = (await deps.questionObserved?.(item)) !== false;

@@ -818,16 +818,19 @@ export class WebServer extends EventEmitter {
   });
   private discordBridge: DiscordBridge = new DiscordBridge({
     nativeUi: createDiscordNativeUiServices({
-      // Read-only fallback: hookless remote Claude choice dialogs must also reach Discord.
+      // Visible-pane fallback: remote Claude questions and hook confirmations must reach Discord.
       questionObserved: async (item) => {
         if (this.sessions.get(item.sessionId)?.suppressNotifications) return true;
         const result = await this.discordBridge.notify({
-          event: SseEvent.HookElicitationDialog,
-          title: 'Question Asked',
+          event: item.kind === 'permission' ? SseEvent.HookPermissionPrompt : SseEvent.HookElicitationDialog,
+          title: item.kind === 'permission' ? 'Permission Required' : 'Question Asked',
           urgency: 'critical',
           sessionId: item.sessionId,
           sessionName: item.sessionName,
-          body: 'Choose in the terminal; this question is waiting for your answer.',
+          body:
+            item.kind === 'permission'
+              ? 'A tool check is waiting for permission. Review it in the terminal.'
+              : 'Choose in the terminal; this question is waiting for your answer.',
           tail: () => item.message || '',
           host: this.windowTitle,
         });

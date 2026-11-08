@@ -78,3 +78,30 @@ export function claudeQuestionGone(raw: string): boolean {
   const frame = normalizeCapturedFrame(raw, { maxLines: 160, maxChars: 24000 });
   return !!frame && !frame.includes('Enter to select') && /(?:^|\n)\s*❯\s*[^\n]*\n[─━]{3,}/.test(frame);
 }
+
+/** Hook tool checks have a different footer/choice contract from AskUserQuestion.
+ * Detection is alert-only: no digits or approval keys are inferred from this pane.
+ */
+export function parseClaudeHookConfirmation(raw: string): { text: string; toolName: string } | undefined {
+  // Most polls are ordinary output; avoid another full normalization pass.
+  if (!raw.includes('Hook') || !raw.includes('confirmation')) return undefined;
+  const frame = normalizeCapturedFrame(raw, { maxLines: 160, maxChars: 24000 });
+  if (!frame) return undefined;
+  // Permit indentation, but require a complete menu at the bottom of the live pane.
+  const menu =
+    /^\s*Do you want to proceed\?\s*\n\s*([❯>]?)\s*1\. Yes\s*\n\s*([❯>]?)\s*2\. No\s*\n\s*Esc to cancel · Tab to amend\s*$/m.exec(
+      frame
+    );
+  if (!menu || frame.slice(menu.index + menu[0].length).trim() || Number(!!menu[1]) + Number(!!menu[2]) !== 1)
+    return undefined;
+  const before = frame.slice(0, menu.index);
+  const heading = [...before.matchAll(/^\s*Bash command\s*$/gm)].at(-1);
+  if (!heading) return undefined;
+  const body = before.slice(heading.index!);
+  const hook = /^\s*(?:│\s*)?Hook ([\w.-]{1,80}) requires confirmation for this command:\s*$/m.exec(body);
+  if (!hook) return undefined;
+  return {
+    toolName: hook[1],
+    text: body.trim() + '\n\nPermission required. Review and choose Yes or No in the terminal.',
+  };
+}

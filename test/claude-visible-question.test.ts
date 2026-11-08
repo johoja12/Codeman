@@ -1,5 +1,9 @@
 import { describe, expect, it, beforeEach, vi } from 'vitest';
-import { claudeVisibleQuestion, claudeQuestionGone } from '../src/web/claude-visible-question.js';
+import {
+  claudeVisibleQuestion,
+  claudeQuestionGone,
+  parseClaudeHookConfirmation,
+} from '../src/web/claude-visible-question.js';
 import { createDiscordNativeUiServices } from '../src/web/discord-native-ui-services.js';
 import { approvalInbox } from '../src/web/approval-inbox.js';
 import type { Session } from '../src/session.js';
@@ -233,4 +237,107 @@ it('projects a single-choice live question into the inbox and forwards it once w
   await expect(f.services.answer('s', q.id, q.revision, '1')).rejects.toThrow();
   await f.services.sessions();
   expect(f.notify).toHaveBeenCalledTimes(1);
+});
+
+const hookConfirmation = `Bash command
+Read a runner note
+
+ssh example-host 'head -12 notes.md'
+
+Hook tool.check requires confirmation for this command:
+This command contains an account address. Review before proceeding. [plugin:privacy-check]
+plugin hooks.json to update hooks
+
+Do you want to proceed?
+❯ 1. Yes
+  2. No
+
+Esc to cancel · Tab to amend
+`;
+describe('visible Claude hook confirmation', () => {
+  it('normalizes Ink character-set resets and cursor-forward spacing from the captured prompt', () => {
+    const ink = hookConfirmation
+      .replace('Bash command', 'Bash command\x1b(B')
+      .replace('Hook tool.check', '│\x1b(B Hook tool.check\x1b(B')
+      .replace(
+        'Do you want to proceed?',
+        '\x1b[CDo\x1b[1X\x1b[Cyou\x1b[1X\x1b[Cwant\x1b[1X\x1b[Cto\x1b[1X\x1b[Cproceed?'
+      );
+    expect(parseClaudeHookConfirmation(ink)).toMatchObject({ toolName: 'tool.check' });
+  });
+  it.each([hookConfirmation, hookConfirmation.replace('❯ 1. Yes', '  1. Yes').replace('  2. No', '❯ 2. No')])(
+    'detects either selected choice without assigning an answer contract',
+    (frame) => {
+      expect(parseClaudeHookConfirmation('\x1b[32m' + frame + '\x1b[0m')).toMatchObject({ toolName: 'tool.check' });
+      expect(parseClaudeHookConfirmation(frame)?.text).toContain('Review before proceeding');
+      expect(claudeVisibleQuestion(frame)).toBeUndefined();
+    }
+  );
+  it.each([
+    '',
+    hookConfirmation.replace('Bash command', 'Example'),
+    hookConfirmation.replace('Hook tool.check requires confirmation for this command:', 'Ordinary output'),
+    hookConfirmation.replace('Do you want to proceed?', 'Continue?'),
+    hookConfirmation.replace('❯ 1. Yes', '  1. Yes'),
+    hookConfirmation.replace('2. No', '3. No'),
+    hookConfirmation.replace('Esc to cancel · Tab to amend', ''),
+    hookConfirmation + '────\n❯ composer\n────',
+    '```\n' + hookConfirmation + '```',
+  ])('rejects incomplete menus, transcript examples and historical dialogs', (frame) => {
+    expect(parseClaudeHookConfirmation(frame)).toBeUndefined();
+  });
+  it('relays a deduplicated permission alert, retries delivery and refuses input', async () => {
+    const f = fixture();
+    f.capture(() => hookConfirmation);
+    f.notify.mockReturnValueOnce(false).mockReturnValueOnce(true);
+    expect((await f.services.sessions())[0].pending).toBe(true);
+    const q = f.services.question('s')!;
+    expect(q).toMatchObject({ kind: 'permission', terminalOnly: true, options: [] });
+    expect(q.text).toContain('tool.check');
+    expect(f.notify.mock.calls[0][0]).toMatchObject({
+      kind: 'permission',
+      toolName: 'tool.check',
+      answerInTerminal: true,
+    });
+    await f.services.sessions();
+    await f.services.sessions();
+    expect(f.services.question('s')!.id).toBe(q.id);
+    expect(f.notify).toHaveBeenCalledTimes(2);
+    await expect(f.services.answer('s', q.id, q.revision, '1')).rejects.toThrow();
+    expect(f.services.question('s')!.id).toBe(q.id);
+    f.capture(() => 'partial frame');
+    await f.services.sessions();
+    expect(f.services.question('s')!.id).toBe(q.id);
+    f.capture(() => '────\n❯ \n────');
+    await f.services.sessions();
+    expect(f.services.question('s')).toBeUndefined();
+  });
+  it('supersedes its permission when a different native question appears', async () => {
+    const f = fixture();
+    f.capture(() => hookConfirmation);
+    await f.services.sessions();
+    const old = f.services.question('s')!.id;
+    f.capture(() => frame);
+    await f.services.sessions();
+    expect(approvalInbox.getById(old)).toBeUndefined();
+    expect(f.services.question('s')!.kind).toBe('question');
+  });
+  it.each(['conversation', 'revision', 'allowed', 'session', 'exit', 'write'])(
+    'does not relay a permission after %s changes during capture',
+    async (change) => {
+      const f = fixture();
+      f.capture(() => {
+        if (change === 'conversation') Object.assign(f.s, { claudeSessionId: 'other' });
+        if (change === 'revision') Object.assign(f.s, { discordQueueRevision: 'other' });
+        if (change === 'allowed') f.revoke();
+        if (change === 'session') f.sessions.delete('s');
+        if (change === 'exit') Object.assign(f.s, { paneExit: { code: 0 } });
+        if (change === 'write') Object.assign(f.s, { guardedInputPendingWrites: 1 });
+        return hookConfirmation;
+      });
+      await f.services.sessions();
+      expect(f.notify).not.toHaveBeenCalled();
+      expect(approvalInbox.listPending()).toEqual([]);
+    }
+  );
 });
