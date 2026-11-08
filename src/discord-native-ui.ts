@@ -413,7 +413,8 @@ export class DiscordNativeUi {
     id: string,
     channel: string,
     userCursor: string,
-    responseCursor?: string
+    responseCursor?: string,
+    visibility?: { updates: boolean; download: boolean }
   ): Promise<NonNullable<DiscordPost['components']>> {
     const s = await this.target(id);
     if (this.host.channelForSession(id) !== channel) throw new Error('Response destination changed');
@@ -431,17 +432,37 @@ export class DiscordNativeUi {
       return h;
     };
     if (!scope || !ctx.conversation) throw new Error('Native conversation is unavailable.');
+    // Missing visibility is reserved for restoring owned controls from older messages.
+    // New response/progress renderers always supply contextual visibility.
+    const snapshot = await this.store.snapshot();
+    if (visibility)
+      visibility = {
+        ...visibility,
+        updates:
+          visibility.updates ||
+          Object.values(snapshot.responses).some(
+            (ref) =>
+              ref.scope === scope &&
+              ref.session === id &&
+              ref.channel === channel &&
+              ref.conversation === ctx.conversation &&
+              ref.userCursor === userCursor &&
+              ref.controls?.updates
+          ),
+      };
     const anchor = responseCursor ?? userCursor;
     const bind = (label: string, run: UiAction['run']) =>
       this.action(ctx, label, run, undefined, 2, anchor + ':' + label);
-    const controls: Array<Record<string, unknown>> = [
-      bind('Show updates', async (m) => {
-        const panel = { ...ctx, actor: m.member?.user?.id ?? m.user?.id };
-        const state = await readDiscordTaskUpdates(this.taskReader(panel, scope), ctx.conversation!, userCursor);
-        return this.updatesView(panel, userCursor, state, 0, scope);
-      }),
-    ];
-    if (responseCursor) {
+    const controls: Array<Record<string, unknown>> = [];
+    if (!visibility || visibility.updates)
+      controls.push(
+        bind('Show updates', async (m) => {
+          const panel = { ...ctx, actor: m.member?.user?.id ?? m.user?.id };
+          const state = await readDiscordTaskUpdates(this.taskReader(panel, scope), ctx.conversation!, userCursor);
+          return this.updatesView(panel, userCursor, state, 0, scope);
+        })
+      );
+    if (responseCursor && (!visibility || visibility.download)) {
       controls.push(
         bind('Download response', async () => {
           const h = await responseHistory();
@@ -469,11 +490,12 @@ export class DiscordNativeUi {
             () => scope === this.host.scope() && this.host.channelForSession(id) === channel
           );
           return this.payload('Response file posted in this session thread.');
-        }),
-        bind('Results & files', (m) => this.results(m, id, { userCursor, responseCursor }))
+        })
       );
     }
-    if (s.url && /^https?:\/\//.test(s.url))
+    if (!visibility && responseCursor)
+      controls.push(bind('Results & files', (m) => this.results(m, id, { userCursor, responseCursor })));
+    if (!visibility && s.url && /^https?:\/\//.test(s.url))
       controls.unshift({ type: 2, style: 5, label: 'Open in Codeman', url: s.url });
     const ref = {
       scope: scope!,
@@ -482,15 +504,16 @@ export class DiscordNativeUi {
       conversation: ctx.conversation!,
       userCursor,
       ...(responseCursor ? { responseCursor } : {}),
+      ...(visibility ? { controls: visibility } : {}),
       updated: this.host.now(),
     };
     const key = hash(JSON.stringify([scope, ctx, anchor]));
-    const saved = (await this.store.snapshot()).responses[key];
-    if (!saved)
+    const saved = snapshot.responses[key];
+    if (!saved || JSON.stringify(saved.controls) !== JSON.stringify(ref.controls))
       await this.store.edit((state) => {
         state.responses[key] = ref;
       });
-    return [row(...controls)];
+    return controls.length ? [row(...controls)] : [];
   }
   /** Initial table cards retain exact response readers; browsing opens an actor-owned private panel. */
   async tableResponsePosts(
@@ -813,7 +836,7 @@ export class DiscordNativeUi {
         (label) => custom === 'cmui:' + hash(JSON.stringify([scope, ctx, anchor + ':' + label])).slice(0, 40)
       );
       if (!match) continue;
-      await this.responseControls(id, channel, ref.userCursor, ref.responseCursor);
+      await this.responseControls(id, channel, ref.userCursor, ref.responseCursor, ref.controls);
       if (!current()) return undefined;
       const restored = this.actions.get(custom);
       if (restored) restored.message = m.message.id;

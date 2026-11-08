@@ -1698,3 +1698,72 @@ it.each([1, 2, 3])('renders a %i-row table with unique controls and usable expor
   const file = (f.host.postFile as any).mock.calls[0][1];
   expect(file.data.toString()).toContain('#1560');
 });
+
+it('omits the entire footer for a short response while keeping web/results on the session card', async () => {
+  const f = await fixture();
+  f.sessions[0].url = 'https://codeman.example/session/s1';
+  expect(await f.ui.responseControls('s1', channel, 'u1', 'r1', { updates: false, download: false })).toEqual([]);
+  await f.ui.poll();
+  const labels = discordUiNodes(f.findCard().components).map((n) => n.label);
+  expect(labels).toContain('Open Codeman');
+  expect(labels).toContain('Results & files');
+});
+it.each([
+  [{ updates: true, download: false }, ['Show updates']],
+  [{ updates: false, download: true }, ['Download response']],
+  [{ updates: true, download: true }, ['Show updates', 'Download response']],
+] as const)('renders only contextual response controls %j', async (visibility, expected) => {
+  const f = await fixture();
+  f.sessions[0].url = 'https://codeman.example/session/s1';
+  const controls = await f.ui.responseControls('s1', channel, 'u1', 'r1', visibility);
+  expect(
+    discordUiNodes(controls)
+      .filter((n) => n.type === 2)
+      .map((n) => n.label)
+  ).toEqual(expected);
+});
+it('remembers real task progress across bounded history pages without leaking it to the next task', async () => {
+  const f = await fixture();
+  await f.ui.responseControls('s1', channel, 'u1', undefined, { updates: true, download: false });
+  const next = new DiscordNativeUi(f.host);
+  const final = await next.responseControls('s1', channel, 'u1', 'r1', { updates: false, download: false });
+  expect(
+    discordUiNodes(final)
+      .filter((n) => n.type === 2)
+      .map((n) => n.label)
+  ).toEqual(['Show updates']);
+  expect(await next.responseControls('s1', channel, 'u2', 'r2', { updates: false, download: false })).toEqual([]);
+});
+it('recovers a new download-only footer after restart without restoring removed actions', async () => {
+  const f = await fixture();
+  f.host.history = async () => ({
+    conversationId: 'conversation-one',
+    partial: false,
+    turns: [
+      { role: 'user', text: 'Build', cursor: 'u1', timestamp: '' },
+      { role: 'assistant', text: 'Long answer '.repeat(200), cursor: 'r1', timestamp: '' },
+    ],
+  });
+  const controls = await f.ui.responseControls('s1', channel, 'u1', 'r1', { updates: false, download: true });
+  const id = snow(),
+    payload = { content: '', components: controls };
+  f.messages.set(id, { ...payload, id, channel, channel_id: channel, author: { id: bot } } as any);
+  const fresh = new DiscordNativeUi(f.host);
+  await fresh.interaction(f.event(f.component(payload, 'Download response'), { message: { id } }));
+  expect(f.host.postFile).toHaveBeenCalledTimes(1);
+  const saved = Object.values((await new DiscordUiStore(f.dir).snapshot()).responses);
+  expect(saved[0].controls).toEqual({ updates: false, download: true });
+});
+it('retains table navigation and exports when the ordinary response footer is empty', async () => {
+  const f = await tableFixture();
+  const controls = await f.ui.responseControls('s1', channel, 'u1', 'r1', { updates: false, download: false });
+  expect(controls).toEqual([]);
+  const cards = (await f.ui.tableResponsePosts('s1', channel, 'u1', 'r1', tableResponse, { controls }))!;
+  const labels = cards
+    .flatMap((p) => discordUiNodes(p.components))
+    .filter((n) => n.type === 2)
+    .map((n) => n.label);
+  expect(labels).toEqual(expect.arrayContaining(['Next', 'View table', 'Download CSV']));
+  expect(labels).not.toContain('Results & files');
+  expect(labels).not.toContain('Open in Codeman');
+});

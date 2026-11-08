@@ -1915,7 +1915,14 @@ export class DiscordBridge {
           const confirmed = proof?.state === 'completed';
           const controls =
             turn.role === 'assistant' && owner && this.nativeUi
-              ? await this.nativeUi.responseControls(sessionId, channel, owner, turn.cursor).catch(() => [])
+              ? await this.nativeUi
+                  .responseControls(sessionId, channel, owner, turn.cursor, {
+                    updates: history.turns
+                      .slice(Math.max(0, history.turns.findIndex((t) => t.cursor === owner) + 1), position)
+                      .some((t) => t.role === 'assistant' && t.phase === 'commentary'),
+                    download: visible.length > 1900,
+                  })
+                  .catch(() => [])
               : [];
           const label = this.deps.sessions?.().find((s) => s.id === sessionId)?.name;
           const responseOptions = {
@@ -2006,7 +2013,12 @@ export class DiscordBridge {
       const updatesUser = progress.activeUser ?? user?.cursor;
       const progressControls =
         updatesUser && this.nativeUi
-          ? await this.nativeUi.responseControls(sessionId, channel, updatesUser).catch(() => [])
+          ? await this.nativeUi
+              .responseControls(sessionId, channel, updatesUser, undefined, {
+                updates: updates.length > 0,
+                download: false,
+              })
+              .catch(() => [])
           : [];
       const progressPost = discordProgressPost(status, '', updates.length, progressControls);
       const hash = createHash('sha256').update(JSON.stringify(progressPost)).digest('hex');

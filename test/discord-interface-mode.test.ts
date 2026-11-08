@@ -2884,3 +2884,53 @@ it('delivers a metadata-only generated-image page before advancing its native ch
   expect(uploaded.some((f) => f.name === 'native.png')).toBe(true);
   expect(sendInput).not.toHaveBeenCalled();
 });
+
+it.each(['short', 'progress', 'long'])('uses contextual controls on a real streamed %s response', async (kind) => {
+  sessions = [{ id: 's1', name: 'one' }];
+  let turns: import('../src/discord-history.js').DiscordHistoryTurn[] = [];
+  const answer = kind === 'long' ? 'Long visible response '.repeat(110) : 'Short visible response';
+  const b = makeBridge(undefined, {
+    history: async () => ({ conversationId: 'native1', partial: false, turns }),
+    nativeUi: {
+      enabled: () => true,
+      sessions: async () => [
+        {
+          id: 's1',
+          name: 'one',
+          host: 'test',
+          caseName: 'Test',
+          mode: 'codex',
+          conversation: 'native1',
+          working: false,
+          ready: true,
+          pending: false,
+          exited: false,
+          url: 'https://codeman.example/session/s1',
+        },
+      ],
+      cases: async () => [],
+      defaults: async () => ({ model: '', effort: '', approval: 'ask' }),
+      saveDefaults: async () => {},
+      question: () => undefined,
+      answer: async () => '',
+      workspace: async () => ({ summary: '', diff: '' }),
+      submitQueued: async () => 'blocked',
+    },
+  });
+  await b.reload();
+  await b.syncSessions();
+  turns = [{ cursor: 'u1', role: 'user', text: 'Do the task', timestamp: '' }];
+  if (kind === 'progress')
+    turns.push({ cursor: 'p1', role: 'assistant', phase: 'commentary', text: 'Compiling', timestamp: '' });
+  turns.push({ cursor: 'r1', role: 'assistant', phase: 'final_answer', text: answer, timestamp: '' });
+  await b.pollConversations();
+  const replies = posts.filter(
+    (p) => p.method === 'POST' && visibleText(p.body)?.includes(kind === 'long' ? 'Long visible response' : answer)
+  );
+  expect(replies.length).toBeGreaterThan(0);
+  const labels = replies
+    .flatMap((p) => discordUiNodes(p.body.components))
+    .filter((n) => n.type === 2)
+    .map((n) => n.label);
+  expect(labels).toEqual(kind === 'long' ? ['Download response'] : kind === 'progress' ? ['Show updates'] : []);
+});
