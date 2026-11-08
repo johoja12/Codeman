@@ -32,7 +32,7 @@ const conversationFor = (s: Session): string | undefined =>
 export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServices {
   const session = (id: string) => {
     const s = deps.sessions().get(id);
-    if (!deps.allowed() || !s) throw new Error('Session unavailable');
+    if (!deps.allowed() || !s || s.suppressNotifications) throw new Error('Session unavailable');
     return s;
   };
   const working = (s: Session) =>
@@ -157,8 +157,9 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
         }
       }
       const cases = await deps.cases();
+      const visible = [...deps.sessions().values()].filter((s) => !s.suppressNotifications);
       return Promise.all(
-        [...deps.sessions().values()].map(async (s) => {
+        visible.map(async (s) => {
           const promptSuggestion = await suggestion(s);
           const pending = approvalInbox.listPending().find((p) => p.sessionId === s.id && p.kind !== 'idle');
           return {

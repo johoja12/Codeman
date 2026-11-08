@@ -616,6 +616,8 @@ const parentSessionIdSchema = z.string().max(100).optional();
 const tabGroupIdSchema = z.string().min(1).max(100).optional();
 
 export const CreateSessionSchema = z.object({
+  /** Suppress all notification channels for this session; persists across recovery. */
+  suppressNotifications: z.boolean().optional(),
   caseName: z
     .string()
     .regex(/^[a-zA-Z0-9_-]+$/, 'Invalid case name format')
@@ -1341,6 +1343,7 @@ export const DockerQuickCreateSchema = z.object({
  * Creates case (if needed) and starts interactive session.
  */
 export const QuickStartSchema = z.object({
+  suppressNotifications: z.boolean().optional(),
   caseName: z
     .string()
     .regex(/^[a-zA-Z0-9_-]+$/, 'Invalid case name format. Use only letters, numbers, hyphens, underscores.')

@@ -1294,7 +1294,7 @@ class CodemanApp {
   }
 
   updateTabAlertFromHooks(sessionId) {
-    const hooks = this.pendingHooks.get(sessionId);
+    const hooks = this.sessions.get(sessionId)?.suppressNotifications ? undefined : this.pendingHooks.get(sessionId);
     if (!hooks || hooks.size === 0) {
       this.tabAlerts.delete(sessionId);
     } else if (hooks.has('permission_prompt') || hooks.has('elicitation_dialog')) {

@@ -52,6 +52,7 @@ export function recoverySessionConfig(
     remote,
     docker: transport.docker,
     owner: record.owner,
+    suppressNotifications: record.suppressNotifications,
     resumeSessionId: record.transport === 'docker' ? (nativeResumeId ?? record.claudeResumeId) : record.claudeResumeId,
     nativeResumeId,
     codexConfig: record.mode === 'codex' && nativeResumeId ? { resumeSessionId: nativeResumeId } : undefined,

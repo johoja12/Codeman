@@ -954,6 +954,26 @@ request is answered with `206` + `Content-Range` (`416` past the end), like
 `file-raw`. Every refusal is a plain-text `404 Not found`; with a password set, an
 unknown or revoked capability is the auth hook's `401` instead.
 
+## Sessions without notifications (`suppressNotifications`)
+
+Pass `"suppressNotifications": true` to `POST /api/v1/sessions` or
+`POST /api/v1/quick-start` to create a session without notifications:
+
+```bash
+curl -X POST http://127.0.0.1:3002/api/v1/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"caseName":"my-case","mode":"codex","suppressNotifications":true}'
+```
+
+The flag defaults to false and is returned in session state when enabled. It
+persists across server restarts and recovery. The session stays visible and
+usable through the web UI and API, including terminal output, state and approval
+endpoints. Discord thread creation, output, activity cards and alerts are
+suppressed, along with web UI notification drawer entries, tab alerts, title
+flashing, browser/audio notifications, Web Push and webhook notifications. This
+includes permission, question, completion and error notifications. It affects
+only the new session; other sessions retain their notification settings.
+
 ## Session lineage (`parentSessionId`)
 
 A create request may name the session that spawned it, which the web UI draws as a

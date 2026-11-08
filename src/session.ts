@@ -1220,6 +1220,7 @@ export class Session extends EventEmitter {
   // route before it reaches here, so this is always either an id that existed at
   // create time or undefined. Decoration only (plus the keep-warm default); see SessionState.parentSessionId.
   private readonly _parentSessionId?: string;
+  readonly suppressNotifications: boolean;
 
   // Session color for visual differentiation
   private _color: import('./types.js').SessionColor = 'default';
@@ -1361,6 +1362,7 @@ export class Session extends EventEmitter {
       owner?: string;
       /** Session that spawned this one — tab lineage decoration, resolved by the caller. */
       parentSessionId?: string;
+      suppressNotifications?: boolean;
     }
   ) {
     super();
@@ -1564,6 +1566,7 @@ export class Session extends EventEmitter {
     }
     this._docker = config.docker;
     this._owner = config.owner;
+    this.suppressNotifications = config.suppressNotifications === true;
     this._discoveredMuxSession = config.discoveredMuxSession === true;
     // Restored so a record that says the agent exited survives a server restart
     // rather than being blanked by the first persist after boot. It runs here
@@ -3157,6 +3160,7 @@ export class Session extends EventEmitter {
       docker: this._docker,
       owner: this._owner,
       parentSessionId: this._parentSessionId,
+      ...(this.suppressNotifications ? { suppressNotifications: true } : {}),
       currentTaskId: this._currentTaskId,
       createdAt: this.createdAt,
       // The wire twin, not the private stamp: it survives the post-recovery

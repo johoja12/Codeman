@@ -50,6 +50,7 @@ export interface SessionRecoveryRecord {
   /** What execution actually proved, independent of the terminal queue status. */
   restoreEvidence?: 'launch_returned' | 'remote_live';
   owner?: string;
+  suppressNotifications?: boolean;
   mode: SessionMode;
   workingDir: string;
   transport: SessionRecoveryTransport;

@@ -218,6 +218,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             lastActivityAt: saved.lastActivityAt,
             owner: saved.owner,
             parentSessionId: saved.parentSessionId,
+            suppressNotifications: saved.suppressNotifications,
           });
 
           await ctx.addSession(session);

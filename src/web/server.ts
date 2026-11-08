@@ -764,27 +764,29 @@ export class WebServer extends EventEmitter {
     sessions: async () => {
       const cases = (await this.discordCases?.()) ?? [];
       const layout = (await this.tabLayouts.getSnapshot(ownerLayoutKey(undefined))).layout;
-      return [...this.sessions.values()].map((s) => ({
-        id: s.id,
-        name: s.name,
-        host: s.remote?.label || 'local',
-        mode: s.mode,
-        group:
-          layout.groups.find((g) => g.refs.some((r) => r.kind === 'session' && r.id === s.id))?.name || 'Ungrouped',
-        caseName:
-          cases.find((c) =>
-            s.remote
-              ? c.remote?.hostId === s.remote.hostId && c.remote.path === s.remote.remotePath
-              : c.path === s.workingDir
-          )?.name || s.workingDir,
-        state: s.paneExit ? 'agent exited' : s.activityProjection.activityStatus,
-      }));
+      return [...this.sessions.values()]
+        .filter((s) => !s.suppressNotifications)
+        .map((s) => ({
+          id: s.id,
+          name: s.name,
+          host: s.remote?.label || 'local',
+          mode: s.mode,
+          group:
+            layout.groups.find((g) => g.refs.some((r) => r.kind === 'session' && r.id === s.id))?.name || 'Ungrouped',
+          caseName:
+            cases.find((c) =>
+              s.remote
+                ? c.remote?.hostId === s.remote.hostId && c.remote.path === s.remote.remotePath
+                : c.path === s.workingDir
+            )?.name || s.workingDir,
+          state: s.paneExit ? 'agent exited' : s.activityProjection.activityStatus,
+        }));
     },
     create: async (body) => {
       if (!this.discordCreate) throw new Error('Session routes unavailable');
       return this.discordCreate(body);
     },
-    recoveries: () => this.store.getSessionRecoveries(),
+    recoveries: () => this.store.getSessionRecoveries().filter((r) => !r.suppressNotifications),
     recover: async (id, action) => {
       if (!this.discordRecover) throw new Error('Recovery routes unavailable');
       return this.discordRecover(id, action);
@@ -818,6 +820,7 @@ export class WebServer extends EventEmitter {
     nativeUi: createDiscordNativeUiServices({
       // Read-only fallback: hookless remote Claude choice dialogs must also reach Discord.
       questionObserved: async (item) => {
+        if (this.sessions.get(item.sessionId)?.suppressNotifications) return true;
         const result = await this.discordBridge.notify({
           event: SseEvent.HookElicitationDialog,
           title: 'Question Asked',
@@ -861,7 +864,7 @@ export class WebServer extends EventEmitter {
     awaitingChoice: (id) => approvalInbox.listPending().some((item) => item.sessionId === id && item.kind !== 'idle'),
     caseForSession: async (id) => {
       const session = this.sessions.get(id);
-      if (!session) return undefined;
+      if (!session || session.suppressNotifications) return undefined;
       const cases = isMultiUserMode() ? [] : ((await this.discordCases?.()) ?? []);
       if (this.sessions.get(id) !== session) return undefined;
       return resolveDiscordCase(
@@ -870,14 +873,16 @@ export class WebServer extends EventEmitter {
       );
     },
     sessions: () =>
-      Array.from(this.sessions.values(), (session) => ({
-        id: session.id,
-        name: session.name,
-        remote: !!session.remote,
-        working: session.isWorking,
-        watching: session.watching,
-        activityStatus: session.activityProjection.activityStatus,
-      })),
+      Array.from(this.sessions.values())
+        .filter((session) => !session.suppressNotifications)
+        .map((session) => ({
+          id: session.id,
+          name: session.name,
+          remote: !!session.remote,
+          working: session.isWorking,
+          watching: session.watching,
+          activityStatus: session.activityProjection.activityStatus,
+        })),
     history: async (id, options) => {
       const session = this.sessions.get(id);
       if (!session) throw new Error('Session unavailable');
@@ -4005,7 +4010,7 @@ export class WebServer extends EventEmitter {
     if (event !== SseEvent.SessionCreated && event !== SseEvent.SessionUpdated) return;
     const d = (data ?? {}) as { id?: string; name?: string; session?: { id?: string; name?: string } };
     const s = d.session ?? d;
-    if (!s.id) return;
+    if (!s.id || this.sessions.get(s.id)?.suppressNotifications) return;
     const id = s.id;
     const run =
       event === SseEvent.SessionCreated
@@ -4258,6 +4263,8 @@ export class WebServer extends EventEmitter {
   // Async only for the Approvals Inbox settings read below; every call site is
   // fire-and-forget (the EventPort signature stays `void`).
   private async sendPushNotifications(event: string, data: Record<string, unknown>): Promise<void> {
+    const sessionIdForPolicy = (data.sessionId ?? data.id) as string | undefined;
+    if (sessionIdForPolicy && this.sessions.get(sessionIdForPolicy)?.suppressNotifications) return;
     const template = WebServer.PUSH_EVENT_MAP[event];
     if (!template) return;
 
@@ -5448,6 +5455,7 @@ export class WebServer extends EventEmitter {
               // that did NOT come back is harmless: the frontend draws an edge only
               // when both tabs are on screen.
               parentSessionId: savedState?.parentSessionId,
+              suppressNotifications: savedState?.suppressNotifications,
             });
 
             // Custom-model selection survives the restart. The tmux session still carries
