@@ -200,7 +200,7 @@ export class DiscordNativeUi {
         ? { ...payload, components: [...(payload.components ?? []), { type: 10, content: marker }] }
         : { ...payload, content: payload.content.slice(0, 1880) + marker };
     const digest = hash(JSON.stringify(payload));
-    const old = (await this.store.snapshot()).cards[storeKey];
+    const old = await this.store.read((state) => state.cards[storeKey]);
     const current = () => this.host.scope() === scope && this.host.ownsChannel(channel);
     if (!current()) return;
     if (old?.phase === 'ready' && old.message && old.channel === channel && old.hash === digest) return;
@@ -219,9 +219,10 @@ export class DiscordNativeUi {
       message = found[0].id;
     }
     if (!current()) return;
+    let existing: { author?: { id: string }; content?: string; components?: unknown } | undefined;
     if (message) {
       try {
-        await this.host.request('GET', `/channels/${channel}/messages/${message}`);
+        existing = (await this.host.request('GET', `/channels/${channel}/messages/${message}`)) as typeof existing;
       } catch (e) {
         if ((e as { status?: number }).status !== 404) throw e;
         message = undefined;
@@ -229,12 +230,7 @@ export class DiscordNativeUi {
     }
     if (message) {
       // Verify that a persisted ID still names our own bot message before editing it.
-      const existing = (await this.host.request('GET', `/channels/${channel}/messages/${message}`)) as {
-        author?: { id: string };
-        content?: string;
-        components?: unknown;
-      };
-      if (existing.author?.id !== (await this.host.botId()) || !ownsUiMarker(existing, marker))
+      if (!existing || existing.author?.id !== (await this.host.botId()) || !ownsUiMarker(existing, marker))
         throw new Error('Control-card ownership changed');
       if (!current()) return;
       await this.host.request('PATCH', `/channels/${channel}/messages/${message}`, uiWirePayload(payload, true));
@@ -284,8 +280,8 @@ export class DiscordNativeUi {
   }
   private async sessionCard(s: DiscordUiSession): Promise<DiscordUiPayload> {
     const ctx: UiContext = { channel: this.host.channelForSession(s.id)!, session: s.id, conversation: s.conversation };
-    const q = (await this.store.snapshot()).queue.filter(
-      (p) => p.session === s.id && p.channel === this.host.channelForSession(s.id)
+    const q = await this.store.read((state) =>
+      state.queue.filter((p) => p.session === s.id && p.channel === this.host.channelForSession(s.id))
     );
     const receipts = await this.host.receipts(s.id);
     const last = receipts[0];
@@ -434,13 +430,14 @@ export class DiscordNativeUi {
     if (!scope || !ctx.conversation) throw new Error('Native conversation is unavailable.');
     // Missing visibility is reserved for restoring owned controls from older messages.
     // New response/progress renderers always supply contextual visibility.
-    const snapshot = await this.store.snapshot();
-    if (visibility)
-      visibility = {
-        ...visibility,
-        updates:
-          visibility.updates ||
-          Object.values(snapshot.responses).some(
+    const anchor = responseCursor ?? userCursor;
+    const key = hash(JSON.stringify([scope, ctx, anchor]));
+    const snapshot = await this.store.read((state) => ({
+      saved: state.responses[key],
+      hasUpdates:
+        !!visibility &&
+        (visibility.updates ||
+          Object.values(state.responses).some(
             (ref) =>
               ref.scope === scope &&
               ref.session === id &&
@@ -448,9 +445,9 @@ export class DiscordNativeUi {
               ref.conversation === ctx.conversation &&
               ref.userCursor === userCursor &&
               ref.controls?.updates
-          ),
-      };
-    const anchor = responseCursor ?? userCursor;
+          )),
+    }));
+    if (visibility) visibility = { ...visibility, updates: snapshot.hasUpdates };
     const bind = (label: string, run: UiAction['run']) =>
       this.action(ctx, label, run, undefined, 2, anchor + ':' + label);
     const controls: Array<Record<string, unknown>> = [];
@@ -507,8 +504,7 @@ export class DiscordNativeUi {
       ...(visibility ? { controls: visibility } : {}),
       updated: this.host.now(),
     };
-    const key = hash(JSON.stringify([scope, ctx, anchor]));
-    const saved = snapshot.responses[key];
+    const saved = snapshot.saved;
     if (!saved || JSON.stringify(saved.controls) !== JSON.stringify(ref.controls))
       await this.store.edit((state) => {
         state.responses[key] = ref;
@@ -800,7 +796,7 @@ export class DiscordNativeUi {
       !contains(message.components)
     )
       return undefined;
-    const refs = Object.values((await this.store.snapshot()).responses);
+    const refs = Object.values(await this.store.read((state) => state.responses));
     for (const ref of refs) {
       if (ref.scope !== scope || ref.session !== id || ref.channel !== channel || ref.conversation !== conversation)
         continue;
@@ -918,7 +914,7 @@ export class DiscordNativeUi {
             this.host.latestPrompt?.(s.id, s.conversation),
             s,
             (await this.host.receipts(s.id))[0],
-            (await this.store.snapshot()).queue.filter((p) => p.session === s.id),
+            await this.store.read((state) => state.queue.filter((p) => p.session === s.id)),
             Math.floor(this.host.now() / 120000),
             this.epoch,
           ])
@@ -978,7 +974,7 @@ export class DiscordNativeUi {
   private async retireLegacyCards(keys?: Set<string>): Promise<void> {
     const scope = this.host.scope();
     if (!scope) return;
-    const cards = Object.entries((await this.store.snapshot()).cards)
+    const cards = Object.entries(await this.store.read((state) => state.cards))
       .filter(
         ([key, card]) =>
           (card.kind === 'delivery' || card.kind === 'result') &&
@@ -1408,8 +1404,8 @@ export class DiscordNativeUi {
   private async queueView(m: DiscordInteraction, id: string): Promise<DiscordUiPayload> {
     const s = await this.target(id),
       ctx = this.ctx(m, s),
-      items = (await this.store.snapshot()).queue.filter(
-        (p) => p.session === id && p.channel === this.host.channelForSession(id)
+      items = await this.store.read((state) =>
+        state.queue.filter((p) => p.session === id && p.channel === this.host.channelForSession(id))
       );
     const components = [
       row(
@@ -1464,8 +1460,8 @@ export class DiscordNativeUi {
   }
   private async queueItem(m: DiscordInteraction, id: string, promptId: string): Promise<DiscordUiPayload> {
     const s = await this.target(id),
-      p = (await this.store.snapshot()).queue.find(
-        (v) => v.id === promptId && v.session === id && v.channel === this.host.channelForSession(id)
+      p = await this.store.read((state) =>
+        state.queue.find((v) => v.id === promptId && v.session === id && v.channel === this.host.channelForSession(id))
       );
     if (!p) throw new Error('Queued prompt is gone');
     const ctx = this.ctx(m, s),
@@ -1517,7 +1513,7 @@ export class DiscordNativeUi {
   private async dispatchQueue(s: DiscordUiSession): Promise<void> {
     if (s.working || s.pending || s.exited || !s.ready || !s.conversation) return;
     const scope = this.host.scope(),
-      p = (await this.store.snapshot()).queue.find((p) => p.session === s.id && p.scope === scope);
+      p = await this.store.read((state) => state.queue.find((p) => p.session === s.id && p.scope === scope));
     if (
       !p ||
       p.state !== 'queued' ||
@@ -1760,7 +1756,7 @@ export class DiscordNativeUi {
     const message = event.responseCursor ? await this.host.responseMessage?.(id, event.responseCursor) : undefined;
     if (this.host.scope() !== scope || this.host.channelForSession(id) !== channel) return;
     const key = this.activityKey(id),
-      old = (await this.store.snapshot()).activities[key];
+      old = await this.store.read((state) => state.activities[key]);
     const same = old?.conversation === event.conversation && old.cursor === event.cursor && old.kind === event.kind;
     if (!newerActivity(old, event) && !(same && message && old.message !== message)) return;
     await this.store.edit((state) => {
@@ -1772,7 +1768,14 @@ export class DiscordNativeUi {
   private async observeSessionActivity(sessions: DiscordUiSession[]): Promise<void> {
     const scope = this.host.scope();
     if (!scope) return;
-    const snapshot = await this.store.snapshot();
+    const snapshot = await this.store.read((state) => ({
+      activities: Object.fromEntries(
+        sessions.map((session) => {
+          const key = this.activityKey(session.id);
+          return [key, state.activities[key]];
+        })
+      ),
+    }));
     const changes: Array<[string, DiscordActivityRecord]> = [];
     for (const s of sessions) {
       const channel = this.host.channelForSession(s.id);
@@ -1830,7 +1833,7 @@ export class DiscordNativeUi {
       stale = true;
     }
     await this.observeSessionActivity(all);
-    const stored = (await this.store.snapshot()).activities;
+    const stored = await this.store.read((state) => state.activities);
     const entries = all
       .map((s) => {
         const record = stored[this.activityKey(s.id)];

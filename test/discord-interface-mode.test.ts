@@ -2375,6 +2375,45 @@ it('keeps long streamed updates and files silent with just one notification-elig
   expect(sendInput).not.toHaveBeenCalled();
 });
 
+it('delivers replies while a coalesced native UI refresh is blocked', async () => {
+  sessions = [{ id: 's1', name: 'one' }];
+  let now = 100000;
+  let turns: any[] = [];
+  const b = makeBridge(undefined, {
+    now: () => now,
+    history: async () => ({ conversationId: 'native1', partial: false, turns }),
+  });
+  await b.reload();
+  await b.syncSessions();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const poll = vi.fn(() => gate);
+  (b as any).nativeUi = {
+    poll,
+    stop() {},
+    observeHistory: async () => {},
+    responseControls: async () => [],
+    tableResponsePosts: async () => undefined,
+  };
+  try {
+    turns = [
+      { role: 'user', cursor: 'u', timestamp: '', text: 'Task' },
+      { role: 'assistant', cursor: 'a', phase: 'final_answer', timestamp: '', text: 'Delivered during slow UI' },
+    ];
+    now += 21000;
+    await b.pollConversations();
+    expect([...remoteMessages.values()].some((m) => visibleText(m) === 'Delivered during slow UI')).toBe(true);
+    now += 21000;
+    await b.pollConversations();
+    expect(poll).toHaveBeenCalledTimes(1);
+    expect(sendInput).not.toHaveBeenCalled();
+  } finally {
+    release();
+    await (b as any).uiRefresh;
+  }
+});
 it('links the live Activity row to the final message actually delivered by the bridge', async () => {
   sessions = [{ id: 's1', name: 'one' }];
   let now = 100000;
@@ -2416,6 +2455,7 @@ it('links the live Activity row to the final message actually delivered by the b
   await b.reload();
   await b.syncSessions();
   await b.pollConversations();
+  await (b as any).uiRefresh;
   turns = [
     { role: 'user', cursor: 'u', timestamp: new Date(1000).toISOString(), text: 'Task' },
     {
@@ -2428,10 +2468,12 @@ it('links the live Activity row to the final message actually delivered by the b
   ];
   now += 21000;
   await b.pollConversations();
+  await (b as any).uiRefresh;
   const sent = [...remoteMessages.values()].find((m) => visibleText(m) === 'Exact delivered final.');
   expect(sent).toBeDefined();
   now += 21000;
   await b.pollConversations();
+  await (b as any).uiRefresh;
   const dashboard = [...remoteMessages.values()].find((m) =>
     discordUiNodes(m.components).some((c) => String(c.content ?? '').includes('## Activity'))
   );
