@@ -36,6 +36,8 @@ export interface RemoteFileWriteScriptOptions {
   /** Opt-in private upload directories and strict staged-file cleanup. */
   privateDirectory?: boolean;
   strict?: boolean;
+  /** Idempotent metadata only: an existing regular file must contain identical bytes. */
+  allowIdenticalExisting?: boolean;
 }
 
 /**
@@ -57,7 +59,14 @@ export function buildRemoteFileWriteScript(opts: RemoteFileWriteScriptOptions): 
       ...(opts.privateDirectory ? ['chmod 700 "$dir"'] : []),
       ...(opts.strict ? [`trap 'rm -f "$tmp"' EXIT HUP INT TERM`] : []),
       'cat > "$tmp"',
-      'mv -n "$tmp" "$file"',
+      ...(opts.allowIdenticalExisting
+        ? [
+            'if [ -L "$file" ] || { [ -e "$file" ] && [ ! -f "$file" ]; }; then exit 74; fi',
+            // Some hosts return 1 on a no-clobber skip; others return 0.
+            'if ! mv -n "$tmp" "$file"; then [ -f "$tmp" ] && [ ! -L "$file" ] && [ -f "$file" ] && cmp -s "$tmp" "$file" || exit 74; fi',
+            'if [ -e "$tmp" ]; then [ ! -L "$file" ] && [ -f "$file" ] && cmp -s "$tmp" "$file" || exit 74; fi',
+          ]
+        : ['mv -n "$tmp" "$file"']),
       'rm -f "$tmp"',
     ].join('; ')
   );
@@ -88,6 +97,7 @@ export async function writeRemoteFileBytes(remote: SessionRemote, opts: WriteRem
     notADirectoryMessage: opts.notADirectoryMessage,
     privateDirectory: opts.privateDirectory,
     strict: opts.strict,
+    allowIdenticalExisting: opts.allowIdenticalExisting,
   });
   const args = [...buildSshConnectionArgv(remote), '-o', 'ConnectTimeout=10', remoteSshTarget(remote), script];
   await new Promise<void>((resolve, reject) => {

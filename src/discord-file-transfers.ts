@@ -197,7 +197,12 @@ export async function writeDiscordRemoteAttachment(
       strict: true,
     };
     await runWithRemoteSshLimit(() =>
-      writeRemoteFileBytes(remote, { ...base, filePath: posix.join(dir, '.gitignore'), bytes: Buffer.from('*\n') })
+      writeRemoteFileBytes(remote, {
+        ...base,
+        allowIdenticalExisting: true,
+        filePath: posix.join(dir, '.gitignore'),
+        bytes: Buffer.from('*\n'),
+      })
     );
     await runWithRemoteSshLimit(() =>
       writeRemoteFileBytes(remote, { ...base, filePath: path, bytes: Buffer.from(bytes) })
