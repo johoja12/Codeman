@@ -381,3 +381,42 @@ Case-channel launches use the same numbered names as web launches: `w1-flux-play
 ### Oversized tool records during native catch-up
 
 Conversation and Quiet readers can pass over bounded Codex `function_call_output`, `custom_tool_call_output` and image-generation Extension events that contain no chat messages. The original record hash is verified and retained as the next cursor; their contents are not posted. This prevents large image/tool payloads from blocking later user prompts, progress or final answers. The 2 MB visible-history page budget and 16 MB individual-record scan cap remain enforced. Oversized visible, unknown, malformed or ambiguous records still pause rather than being silently discarded. Tools mode retains the stricter behavior for oversized requested output; use Conversation/Quiet or the web transcript for that case.
+
+### Bridge profiling
+
+`GET /api/discord/profiling` returns lightweight, in-memory diagnostics since the
+bridge was constructed. It reports local/SSH history reads, Discord HTTP methods,
+polling, control rendering, file/image reads and delivery controls. Each operation
+has call/error counts, active/peak concurrency, wall-time totals/mean/max, and p95
+for its most recent 128 completions. Poll skips identify in-flight reads,
+not-yet-due sessions, concurrency limits and missing destinations. Queue and cache
+counts help distinguish slow reads from growing work queues.
+
+These wall times include network/disk waits. Nested and overlapping operation
+totals must not be summed as CPU time. The Node RSS, heap and CPU fields explicitly
+cover the **whole process**. Cached text payload bytes are only the UTF-8 lengths
+of known strings, not total bridge heap memory. No prompts, responses, session IDs,
+tokens, request paths or error messages are retained in the metrics.
+
+For an opt-in sample, send `POST /api/discord/profiling/capture` with JSON
+`{"durationMs":5000}`. Durations are limited to 1–15 seconds; omitted duration is
+5 seconds. Only one capture can run per process, and an existing inspector session
+causes a conflict. Both routes follow the Discord settings' administrator-only
+rule in multi-user mode and normal server authentication.
+
+The capture uses an internal inspector session, opens no debugger port and takes
+no heap snapshot. It returns the top 20 bridge CPU-stack and allocation hotspots,
+plus process CPU context and sampling limitations. It stores only the latest
+summary in memory; no raw profile or heap object is exported or written to disk.
+Sampling adds overhead, so use short diagnostic captures rather than repeatedly
+polling the capture endpoint. Lightweight counters remain available without it.
+
+CPU stack attribution is statistical and inclusive: shared asynchronous callbacks
+may have lost their originating bridge frame, while child SSH/Python CPU is
+outside V8 sampling. Allocation sampling covers only the capture window and
+misses existing or unsampled allocations; it is not a bridge RSS measurement.
+
+For bottleneck triage, compare `history.remote` p95 and active reads with due
+session counts, inspect Discord 429/5xx counters, and compare UI polling/control
+wall times with the sampled CPU hotspots. An idle bridge profile can legitimately
+contain zero bridge CPU or allocation samples.
