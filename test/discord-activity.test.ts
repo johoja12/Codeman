@@ -212,7 +212,7 @@ describe('Discord live activity', () => {
       sessions[0] = { id: 's1', name: 'hs-lab', working: false, watching: '1 shell', activityStatus };
       await activity.poll();
       expect(rename).toHaveBeenLastCalledWith('thread', '🟡 Working · hs-lab', expect.any(Function));
-      expect(typing).toHaveBeenCalledTimes(1);
+      expect(typing).not.toHaveBeenCalled();
       sessions[0].waiting = true;
       now += 4000;
       await activity.poll();
@@ -223,14 +223,57 @@ describe('Discord live activity', () => {
       expect(rename).toHaveBeenLastCalledWith('thread', '⚫ Offline · hs-lab', expect.any(Function));
     }
   );
+  it('isolates typing to the foreground session when other threads have background work', async () => {
+    sessions = [
+      { id: 's1', name: 'finished', working: false, watching: '2 background terminals', activityStatus: 'idle' },
+      { id: 's2', name: 'active', working: true },
+      { id: 's3', name: 'agent wait', working: false, activityStatus: 'waiting_agents' },
+    ];
+    activity = new DiscordActivity({
+      scope: () => scope,
+      sessions: () => sessions,
+      destination: (id) => 'thread-' + id,
+      verify,
+      rename,
+      typing,
+      now: () => now,
+    });
+    await activity.poll();
+    expect(typing).toHaveBeenCalledTimes(1);
+    expect(typing).toHaveBeenLastCalledWith('thread-s2', expect.any(Function));
+    const stillCurrent = typing.mock.calls[0][1];
+    expect(stillCurrent()).toBe(true);
+    sessions[1].working = false;
+    sessions[1].watching = '1 shell';
+    expect(stillCurrent()).toBe(false);
+    now += 8000;
+    await activity.poll();
+    expect(typing).toHaveBeenCalledTimes(1);
+    sessions[0].working = true;
+    now += 8000;
+    await activity.poll();
+    expect(typing).toHaveBeenCalledTimes(2);
+    expect(typing).toHaveBeenLastCalledWith('thread-s1', expect.any(Function));
+  });
+  it('does not type when foreground work ends during ownership verification', async () => {
+    verify.mockImplementationOnce(async () => {
+      sessions[0].working = false;
+      sessions[0].watching = '2 background terminals';
+      return true;
+    });
+    await activity.poll();
+    expect(typing).not.toHaveBeenCalled();
+    expect(rename).toHaveBeenLastCalledWith('thread', '🟡 Working · hs-lab', expect.any(Function));
+  });
   it('moves from foreground to background and waits for settled absence before showing idle', async () => {
     await activity.poll();
     sessions[0].working = false;
     sessions[0].watching = '1 shell';
-    now += 4000;
+    now += 8000;
     await activity.poll();
     expect(rename).toHaveBeenCalledTimes(1);
     expect(rename).toHaveBeenLastCalledWith('thread', '🟡 Working · hs-lab', expect.any(Function));
+    expect(typing).toHaveBeenCalledTimes(1);
     const typed = typing.mock.calls.length;
     sessions[0].watching = null;
     now += 4000;

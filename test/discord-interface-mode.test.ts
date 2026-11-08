@@ -387,7 +387,7 @@ describe('Discord interface mode', () => {
     expect(remoteChannels.get(thread).name).toBe('🟡 Working · w29-buildmesh');
     await b.pollActivity();
     const typing = () => posts.filter((p) => p.path.endsWith('/typing'));
-    expect(typing()).toHaveLength(1);
+    expect(typing()).toHaveLength(0);
     await b.syncSessions();
     expect(remoteChannels.get(thread).name).toBe('🟡 Working · w29-buildmesh');
     b.stop();
@@ -403,7 +403,7 @@ describe('Discord interface mode', () => {
     now += 30000;
     await restarted.pollActivity();
     expect(remoteChannels.get(thread).name).toBe('⚫ Idle · w29-buildmesh');
-    expect(typing()).toHaveLength(2);
+    expect(typing()).toHaveLength(0);
     expect(sendInput).not.toHaveBeenCalled();
   });
 
