@@ -145,11 +145,13 @@ export class DiscordActivity {
         return now - (progress.idleSince ?? now) >= 30_000;
       return progress.renamedAt === undefined || now - progress.renamedAt >= 30_000;
     };
+    // Background terminals and agent waits keep the broad Working status, but do
+    // not imply that this session has a foreground response in progress.
     const needsTyping = () => {
       const s = current();
       return (
         s &&
-        discordActivityWorking(s) &&
+        s.working &&
         !s.waiting &&
         !s.exited &&
         (progress.typingRetryAt ?? 0) <= now &&
@@ -175,7 +177,7 @@ export class DiscordActivity {
       try {
         await this.deps.typing(destination, () => {
           const s = current();
-          return !!s && discordActivityWorking(s) && !s.waiting && !s.exited;
+          return !!s && !!s.working && !s.waiting && !s.exited;
         });
       } catch (error) {
         progress.typingRetryAt = this.deps.now() + retryAfter(error);
