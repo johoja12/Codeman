@@ -212,6 +212,114 @@ afterEach(async () => {
 });
 
 describe('Discord interface mode', () => {
+  it('reads responses while a slow UI refresh is pending and coalesces overlapping refreshes', async () => {
+    sessions = [{ id: 's1', name: 'remote', remote: true }];
+    const b = makeBridge(undefined, {
+      history: async () => ({ conversationId: 'native1', partial: false, turns: [] }),
+    });
+    await b.reload();
+    await b.syncSessions();
+    let release!: () => void;
+    const controls = vi.spyOn(b as any, 'refreshControls').mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        })
+    );
+    const read = vi.spyOn(b as any, 'observeConversation').mockResolvedValue(undefined);
+    const first = b.pollConversations();
+    const second = b.pollConversations();
+    try {
+      // Reads start before the UI promise resolves, and the overlapping tick does not duplicate them.
+      expect(read).toHaveBeenCalledTimes(1);
+      expect(controls).toHaveBeenCalledTimes(1);
+    } finally {
+      release();
+      await Promise.all([first, second]);
+    }
+  });
+
+  it('serves all 27 sessions fairly without exceeding two remote or four local reads', async () => {
+    let now = 100000;
+    sessions = Array.from({ length: 27 }, (_, i) => ({
+      id: `s${i}`,
+      name: `session-${i}`,
+      remote: i < 17,
+    }));
+    const b = makeBridge(undefined, {
+      now: () => now,
+      history: async (id) => ({ conversationId: `native-${id}`, partial: false, turns: [] }),
+    });
+    await b.reload();
+    await b.syncSessions();
+    const active = { remote: 0, local: 0 };
+    const peaks = { remote: 0, local: 0 };
+    const seen = new Set<string>();
+    let release: Array<() => void> = [];
+    vi.spyOn(b as any, 'observeConversation').mockImplementation((id: string) => {
+      const kind = sessions.find((s) => s.id === id)!.remote ? 'remote' : 'local';
+      active[kind]++;
+      peaks[kind] = Math.max(peaks[kind], active[kind]);
+      seen.add(id);
+      return new Promise<void>((resolve) =>
+        release.push(() => {
+          active[kind]--;
+          resolve();
+        })
+      );
+    });
+    for (let tick = 0; tick < 9; tick++) {
+      const poll = b.pollConversations();
+      const overlap = b.pollConversations();
+      expect(active.remote).toBeLessThanOrEqual(2);
+      expect(active.local).toBeLessThanOrEqual(4);
+      const pending = release;
+      release = [];
+      pending.forEach((done) => done());
+      await Promise.all([poll, overlap]);
+      now += 2000;
+    }
+    expect(seen.size).toBe(27);
+    expect(peaks).toEqual({ remote: 2, local: 4 });
+  });
+
+  it('checks idle remote responses after 15 seconds and wakes on foreground start and completion', async () => {
+    let now = 100000;
+    sessions = [{ id: 's1', name: 'remote', remote: true, working: false }];
+    const b = makeBridge(undefined, {
+      now: () => now,
+      history: async () => ({ conversationId: 'native1', partial: false, turns: [] }),
+    });
+    await b.reload();
+    await b.syncSessions();
+    const read = vi.spyOn(b as any, 'observeConversation').mockResolvedValue(undefined);
+    await b.pollConversations();
+    now += 14999;
+    await b.pollConversations();
+    expect(read).toHaveBeenCalledTimes(1);
+    now++;
+    await b.pollConversations();
+    expect(read).toHaveBeenCalledTimes(2);
+    now += 2000;
+    sessions[0].working = true;
+    await b.pollConversations();
+    expect(read).toHaveBeenCalledTimes(3);
+    now += 4999;
+    await b.pollConversations();
+    expect(read).toHaveBeenCalledTimes(3);
+    now++;
+    await b.pollConversations();
+    expect(read).toHaveBeenCalledTimes(4);
+    now += 2000;
+    sessions[0].working = false;
+    await b.pollConversations();
+    expect(read).toHaveBeenCalledTimes(5);
+    b.stop();
+    now += 60000;
+    await b.pollConversations();
+    expect(read).toHaveBeenCalledTimes(5);
+  });
+
   it('keeps unresolved history warnings through journal pruning/restart and edits them after recovery', async () => {
     let readable = false;
     let now = 100000;
