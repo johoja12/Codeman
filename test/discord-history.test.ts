@@ -208,3 +208,79 @@ it('reads a status-confirmed local resumed conversation from its custom home des
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+describe('passive Claude settings metadata', () => {
+  const row = (extra: Record<string, unknown> = {}) => ({
+    type: 'assistant',
+    sessionId: id,
+    timestamp: '2026-11-09T12:00:00Z',
+    message: { model: 'claude-opus-5-5', content: [{ type: 'tool_use', input: 'SECRET' }] },
+    effort: 'high',
+    perTurnEffort: 'medium',
+    ...extra,
+  });
+  it('reads actual model and per-turn effort even when a tool-only record has no visible text', () => {
+    const h = parseDiscordHistory({ mode: 'claude', conversationId: id }, packet([row()]));
+    expect(h.reportedSettings).toMatchObject({
+      model: 'claude-opus-5-5',
+      effort: 'medium',
+      timestamp: '2026-11-09T12:00:00Z',
+    });
+    expect(h.reportedSettings?.cursor).toMatch(new RegExp('^' + id + ':0:[a-f0-9]{16}$'));
+    expect(h.turns).toEqual([]);
+    expect(JSON.stringify(h)).not.toContain('SECRET');
+  });
+  it.each([
+    row({ type: 'user' }),
+    row({ sessionId: other }),
+    row({ sessionId: undefined }),
+    row({ isSidechain: true }),
+    row({ isMeta: true }),
+    row({ isCompactSummary: true }),
+    row({ timestamp: 'invalid' }),
+    row({ message: { model: '<synthetic>' } }),
+    row({ message: { model: 'unsafe\nmodel' } }),
+  ])('ignores invalid, synthetic and foreign metadata', (bad) => {
+    expect(parseDiscordHistory({ mode: 'claude', conversationId: id }, packet([bad])).reportedSettings).toBeUndefined();
+  });
+  it('updates metadata in native order and does not carry effort across an unreported model switch', () => {
+    const h = parseDiscordHistory(
+      { mode: 'claude', conversationId: id },
+      packet([
+        row(),
+        row({
+          timestamp: '2026-11-09T12:01:00Z',
+          effort: undefined,
+          perTurnEffort: undefined,
+          message: { model: 'claude-sonnet-5' },
+        }),
+      ])
+    );
+    expect(h.reportedSettings?.model).toBe('claude-sonnet-5');
+    expect(h.reportedSettings?.effort).toBeUndefined();
+  });
+  it('rejects effort prose and unsupported levels without guessing a default', () => {
+    const h = parseDiscordHistory(
+      { mode: 'claude', conversationId: id },
+      packet([row({ effort: 'high because I said so', perTurnEffort: 42 })])
+    );
+    expect(h.reportedSettings?.model).toBe('claude-opus-5-5');
+    expect(h.reportedSettings?.effort).toBeUndefined();
+  });
+});
+
+it.each(['shell', 'codex'])('does not treat other CLI transcripts as Claude settings (%s)', (mode) => {
+  const h = parseDiscordHistory(
+    { mode: mode as 'shell' | 'codex', conversationId: id },
+    packet([
+      {
+        type: 'assistant',
+        sessionId: id,
+        timestamp: '2026-11-09',
+        effort: 'high',
+        message: { model: 'claude-opus-5-5', content: 'example' },
+      },
+    ])
+  );
+  expect(h.reportedSettings).toBeUndefined();
+});

@@ -45,19 +45,33 @@ const ResponseRef = z
     updated: z.number(),
   })
   .strict();
+const ReportedSettings = z
+  .object({
+    scope: z.string().max(200),
+    session: z.string().max(100),
+    channel: z.string().regex(/^\d{15,25}$/),
+    conversation: z.string().max(200),
+    model: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,95}$/),
+    effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'ultracode']).optional(),
+    cursor: z.string().max(250),
+    at: z.number().finite().nonnegative(),
+  })
+  .strict();
 const State = z
   .object({
     version: z.literal(1),
+    settings: z.record(z.string().max(200), ReportedSettings).default({}),
     cards: z.record(z.string().max(200), Card),
     queue: z.array(Prompt).max(50),
     activities: z.record(z.string().max(200), DiscordActivityRecordSchema).default({}),
     responses: z.record(z.string().max(200), ResponseRef).default({}),
   })
   .strict();
+export type DiscordReportedSettings = z.infer<typeof ReportedSettings>;
 export type DiscordQueuedPrompt = z.infer<typeof Prompt>;
 export type DiscordUiState = z.infer<typeof State>;
 export class DiscordUiStore {
-  private state: DiscordUiState = { version: 1, cards: {}, queue: [], responses: {}, activities: {} };
+  private state: DiscordUiState = { version: 1, cards: {}, queue: [], responses: {}, activities: {}, settings: {} };
   private loaded?: Promise<void>;
   private chain: Promise<unknown> = Promise.resolve();
   constructor(
@@ -80,6 +94,7 @@ export class DiscordUiStore {
         } finally {
           await f.close();
         }
+        if (Object.keys(raw.settings).length > 1024) throw new Error('Too many settings reports');
         if (Object.keys(raw.activities).length > 1024) throw new Error('Too many activity records');
         if (Object.keys(raw.responses).length > 1024) throw new Error('Too many response references');
         if (Object.keys(raw.cards).length > 4096) throw new Error('Too many UI cards');
@@ -96,6 +111,11 @@ export class DiscordUiStore {
     await this.chain;
     return structuredClone(this.state);
   }
+  async reportedSettings(key: string): Promise<DiscordReportedSettings | undefined> {
+    await this.load();
+    await this.chain;
+    return structuredClone(this.state.settings[key]);
+  }
   edit<T>(fn: (state: DiscordUiState) => T): Promise<T> {
     const run = this.chain.then(async () => {
       await this.load();
@@ -111,6 +131,9 @@ export class DiscordUiStore {
       const activities = Object.entries(next.activities).sort((a, b) => b[1].at - a[1].at);
       for (const [key, value] of activities) if (value.at < this.now() - 30 * 86400000) delete next.activities[key];
       for (const [key] of activities.slice(1024)) delete next.activities[key];
+      const settings = Object.entries(next.settings).sort((a, b) => b[1].at - a[1].at);
+      for (const [key, value] of settings) if (value.at < this.now() - 30 * 86400000) delete next.settings[key];
+      for (const [key] of settings.slice(1024)) delete next.settings[key];
       State.parse(next);
       if (Object.keys(next.cards).length > 4096) throw new Error('UI card capacity reached');
       await fs.mkdir(this.dir, { recursive: true });

@@ -23,7 +23,9 @@ interface NativeHistoryRow {
   isSidechain?: boolean;
   isMeta?: boolean;
   isCompactSummary?: boolean;
-  message?: { content?: unknown; stop_reason?: string };
+  message?: { content?: unknown; stop_reason?: string; model?: unknown };
+  effort?: unknown;
+  perTurnEffort?: unknown;
   payload?: {
     thread_id?: string;
     type?: string;
@@ -89,9 +91,11 @@ export interface DiscordGeneratedImage {
   cursor: string;
   timestamp: string;
 }
+export type DiscordReportedEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | 'ultracode';
 export interface DiscordHistory {
   conversationId: string;
   turns: DiscordHistoryTurn[];
+  reportedSettings?: { model: string; effort?: DiscordReportedEffort; cursor: string; timestamp: string };
   generatedImages?: DiscordGeneratedImage[];
   partial: boolean;
   executions?: DiscordNativeExecution[];
@@ -336,6 +340,7 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
     offset += Buffer.byteLength(line) + 1;
   }
   const turns: DiscordHistoryTurn[] = [];
+  let reportedSettings: DiscordHistory['reportedSettings'];
   const generatedImages: DiscordGeneratedImage[] = [];
   const addImage = (image: DiscordGeneratedImage) => {
     if (
@@ -431,6 +436,28 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
     } else {
       if (e.isSidechain || e.isMeta || e.isCompactSummary || (e.sessionId && e.sessionId !== source.conversationId))
         continue;
+      // Native metadata only; transcript prose, synthetic replies and other sessions cannot report settings.
+      const model = e.message?.model;
+      if (
+        format === 'claude-jsonl' &&
+        !!source.conversationId &&
+        UUID.test(source.conversationId) &&
+        e.type === 'assistant' &&
+        e.sessionId === source.conversationId &&
+        typeof model === 'string' &&
+        /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,95}$/.test(model) &&
+        Number.isFinite(Date.parse(timestamp))
+      ) {
+        const validEffort = (v: unknown): v is DiscordReportedEffort =>
+          typeof v === 'string' && /^(low|medium|high|xhigh|max|ultra|ultracode)$/.test(v);
+        const effort = validEffort(e.perTurnEffort) ? e.perTurnEffort : validEffort(e.effort) ? e.effort : undefined;
+        reportedSettings = {
+          model,
+          ...(effort ? { effort } : {}),
+          timestamp,
+          cursor: `${source.conversationId}:${offset}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`,
+        };
+      }
       let body = e.message?.content;
       if (
         e.type === 'attachment' &&
@@ -497,6 +524,7 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
   return {
     conversationId: source.conversationId!,
     turns,
+    ...(reportedSettings ? { reportedSettings } : {}),
     ...(generatedImages.length ? { generatedImages } : {}),
     partial: packet.partial === true,
     executions,

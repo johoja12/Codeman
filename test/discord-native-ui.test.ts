@@ -1804,3 +1804,132 @@ it('attributes neutral prompt activity to verified history without changing the 
   );
   expect(f.sessions[0].conversation).toBe('conversation-one');
 });
+
+const settingsHistory = (
+  model = 'claude-opus-5-5',
+  effort: 'low' | 'medium' | 'high' | undefined = 'medium',
+  at = 990000
+) => ({
+  conversationId: 'conversation-one',
+  partial: false,
+  turns: [],
+  reportedSettings: {
+    model,
+    ...(effort ? { effort } : {}),
+    cursor: `conversation-one:${at}:aaaaaaaaaaaaaaaa`,
+    timestamp: new Date(at).toISOString(),
+  },
+});
+it('shows passive Claude model/effort with last-reported labels across input and restart', async () => {
+  const f = await fixture();
+  Object.assign(f.sessions[0], { mode: 'claude', model: undefined });
+  await f.ui.observeHistory('s1', settingsHistory());
+  await f.ui.poll();
+  expect(f.findCard().content).toContain('claude-opus-5-5 (last reported)');
+  expect(f.findCard().content).toContain('medium (last reported)');
+  Object.assign(f.sessions[0], { inputRevision: 'new-input' });
+  f.advance(1000);
+  await f.ui.poll();
+  expect(f.findCard().content).toContain('medium (last reported)');
+  const settings = await f.click(f.findCard(), 'Settings');
+  expect(settings.content).toContain('claude-opus-5-5 (last reported)');
+  const restored = new DiscordNativeUi(f.host);
+  await restored.poll();
+  expect(f.findCard().content).toContain('medium (last reported)');
+  expect(f.host.control).not.toHaveBeenCalled();
+  expect(f.host.submit).not.toHaveBeenCalled();
+});
+it('prefers fresh reports to launch defaults and current native settings to historical metadata', async () => {
+  const f = await fixture();
+  Object.assign(f.sessions[0], { mode: 'claude', model: 'Old launch model', modelSource: 'launch' });
+  await f.ui.observeHistory('s1', settingsHistory());
+  await f.ui.poll();
+  expect(f.findCard().content).toContain('claude-opus-5-5 (last reported)');
+  Object.assign(f.sessions[0], {
+    model: 'Current picker model (native verified)',
+    modelSource: 'native-verified',
+    effort: 'high (native verified)',
+  });
+  await f.ui.poll();
+  expect(f.findCard().content).toContain('Current picker model (native verified)');
+  expect(f.findCard().content).toContain('high (native verified)');
+  expect(f.findCard().content).not.toContain('medium (last reported)');
+});
+it('refreshes passive settings without waiting for token rotation and rejects older metadata', async () => {
+  const f = await fixture();
+  Object.assign(f.sessions[0], { mode: 'claude', model: undefined });
+  await f.ui.observeHistory('s1', settingsHistory());
+  await f.ui.poll();
+  await f.ui.observeHistory('s1', settingsHistory('claude-sonnet-5', 'low', 995000));
+  await f.ui.poll();
+  expect(f.findCard().content).toContain('claude-sonnet-5 (last reported)');
+  expect(f.findCard().content).toContain('low (last reported)');
+  await f.ui.observeHistory('s1', settingsHistory());
+  await f.ui.poll();
+  expect(f.findCard().content).toContain('claude-sonnet-5 (last reported)');
+  expect(Object.values((await f.ui.store.snapshot()).settings)[0].at).toBe(995000);
+});
+it.each(['conversation', 'mode', 'future', 'expired', 'cursor'])(
+  'does not show mismatched or invalid settings (%s)',
+  async (change) => {
+    const f = await fixture();
+    Object.assign(f.sessions[0], { mode: 'claude', model: undefined });
+    const h = settingsHistory();
+    if (change === 'future') h.reportedSettings.timestamp = new Date(2000000).toISOString();
+    if (change === 'expired') h.reportedSettings.timestamp = new Date(-30 * 86400000).toISOString();
+    if (change === 'cursor') h.reportedSettings.cursor = 'unrelated:42:aaaaaaaaaaaaaaaa';
+    await f.ui.observeHistory('s1', h);
+    if (change === 'conversation') f.sessions[0].conversation = 'different';
+    if (change === 'mode') f.sessions[0].mode = 'codex';
+    await f.ui.poll();
+    expect(f.findCard().content).not.toContain('claude-opus-5-5');
+    expect(f.findCard().content).not.toContain('medium (last reported)');
+  }
+);
+it('loads pre-feature UI state without settings and isolates narrow metadata reads', async () => {
+  const f = await fixture();
+  await writeFile(
+    join(f.dir, 'discord-native-ui.json'),
+    JSON.stringify({ version: 1, cards: {}, queue: [], activities: {}, responses: {} })
+  );
+  const store = new DiscordUiStore(f.dir);
+  expect((await store.snapshot()).settings).toEqual({});
+  await store.edit((state) => {
+    state.settings.example = {
+      scope: 's',
+      session: 's1',
+      channel,
+      conversation: 'c',
+      model: 'claude-opus-5-5',
+      effort: 'medium',
+      cursor: 'c:0:aaaaaaaaaaaaaaaa',
+      at: Date.now(),
+    };
+  });
+  const saved = await store.reportedSettings('example');
+  saved!.model = 'mutated';
+  expect((await store.reportedSettings('example'))!.model).toBe('claude-opus-5-5');
+});
+
+it.each(['scope', 'channel'])('keeps last-reported settings within the owned %s', async (change) => {
+  const f = await fixture();
+  Object.assign(f.sessions[0], { mode: 'claude', model: undefined });
+  await f.ui.observeHistory('s1', settingsHistory());
+  if (change === 'scope') f.setScope('new-scope');
+  else f.host.channelForSession = () => parent;
+  const view = await f.command('codeman');
+  expect(activityBody(view)).not.toContain('claude-opus-5-5');
+  const settings = await (f.ui as any).settings({ channel_id: change === 'channel' ? parent : channel }, 's1');
+  expect(settings.content).not.toContain('medium (last reported)');
+});
+it('does not retain a previous model effort when the new model omits it', async () => {
+  const f = await fixture();
+  Object.assign(f.sessions[0], { mode: 'claude', model: undefined });
+  await f.ui.observeHistory('s1', settingsHistory());
+  const changed = settingsHistory('claude-sonnet-5', 'low', 995000);
+  delete changed.reportedSettings.effort;
+  await f.ui.observeHistory('s1', changed);
+  await f.ui.poll();
+  expect(f.findCard().content).toContain('claude-sonnet-5 (last reported)');
+  expect(f.findCard().content).toContain('**Effort:** Not reported');
+});

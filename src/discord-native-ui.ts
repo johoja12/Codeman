@@ -1,3 +1,4 @@
+import { getCli } from './config/cli-registry/registry.js';
 /** Native Discord controls. Tokens bind actor, origin, configuration and exact conversation. */
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -282,7 +283,42 @@ export class DiscordNativeUi {
       await this.host.request('PUT', `/channels/${channel}/messages/pins/${message}`).catch(() => undefined);
     }
   }
+  private settingsKey(id: string, conversation: string): string {
+    return hash(JSON.stringify([this.host.scope(), this.host.channelForSession(id), id, conversation]));
+  }
+  private async reportedSettingsFor(s: DiscordUiSession): Promise<{ model?: string; effort?: string }> {
+    if (getCli(s.mode)?.capabilities.transcript !== 'claude-jsonl') return { model: s.model, effort: s.effort };
+    const scope = this.host.scope(),
+      channel = this.host.channelForSession(s.id);
+    const conversation = s.activityConversation ?? s.conversation;
+    const known =
+      scope && channel && conversation
+        ? await this.store.reportedSettings(this.settingsKey(s.id, conversation))
+        : undefined;
+    const valid =
+      known &&
+      known.scope === scope &&
+      known.session === s.id &&
+      !!channel &&
+      this.host.sessionForChannel(channel) === s.id &&
+      known.channel === channel &&
+      known.conversation === conversation &&
+      known.at >= this.host.now() - 30 * 86400000 &&
+      known.at <= this.host.now() &&
+      this.host.scope() === scope &&
+      this.host.channelForSession(s.id) === channel;
+    return {
+      model:
+        s.model && s.modelSource !== 'launch' && s.modelSource !== 'config'
+          ? s.model
+          : valid
+            ? known.model + ' (last reported)'
+            : s.model,
+      effort: s.effort ?? (valid && known.effort ? known.effort + ' (last reported)' : undefined),
+    };
+  }
   private async sessionCard(s: DiscordUiSession): Promise<DiscordUiPayload> {
+    const settings = await this.reportedSettingsFor(s);
     const ctx: UiContext = { channel: this.host.channelForSession(s.id)!, session: s.id, conversation: s.conversation };
     const q = (await this.store.snapshot()).queue.filter(
       (p) => p.session === s.id && p.channel === this.host.channelForSession(s.id)
@@ -404,7 +440,7 @@ export class DiscordNativeUi {
       controls[1].components.push({ type: 2, style: 5, label: 'Open Codeman', url: s.url });
     const task = this.host.latestPrompt?.(s.id, s.conversation) ?? '';
     return this.payload(
-      `**${safe(s.caseName)} · ${safe(s.host)}**\n${status} · ${safe(s.mode)}\n${suggestion ? '\n**Claude suggests:** ' + safe(suggestion, 600) + '\n' : ''}\n**Model:** ${safe(s.model || 'Not reported')}\n**Effort:** ${safe(s.effort || 'Not reported')}\n**Launch approvals:** ${safe(s.approval || 'CLI default / not reported')}\n**Conversation:** ${safe(s.conversation || 'Not yet identified')}\n${task ? '\n**Latest prompt:** ' + safe(task, 240) + '\n' : ''}${last ? '\n**Latest delivery:** ' + (stateLabels[last.state] ?? safe(last.state)) : ''}${q.some((p) => p.state === 'uncertain') ? '\n⚠ A queued submission is unconfirmed; it will not replay.' : ''}`,
+      `**${safe(s.caseName)} · ${safe(s.host)}**\n${status} · ${safe(s.mode)}\n${suggestion ? '\n**Claude suggests:** ' + safe(suggestion, 600) + '\n' : ''}\n**Model:** ${safe(settings.model || 'Not reported')}\n**Effort:** ${safe(settings.effort || 'Not reported')}\n**Launch approvals:** ${safe(s.approval || 'CLI default / not reported')}\n**Conversation:** ${safe(s.conversation || 'Not yet identified')}\n${task ? '\n**Latest prompt:** ' + safe(task, 240) + '\n' : ''}${last ? '\n**Latest delivery:** ' + (stateLabels[last.state] ?? safe(last.state)) : ''}${q.some((p) => p.state === 'uncertain') ? '\n⚠ A queued submission is unconfirmed; it will not replay.' : ''}`,
       controls
     );
   }
@@ -1224,8 +1260,9 @@ export class DiscordNativeUi {
   private async settings(m: DiscordInteraction, id: string): Promise<DiscordUiPayload> {
     const s = await this.target(id),
       ctx = this.ctx(m, s);
+    const settings = await this.reportedSettingsFor(s);
     return this.payload(
-      `**Settings · ${safe(s.name)}**\nReported model: ${safe(s.model || 'unknown')}\nReported effort: ${safe(s.effort || 'unknown')}\nLaunch approvals: ${safe(s.approval || 'CLI default')}\n\nSession changes use the provider’s native controls and preserve the conversation. Approval changes apply to future launches; this process is never restarted silently.`,
+      `**Settings · ${safe(s.name)}**\nReported model: ${safe(settings.model || 'unknown')}\nReported effort: ${safe(settings.effort || 'unknown')}\nLaunch approvals: ${safe(s.approval || 'CLI default')}\n\nSession changes use the provider’s native controls and preserve the conversation. Approval changes apply to future launches; this process is never restarted silently.`,
       [
         row(
           this.action(ctx, 'Model', (x) => this.nativeChoices(x, id, 'model')),
@@ -1749,8 +1786,49 @@ export class DiscordNativeUi {
   private activityKey(id: string): string {
     return hash(JSON.stringify([this.host.scope(), this.host.channelForSession(id), id]));
   }
+  private async observeReportedSettings(id: string, history: DiscordHistory): Promise<void> {
+    const report = history.reportedSettings,
+      scope = this.host.scope(),
+      channel = this.host.channelForSession(id);
+    if (!report || !scope || !channel || this.host.sessionForChannel(channel) !== id) return;
+    const at = Date.parse(report.timestamp);
+    if (!Number.isFinite(at) || at < this.host.now() - 30 * 86400000 || at > this.host.now()) return;
+    if (
+      !report.cursor.startsWith(history.conversationId + ':') ||
+      !/^[0-9]{1,16}:[a-f0-9]{16}$/.test(report.cursor.slice(history.conversationId.length + 1)) ||
+      !Number.isSafeInteger(Number(report.cursor.split(':')[1]))
+    )
+      return;
+    const key = this.settingsKey(id, history.conversationId),
+      old = await this.store.reportedSettings(key);
+    if (old && (old.at > at || (old.at === at && old.cursor === report.cursor))) return;
+    let changed = false;
+    await this.store.edit((state) => {
+      if (
+        this.host.scope() !== scope ||
+        this.host.channelForSession(id) !== channel ||
+        this.host.sessionForChannel(channel) !== id
+      )
+        return;
+      const prior = state.settings[key];
+      if (prior && prior.at >= at) return;
+      state.settings[key] = {
+        scope,
+        session: id,
+        channel,
+        conversation: history.conversationId,
+        model: report.model,
+        ...(report.effort ? { effort: report.effort } : {}),
+        cursor: report.cursor,
+        at,
+      };
+      changed = !prior || prior.model !== report.model || prior.effort !== report.effort;
+    });
+    if (changed) this.cardActions.delete('session:' + id + ':signature');
+  }
   /** The event time comes from native evidence, never from a dashboard refresh. */
   async observeHistory(id: string, history: DiscordHistory): Promise<void> {
+    await this.observeReportedSettings(id, history);
     const event = activityFromHistory(history, this.host.now());
     if (!event || event.at < this.host.now() - 30 * 86400000) return;
     const scope = this.host.scope(),
