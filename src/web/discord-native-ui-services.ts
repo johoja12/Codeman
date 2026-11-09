@@ -25,6 +25,7 @@ interface Deps {
   allowed(): boolean;
   url(): string | undefined;
   capture?(id: string): string | null | undefined | Promise<string | null | undefined>;
+  activityConversation?(session: Session): string | undefined;
   questionObserved?(item: ApprovalItem): boolean | void | Promise<boolean | void>;
   observed?(id: string): { model: string; effort?: string } | undefined;
 }
@@ -189,6 +190,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
                   : !c.remote && c.path === s.workingDir
               )?.name || 'Unlinked workspace',
             conversation: conversationFor(s),
+            activityConversation: deps.activityConversation?.(s),
             inputRevision: s.discordQueueRevision,
             working: working(s),
             promptSuggestion,

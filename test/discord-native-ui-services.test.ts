@@ -178,3 +178,25 @@ it('excludes notification-suppressed sessions before inspecting their screen or 
   expect(await services.sessions()).toEqual([]);
   expect(capture).not.toHaveBeenCalled();
 });
+
+it('keeps canonical activity identity separate from action/input conversation identity', async () => {
+  const s = {
+    id: 's',
+    name: 'Brain',
+    mode: 'codex',
+    nativeResumeId: 'configured',
+    workingDir: '/tmp',
+  } as unknown as Session;
+  const services = createDiscordNativeUiServices({
+    sessions: () => new Map([['s', s]]),
+    cases: async () => [],
+    allowed: () => true,
+    url: () => undefined,
+    activityConversation: () => 'verified-current',
+  });
+  expect((await services.sessions())[0]).toMatchObject({
+    conversation: 'configured',
+    activityConversation: 'verified-current',
+  });
+  expect(s.nativeResumeId).toBe('configured');
+});

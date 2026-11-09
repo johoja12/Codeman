@@ -1767,3 +1767,40 @@ it('retains table navigation and exports when the ordinary response footer is em
   expect(labels).not.toContain('Results & files');
   expect(labels).not.toContain('Open in Codeman');
 });
+
+it('shows a verified canonical reply despite stale configured resume metadata, without accepting unrelated activity', async () => {
+  const f = await fixture();
+  await f.ui.observeHistory('s1', {
+    conversationId: 'verified-current',
+    partial: false,
+    turns: [
+      {
+        role: 'assistant',
+        cursor: 'reply',
+        phase: 'final_answer',
+        timestamp: new Date(990000).toISOString(),
+        text: 'Current verified reply.',
+      },
+    ],
+  });
+  expect(activityBody(await f.command('codeman'))).not.toContain('Current verified reply.');
+  Object.assign(f.sessions[0], { activityConversation: 'verified-current' });
+  const shown = activityBody(await f.command('codeman'));
+  expect(shown).toContain('Current verified reply.');
+  expect(shown).toContain('<t:990:R>');
+  expect(f.sessions[0].conversation).toBe('conversation-one');
+  f.advance(30000);
+  expect(activityBody(await f.command('codeman'))).toContain('<t:990:R>');
+  Object.assign(f.sessions[0], { activityConversation: 'unrelated' });
+  expect(activityBody(await f.command('codeman'))).not.toContain('Current verified reply.');
+});
+it('attributes neutral prompt activity to verified history without changing the control identity', async () => {
+  const f = await fixture();
+  Object.assign(f.sessions[0], { activityConversation: 'verified-current', lastPromptAt: 990000 });
+  await f.command('codeman');
+  const records = Object.values((await f.ui.store.snapshot()).activities);
+  expect(records).toEqual(
+    expect.arrayContaining([expect.objectContaining({ conversation: 'verified-current', kind: 'prompt', at: 990000 })])
+  );
+  expect(f.sessions[0].conversation).toBe('conversation-one');
+});
