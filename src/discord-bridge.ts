@@ -1043,7 +1043,8 @@ export class DiscordBridge {
   private readonly activity: DiscordActivity;
   private activityBot?: Promise<string | undefined>;
   private outputReads = new Map<string, { remote: boolean; run: Promise<void> }>();
-  private outputIndex = 0;
+  private uiRefresh?: Promise<void>;
+  private outputWorking = new Map<string, boolean>();
   private actions = new Map<string, DiscordBoundAction>();
   private nativeUi?: DiscordNativeUi;
   private uiPrompts = new Map<string, { conversation: string; text: string }>();
@@ -1554,23 +1555,47 @@ export class DiscordBridge {
     return run;
   }
 
-  /** Bounded round-robin polling: only native text, never redraw/scrollback snapshots. */
+  /** Coalesce slow UI requests independently of native response reads. */
+  private refreshConversationUi(): Promise<void> {
+    if (this.uiRefresh) return this.uiRefresh;
+    const run = (async () => {
+      await this.profiler.measure('ui.controls', () => this.refreshControls());
+      await this.profiler.measure('ui.poll', async () => this.nativeUi?.poll());
+    })()
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.uiRefresh === run) this.uiRefresh = undefined;
+      });
+    this.uiRefresh = run;
+    return run;
+  }
+
+  /** Oldest-due-first polling: only native text, never redraw/scrollback snapshots. */
   async pollConversations(): Promise<void> {
     return this.profiler.measure('poll.conversations', () => this.pollConversationsNow());
   }
   private async pollConversationsNow(): Promise<void> {
     if (this.stopped || this.held || !this.cfg.enabled || this.cfg.mode !== 'full' || !this.deps.history) return;
-    await this.profiler.measure('ui.controls', () => this.refreshControls());
-    await this.profiler.measure('ui.poll', async () => this.nativeUi?.poll()).catch(() => undefined);
+    const ui = this.refreshConversationUi();
     const sessions = this.deps.sessions?.() ?? [];
-    if (!sessions.length) return;
-    const batch = Array.from(
-      { length: Math.min(8, sessions.length) },
-      (_, i) => sessions[(this.outputIndex + i) % sessions.length]
-    );
-    this.outputIndex = (this.outputIndex + batch.length) % sessions.length;
-    const reads: Promise<void>[] = [];
-    for (const session of batch) {
+    const live = new Set(sessions.map((session) => session.id));
+    for (const id of this.outputWorking.keys()) {
+      if (!live.has(id)) {
+        this.outputWorking.delete(id);
+        this.outputDue.delete(id);
+      }
+    }
+    for (const session of sessions) {
+      const working = !!session.working;
+      const previous = this.outputWorking.get(session.id);
+      // A newly submitted turn or completion should not wait out an idle polling interval.
+      if (previous !== undefined && previous !== working)
+        this.outputDue.set(session.id, Math.min(this.outputDue.get(session.id) ?? 0, this.now()));
+      this.outputWorking.set(session.id, working);
+    }
+    const due = [...sessions].sort((a, b) => (this.outputDue.get(a.id) ?? 0) - (this.outputDue.get(b.id) ?? 0));
+    const reads: Promise<void>[] = [ui];
+    for (const session of due) {
       if (this.outputReads.has(session.id)) {
         this.profiler.count('poll.inFlight');
         continue;
@@ -1591,7 +1616,7 @@ export class DiscordBridge {
       }
       this.outputDue.set(
         session.id,
-        this.now() + (remote ? (session.working ? 10000 : 60000) : session.working ? 3000 : 15000)
+        this.now() + (remote ? (session.working ? 5000 : 15000) : session.working ? 2000 : 5000)
       );
       const run = this.observeConversation(session.id, channel)
         .catch((error) => {
@@ -2309,7 +2334,7 @@ export class DiscordBridge {
       void this.syncSessions().catch(() => undefined);
     }
     if (want && this.cfg.mode === 'full' && this.deps.history && !this.outputTimer) {
-      this.outputTimer = setInterval(() => void this.pollConversations().catch(() => undefined), 5000);
+      this.outputTimer = setInterval(() => void this.pollConversations().catch(() => undefined), 2000);
       this.outputTimer.unref();
     } else if (!want || this.cfg.mode !== 'full') {
       clearInterval(this.outputTimer);
@@ -2388,6 +2413,7 @@ export class DiscordBridge {
     this.unavailableNotices.clear();
     this.historyWarningsChecked.clear();
     this.syncQueued = false;
+    this.outputWorking.clear();
     clearInterval(this.outputTimer);
     this.outputTimer = undefined;
     clearInterval(this.sweepTimer);
@@ -2864,6 +2890,7 @@ export class DiscordBridge {
     for (const key of this.unavailableNotices) if (key.startsWith(sessionId + ':')) this.unavailableNotices.delete(key);
     this.activity.forget(sessionId);
     this.outputDue.delete(sessionId);
+    this.outputWorking.delete(sessionId);
     this.lastReply.delete(sessionId);
     this.names.delete(sessionId);
     this.lastFull.delete(sessionId);
