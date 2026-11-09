@@ -16,7 +16,7 @@ export function parseClaudeVisibleQuestion(raw: string): ClaudeVisibleQuestion |
   if (!frame) return undefined;
   const lines = frame.split('\n');
   const footer = lines.findIndex((line) =>
-    /^\s*Enter to select\s*·\s*↑\/↓ to navigate\s*·\s*Esc to cancel\s*$/.test(line)
+    /^\s*Enter to select\s*·\s*(?:↑\/↓|Tab\/Arrow keys) to navigate\s*·\s*Esc to cancel\s*$/.test(line)
   );
   if (footer < 0 || lines.slice(footer + 1).some((line) => line.trim())) return undefined;
   const options = [...frame.matchAll(/^\s*[❯>]?\s*(\d+)\.\s+(?:(\[[ xX✓✔]\])\s+)?(.+)$/gm)];
