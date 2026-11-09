@@ -7,6 +7,7 @@ import { applyDiscordLaunchDefaults } from './discord-launch-defaults.js';
 import { activeSessionRecoveryActions } from './session-recovery-service.js';
 import { isRecoveryDismissed } from '../session-recovery-fence.js';
 import { discordTaskControl, discordControlCurrent } from '../discord-task-controls.js';
+import { DiscordActivityIdentities } from '../discord-activity-identity.js';
 import { readDiscordCanonicalHistory } from '../discord-history-recovery.js';
 import { discordHistoryControl, readDiscordSessionGeneratedImage } from '../discord-history.js';
 import { readDiscordSessionFile, writeDiscordRemoteAttachment } from '../discord-file-transfers.js';
@@ -816,8 +817,10 @@ export class WebServer extends EventEmitter {
         : undefined;
     },
   });
+  private readonly discordActivityIdentities = new DiscordActivityIdentities();
   private discordBridge: DiscordBridge = new DiscordBridge({
     nativeUi: createDiscordNativeUiServices({
+      activityConversation: (session) => this.discordActivityIdentities.get(session),
       // Visible-pane fallback: remote Claude questions and hook confirmations must reach Discord.
       questionObserved: async (item) => {
         if (this.sessions.get(item.sessionId)?.suppressNotifications) return true;
@@ -4413,17 +4416,25 @@ export class WebServer extends EventEmitter {
    */
   private async discordCanonicalHistory(session: Session, options?: { includeTools?: boolean; after?: string }) {
     const before = session.nativeResumeId;
-    const history = await readDiscordCanonicalHistory(
-      session,
-      options,
-      () =>
-        !isMultiUserMode() &&
-        this.discordBridge.acceptsControls &&
-        this.sessions.get(session.id) === session &&
-        !approvalInbox.listPending().some((item) => item.sessionId === session.id && item.kind !== 'idle')
-    );
-    if (session.nativeResumeId !== before) this._persistSessionStateNow(session);
-    return history;
+    const scope = this.discordActivityIdentities.scope(session);
+    try {
+      const history = await readDiscordCanonicalHistory(
+        session,
+        options,
+        () =>
+          !isMultiUserMode() &&
+          this.discordBridge.acceptsControls &&
+          this.sessions.get(session.id) === session &&
+          !approvalInbox.listPending().some((item) => item.sessionId === session.id && item.kind !== 'idle')
+      );
+      if (session.nativeResumeId !== before) this._persistSessionStateNow(session);
+      if (this.sessions.get(session.id) === session)
+        this.discordActivityIdentities.remember(session, scope, history.conversationId);
+      return history;
+    } catch (error) {
+      this.discordActivityIdentities.forget(session);
+      throw error;
+    }
   }
 
   private async discordFullText(session: Session): Promise<{ text: string; version?: string } | undefined> {

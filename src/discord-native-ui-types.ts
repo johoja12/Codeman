@@ -14,6 +14,8 @@ export interface DiscordUiSession {
   host: string;
   caseName: string;
   conversation?: string;
+  /** Canonical history identity for activity display only, never action authority. */
+  activityConversation?: string;
   inputRevision?: string;
   working: boolean;
   pending: boolean;

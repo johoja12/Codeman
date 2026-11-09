@@ -1777,12 +1777,13 @@ export class DiscordNativeUi {
     for (const s of sessions) {
       const channel = this.host.channelForSession(s.id);
       if (!channel) continue;
+      const conversation = s.activityConversation ?? s.conversation ?? '';
       const key = this.activityKey(s.id),
         old = snapshot.activities[key];
       let event: DiscordActivityEvent | undefined;
       if (s.lastPromptAt && s.lastPromptAt <= this.host.now())
         event = {
-          conversation: s.conversation ?? '',
+          conversation,
           kind: 'prompt',
           cursor: 'prompt:' + s.lastPromptAt,
           at: s.lastPromptAt,
@@ -1791,11 +1792,11 @@ export class DiscordNativeUi {
       if (s.pending) {
         const cursor = 'question:' + (s.pendingRevision ?? 'observed');
         const at =
-          old?.kind === 'question' && old.cursor === cursor && old.conversation === (s.conversation ?? '')
+          old?.kind === 'question' && old.cursor === cursor && old.conversation === conversation
             ? old.at
             : (s.pendingAt ?? this.host.now());
         const question: DiscordActivityEvent = {
-          conversation: s.conversation ?? '',
+          conversation,
           kind: 'question',
           cursor,
           at: Math.min(at, this.host.now()),
@@ -1834,10 +1835,11 @@ export class DiscordNativeUi {
     const entries = all
       .map((s) => {
         const record = stored[this.activityKey(s.id)];
+        const conversation = s.activityConversation ?? s.conversation;
         const activity =
           record?.scope === scope &&
           record.channel === this.host.channelForSession(s.id) &&
-          (!s.conversation || record.conversation === s.conversation)
+          (!conversation || record.conversation === conversation)
             ? record
             : undefined;
         const finished =
