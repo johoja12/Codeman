@@ -1,6 +1,7 @@
 import { describe, expect, it, beforeEach, vi } from 'vitest';
 import {
   claudeVisibleQuestion,
+  parseClaudeVisibleQuestion,
   claudeQuestionGone,
   parseClaudeHookConfirmation,
 } from '../src/web/claude-visible-question.js';
@@ -340,4 +341,62 @@ describe('visible Claude hook confirmation', () => {
       expect(approvalInbox.listPending()).toEqual([]);
     }
   );
+});
+
+const tabbedQuestion = `←  ☒ Benchmark  ☐ Alt model  ✔ Submit  →
+
+│ Which alternative model should the benchmark use?
+
+❯ 1. Pick a certified one
+     Use an already certified staging model.
+  2. Skip the comparison for now
+     Run only the baseline after the fixes land.
+  3. Type something.
+─────────────────────────────
+  4. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+`;
+it('recognizes the tab-navigation footer in a complete live question, including ANSI-positioned captures', () => {
+  const q = parseClaudeVisibleQuestion(tabbedQuestion)!;
+  expect(q.question).toBe('Which alternative model should the benchmark use?');
+  expect(q.choices).toEqual([
+    { n: 1, label: 'Pick a certified one' },
+    { n: 2, label: 'Skip the comparison for now' },
+  ]);
+  expect(q.multiSelect).toBe(false);
+  const ansi = tabbedQuestion
+    .split('\n')
+    .map((line, i) => `\x1b[${i + 1};1H\x1b[32m${line}\x1b[0m`)
+    .join('');
+  expect(parseClaudeVisibleQuestion(ansi)).toEqual(q);
+  expect(parseClaudeVisibleQuestion(tabbedQuestion.replace('Tab/Arrow keys', '↑/↓'))).toEqual(q);
+});
+it('forwards a tabbed question once and retains terminal-only handling without an input lease', async () => {
+  const f = fixture();
+  f.capture(() => tabbedQuestion);
+  expect((await f.services.sessions())[0].pending).toBe(true);
+  const q = f.services.question('s')!;
+  expect(q.text).toContain('Which alternative model should the benchmark use?');
+  expect(q.terminalOnly).toBe(true);
+  await expect(f.services.answer('s', q.id, q.revision, '1')).rejects.toThrow();
+  await f.services.sessions();
+  expect(f.notify).toHaveBeenCalledTimes(1);
+});
+it('keeps tab-navigation checkbox questions terminal-only', async () => {
+  const f = fixture();
+  f.capture(() => frame.replace('↑/↓', 'Tab/Arrow keys'));
+  expect((await f.services.sessions())[0].pending).toBe(true);
+  expect(f.services.question('s')!.terminalOnly).toBe(true);
+});
+it.each([
+  tabbedQuestion.replace('Tab/Arrow keys', 'Anything'),
+  tabbedQuestion.replace('Enter to select', 'Enter to confirm'),
+  tabbedQuestion.replace('4. Chat about this', '4. Other prose'),
+  tabbedQuestion.replace('❯ 1.', '  1.'),
+  tabbedQuestion.replace('2. Skip', '7. Skip'),
+  tabbedQuestion + '❯ composer\n────',
+  '\x60\x60\x60\n' + tabbedQuestion + '\x60\x60\x60',
+])('rejects incomplete or prose lookalikes with the tab-navigation footer', (value) => {
+  expect(parseClaudeVisibleQuestion(value)).toBeUndefined();
 });
