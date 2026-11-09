@@ -80,7 +80,7 @@ Discord for them; only the agent-initiated `codeman notify` habit is missing.
   `[attached: <path>]`. At most 5 files of 8 MB each. The folder ignores itself, so nothing in it is committed.
 - **Agent to you:** `codeman notify "message" --file <path>` uploads a file of at most 8 MB that lies
   inside the tab's folder. Credential files such as `.env` are refused.
-- Remote (ssh) tabs have no local folder, so they neither send nor receive files.
+- Linked SSH tabs support file transfers in Full mode using their remote workspace.
 - A file you send is untrusted content to the agent that opens it.
 
 ## Safety
@@ -121,5 +121,7 @@ New prompts receive visible delivery receipts. Received, input delivered, native
 Model/effort menus change the current supported Claude/Codex conversation through verified native controls. Future Codex defaults are edited separately. Changing an approval launch flag never silently restarts a running session. Questions use exact prompt-bound choice menus or supported idle-response forms; dialogs Codeman cannot verify must still be answered in the terminal.
 
 Results show observed native execution and provide guarded local/SSH file downloads, diff snapshots and execution receipts. A shared-workspace snapshot is not claimed as this task's changes, and tests/merge/deployment are not inferred from conversational text.
+
+Generated files outside the session folder offer **Review <filename>**, followed by a private **Allow this file** confirmation showing the host and full path. The one-use approval attaches that file to the original response without granting folder access. Other attachments are retained; credential blocks and the four-file / 8 MB response limits remain. Controls expire after six minutes or a restart. Use `!codeman file /absolute/path` to reopen a review for an older output.
 
 A message's **Apps** menu offers **Codeman: Send to session**, **Codeman: Queue follow-up** and **Codeman: Start session**. Review the explicit destination, source text and attachments before confirming. Creating a session and submitting the selected source are separate choices. All controls use the configured allowlist and private destinations; Notifications mode retains its existing behavior.

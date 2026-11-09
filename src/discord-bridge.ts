@@ -48,7 +48,12 @@ import { existsSync, mkdirSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
-import { boundedDiscordDownload, DISCORD_FILE_LIMIT } from './discord-file-transfers.js';
+import {
+  boundedDiscordDownload,
+  DISCORD_FILE_LIMIT,
+  DiscordFileOutsideWorkspace,
+  type DiscordFileApproval,
+} from './discord-file-transfers.js';
 import { probePathKind } from './utils/bounded-path-probe.js';
 import { DISCORD_RECEIVED_DIR } from './web/paste-image-gc.js';
 import WebSocket from 'ws';
@@ -624,9 +629,10 @@ export class DiscordApi {
     id: string,
     p: DiscordPost,
     files: DiscordFile[],
-    current?: () => boolean
+    current?: () => boolean,
+    retained: Array<{ id: string; filename: string }> = []
   ): Promise<{ id: string } | null> {
-    return this.writeWithFiles('PATCH', channelId, id, p, files, current);
+    return this.writeWithFiles('PATCH', channelId, id, p, files, current, retained);
   }
   private writeWithFiles(
     method: 'POST' | 'PATCH',
@@ -634,7 +640,8 @@ export class DiscordApi {
     id: string | undefined,
     p: DiscordPost,
     files: DiscordFile[],
-    current?: () => boolean
+    current?: () => boolean,
+    retained: Array<{ id: string; filename: string }> = []
   ): Promise<{ id: string } | null> {
     const galleryFiles = new Set(
       discordUiNodes(p.components).flatMap((node) =>
@@ -666,7 +673,7 @@ export class DiscordApi {
         ...(method === 'POST'
           ? { nonce: p.nonce ?? randomUUID().replaceAll('-', '').slice(0, 24), enforce_nonce: true }
           : {}),
-        attachments: files.map((file, i) => ({ id: i, filename: safeAttachmentName(file.name) })),
+        attachments: [...retained, ...files.map((file, i) => ({ id: i, filename: safeAttachmentName(file.name) }))],
       })
     );
     for (const [i, file] of files.entries())
@@ -986,7 +993,13 @@ export interface DiscordBridgeDeps {
     sessionId: string,
     image: import('./discord-history.js').DiscordGeneratedImage
   ) => Promise<DiscordFile>;
-  getAttachment?: (sessionId: string, path: string, relativeToWorkspace?: boolean) => Promise<DiscordFile>;
+  attachmentContext?: (sessionId: string) => string | undefined;
+  getAttachment?: (
+    sessionId: string,
+    path: string,
+    relativeToWorkspace?: boolean,
+    approval?: DiscordFileApproval
+  ) => Promise<DiscordFile>;
   /** Snapshot only: never discovers or starts agents. Called after restoration is released. */
   sessions?: () => Array<DiscordActivitySession & { remote?: boolean }>;
   socketFactory?: SocketFactory;
@@ -1046,6 +1059,8 @@ export class DiscordBridge {
   private outputIndex = 0;
   private actions = new Map<string, DiscordBoundAction>();
   private nativeUi?: DiscordNativeUi;
+  private artifactGeneration = 0;
+  private artifactEdits = new Map<string, Promise<void>>();
   private uiPrompts = new Map<string, { conversation: string; text: string }>();
   private outputDue = new Map<string, number>();
   private unavailableNotices = new Set<string>();
@@ -1664,6 +1679,237 @@ export class DiscordBridge {
     }
   }
 
+  private serializeArtifactEdit(key: string, edit: () => Promise<void>): Promise<void> {
+    if (!this.artifactEdits.has(key) && this.artifactEdits.size >= 64)
+      return Promise.reject(new Error('Too many file approvals are in progress; retry later'));
+    const run = (this.artifactEdits.get(key) ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(edit)
+      .finally(() => {
+        if (this.artifactEdits.get(key) === run) this.artifactEdits.delete(key);
+      });
+    this.artifactEdits.set(key, run);
+    return run;
+  }
+
+  private async artifactFileButton(
+    sessionId: string,
+    channel: string,
+    message: string,
+    path: string,
+    originalPath: string,
+    cursor?: string,
+    delivered?: () => Promise<void>,
+    expectedBinding?: string
+  ): Promise<Record<string, unknown>> {
+    if (!this.nativeUi || !this.deps.getAttachment) throw new Error('File approval controls are unavailable');
+    const binding = this.deps.attachmentContext?.(sessionId);
+    if (!binding || (expectedBinding !== undefined && expectedBinding !== binding))
+      throw new Error('File approval identity changed or is unavailable');
+    const scope = this.controlScope,
+      generation = this.artifactGeneration;
+    const current = () =>
+      !this.stopped &&
+      !this.held &&
+      this.acceptsControls &&
+      this.deps.nativeUi?.enabled() === true &&
+      this.deps.attachmentContext?.(sessionId) === binding &&
+      this.controlScope === scope &&
+      this.artifactGeneration === generation &&
+      this.destinationMatches(sessionId, channel);
+    const sourceCurrent = async () => {
+      if (!current()) throw new Error('File approval context changed');
+      if (cursor) {
+        if (!this.deps.history) throw new Error('Native response identity is unavailable');
+        const history = await this.deps.history(sessionId, { after: cursor });
+        if (
+          !current() ||
+          history.conversationId !== cursor.split(':')[0] ||
+          (history.verifiedAfter !== cursor && !history.turns.some((t) => t.cursor === cursor))
+        )
+          throw new Error('The original native response changed; review this file again');
+      }
+    };
+    let reviewId = '';
+    const button = await this.nativeUi.fileApprovalButton(
+      sessionId,
+      channel,
+      message,
+      path,
+      () =>
+        this.serializeArtifactEdit(scope + ':' + channel + ':' + message, async () => {
+          await sourceCurrent();
+          const readMessage = async () => {
+            const item = (await this.api.request(
+              'GET',
+              `/channels/${channel}/messages/${message}`,
+              undefined,
+              0,
+              current
+            )) as {
+              id: string;
+              channel_id?: string;
+              author?: { id: string };
+              content?: string;
+              flags?: number;
+              embeds?: DiscordPost['embeds'];
+              components?: DiscordPost['components'];
+              attachments?: Array<{ id: string; filename: string; size: number; url?: string; proxy_url?: string }>;
+            };
+            const bot = await (this.activityBot ??= this.api.botUserId().then((me) => me?.id));
+            if (
+              !current() ||
+              item.id !== message ||
+              item.channel_id !== channel ||
+              !bot ||
+              item.author?.id !== bot ||
+              !discordUiNodes(item.components).some((n) => n.custom_id === reviewId)
+            )
+              throw new Error('This response no longer offers that file approval');
+            return item;
+          };
+          await readMessage();
+          const file = await this.deps.getAttachment!(sessionId, path, false, { path });
+          await sourceCurrent();
+          const item = await readMessage();
+          const retained = item.attachments ?? [];
+          if (
+            !Array.isArray(retained) ||
+            retained.length >= DISCORD_ARTIFACT_COUNT ||
+            retained.some(
+              (a) =>
+                !SNOWFLAKE.test(a.id) ||
+                typeof a.filename !== 'string' ||
+                a.filename.length > 250 ||
+                !Number.isSafeInteger(a.size) ||
+                a.size < 0 ||
+                a.size > DISCORD_FILE_LIMIT
+            ) ||
+            retained.reduce((sum, a) => sum + a.size, 0) + file.data.byteLength > DISCORD_FILE_LIMIT ||
+            file.data.byteLength > DISCORD_FILE_LIMIT
+          )
+            throw new Error('The response file/count or 8 MB total limit would be exceeded');
+          const base = safeAttachmentName(file.name);
+          const name = Array.from({ length: DISCORD_ARTIFACT_COUNT + 1 }, (_, i) =>
+            safeAttachmentName(i ? `${i}-${base}` : base)
+          ).find((n) => !retained.some((a) => a.filename === n));
+          if (!name) throw new Error('Attachment filenames could not be made unique');
+          // GET returns resolved CDN URLs and read-only media fields. Rebuild upload references
+          // from this response's retained attachment IDs before editing the original message.
+          const mediaReference = (value: unknown): unknown => {
+            if (!value || typeof value !== 'object') return value;
+            const media = value as Record<string, unknown>;
+            const attachment = retained.find(
+              (a) =>
+                a.id === media.attachment_id ||
+                (typeof media.url === 'string' &&
+                  (media.url === a.url || media.url === a.proxy_url || media.url === 'attachment://' + a.filename))
+            );
+            return { url: attachment ? 'attachment://' + attachment.filename : media.url };
+          };
+          const remove = (nodes: Array<Record<string, unknown>>): Array<Record<string, unknown>> =>
+            nodes.flatMap((node) => {
+              if (node.custom_id === reviewId) return [];
+              const next = { ...node };
+              if (next.type === 13) next.file = mediaReference(next.file);
+              if (next.type === 11) next.media = mediaReference(next.media);
+              if (next.type === 12 && Array.isArray(next.items))
+                next.items = next.items.map((entry: Record<string, unknown>) => ({
+                  ...entry,
+                  media: mediaReference(entry.media),
+                }));
+              if (next.accessory && typeof next.accessory === 'object')
+                next.accessory = remove([next.accessory as Record<string, unknown>])[0];
+              if (Array.isArray(next.components))
+                next.components = remove(next.components as Array<Record<string, unknown>>);
+              if (next.type === 1 && Array.isArray(next.components) && !next.components.length) return [];
+              if (
+                next.type === 17 &&
+                Array.isArray(next.components) &&
+                (next.components[0] as { content?: string })?.content === '**File access approval**' &&
+                !discordUiNodes(next.components).some((n) => n.type === 2)
+              )
+                return [];
+              if (typeof next.content === 'string')
+                next.content = discordAttachedFileLabels(next.content, new Set([originalPath]));
+              return [next];
+            });
+          const post: DiscordPost = {
+            content: discordAttachedFileLabels(item.content ?? '', new Set([originalPath])),
+            flags: (item.flags ?? 0) | DISCORD_SUPPRESS_NOTIFICATIONS,
+            allowed_mentions: { parse: [], users: [] },
+            ...(item.embeds
+              ? {
+                  embeds: item.embeds.map((e) => ({
+                    ...e,
+                    description: discordAttachedFileLabels(e.description ?? '', new Set([originalPath])),
+                  })),
+                }
+              : {}),
+            components: remove(
+              structuredClone(item.components ?? []) as Array<Record<string, unknown>>
+            ) as DiscordPost['components'],
+          };
+          await this.deliverPost(
+            channel,
+            post,
+            [{ ...file, name }],
+            sessionId,
+            'file-allow:' + reviewId,
+            current,
+            message,
+            retained.map(({ id, filename }) => ({ id, filename }))
+          );
+          await delivered?.();
+        }),
+      cursor?.split(':')[0]
+    );
+    reviewId = button.custom_id as string;
+    return button;
+  }
+
+  private async fileApprovalOffer(
+    sessionId: string,
+    channel: string,
+    path: string,
+    key: string,
+    delivered?: () => Promise<void>,
+    binding?: string
+  ): Promise<void> {
+    if (!binding || this.deps.attachmentContext?.(sessionId) !== binding)
+      throw new Error('File request identity changed');
+    const post: DiscordPost = {
+      content: '',
+      flags: DISCORD_COMPONENTS_V2 | DISCORD_SUPPRESS_NOTIFICATIONS,
+      allowed_mentions: { parse: [], users: [] },
+      components: [
+        {
+          type: 17,
+          components: [
+            { type: 10, content: '**File access approval**' },
+            {
+              type: 10,
+              content: 'This file is outside the session folder. Review its full path to allow this download.',
+            },
+          ],
+        },
+      ],
+    };
+    const sent = (await this.deliverPost(channel, post, undefined, sessionId, key + ':offer')) as { id: string };
+    const button = await this.artifactFileButton(
+      sessionId,
+      channel,
+      sent.id,
+      path,
+      path,
+      undefined,
+      delivered,
+      binding
+    );
+    post.components![0].components!.push({ type: 1, components: [button] });
+    await this.deliverPost(channel, post, undefined, sessionId, key + ':controls', undefined, sent.id);
+  }
+
   private async deliverArtifacts(
     sessionId: string,
     channel: string,
@@ -1674,6 +1920,7 @@ export class DiscordBridge {
     const paths = discordArtifactPaths(visible);
     if (!paths.length || !response) return;
     const scope = this.controlScope;
+    const binding = this.deps.attachmentContext?.(sessionId);
     const current = () =>
       !this.stopped &&
       !this.held &&
@@ -1681,6 +1928,7 @@ export class DiscordBridge {
       this.controlScope === scope &&
       this.destinationMatches(sessionId, channel);
     const files: DiscordFile[] = [];
+    const approvals: Array<Record<string, unknown>> = [];
     const attachedPaths = new Set<string>();
     let bytes = 0,
       skipped = paths.length > DISCORD_ARTIFACT_COUNT;
@@ -1698,14 +1946,43 @@ export class DiscordBridge {
         while (files.some((f) => f.name === name)) name = `${files.length}-${name}`;
         files.push({ ...file, name });
         attachedPaths.add(path);
-      } catch {
-        skipped = true;
+      } catch (error) {
+        if (error instanceof DiscordFileOutsideWorkspace && this.nativeUi) {
+          try {
+            approvals.push(
+              await this.artifactFileButton(
+                sessionId,
+                channel,
+                response.id,
+                error.path,
+                path,
+                cursor,
+                undefined,
+                binding
+              )
+            );
+          } catch {
+            skipped = true;
+          }
+        } else skipped = true;
       }
     }
     if (!current()) return;
     const note =
       'Some linked output files could not be attached (workspace access, file/count or 8 MB total limit). Use Results & files or !codeman file to inspect them.';
     const post: DiscordPost = structuredClone(response.post);
+    if (approvals.length) {
+      const group = [
+        { type: 10, content: '**File access approval**' },
+        { type: 10, content: 'Some files are outside the session folder. Review a file to allow this download only.' },
+        { type: 1, components: approvals },
+      ];
+      if ((post.flags ?? 0) & DISCORD_COMPONENTS_V2) (post.components ??= []).push({ type: 17, components: group });
+      else {
+        post.content += '\nSome files are outside the session folder. Review to allow a download.';
+        (post.components ??= []).push({ type: 1, components: approvals });
+      }
+    }
     if (response) {
       const rewrite = (nodes: Array<Record<string, unknown>>) => {
         for (const node of nodes) {
@@ -2377,6 +2654,7 @@ export class DiscordBridge {
   }
 
   stop(): void {
+    this.artifactGeneration++;
     this.nativeUi?.stop();
     this.launchCommands.clear();
     this.launchScope = '';
@@ -2905,7 +3183,8 @@ export class DiscordBridge {
     sessionId: string | undefined,
     key: string,
     current?: () => boolean,
-    editMessageId?: string
+    editMessageId?: string,
+    retained: Array<{ id: string; filename: string }> = []
   ): Promise<unknown> {
     if (this.cfg.mode === 'full' && sessionId) {
       if (!this.destinationMatches(sessionId, channelId)) throw new BridgeProblem('Discord destination changed');
@@ -2920,6 +3199,7 @@ export class DiscordBridge {
         content: post.content,
         embeds: post.embeds,
         components: post.components,
+        ...(retained.length ? { retained } : {}),
         file: Array.isArray(file) ? file.map((f) => [f.name, f.data.byteLength]) : file?.name,
       })
     );
@@ -2949,7 +3229,14 @@ export class DiscordBridge {
     try {
       const result = editMessageId
         ? file
-          ? await this.api.editWithFiles(channelId, editMessageId, post, Array.isArray(file) ? file : [file], current)
+          ? await this.api.editWithFiles(
+              channelId,
+              editMessageId,
+              post,
+              Array.isArray(file) ? file : [file],
+              current,
+              retained
+            )
           : ((await this.api.editMessage(channelId, editMessageId, post, current)) as { id: string })
         : Array.isArray(file)
           ? await this.api.postWithFiles(channelId, payload, file, current)
@@ -3590,6 +3877,7 @@ export class DiscordBridge {
           await this.deliveries.update(id, 'failed', 'invalid_command');
           return;
         }
+        const fileBinding = this.deps.attachmentContext?.(sessionId);
         try {
           await this.api.react(m.channel_id, m.id, '📤').catch(() => undefined);
           const path = match[1].replace(/^("|')(.*)\1$/, '$2');
@@ -3604,7 +3892,26 @@ export class DiscordBridge {
           );
           await this.deliveries.update(id, 'delivered');
           await this.api.react(m.channel_id, m.id, '✅').catch(() => undefined);
-        } catch {
+        } catch (error) {
+          if (error instanceof DiscordFileOutsideWorkspace && this.nativeUi) {
+            try {
+              await this.deliveries.update(id, 'awaiting_choice');
+              await this.fileApprovalOffer(
+                sessionId,
+                m.channel_id,
+                error.path,
+                'file:' + m.id,
+                async () => {
+                  await this.deliveries.update(id, 'delivered');
+                  await this.api.react(m.channel_id, m.id, '✅').catch(() => undefined);
+                },
+                fileBinding
+              );
+              return;
+            } catch {
+              /* Fall through to a clear refusal; no unapproved contents were read. */
+            }
+          }
           await this.deliveries.update(id, 'failed', 'transfer_failed');
           await this.say(
             m.channel_id,

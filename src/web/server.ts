@@ -931,12 +931,30 @@ export class WebServer extends EventEmitter {
       if (this.sessions.get(id) !== session) throw new Error('Session changed');
       return file;
     },
-    getAttachment: async (id, path, relativeToWorkspace) => {
+    attachmentContext: (id) => this.discordFileContext(id),
+    getAttachment: async (id, path, relativeToWorkspace, approval) => {
       const session = this.sessions.get(id);
       if (!session) throw new Error('Session unavailable');
       if (relativeToWorkspace)
         path = session.remote ? posix.resolve(session.remote.remotePath, path) : resolve(session.workingDir, path);
-      return readDiscordSessionFile({ workingDir: session.workingDir, remote: session.remote }, path);
+      const remote = session.remote,
+        workingDir = session.workingDir;
+      const binding = this.discordFileContext(id);
+      if (approval && !binding) throw new Error('File approval identity is unavailable');
+      const current = () =>
+        this.sessions.get(id) === session &&
+        session.remote === remote &&
+        session.workingDir === workingDir &&
+        (!binding || this.discordFileContext(id) === binding);
+      try {
+        const file = await readDiscordSessionFile({ workingDir, remote }, path, approval);
+        if (!current()) throw new Error('Session changed during file transfer');
+        return file;
+      } catch (error) {
+        // A refusal can carry a canonical external path; never offer it in a replacement host/session.
+        if (!current()) throw new Error('Session changed during file transfer');
+        throw error;
+      }
     },
     saveRemoteAttachment: async (id, name, bytes) => {
       const remote = this.sessions.get(id)?.remote;
@@ -4407,6 +4425,24 @@ export class WebServer extends EventEmitter {
     // The composer row and the status lines under it are screen chrome, not what the CLI said.
     const glyph = cutComposer ? getCli(session.mode)?.capabilities.workDetect?.promptGlyph : undefined;
     return screenTail(pane ?? session.textOutput ?? '', 14, 900, glyph);
+  }
+
+  /** No credentials: binds a one-file grant to its current owner, host, workspace and native identity. */
+  private discordFileContext(id: string): string | undefined {
+    const s = this.sessions.get(id);
+    if (!s || s.docker || s.suppressNotifications || isMultiUserMode()) return undefined;
+    const r = s.remote;
+    return JSON.stringify([
+      id,
+      s.owner,
+      s.mode,
+      s.workingDir,
+      !!s.docker,
+      r && [r.hostId, r.host, r.username, r.port, r.remotePath, r.owned],
+      s.nativeResumeId,
+      s.claudeSessionId,
+      s.codexConfig?.resumeSessionId,
+    ]);
   }
 
   /**
