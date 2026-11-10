@@ -7,6 +7,7 @@ import { readDiscordSessionFile } from '../src/discord-file-transfers.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { discordUiNodes } from '../src/discord-native-ui.js';
 import { DISCORD_SUPPRESS_NOTIFICATIONS } from '../src/discord-response-format.js';
+import { DiscordFileOutsideWorkspace } from '../src/discord-file-transfers.js';
 import { DiscordHistoryReadError } from '../src/discord-history.js';
 import {
   DEFAULT_DISCORD_CONFIG,
@@ -35,6 +36,7 @@ let bridges: DiscordBridge[];
 let posts: Array<{ path: string; method: string; body?: any; fileFields?: string[] }>;
 let sendInput: ReturnType<typeof vi.fn>;
 let sequence: number;
+let attachmentSequence: bigint;
 let remoteChannels: Map<string, any>;
 let remoteMessages: Map<string, any>;
 let statusEditRefused: boolean;
@@ -87,6 +89,21 @@ function makeBridge(
           ? { fileFields: [...init.body.keys()].filter((k) => k.startsWith('files[')) }
           : {}),
       } as any);
+      const responseBody =
+        body && Array.isArray(body.attachments)
+          ? {
+              ...body,
+              attachments: body.attachments.map((a: any) => {
+                const file =
+                  init.body instanceof FormData && typeof a.id === 'number'
+                    ? init.body.get(`files[${a.id}]`)
+                    : undefined;
+                if (file instanceof Blob)
+                  return { id: String(attachmentSequence++), filename: a.filename, size: file.size };
+                return [...remoteMessages.values()].flatMap((m) => m.attachments ?? []).find((x) => x.id === a.id) ?? a;
+              }),
+            }
+          : body;
       if (artifactPostUncertain && ['POST', 'PATCH'].includes(method) && init.body instanceof FormData)
         throw Error('Upload outcome unknown');
       if (artifactPostRefused && ['POST', 'PATCH'].includes(method) && init.body instanceof FormData)
@@ -104,7 +121,7 @@ function makeBridge(
           return Response.json({}, { status: 403 });
         const m = remoteMessages.get(messageMatch[2]);
         if (!m) return Response.json({}, { status: 404 });
-        Object.assign(m, body);
+        Object.assign(m, responseBody);
         return Response.json(m);
       }
       if (method === 'GET' && messageMatch) {
@@ -136,7 +153,7 @@ function makeBridge(
           : undefined;
         if (existing) return Response.json(existing);
         const m = {
-          ...body,
+          ...responseBody,
           id: String(555555555555555440n + BigInt(sequence++)),
           channel_id: messageMatch[1],
           author: { id: BOT },
@@ -196,6 +213,7 @@ beforeEach(async () => {
   bridges = [];
   posts = [];
   sequence = 0;
+  attachmentSequence = 800000000000000000n;
   remoteChannels = new Map();
   remoteMessages = new Map();
   statusEditRefused = false;
@@ -2955,4 +2973,224 @@ it('profiles real bridge local/remote history and HTTP work without exporting se
   expect(stats.operations.some((o) => o.name.startsWith('http.'))).toBe(true);
   expect(stats.bridge).toMatchObject({ sessions: 2, remoteSessions: 1, eligibleSessions: 2 });
   expect(JSON.stringify(stats)).not.toMatch(/PRIVATE_|native1|u1/);
+});
+
+async function externalArtifactFixture(paths = ['/outside/report.pdf'], inside = false) {
+  sessions = [{ id: 's1', name: 'one' }];
+  let turns: any[] = [],
+    binding = 'context-one',
+    conversation = 'native1';
+  const getAttachment = vi.fn(async (_id: string, path: string, _relative?: boolean, approval?: { path: string }) => {
+    if (path === '/workspace/inside.csv') return { name: 'inside.csv', data: Buffer.from('INSIDE') };
+    if (!approval) throw new DiscordFileOutsideWorkspace(path, 3);
+    if (approval.path !== path) throw Error('wrong grant');
+    return { name: path.split('/').at(-1)!, data: Buffer.from('PDF') };
+  });
+  const b = makeBridge(undefined, {
+    sleep: async () => {},
+    attachmentContext: () => binding,
+    getAttachment,
+    history: async (_id, options) => ({
+      conversationId: conversation,
+      partial: false,
+      turns,
+      verifiedAfter: options?.after,
+    }),
+    nativeUi: {
+      enabled: () => true,
+      sessions: async () => [
+        {
+          id: 's1',
+          name: 'one',
+          mode: 'codex',
+          host: 'fixture',
+          caseName: 'case',
+          conversation: 'native1',
+          working: true,
+          pending: false,
+          exited: false,
+          ready: false,
+        },
+      ],
+      cases: async () => [],
+      defaults: async () => ({ model: '', effort: '', approval: 'ask' }),
+      saveDefaults: async () => {},
+      question: () => undefined,
+      answer: async () => '',
+      workspace: async () => ({ summary: '', diff: '' }),
+      submitQueued: async () => 'blocked',
+    },
+  });
+  await b.reload();
+  await b.syncSessions();
+  turns = [
+    { role: 'user', cursor: 'native1:1:u', timestamp: '', text: 'Create report' },
+    {
+      role: 'assistant',
+      cursor: 'native1:2:a',
+      phase: 'final_answer',
+      timestamp: '',
+      text:
+        (inside ? '[Inside](/workspace/inside.csv)\n' : '') + paths.map((p, i) => `[Report ${i + 1}](${p})`).join('\n'),
+    },
+  ];
+  await b.pollConversations();
+  const message = [...remoteMessages.values()].find((m) =>
+    discordUiNodes(m.components).some((n) => String(n.label ?? '').startsWith('Review '))
+  )!;
+  expect(message).toBeDefined();
+  let interaction = 920000000000000000n;
+  const click = async (button: any, original = message.id, actor = cfg.allowedUserIds[0]) => {
+    await b.onGatewayInteraction({
+      id: String(interaction++),
+      application_id: BOT,
+      token: 'test-token',
+      guild_id: cfg.guildId,
+      channel_id: message.channel_id,
+      type: 3,
+      member: { user: { id: actor } },
+      message: { id: original, flags: 32768 },
+      data: { custom_id: button.custom_id },
+    });
+  };
+  const review = (index = 0) =>
+    discordUiNodes(remoteMessages.get(message.id).components).filter((n) =>
+      String(n.label ?? '').startsWith('Review ')
+    )[index];
+  const open = async (button: any, original = message.id) => {
+    await click(button, original);
+    const panel = posts
+      .filter(
+        (p) =>
+          p.path.includes('/webhooks/') && discordUiNodes(p.body?.components).some((n) => n.label === 'Allow this file')
+      )
+      .at(-1)!;
+    expect(panel).toBeDefined();
+    return discordUiNodes(panel.body.components).find((n) => n.label === 'Allow this file')!;
+  };
+  return {
+    b,
+    message,
+    getAttachment,
+    click,
+    review,
+    open,
+    changeContext: () => {
+      binding = 'context-two';
+    },
+    changeConversation: () => {
+      conversation = 'other';
+    },
+    approvedReads: () => getAttachment.mock.calls.filter((c) => !!c[3]).length,
+  };
+}
+it('attaches an approved external PDF to its original response while retaining an existing file', async () => {
+  const f = await externalArtifactFixture(['/outside/report.pdf'], true);
+  const original = remoteMessages.get(f.message.id);
+  const existing = original.attachments[0].id;
+  original.attachments[0].url = 'https://cdn.discordapp.com/attachments/fixture/inside.csv';
+  const fileNode = discordUiNodes(original.components).find((n) => n.type === 13)!;
+  fileNode.file = { url: original.attachments[0].url, attachment_id: existing, content_type: 'text/csv' };
+  expect(f.approvedReads()).toBe(0);
+  const allow = await f.open(f.review());
+  expect(f.approvedReads()).toBe(0);
+  await f.click(allow, '999999999999999991');
+  const changed = remoteMessages.get(f.message.id);
+  expect(changed.attachments.map((a: any) => a.filename)).toEqual(['inside.csv', 'report.pdf']);
+  expect(changed.attachments[0].id).toBe(existing);
+  expect(discordUiNodes(changed.components).find((n) => n.type === 13)?.file).toEqual({
+    url: 'attachment://inside.csv',
+  });
+  expect(discordUiNodes(changed.components).some((n) => String(n.label ?? '').startsWith('Review '))).toBe(false);
+  expect(f.approvedReads()).toBe(1);
+  expect(JSON.stringify(changed.components)).not.toContain('](/outside/report.pdf)');
+  expect(
+    posts
+      .filter((p) => p.method === 'PATCH' && p.path.endsWith('/messages/' + f.message.id) && p.fileFields?.length)
+      .at(-1)!.body.attachments[0].id
+  ).toBe(existing);
+  await f.click(allow, '999999999999999991');
+  expect(f.approvedReads()).toBe(1);
+  expect(sendInput).not.toHaveBeenCalled();
+});
+it('serializes approvals for two same-named files and keeps both attachments', async () => {
+  const f = await externalArtifactFixture(['/outside/a/report.pdf', '/outside/b/report.pdf']);
+  const [a, b] = [f.review(0), f.review(1)];
+  const first = await f.open(a),
+    second = await f.open(b);
+  await Promise.all([f.click(first, '999999999999999991'), f.click(second, '999999999999999992')]);
+  const saved = remoteMessages.get(f.message.id);
+  expect(saved.attachments.map((a: any) => a.filename)).toEqual(['report.pdf', '1-report.pdf']);
+  expect(new Set(saved.attachments.map((a: any) => a.id)).size).toBe(2);
+  expect(f.approvedReads()).toBe(2);
+  expect(discordUiNodes(saved.components).filter((n) => n.type === 13)).toHaveLength(2);
+});
+it.each(['identity', 'conversation', 'author', 'limit', 'restart'])(
+  'does not approve an external artifact after %s changes',
+  async (change) => {
+    const f = await externalArtifactFixture();
+    const allow = await f.open(f.review());
+    if (change === 'identity') f.changeContext();
+    if (change === 'conversation') f.changeConversation();
+    if (change === 'author') remoteMessages.get(f.message.id).author.id = '999999999999999999';
+    if (change === 'limit')
+      remoteMessages.get(f.message.id).attachments = [
+        { id: '888888888888888889', filename: 'large.bin', size: 8 * 1024 * 1024 },
+      ];
+    if (change === 'restart') {
+      f.b.stop();
+      await f.b.reload();
+    }
+    await f.click(allow, '999999999999999991');
+    expect(
+      posts.filter((p) => p.method === 'PATCH' && p.path.endsWith('/messages/' + f.message.id) && p.fileFields?.length)
+    ).toHaveLength(0);
+    expect(sendInput).not.toHaveBeenCalled();
+  }
+);
+it('does not rerun an uncertain approved upload on another click', async () => {
+  const f = await externalArtifactFixture();
+  const allow = await f.open(f.review());
+  artifactPostUncertain = true;
+  await f.click(allow, '999999999999999991');
+  const attempts = posts.filter((p) => p.path.endsWith('/messages/' + f.message.id) && p.fileFields?.length).length;
+  expect(attempts).toBeGreaterThan(0);
+  await f.click(allow, '999999999999999991');
+  expect(posts.filter((p) => p.path.endsWith('/messages/' + f.message.id) && p.fileFields?.length)).toHaveLength(
+    attempts
+  );
+  expect(f.approvedReads()).toBe(1);
+});
+it('offers a new scoped approval for an explicit file command outside the workspace', async () => {
+  const f = await externalArtifactFixture();
+  await f.b.onGatewayMessage({
+    id: '999999999999999981',
+    channel_id: f.message.channel_id,
+    guild_id: cfg.guildId,
+    author: { id: cfg.allowedUserIds[0] },
+    content: '!codeman file /outside/older.pdf',
+  });
+  const offered = [...remoteMessages.values()].find(
+    (m) => m.id !== f.message.id && discordUiNodes(m.components).some((n) => n.label === 'Review older.pdf')
+  );
+  expect(offered).toBeDefined();
+  expect(f.approvedReads()).toBe(0);
+  const review = discordUiNodes(offered.components).find((n) => n.label === 'Review older.pdf')!;
+  const allow = await f.open(review, offered.id);
+  await f.click(allow, '999999999999999991');
+  expect(remoteMessages.get(offered.id).attachments[0].filename).toBe('older.pdf');
+  expect(f.approvedReads()).toBe(1);
+  expect(sendInput).not.toHaveBeenCalled();
+});
+
+it('rechecks file identity after its asynchronous contents read before uploading', async () => {
+  const f = await externalArtifactFixture();
+  const allow = await f.open(f.review());
+  f.getAttachment.mockImplementationOnce(async () => {
+    f.changeContext();
+    return { name: 'report.pdf', data: Buffer.from('PDF') };
+  });
+  await f.click(allow, '999999999999999991');
+  expect(posts.filter((p) => p.path.endsWith('/messages/' + f.message.id) && p.fileFields?.length)).toHaveLength(0);
+  expect(sendInput).not.toHaveBeenCalled();
 });

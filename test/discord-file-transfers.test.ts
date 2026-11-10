@@ -5,7 +5,13 @@ import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { describe, it, expect } from 'vitest';
-import { discordRemoteReadCommand, boundedDiscordDownload, DISCORD_FILE_LIMIT } from '../src/discord-file-transfers.js';
+import {
+  discordRemoteReadCommand,
+  boundedDiscordDownload,
+  DISCORD_FILE_LIMIT,
+  readDiscordSessionFile,
+  DiscordFileOutsideWorkspace,
+} from '../src/discord-file-transfers.js';
 const exec = promisify(execFile);
 describe('guarded Discord binary transfer', () => {
   it('reads exact binary bytes with spaces and rejects leaf and parent symlinks, escape and oversized files', async () => {
@@ -41,4 +47,50 @@ describe('guarded Discord binary transfer', () => {
     );
     expect(await boundedDiscordDownload(new Response(Buffer.from([1, 0, 2])))).toEqual(Buffer.from([1, 0, 2]));
   });
+});
+
+it('requires an exact one-file approval outside the workspace and keeps other paths closed', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'discord-file-approval-'));
+  const root = join(dir, 'workspace'),
+    report = join(dir, 'report.pdf'),
+    sibling = join(dir, 'other.pdf');
+  try {
+    await mkdir(root);
+    await writeFile(report, 'PDF');
+    await writeFile(sibling, 'OTHER');
+    const refused = await readDiscordSessionFile({ workingDir: root }, report).catch((e) => e);
+    expect(refused).toBeInstanceOf(DiscordFileOutsideWorkspace);
+    expect(refused).toMatchObject({ path: report, size: 3 });
+    expect((await readDiscordSessionFile({ workingDir: root }, report, { path: report })).data).toEqual(
+      Buffer.from('PDF')
+    );
+    await expect(readDiscordSessionFile({ workingDir: root }, sibling, { path: report })).rejects.toThrow('changed');
+    await expect(readDiscordSessionFile({ workingDir: root }, sibling)).rejects.toBeInstanceOf(
+      DiscordFileOutsideWorkspace
+    );
+    await symlink(sibling, join(dir, 'alias.pdf'));
+    await expect(
+      readDiscordSessionFile({ workingDir: root }, join(dir, 'alias.pdf'), { path: join(dir, 'alias.pdf') })
+    ).rejects.toThrow('changed');
+    await writeFile(report, Buffer.alloc(DISCORD_FILE_LIMIT + 1));
+    await expect(readDiscordSessionFile({ workingDir: root }, report, { path: report })).rejects.toThrow('8 MB');
+    await rm(report);
+    await expect(readDiscordSessionFile({ workingDir: root }, report, { path: report })).rejects.toThrow();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+it('never offers or honors an external approval for credential paths', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'discord-private-approval-'));
+  try {
+    const root = join(dir, 'workspace');
+    await mkdir(root);
+    await mkdir(join(dir, '.ssh'));
+    const secret = join(dir, '.ssh', 'key.pdf');
+    await writeFile(secret, 'SECRET');
+    await expect(readDiscordSessionFile({ workingDir: root }, secret)).rejects.toThrow('credentials');
+    await expect(readDiscordSessionFile({ workingDir: root }, secret, { path: secret })).rejects.toThrow('credentials');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

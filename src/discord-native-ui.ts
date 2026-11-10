@@ -1153,7 +1153,11 @@ export class DiscordNativeUi {
           action.expires <= this.host.now() ||
           (m.type === 3 && action.message && m.message?.id !== action.message))
       ) {
-        await reject('This menu expired or changed. Use /codeman or !codeman ui to reopen it.');
+        await reject(
+          custom.endsWith(':file')
+            ? 'This file approval expired or changed. Run !codeman file <full-path> in this thread to request it again.'
+            : 'This menu expired or changed. Use /codeman or !codeman ui to reopen it.'
+        );
         return true;
       }
       if (!recovering && action && !action.modal && (action.actor || action.group || action.submitOnly))
@@ -1240,6 +1244,68 @@ export class DiscordNativeUi {
         .catch(() => undefined);
     }
     return true;
+  }
+  /** Public review button, followed by a private one-use, actor-bound file grant. */
+  async fileApprovalButton(
+    id: string,
+    channel: string,
+    message: string,
+    path: string,
+    approve: () => Promise<void>,
+    conversation?: string
+  ): Promise<Record<string, unknown>> {
+    const s = await this.target(id);
+    if (
+      this.host.channelForSession(id) !== channel ||
+      (conversation !== undefined && (s.activityConversation ?? s.conversation) !== conversation)
+    )
+      throw new Error('File response context changed');
+    const fence = '`'.repeat(Math.max(3, ...[...path.matchAll(/`+/g)].map((m) => m[0].length + 1)));
+    const displayPath = fence + '\n' + path + '\n' + fence;
+    // eslint-disable-next-line no-control-regex
+    if (path.length > 1200 || /[\x00-\x1f\x7f]/.test(path) || displayPath.length > 1450)
+      throw new Error('The canonical file path cannot be displayed safely in an approval panel');
+    const ctx = { channel, session: id, conversation: s.conversation };
+    let used = false;
+    const button = this.action(
+      ctx,
+      'Review ' + path.split('/').at(-1),
+      async (m) => {
+        if (used) return this.payload('This file approval has already been used. Check the original response.');
+        const actor = m.member?.user?.id ?? m.user?.id;
+        return this.payload(
+          '**Allow this file?**\nHost: ' +
+            safe(s.host) +
+            '\n' +
+            displayPath +
+            '\n\nThis file is outside the session folder. Allow this download only; folder access and credential protections remain unchanged.',
+          [
+            row(
+              this.action(
+                { ...ctx, actor },
+                'Allow this file',
+                async () => {
+                  if (used) throw new Error('This file approval has already been used');
+                  used = true;
+                  await approve();
+                  return this.payload('The file was attached to the original response.');
+                },
+                undefined,
+                1,
+                undefined,
+                ':file'
+              )
+            ),
+          ]
+        );
+      },
+      undefined,
+      2,
+      'file-approval:' + message + ':' + path,
+      ':file'
+    );
+    this.actions.get(button.custom_id as string)!.message = message;
+    return button;
   }
   async command(id: string, channel: string, actor: string, command: string): Promise<boolean> {
     if (!['ui', 'dashboard', 'queue', 'settings', 'results'].includes(command)) return false;
