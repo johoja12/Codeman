@@ -177,6 +177,8 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       return Promise.all(
         visible.map(async (s) => {
           const promptSuggestion = await suggestion(s);
+          const observed = deps.observed?.(s.id);
+          const displayModel = s.displayModel;
           const pending = approvalInbox.listPending().find((p) => p.sessionId === s.id && p.kind !== 'idle');
           return {
             id: s.id,
@@ -200,12 +202,13 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
             pending: approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle'),
             exited: !!s.paneExit,
             ready: !working(s) && !s.paneExit && !s.guardedInputHeld && !s.guardedInputPendingWrites,
-            model: deps.observed?.(s.id)?.model
-              ? deps.observed(s.id)!.model + ' (native verified)'
-              : s.displayModel
-                ? `${s.displayModel.model} (${s.displayModel.source})`
+            model: observed?.model
+              ? observed.model + ' (native verified)'
+              : displayModel
+                ? `${displayModel.model} (${displayModel.source})`
                 : undefined,
-            effort: deps.observed?.(s.id)?.effort, // launch effort is not proof of a current setting
+            modelSource: observed?.model ? 'native-verified' : displayModel?.source,
+            effort: observed?.effort ? observed.effort + ' (native verified)' : undefined,
             approval:
               getCli(s.mode)?.launch.legacyConfigField === 'codexConfig'
                 ? s.codexConfig?.baseCommand

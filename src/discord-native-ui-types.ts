@@ -6,6 +6,7 @@ import type {
   DiscordInteraction,
   DiscordPost,
 } from './discord-bridge.js';
+import type { DisplayModelSource } from './types/session.js';
 import type { DiscordHistory } from './discord-history.js';
 export interface DiscordUiSession {
   id: string;
@@ -22,6 +23,7 @@ export interface DiscordUiSession {
   exited: boolean;
   ready: boolean;
   model?: string;
+  modelSource?: DisplayModelSource | 'native-verified';
   effort?: string;
   approval?: string;
   promptSuggestion?: string;
