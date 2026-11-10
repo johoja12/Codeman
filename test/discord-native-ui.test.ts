@@ -1804,3 +1804,60 @@ it('attributes neutral prompt activity to verified history without changing the 
   );
   expect(f.sessions[0].conversation).toBe('conversation-one');
 });
+
+it('requires a private, actor-bound confirmation for one external file and consumes it once', async () => {
+  const f = await fixture();
+  const config = f.host.config;
+  f.host.config = () => ({ ...config(), allowed: [actor, '999999999999999999'] });
+  const approve = vi.fn(async () => {}),
+    message = snow();
+  const review = await f.ui.fileApprovalButton(
+    's1',
+    channel,
+    message,
+    '/outside/my_report.pdf',
+    approve,
+    'conversation-one'
+  );
+  await f.ui.interaction(f.event(review, { message: { id: message } }));
+  const panel = f.finishes.at(-1)!;
+  expect(panel.content).toContain('/outside/my_report.pdf');
+  expect(panel.content).toContain('Host: beelink');
+  expect(approve).not.toHaveBeenCalled();
+  const allow = f.component(panel, 'Allow this file');
+  await f.ui.interaction(f.event(allow, { member: { user: { id: '999999999999999999' } } }));
+  expect(approve).not.toHaveBeenCalled();
+  await f.ui.interaction(f.event(allow));
+  expect(approve).toHaveBeenCalledTimes(1);
+  await f.ui.interaction(f.event(allow));
+  await f.ui.interaction(f.event(review, { message: { id: message } }));
+  expect(approve).toHaveBeenCalledTimes(1);
+  expect(f.host.submit).not.toHaveBeenCalled();
+});
+it.each(['message', 'channel', 'conversation', 'expiry', 'restart'])(
+  'rejects external file approval after %s changes',
+  async (change) => {
+    const f = await fixture();
+    const approve = vi.fn(async () => {}),
+      message = snow();
+    const review = await f.ui.fileApprovalButton(
+      's1',
+      channel,
+      message,
+      '/outside/report.pdf',
+      approve,
+      'conversation-one'
+    );
+    if (change === 'conversation') f.sessions[0].conversation = 'different';
+    if (change === 'expiry') f.advance(7 * 60000);
+    const ui = change === 'restart' ? new DiscordNativeUi(f.host) : f.ui;
+    await ui.interaction(
+      f.event(review, {
+        message: { id: change === 'message' ? snow() : message },
+        channel_id: change === 'channel' ? parent : channel,
+      })
+    );
+    expect(approve).not.toHaveBeenCalled();
+    expect(f.finishes.some((p) => p.content?.includes('Allow this file?'))).toBe(false);
+  }
+);

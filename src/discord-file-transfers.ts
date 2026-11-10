@@ -22,6 +22,19 @@ export interface DiscordTransferredFile {
   data: Uint8Array;
 }
 export class DiscordFileProblem extends Error {}
+/** Metadata only: contents are not read until the user approves this exact canonical path. */
+export class DiscordFileOutsideWorkspace extends DiscordFileProblem {
+  constructor(
+    readonly path: string,
+    readonly size: number
+  ) {
+    super('This file is outside the session folder and needs one-file approval');
+  }
+}
+export interface DiscordFileApproval {
+  path: string;
+}
+
 const inside = (root: string, path: string) => {
   const rel = posix.relative(root, path);
   return !!rel && rel !== '..' && !rel.startsWith('../') && !posix.isAbsolute(rel);
@@ -101,7 +114,11 @@ export async function runDiscordRemoteRead(remote: SessionRemote, command: strin
   );
 }
 
-export async function readDiscordSessionFile(scope: DiscordFileScope, path: string): Promise<DiscordTransferredFile> {
+export async function readDiscordSessionFile(
+  scope: DiscordFileScope,
+  path: string,
+  approval?: DiscordFileApproval
+): Promise<DiscordTransferredFile> {
   if (!(scope.remote ? posix.isAbsolute(path) : isAbsolute(path)) || /[\0\r\n]/.test(path))
     throw new DiscordFileProblem('The file path must be absolute');
   const guard = await loadAttachmentGuardConfig();
@@ -117,14 +134,22 @@ export async function readDiscordSessionFile(scope: DiscordFileScope, path: stri
     }
     if (root?.kind !== 'directory' || file?.kind !== 'file')
       throw new DiscordFileProblem('Not a regular file in an available remote workspace');
-    if (!inside(root.realPath, file.realPath))
-      throw new DiscordFileProblem('The file must be inside the session folder');
     if (isBlockedAttachmentPath(file.realPath, guard.blockedTrees))
       throw new DiscordFileProblem('That file cannot be sent: it can hold credentials');
     if (file.size > DISCORD_FILE_LIMIT) throw new DiscordFileProblem('The file is over 8 MB');
+    if (approval && (approval.path !== path || approval.path !== file.realPath))
+      throw new DiscordFileProblem('The approved file path changed; review it again');
+    if (!inside(root.realPath, file.realPath) && !approval)
+      throw new DiscordFileOutsideWorkspace(file.realPath, file.size);
     return {
       name: posix.basename(path),
-      data: await runDiscordRemoteRead(scope.remote, discordRemoteReadCommand(root.realPath, file.realPath)),
+      data: await runDiscordRemoteRead(
+        scope.remote,
+        discordRemoteReadCommand(
+          inside(root.realPath, file.realPath) ? root.realPath : posix.dirname(file.realPath),
+          file.realPath
+        )
+      ),
     };
   }
   if ((await probePathKind(scope.workingDir, { pastCap: true })) !== 'directory')
@@ -139,8 +164,9 @@ export async function readDiscordSessionFile(scope: DiscordFileScope, path: stri
     throw new DiscordFileProblem('The file could not be read');
   }
   const rel = relative(root, real);
-  if (!rel || rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel))
-    throw new DiscordFileProblem('The file must be inside the session folder');
+  const outside = !rel || rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel);
+  if (approval && (approval.path !== path || approval.path !== real))
+    throw new DiscordFileProblem('The approved file path changed; review it again');
   if (isBlockedAttachmentPath(real, guard.blockedTrees))
     throw new DiscordFileProblem('That file cannot be sent: it can hold credentials');
   let file;
@@ -149,6 +175,7 @@ export async function readDiscordSessionFile(scope: DiscordFileScope, path: stri
     const info = await file.stat();
     if (!info.isFile()) throw new DiscordFileProblem('Not a regular file');
     if (info.size > DISCORD_FILE_LIMIT) throw new DiscordFileProblem('The file is over 8 MB');
+    if (outside && !approval) throw new DiscordFileOutsideWorkspace(real, info.size);
     const bytes: Buffer[] = [];
     let total = 0;
     while (total <= DISCORD_FILE_LIMIT) {
