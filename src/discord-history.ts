@@ -197,7 +197,30 @@ try:
   finally:
    for fd in reversed(fds):os.close(fd)
   sys.exit(0)
- after=s.get('after');scanned=None;images=[]
+ after=s.get('after');scanned=None;images=[];projected=[]
+ def project_message(line,at):
+  # Preserve every visible text block and the original record's exact cursor.
+  # Only recognized image blocks may be omitted; unknown content stays fail-closed.
+  if mode!='codex-rollout':return None
+  try:v=json.loads(line)
+  except Exception:return None
+  if not isinstance(v,dict) or v.get('type')!='response_item':return None
+  p=v.get('payload')
+  if not isinstance(p,dict) or p.get('type')!='message' or p.get('role') not in ('user','assistant'):return None
+  blocks=p.get('content')
+  if not isinstance(blocks,list) or not blocks:return None
+  text=[];image=False
+  for b in blocks:
+   if not isinstance(b,dict):return None
+   if b.get('type') in ('input_text','output_text','text') and isinstance(b.get('text'),str):text.append(b)
+   elif b.get('type')=='input_image' and set(b).issubset({'type','image_url','detail'}) and isinstance(b.get('image_url'),str):image=True
+   else:return None
+  if not image:return None
+  value={'type':'response_item','timestamp':v.get('timestamp'),'payload':{'type':'message','role':p['role'],'content':text}}
+  if 'phase' in p:value['payload']['phase']=p['phase']
+  if len(json.dumps(value).encode())>limit:return None
+  return {'offset':at,'hash':hashlib.sha256(line[:-1]).hexdigest()[:16],'value':value}
+
  if after:
   parts=after.split(':');offset=int(parts[1])
   if offset>=info.st_size:fail('cursor_missing')
@@ -221,7 +244,7 @@ try:
    except Exception: anchored_image=None
    if anchored_image:offset+=len(anchor)
    elif len(anchor)>limit:
-    if not ignored_large(anchor):fail('record_too_large')
+    if not ignored_large(anchor) and project_message(anchor,offset) is None:fail('record_too_large')
     offset+=len(anchor)
    stream.seek(offset);chunks=[];size=0;budget=limit+(len(anchor) if len(anchor)<=limit else 0)
    scanned=after;skipped_end=None
@@ -235,7 +258,11 @@ try:
     if image:
      images.append(image);scanned=cursor;skipped_end=at+len(line);break
     if len(line)>limit:
-     if not ignored_large(line):fail('record_too_large')
+     projection=project_message(line,at)
+     if projection is not None:
+      if size+len(json.dumps(projection).encode())>budget:break
+      projected.append(projection)
+     elif not ignored_large(line):fail('record_too_large')
      scanned=cursor;skipped_end=at+len(line)
      break
     if size+len(line)>budget:break
@@ -252,7 +279,7 @@ try:
    offset+=end+1;data=data[end+1:]
   end=data.rfind(b'\n');data=data[:end+1] if end>=0 else b''
   more=offset+len(data)<info.st_size
- print(json.dumps({'offset':offset,'data':base64.b64encode(data).decode(),'partial':offset>0,'verifiedAfter':after,'hasMore':more,'scannedCursor':scanned,'images':images}))
+ print(json.dumps({'offset':offset,'data':base64.b64encode(data).decode(),'partial':offset>0,'verifiedAfter':after,'hasMore':more,'scannedCursor':scanned,'images':images,**({'projected':projected} if projected else {})}))
 finally: os.close(f)
 `;
 export function discordHistoryCommand(source: DiscordHistorySource, image?: DiscordGeneratedImage): string {
@@ -302,6 +329,7 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
     hasMore?: boolean;
     scannedCursor?: string;
     images?: DiscordGeneratedImage[];
+    projected?: Array<{ offset: number; hash: string; value: NativeHistoryRow }>;
   };
   if (packet.error) throw new DiscordHistoryReadError(packet.error);
   if (source.after && packet.verifiedAfter !== source.after) throw new DiscordHistoryReadError('cursor_changed');
@@ -322,18 +350,50 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
     throw new DiscordHistoryReadError('cursor_changed');
   const content = Buffer.from(packet.data, 'base64');
   let offset = packet.offset;
-  const rows: Array<{ value: NativeHistoryRow; offset: number; raw: string }> = [];
+  const rows: Array<{ value: NativeHistoryRow; offset: number; hash: string }> = [];
   for (const line of content.toString('utf8').split('\n')) {
     if (line) {
       try {
         const value: unknown = JSON.parse(line);
         if (value && typeof value === 'object' && !Array.isArray(value))
-          rows.push({ value: value as NativeHistoryRow, offset, raw: line });
+          rows.push({
+            value: value as NativeHistoryRow,
+            offset,
+            hash: createHash('sha256').update(line).digest('hex').slice(0, 16),
+          });
       } catch {
         /* partial or malformed record */
       }
     }
     offset += Buffer.byteLength(line) + 1;
+  }
+  if (packet.projected !== undefined) {
+    if (!source.after || format !== 'codex-rollout' || !Array.isArray(packet.projected) || packet.projected.length > 1)
+      throw new Error('Invalid projected history record');
+    for (const row of packet.projected) {
+      const p = row?.value?.payload;
+      if (
+        !Number.isSafeInteger(row?.offset) ||
+        row.offset < Number(source.after.split(':')[1]) ||
+        !/^[a-f0-9]{16}$/.test(row.hash) ||
+        row.value.type !== 'response_item' ||
+        p?.type !== 'message' ||
+        (p.role !== 'user' && p.role !== 'assistant') ||
+        !Array.isArray(p.content) ||
+        p.content.some(
+          (b) =>
+            !b ||
+            typeof b !== 'object' ||
+            !['input_text', 'output_text', 'text'].includes(b.type) ||
+            typeof b.text !== 'string'
+        ) ||
+        Buffer.byteLength(JSON.stringify(row.value)) > 2 * 1024 * 1024 ||
+        packet.scannedCursor !== `${source.conversationId}:${row.offset}:${row.hash}` ||
+        rows.some((r) => r.offset >= row.offset)
+      )
+        throw new Error('Invalid projected history record');
+      rows.push(row);
+    }
   }
   const turns: DiscordHistoryTurn[] = [];
   const generatedImages: DiscordGeneratedImage[] = [];
@@ -358,7 +418,7 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
       throw new Error('Invalid generated image metadata');
     for (const image of packet.images) addImage(image);
   }
-  for (const { value: e, offset, raw } of rows) {
+  for (const { value: e, offset, hash } of rows) {
     let role: 'user' | 'assistant' | 'tool' | undefined,
       text = '',
       phase: DiscordHistoryTurn['phase'],
@@ -380,7 +440,7 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
       addImage({
         id: item.id,
         timestamp,
-        cursor: `${source.conversationId}:${offset}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`,
+        cursor: `${source.conversationId}:${offset}:${hash}`,
       });
     if (source.includeTools) {
       let output = '';
@@ -419,7 +479,7 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
           role: 'tool',
           text: output.slice(0, 2000),
           timestamp,
-          cursor: `${source.conversationId}:${offset}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`,
+          cursor: `${source.conversationId}:${offset}:${hash}`,
         });
     }
     if (format === 'codex-rollout') {
@@ -481,7 +541,7 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
       text,
       ...(phase ? { phase } : {}),
       timestamp,
-      cursor: `${source.conversationId}:${offset}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`,
+      cursor: `${source.conversationId}:${offset}:${hash}`,
     });
   }
   const executions = nativeExecutions(
@@ -489,7 +549,7 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
     source.conversationId!,
     rows.map((r) => ({
       value: r.value,
-      cursor: `${source.conversationId}:${r.offset}:${createHash('sha256').update(r.raw).digest('hex').slice(0, 16)}`,
+      cursor: `${source.conversationId}:${r.offset}:${r.hash}`,
     })),
     turns
   );
@@ -505,10 +565,7 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
           verifiedAfter: packet.verifiedAfter,
           hasMore: packet.hasMore === true,
           scannedCursor:
-            packet.scannedCursor ??
-            (last
-              ? `${source.conversationId}:${last.offset}:${createHash('sha256').update(last.raw).digest('hex').slice(0, 16)}`
-              : undefined),
+            packet.scannedCursor ?? (last ? `${source.conversationId}:${last.offset}:${last.hash}` : undefined),
         }
       : {}),
   };

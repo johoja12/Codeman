@@ -1,8 +1,11 @@
 /** Cursor recovery uses temporary exact transcripts, never production histories or agents. */
-import { mkdtemp, mkdir, writeFile, appendFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, appendFile, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect } from 'vitest';
+import { createHash } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { readDiscordHistory, discordHistoryCommand } from '../src/discord-history.js';
 const id = '12345678-1234-1234-1234-123456789abc';
 const row = (v: unknown) => JSON.stringify(v) + '\n';
@@ -236,3 +239,90 @@ it.each([
     await expect(readDiscordHistory({ ...source, after })).rejects.toThrow('bounded recovery size');
   });
 });
+
+it('projects image-heavy prompts without sending image bytes, retaining text, original hashes and all later updates', async () => {
+  await fixture('codex', async (root, path) => {
+    const source = { mode: 'codex', conversationId: id, configHome: root };
+    await appendFile(path, row(answer('codex', 'Already delivered')));
+    const after = (await readDiscordHistory(source)).turns[0].cursor;
+    const imageRow = row({
+      type: 'response_item',
+      timestamp: '2026-11-10T08:52:04Z',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'Inspect this screenshot\nKeep the line breaks.' },
+          {
+            type: 'input_image',
+            image_url: 'data:image/png;base64,' + 'PRIVATE_BINARY'.repeat(290000),
+            detail: 'original',
+          },
+          { type: 'input_text', text: 'Second line.' },
+        ],
+      },
+    });
+    const at = (await readFile(path)).length;
+    const expected = `${id}:${at}:${createHash('sha256').update(imageRow.slice(0, -1)).digest('hex').slice(0, 16)}`;
+    await appendFile(
+      path,
+      imageRow +
+        row({
+          type: 'event_msg',
+          payload: { type: 'agent_message', message: 'Progress after image', phase: 'commentary' },
+        }) +
+        row(answer('codex', 'Final after image'))
+    );
+    const command = discordHistoryCommand({ ...source, after });
+    const raw = (await promisify(execFile)('sh', ['-c', command], { maxBuffer: 8 * 1024 * 1024 })).stdout;
+    expect(raw).not.toContain('PRIVATE_BINARY');
+    expect(raw.length).toBeLessThan(10000);
+    const first = await readDiscordHistory({ ...source, after });
+    expect(first.turns.at(-1)).toMatchObject({
+      role: 'user',
+      text: 'Inspect this screenshot\nKeep the line breaks.\nSecond line.',
+      cursor: expected,
+    });
+    expect(first.scannedCursor).toBe(expected);
+    const second = await readDiscordHistory({ ...source, after: first.scannedCursor });
+    expect(second.verifiedAfter).toBe(expected);
+    expect(second.turns.map((t) => t.text)).toEqual(['Progress after image', 'Final after image']);
+    const bytes = await readFile(path);
+    bytes[at + 30] = bytes[at + 30] === 65 ? 66 : 65;
+    await writeFile(path, bytes);
+    await expect(readDiscordHistory({ ...source, after: expected })).rejects.toThrow('changed');
+  });
+});
+it.each(['unknown-block', 'oversized-text', 'image-with-text'])(
+  'refuses unsafe image projections (%s)',
+  async (kind) => {
+    await fixture('codex', async (root, path) => {
+      const source = { mode: 'codex', conversationId: id, configHome: root };
+      await appendFile(path, row(answer('codex', 'anchor')));
+      const after = (await readDiscordHistory(source)).turns[0].cursor;
+      const image = {
+        type: 'input_image',
+        image_url: 'data:image/png;base64,' + 'x'.repeat(2300000),
+        ...(kind === 'image-with-text' ? { text: 'Do not drop this' } : {}),
+      };
+      await appendFile(
+        path,
+        row({
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [
+              image,
+              {
+                type: kind === 'unknown-block' ? 'new-type' : 'input_text',
+                text: kind === 'oversized-text' ? 't'.repeat(2300000) : 'Keep this',
+              },
+            ],
+          },
+        })
+      );
+      await expect(readDiscordHistory({ ...source, after })).rejects.toThrow('bounded recovery size');
+    });
+  }
+);
