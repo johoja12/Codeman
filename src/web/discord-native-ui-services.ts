@@ -1,6 +1,7 @@
 import {
   parseClaudeVisibleQuestion,
   parseClaudeHookConfirmation,
+  parseClaudeCompactionPrompt,
   claudeQuestionGone,
 } from './claude-visible-question.js';
 import type { ApprovalItem } from './approval-inbox.js';
@@ -93,10 +94,11 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       if (!frame) return undefined;
       const dialog = parseClaudeVisibleQuestion(frame);
       const permission = dialog ? undefined : parseClaudeHookConfirmation(frame);
-      const text = dialog?.text ?? permission?.text;
+      const compaction = dialog || permission ? undefined : parseClaudeCompactionPrompt(frame);
+      const text = dialog?.text ?? permission?.text ?? compaction?.text;
       const kind = permission ? 'permission' : 'question';
       const previous = observed.get(s.id);
-      if (text && (dialog || permission) && conversation && revision !== undefined) {
+      if (text && (dialog || permission || compaction) && conversation && revision !== undefined) {
         if (
           !previous ||
           previous.text !== text ||
@@ -113,7 +115,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
             sessionName: s.name || s.id.slice(0, 8),
             mode: 'claude',
             kind,
-            toolName: permission?.toolName ?? 'AskUserQuestion',
+            toolName: permission?.toolName ?? compaction?.toolName ?? 'AskUserQuestion',
             answerInTerminal: !dialog || dialog.multiSelect || typeof s.withNativeQuestionInput !== 'function',
             nativeQuestion:
               dialog && !dialog.multiSelect && typeof s.withNativeQuestionInput === 'function'
