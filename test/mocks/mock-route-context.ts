@@ -190,13 +190,13 @@ export function createMockRouteContext(options?: {
     getGlobalNiceConfig: vi.fn(async () => undefined),
     getModelConfig: vi.fn(async () => null),
     getClaudeModeConfig: vi.fn(async () => ({})),
-    getTerminalHistoryConfig: vi.fn(async () => resolveTerminalHistoryConfig()),
+    getTerminalHistoryConfig: vi.fn(async () => resolveTerminalHistoryConfig({})),
     getTruecolorEnabled: vi.fn(async () => false),
     getCheckpointDefaultEnabled: vi.fn(async () => true),
-    // Default OFF mirrors the shipped setting, so existing tests never touch a
+    // Default ON mirrors the shipped setting, so existing tests never touch a
     // case's .claude/skills. Overridable per test because the create-time
     // injection call sites are otherwise unreachable from a route test.
-    getAgentSkillEnabled: vi.fn(async () => options?.agentSkillEnabled ?? false),
+    getAgentSkillEnabled: vi.fn(async () => options?.agentSkillEnabled ?? true),
     // Default OFF mirrors the shipped setting: no test opens a voice relay by accident.
     getClaudeVoiceEnabled: vi.fn(async () => options?.claudeVoiceEnabled ?? false),
     // Default ON mirrors the shipped setting, so a route test sees what a user sees.
@@ -222,6 +222,10 @@ export function createMockRouteContext(options?: {
       createSession: vi.fn(),
       killSession: vi.fn(),
       listSessions: vi.fn(() => []),
+      // A DIFFERENT method from listSessions, and the adoption routes call this
+      // one. Missing it is not a type error: the handler throws and the route
+      // answers 500, which reads as a broken endpoint rather than a broken mock.
+      getSessions: vi.fn(() => []),
       getStats: vi.fn(() => ({})),
       updateSessionName: vi.fn(() => true),
       setHistoryLimit: vi.fn(async () => {}),

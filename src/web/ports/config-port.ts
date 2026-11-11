@@ -21,7 +21,7 @@ export interface ConfigPort {
   getTruecolorEnabled(): Promise<boolean>;
   /** COD-257: whether newly created sessions enable Agent Checkpoint (settings.json, default on). */
   getCheckpointDefaultEnabled(): Promise<boolean>;
-  /** Synced `agentSkillEnabled` app setting (default OFF); gates per-case agent-skill injection. */
+  /** Synced `agentSkillEnabled` app setting (default ON, only an explicit false is off); gates per-case agent-skill injection. */
   getAgentSkillEnabled(): Promise<boolean>;
   /** Synced `workspaceHooksEnabled` app setting (default ON); gates INSTALLING hooks into a session's workspace. */
   getWorkspaceHooksEnabled(): Promise<boolean>;

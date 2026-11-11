@@ -98,6 +98,17 @@ export function registerRespawnRoutes(
     }
     const session = findSessionOrFail(ctx, id, req);
 
+    // ⚠️ Adoption gate, kept SEPARATE from the external-CLI gate above: an adopted
+    // session can be `mode: 'claude'` and still be a process we never launched.
+    // Everything below drives the pane on the assumption Codeman owns what runs
+    // in it (sending `/clear`, killing and relaunching the agent), which against
+    // someone else's live session is destructive, not merely unsupported.
+    if (session.isAdopted) {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        'Respawn is not available for adopted sessions: Codeman did not start this agent and must not drive its lifecycle'
+      );
+    }
     // Respawn is not supported for external CLI sessions.
     //
     // COD-416/Q23: this was a hardcoded `opencode|codex|gemini|antigravity` list — the external
@@ -248,6 +259,17 @@ export function registerRespawnRoutes(
       return createErrorResponse(ApiErrorCode.SESSION_BUSY, 'Session is busy');
     }
 
+    // ⚠️ Adoption gate, kept SEPARATE from the external-CLI gate above: an adopted
+    // session can be `mode: 'claude'` and still be a process we never launched.
+    // Everything below drives the pane on the assumption Codeman owns what runs
+    // in it (sending `/clear`, killing and relaunching the agent), which against
+    // someone else's live session is destructive, not merely unsupported.
+    if (session.isAdopted) {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        'Respawn is not available for adopted sessions: Codeman did not start this agent and must not drive its lifecycle'
+      );
+    }
     // Respawn is not supported for external CLI sessions.
     //
     // COD-416/Q23: this was a hardcoded `opencode|codex|gemini|antigravity` list — the external
@@ -324,6 +346,17 @@ export function registerRespawnRoutes(
     const body = reResult.data as { config?: Partial<RespawnConfig>; durationMinutes?: number };
     const session = findSessionOrFail(ctx, id, req);
 
+    // ⚠️ Adoption gate, kept SEPARATE from the external-CLI gate above: an adopted
+    // session can be `mode: 'claude'` and still be a process we never launched.
+    // Everything below drives the pane on the assumption Codeman owns what runs
+    // in it (sending `/clear`, killing and relaunching the agent), which against
+    // someone else's live session is destructive, not merely unsupported.
+    if (session.isAdopted) {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        'Respawn is not available for adopted sessions: Codeman did not start this agent and must not drive its lifecycle'
+      );
+    }
     // Respawn is not supported for external CLI sessions.
     //
     // COD-416/Q23: this was a hardcoded `opencode|codex|gemini|antigravity` list — the external

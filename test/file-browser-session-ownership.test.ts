@@ -28,6 +28,7 @@ type BrowserData = {
 type FakeTreeItem = {
   dataset: { path: string; type: string };
   addEventListener: ReturnType<typeof vi.fn>;
+  querySelector: ReturnType<typeof vi.fn>;
 };
 
 type FakeTree = {
@@ -46,7 +47,7 @@ type Host = {
   fileBrowserExpandedDirs: Set<string>;
   fileBrowserShowHidden?: boolean;
   renderFileBrowserTree: () => void;
-  loadFileBrowser: (sessionId: string) => Promise<void>;
+  loadFileBrowser: (sessionId: string, options?: { adoptOwner?: boolean }) => Promise<void>;
   refreshFileBrowser: () => void;
   getFileIcon: ReturnType<typeof vi.fn>;
   formatFileSize: ReturnType<typeof vi.fn>;
@@ -79,6 +80,7 @@ function loadPanelsUiPrototype(fetchImpl = vi.fn()): Record<string, (...args: ne
   const source = readFileSync(resolve(import.meta.dirname, '../src/web/public/panels-ui.js'), 'utf8');
   const context = vm.createContext({
     console,
+    CodemanBase: { url: (path: string) => path },
     CodemanApp: class CodemanApp {},
     escapeHtml: (value: unknown) => String(value ?? ''),
     fetch: fetchImpl,
@@ -94,6 +96,14 @@ function loadPanelsUiPrototype(fetchImpl = vi.fn()): Record<string, (...args: ne
   return (context as { __proto: Record<string, (...args: never[]) => unknown> }).__proto;
 }
 
+function wireHost(host: Host, proto: Record<string, (...args: never[]) => unknown>): void {
+  Object.setPrototypeOf(host, proto);
+  const query = host.$;
+  host.$ = vi.fn((id: string) => (id === 'fileBrowserPanel' ? { classList: { contains: () => true } } : query(id)));
+  host.fileBrowserExpandedDirs ??= new Set();
+  host.fileBrowserFilter ??= '';
+}
+
 function browserData(path: string): BrowserData {
   return {
     tree: [{ name: path.split('/').at(-1) ?? path, path, type: 'file', extension: 'docx', size: 1024 }],
@@ -107,6 +117,7 @@ function fakeTree(path: string): { tree: FakeTree; item: FakeTreeItem } {
   const item: FakeTreeItem = {
     dataset: { path, type: 'file' },
     addEventListener: vi.fn(),
+    querySelector: vi.fn(() => null),
   };
   return {
     tree: {
@@ -156,9 +167,10 @@ describe('COD-231 file-browser session ownership', () => {
       fileBrowserData: null,
       renderFileBrowserTree: vi.fn(),
     } as unknown as Host;
+    wireHost(host, proto);
     host.loadFileBrowser = proto.loadFileBrowser as Host['loadFileBrowser'];
 
-    await host.loadFileBrowser('requested-session');
+    await host.loadFileBrowser('requested-session', { adoptOwner: true });
 
     expect(host.fileBrowserData).toBe(data);
     expect(host.fileBrowserSessionId).toBe('requested-session');
@@ -170,6 +182,7 @@ describe('COD-231 file-browser session ownership', () => {
     const path = 'deliverables/story.docx';
     const { tree, item } = fakeTree(path);
     const host = renderHost(proto, tree, browserData(path));
+    wireHost(host, proto);
 
     host.renderFileBrowserTree();
     const clickHandler = item.addEventListener.mock.calls.find(([event]) => event === 'click')?.[1] as
@@ -191,6 +204,7 @@ describe('COD-231 file-browser session ownership', () => {
     const path = 'deliverables/story.docx';
     const { tree } = fakeTree(path);
     const host = renderHost(proto, tree, browserData(path));
+    wireHost(host, proto);
 
     host.renderFileBrowserTree();
 
@@ -217,9 +231,10 @@ describe('COD-231 file-browser session ownership', () => {
         snapshots.push({ data: this.fileBrowserData, sessionId: this.fileBrowserSessionId });
       }),
     } as unknown as Host;
+    wireHost(host, proto);
     host.loadFileBrowser = proto.loadFileBrowser as Host['loadFileBrowser'];
 
-    await host.loadFileBrowser('new-session');
+    await host.loadFileBrowser('new-session', { adoptOwner: true });
 
     expect(snapshots).toEqual([{ data: newData, sessionId: 'new-session' }]);
   });
@@ -246,10 +261,11 @@ describe('COD-231 file-browser session ownership', () => {
         tree.innerHTML = `rendered:${this.fileBrowserSessionId}`;
       }),
     } as unknown as Host;
+    wireHost(host, proto);
     host.loadFileBrowser = proto.loadFileBrowser as Host['loadFileBrowser'];
 
-    const loadA = host.loadFileBrowser('session-a');
-    const loadB = host.loadFileBrowser('session-b');
+    const loadA = host.loadFileBrowser('session-a', { adoptOwner: true });
+    const loadB = host.loadFileBrowser('session-b', { adoptOwner: true });
     requestB.resolve(successfulResponse(dataB));
     await loadB;
 
@@ -289,12 +305,13 @@ describe('COD-231 file-browser session ownership', () => {
         tree.innerHTML = `rendered:${this.fileBrowserSessionId}`;
       }),
     } as unknown as Host;
+    wireHost(host, proto);
     host.loadFileBrowser = proto.loadFileBrowser as Host['loadFileBrowser'];
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 
     try {
-      const loadA = host.loadFileBrowser('session-a');
-      const loadB = host.loadFileBrowser('session-b');
+      const loadA = host.loadFileBrowser('session-a', { adoptOwner: true });
+      const loadB = host.loadFileBrowser('session-b', { adoptOwner: true });
       requestB.resolve(successfulResponse(dataB));
       await loadB;
       requestA.resolve({ ok: false, json: async () => ({ success: false, error: 'stale failure' }) });
@@ -324,11 +341,12 @@ describe('COD-231 file-browser session ownership', () => {
       fileBrowserExpandedDirs: new Set(['tree-owner-session']),
       loadFileBrowser: vi.fn(),
     } as unknown as Host;
+    wireHost(host, proto);
     host.refreshFileBrowser = proto.refreshFileBrowser as Host['refreshFileBrowser'];
 
     host.refreshFileBrowser();
 
-    expect(host.loadFileBrowser).toHaveBeenCalledWith('tree-owner-session');
+    expect(host.loadFileBrowser).toHaveBeenCalledWith('tree-owner-session', { force: true });
     expect(host.loadFileBrowser).not.toHaveBeenCalledWith('new-active-session');
     expect(host.fileBrowserExpandedDirs.size).toBe(0);
     expect(host.fileBrowserFilter).toBe('');
@@ -359,6 +377,7 @@ describe('COD-231 file-browser session ownership', () => {
       fileBrowserShowHidden: false,
       renderFileBrowserTree: vi.fn(),
     } as unknown as Host;
+    wireHost(host, proto);
     host.toggleFileBrowserFolder = proto.toggleFileBrowserFolder as Host['toggleFileBrowserFolder'];
 
     await host.toggleFileBrowserFolder('src');
@@ -387,6 +406,7 @@ describe('COD-231 file-browser session ownership', () => {
       fileBrowserExpandedDirs: new Set<string>(),
       renderFileBrowserTree: vi.fn(),
     } as unknown as Host;
+    wireHost(host, proto);
     host.toggleFileBrowserFolder = proto.toggleFileBrowserFolder as Host['toggleFileBrowserFolder'];
 
     const expand = host.toggleFileBrowserFolder('src');

@@ -12,6 +12,7 @@ import type {
   SessionRemote,
 } from '../../src/types.js';
 import { sanitizeAttachmentHistory, upsertAttachmentHistory } from '../../src/session-attachment-history.js';
+import type { SessionAdopt } from '../../src/types/session.js';
 import type { GitFetchStatus } from '../../src/git-fetch.js';
 
 /**
@@ -27,6 +28,15 @@ export class MockSession extends EventEmitter {
    * over ssh instead of with local `fs` (#415).
    */
   remote?: SessionRemote;
+  /**
+   * Mirrors `Session.isAdopted`: true when this session wraps a process SOMEONE
+   * ELSE started (a hand-opened tmux session Codeman attached to). A plain field
+   * rather than a getter over `adopt`, because the routes only ever read the
+   * boolean and the tests only ever need to set it.
+   */
+  isAdopted: boolean = false;
+  /** Mirrors `Session.adopt`, the record the one-wrapper-per-target check keys on. */
+  adopt?: SessionAdopt;
   /**
    * The REAL union, deliberately. This used to be `'idle' | 'working'`, and
    * `'working'` is not a `SessionStatus` at all — so `signalForStatus()` fell to its
@@ -488,6 +498,18 @@ export class MockSession extends EventEmitter {
   // ─────────────────────────────────────────────────────────────────────────
 
   /** Auto-resume on usage limit (token pause control) */
+  autoClearEnabled: boolean = false;
+  autoClearThreshold: number = 0;
+  setAutoClear = vi.fn((enabled: boolean, threshold?: number) => {
+    this.autoClearEnabled = enabled;
+    if (typeof threshold === 'number') this.autoClearThreshold = threshold;
+  });
+  autoCompactEnabled: boolean = false;
+  autoCompactThreshold: number = 0;
+  setAutoCompact = vi.fn((enabled: boolean, threshold?: number) => {
+    this.autoCompactEnabled = enabled;
+    if (typeof threshold === 'number') this.autoCompactThreshold = threshold;
+  });
   autoResumeEnabled: boolean = false;
   autoResumeAt: number | null = null;
   isLimitPaused: boolean = false;
@@ -550,6 +572,8 @@ export class MockSession extends EventEmitter {
   /** Mirrors Session.envOverrideValue; no override map here, so the custom-model
    *  real-home lookup defaults to "session says nothing" (overridable per test). */
   envOverrideValue = vi.fn((_key: string): string | undefined => undefined);
+  /** Mirrors Session.ownEnvValue, same default. */
+  ownEnvValue = vi.fn((_key: string): string | undefined => undefined);
   getCustomModelForPersist = vi.fn(() => this._mockCustomModel);
   /** Mirrors Session.noteReportedModel: the statusline route records the CLI's model. */
   reportedModel: { model: string; source: 'statusline' | 'screen' } | null = null;

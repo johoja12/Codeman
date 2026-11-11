@@ -86,15 +86,35 @@ export const REMOTE_LOGIN_SHELL_RESOLVE =
   '[ -n "$login_shell" ] && [ -x "$login_shell" ] || login_shell="${SHELL:-/bin/sh}"; ';
 
 /**
+ * The remote login shell with the flags that make it one, as ONE compound command, so
+ * `cd <path> && <this>` keeps its short-circuit (a failed `cd` must not start a shell in
+ * the wrong folder). `args` follows the flags verbatim.
+ *
+ * The flags are chosen on the far end: the shell is whatever the REMOTE passwd says, so
+ * this is `loginShellArgs()` run where the answer is known. tcsh honors `-l` only as its
+ * ONLY flag and exits on `-i -l -c`, `-l -c` and `-i -l` (measured on tcsh 6.24), and
+ * `-c` needs no login flag to read `.tcshrc`, so csh and tcsh get neither flag.
+ */
+function remoteLoginShell(args: string): string {
+  return `{ ${REMOTE_LOGIN_SHELL_RESOLVE}set -- -i -l; case \${login_shell##*/} in csh|tcsh) set --;; esac; exec "$login_shell" "$@"${args}; }`;
+}
+
+/**
  * Run `command` through the remote user's interactive login shell, so per-user
- * PATH entries (~/.local/bin, ~/.opencode/bin, …) and rc-file env (~/.zshrc etc.)
- * are resolved before the CLI name is looked up. ssh's remote-command execution is
- * neither interactive nor login, so a bare `exec claude` sees only sshd's minimal
- * default PATH and dies with "command not found" (exit 127). The login shell is
- * resolved from the passwd entry at runtime (see REMOTE_LOGIN_SHELL_RESOLVE).
+ * PATH entries (~/.local/bin, ~/.opencode/bin, …) are resolved before the CLI name
+ * is looked up. ssh's remote-command execution is neither interactive nor login,
+ * so a bare `exec claude` sees only sshd's minimal default PATH and dies with
+ * "command not found" (exit 127).
+ *
+ * ⚠️ POSIX text, like `REMOTE_LOGIN_SHELL`: only `/bin/sh -c` may parse it.
+ *
+ * Other shells that take neither flag are what the per-host `commands.*` override is
+ * for. It only goes so far: the PATH bootstrap below runs in the login shell first, so
+ * a shell that cannot parse `export` at all (nushell, elvish) cannot be rescued by an
+ * override.
  */
 export function remoteLoginShellCommand(command: string): string {
-  return `${REMOTE_LOGIN_SHELL_RESOLVE}exec "$login_shell" -i -l -c ${shellescape(command)}`;
+  return remoteLoginShell(` -c ${shellescape(command)}`);
 }
 
 /**
@@ -135,8 +155,9 @@ function overlayCliCommand(mode: SessionMode, location: 'remote' | 'docker'): st
  * user's interactive-login shell startup files (~/.zshrc etc.). ssh's remote-command
  * execution is neither interactive nor login, so a bare `exec claude` sees only sshd's
  * minimal default PATH and fails with "command not found" (exit 127) — confirmed via
- * `tmux capture-pane` on the remain-on-exit-preserved dead pane. Route through
- * `$SHELL -i -l -c`, the same fix shell mode uses, so PATH is fully resolved first.
+ * `tmux capture-pane` on the remain-on-exit-preserved dead pane. Route through the
+ * login shell (`remoteLoginShellCommand`), the same fix shell mode uses, so PATH is fully
+ * resolved first.
  *
  * ⚠️ The per-CLI half is now READ FROM THE REGISTRY (`overlays.remote`), not from a
  * hardcoded `Record<RemoteCommandMode, string>`. The table it replaces duplicated the
@@ -151,19 +172,10 @@ function overlayCliCommand(mode: SessionMode, location: 'remote' | 'docker'): st
  * The per-host `commands.*` override remains the escape hatch for every mode.
  */
 export function defaultRemoteCommandForMode(mode: SessionMode): string {
-  // Upstream (#347) replaced the hardcoded per-mode map with the CLI registry
-  // overlay, and it is the better structure: verified entry-by-entry that it
-  // preserves every command our map spelled out — claude keeps
-  // `--dangerously-skip-permissions` via its remote overlay, deepseek resolves to
-  // `dsh` and antigravity to `agy` through binaries[0], and the rest match their
-  // own names. So the map is dropped rather than kept in parallel.
-  //
-  // ⚠ The `shell` arm keeps the DOWNSTREAM resolution (COD-277). Upstream uses
-  // `$SHELL`, but in a tmux pane that is the tmux SERVER's shell — which was bash
-  // and skipped ~/.zshrc for a zsh user. REMOTE_LOGIN_SHELL_RESOLVE reads the real
-  // login shell from getent/dscl instead. `remoteLoginShellCommand` already uses
-  // it, so the two arms now agree.
-  const shellCommand = `${REMOTE_LOGIN_SHELL_RESOLVE}exec "$login_shell" -i -l`;
+  // Resolve the remote user's passwd login shell rather than the tmux server's inherited
+  // SHELL, preserving the fork's rc-file environment discovery. The compound wrapper also
+  // chooses flags the selected shell accepts before executing it.
+  const shellCommand = remoteLoginShell('');
   const cli = overlayCliCommand(mode, 'remote');
   return cli === null ? shellCommand : remoteLoginShellCommand(cli);
 }
@@ -391,13 +403,15 @@ function remoteCliBin(mode: SessionMode): string | undefined {
 
 /**
  * Build the SSH command that reads the remote CLI's version (`claude --version`
- * on the remote host). The version query is routed through
- * `remoteLoginShellCommand` (the SAME `$SHELL -i -l -c` wrapper the real
- * launch uses), because agent CLIs live on PATH only after the remote user's
+ * on the remote host). The version query runs under `$SHELL -i -l -c` like the real
+ * launch, because agent CLIs live on PATH only after the remote user's
  * interactive-login startup files run (see defaultRemoteCommandForMode); a bare
  * `claude --version` over ssh exits 127. Connection options come from the
  * shared `buildSshConnectionArgs`, so the probe reaches exactly the hosts the
  * launch can reach. Returns null for modes with no CLI (shell).
+ *
+ * The remote default shell only starts `/bin/sh -c`; POSIX lookup and flag selection then
+ * run inside that shell, so fish/tcsh never need to parse the passwd lookup themselves.
  */
 export function buildRemoteCliVersionProbeCommand(
   host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions,
@@ -408,7 +422,7 @@ export function buildRemoteCliVersionProbeCommand(
   return [
     ...buildSshConnectionArgs(host),
     remoteSshTarget(host),
-    shellescape(remoteLoginShellCommand(`${bin} --version`)),
+    shellescape(`/bin/sh -c ${shellescape(remoteLoginShellCommand(`${bin} --version`))}`),
   ].join(' ');
 }
 

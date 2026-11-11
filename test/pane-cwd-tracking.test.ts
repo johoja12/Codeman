@@ -29,13 +29,16 @@
  *
  * Port: ephemeral
  */
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import vm from 'node:vm';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Session, rebasePath } from '../src/session.js';
 import { WebServer } from '../src/web/server.js';
+import { dataPath } from '../src/config/instance.js';
+import { createUser } from '../src/user-store.js';
 import type { SessionDocker, SessionRemote } from '../src/types.js';
 import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
 import { TmuxManager, derivePaneCurrentPaths, parsePaneRows, type PaneRow } from '../src/tmux-manager.js';
@@ -278,6 +281,248 @@ describe('a pane read reaching the session record', () => {
     expect(session.toState().workingDir).toBe('/work/proj');
   });
 
+  describe('liveWorktree (#765)', () => {
+    let base: string;
+    let repo: string;
+    let worktree: string;
+
+    beforeEach(() => {
+      base = mkdtempSync(join(tmpdir(), 'pane-live-worktree-'));
+      repo = join(base, 'repo');
+      worktree = join(repo, '.claude', 'worktrees', 'probe');
+      mkdirSync(worktree, { recursive: true });
+      writeFileSync(join(worktree, '.git'), `gitdir: ${repo}/.git/worktrees/probe\n`);
+    });
+
+    afterEach(() => {
+      rmSync(base, { recursive: true, force: true });
+    });
+
+    const inRepo = () => {
+      const { mux, sessions, web } = build();
+      const session = localMuxSession({ workingDir: repo });
+      sessions.set(session.id, session);
+      const broadcast = vi.fn();
+      (web as unknown as { broadcastSessionStateDebounced: (id: string) => void }).broadcastSessionStateDebounced =
+        broadcast;
+      mux.getPaneExit = () => undefined;
+      return { mux, session, web, broadcast };
+    };
+
+    it('publishes the worktree the pane moved into, and clears it when the pane leaves', async () => {
+      const { mux, session, web, broadcast } = inRepo();
+      let dir = worktree;
+      mux.getPaneCurrentPath = () => dir;
+      mux.emit('paneExitsUpdated');
+      await vi.waitFor(() => expect(session.liveWorktree).toEqual({ name: 'probe', path: worktree }));
+      // What the browser receives, and what the file routes read: never the confinement root.
+      const state = (
+        web as unknown as {
+          getSessionStateWithRespawn: (s: Session) => { liveWorktree?: unknown; outsideWorktree?: unknown };
+        }
+      ).getSessionStateWithRespawn(session);
+      expect(state.liveWorktree).toEqual({ name: 'probe', path: worktree });
+      expect(state.outsideWorktree).toBeUndefined();
+      expect(session.toState().workingDir).toBe(repo);
+
+      const broadcasts = broadcast.mock.calls.length;
+      dir = repo;
+      mux.emit('paneExitsUpdated');
+      await vi.waitFor(() => expect(session.liveWorktree).toBeUndefined());
+      expect(broadcast.mock.calls.length).toBeGreaterThan(broadcasts);
+    });
+
+    it('does nothing for a pane that has not moved', async () => {
+      const { mux, session } = inRepo();
+      mux.getPaneCurrentPath = () => repo;
+      const lookup = vi.spyOn(session, 'setLiveWorktree');
+      mux.emit('paneExitsUpdated');
+      await vi.waitFor(() => expect(lookup).toHaveBeenCalledTimes(1));
+      mux.emit('paneExitsUpdated');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(lookup).toHaveBeenCalledTimes(1);
+    });
+
+    it('drops an answer for a directory the pane has already left', async () => {
+      const { web, session } = inRepo();
+      session.setPaneCwd(worktree);
+      const refresh = (
+        web as unknown as { refreshLiveWorktree: (s: Session) => Promise<void> }
+      ).refreshLiveWorktree.call(web, session);
+      session.setPaneCwd(repo);
+      await refresh;
+      expect(session.liveWorktree).toBeUndefined();
+    });
+  });
+
+  describe('liveWorktree outside the session folder (#765 follow-up)', () => {
+    let base: string;
+    let repo: string;
+    let sibling: string;
+
+    const git = (cwd: string, ...args: string[]): void => {
+      execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, stdio: 'ignore' });
+    };
+
+    beforeEach(() => {
+      base = realpathSync(mkdtempSync(join(tmpdir(), 'pane-outside-worktree-')));
+      repo = join(base, 'myapp');
+      mkdirSync(repo);
+      git(repo, 'init', '-q');
+      writeFileSync(join(repo, 'README.md'), 'main');
+      git(repo, 'add', 'README.md');
+      git(repo, 'commit', '-q', '-m', 'init');
+      sibling = join(base, 'myapp-feature');
+      git(repo, 'worktree', 'add', '-q', sibling);
+    });
+
+    afterEach(() => {
+      rmSync(base, { recursive: true, force: true });
+    });
+
+    it('publishes a sibling worktree of the session repository as outside, and clears it on the way back', async () => {
+      const { mux, sessions, web } = build();
+      const session = localMuxSession({ workingDir: repo });
+      sessions.set(session.id, session);
+      (web as unknown as { broadcastSessionStateDebounced: (id: string) => void }).broadcastSessionStateDebounced =
+        vi.fn();
+      mux.getPaneExit = () => undefined;
+      let dir = sibling;
+      mux.getPaneCurrentPath = () => dir;
+      // A reading outside `workingDir` waits until the workspace's real path is known, so tick
+      // until it lands.
+      await vi.waitFor(() => {
+        mux.emit('paneExitsUpdated');
+        expect(session.liveWorktree).toEqual({ name: 'myapp-feature', path: sibling, outside: true });
+      });
+      expect(session.toState().workingDir).toBe(repo);
+      // On the wire an outside answer rides `outsideWorktree`; `liveWorktree` stays inside-only.
+      const state = session.toState();
+      expect(state.outsideWorktree).toEqual({ name: 'myapp-feature', path: sibling, outside: true });
+      expect(state.liveWorktree).toBeUndefined();
+
+      dir = repo;
+      mux.emit('paneExitsUpdated');
+      await vi.waitFor(() => expect(session.liveWorktree).toBeUndefined());
+    });
+
+    /**
+     * A session in `repo` whose pane sits in the sibling worktree, ticked until the lookup has
+     * answered. Returns the answer, so a test can tell "followed" from "refused".
+     */
+    const paneInSibling = async (sessionExtra: Record<string, unknown> = {}) => {
+      const { mux, sessions, web } = build();
+      const session = localMuxSession({ workingDir: repo, ...sessionExtra });
+      sessions.set(session.id, session);
+      (web as unknown as { broadcastSessionStateDebounced: (id: string) => void }).broadcastSessionStateDebounced =
+        vi.fn();
+      mux.getPaneExit = () => undefined;
+      mux.getPaneCurrentPath = () => sibling;
+      const lookup = vi.spyOn(session, 'setLiveWorktree');
+      // A reading outside `workingDir` waits until the workspace's real path is known, so tick
+      // until a lookup has run.
+      await vi.waitFor(() => {
+        mux.emit('paneExitsUpdated');
+        expect(lookup).toHaveBeenCalled();
+      });
+      // The lookup answers asynchronously; let the answer land before it is read.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return session.liveWorktree;
+    };
+
+    /** Sets env vars for one test and restores them afterwards. */
+    const withEnv = async (env: Record<string, string>, run: () => Promise<void>): Promise<void> => {
+      const before = Object.fromEntries(Object.keys(env).map((key) => [key, process.env[key]]));
+      Object.assign(process.env, env);
+      try {
+        await run();
+      } finally {
+        for (const [key, value] of Object.entries(before)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+    };
+
+    it('follows nothing while attachment workspace confinement is on', async () => {
+      await withEnv({ CODEMAN_ATTACHMENT_CONFINE: '1' }, async () => {
+        expect(await paneInSibling()).toBeUndefined();
+      });
+      expect(await paneInSibling()).toEqual({ name: 'myapp-feature', path: sibling, outside: true });
+    });
+
+    it('follows nothing at a worktree that is itself a sensitive folder such as .ssh', async () => {
+      const keys = join(base, 'keys');
+      mkdirSync(keys);
+      const ssh = join(keys, '.ssh');
+      git(repo, 'worktree', 'add', '-q', '-b', 'keys-branch', ssh);
+      sibling = ssh;
+      expect(await paneInSibling()).toBeUndefined();
+    });
+
+    it('follows nothing at, inside or around an attachment blocked tree', async () => {
+      // Around the worktree: its parent folder is blocked.
+      await withEnv({ CODEMAN_ATTACHMENT_BLOCKED_PATHS: base }, async () => {
+        expect(await paneInSibling()).toBeUndefined();
+      });
+      // Inside the worktree: a blocked tree below its root.
+      mkdirSync(join(sibling, 'private'));
+      await withEnv({ CODEMAN_ATTACHMENT_BLOCKED_PATHS: join(sibling, 'private') }, async () => {
+        expect(await paneInSibling()).toBeUndefined();
+      });
+      // A blocked tree elsewhere changes nothing.
+      await withEnv({ CODEMAN_ATTACHMENT_BLOCKED_PATHS: join(base, 'elsewhere') }, async () => {
+        expect(await paneInSibling()).toEqual({ name: 'myapp-feature', path: sibling, outside: true });
+      });
+    });
+
+    it('follows nothing in a Docker case workspace, around or inside it', async () => {
+      const casesFile = dataPath('docker-cases.json');
+      mkdirSync(dirname(casesFile), { recursive: true });
+      try {
+        for (const hostWorkspacePath of [sibling, base, join(sibling, 'src')]) {
+          writeFileSync(casesFile, JSON.stringify([{ hostWorkspacePath }]));
+          expect(await paneInSibling()).toBeUndefined();
+        }
+        writeFileSync(casesFile, JSON.stringify([{ hostWorkspacePath: join(base, 'elsewhere') }]));
+        expect(await paneInSibling()).toEqual({ name: 'myapp-feature', path: sibling, outside: true });
+      } finally {
+        rmSync(casesFile, { force: true });
+      }
+    });
+
+    it('follows nothing while docker-cases.json cannot be parsed', async () => {
+      const casesFile = dataPath('docker-cases.json');
+      mkdirSync(dirname(casesFile), { recursive: true });
+      try {
+        // A read that lands while the writer is rewriting the file.
+        writeFileSync(casesFile, '[{"hostWorkspacePath": "/hom');
+        expect(await paneInSibling()).toBeUndefined();
+        writeFileSync(casesFile, '[]');
+        expect(await paneInSibling()).toEqual({ name: 'myapp-feature', path: sibling, outside: true });
+      } finally {
+        rmSync(casesFile, { force: true });
+      }
+    });
+
+    it('applies the owner folder rule in multi-user mode', async () => {
+      const spaces = join(base, 'spaces');
+      mkdirSync(spaces);
+      await createUser({ username: 'pane-admin', role: 'admin', password: 'correct horse battery' });
+      await createUser({ username: 'pane-user', role: 'user', password: 'correct horse battery' });
+      await withEnv({ CODEMAN_MULTIUSER: '1', CODEMAN_USER_SPACES_DIR: spaces }, async () => {
+        // A regular user's space does not hold the sibling, and neither does the session folder.
+        expect(await paneInSibling({ owner: 'pane-user' })).toBeUndefined();
+        // An admin may follow any worktree the repository lists.
+        expect(await paneInSibling({ owner: 'pane-admin' })).toEqual({
+          name: 'myapp-feature',
+          path: sibling,
+          outside: true,
+        });
+      });
+    });
+  });
+
   it('broadcasts a directory change once, and nothing on an unchanged tick', () => {
     const { mux, sessions } = build();
     const session = localMuxSession();
@@ -481,10 +726,14 @@ describe('confinement is unchanged by the live cwd', () => {
         __proto: {
           _resolveLinkedFilePath: (p: string, id: string) => string;
           _isExternalPreviewPath: (p: string, id: string) => boolean;
+          _isOutsideWorktreePath: (p: string, id: string) => boolean;
         };
       }
     ).__proto;
-    const app = { sessions: new Map([['s1', session]]) };
+    const app = {
+      sessions: new Map([['s1', session]]),
+      _isOutsideWorktreePath: proto._isOutsideWorktreePath,
+    };
     return {
       target: (p: string) => proto._resolveLinkedFilePath.call(app, p, 's1'),
       external: (p: string) => proto._isExternalPreviewPath.call(app, p, 's1'),
@@ -529,10 +778,14 @@ describe('a workspace reached through a symlink', () => {
         __proto: {
           _resolveLinkedFilePath: (p: string, id: string) => string;
           _isExternalPreviewPath: (p: string, id: string) => boolean;
+          _isOutsideWorktreePath: (p: string, id: string) => boolean;
         };
       }
     ).__proto;
-    const app = { sessions: new Map([['s1', session]]) };
+    const app = {
+      sessions: new Map([['s1', session]]),
+      _isOutsideWorktreePath: proto._isOutsideWorktreePath,
+    };
     return (p: string) => proto._isExternalPreviewPath.call(app, proto._resolveLinkedFilePath.call(app, p, 's1'), 's1');
   };
 

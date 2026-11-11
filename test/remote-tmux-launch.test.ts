@@ -11,7 +11,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { describe, it, expect } from 'vitest';
-import { REMOTE_PATH_BOOTSTRAP, REMOTE_LOGIN_SHELL_RESOLVE } from '../src/remote-hosts.js';
+import { REMOTE_PATH_BOOTSTRAP, REMOTE_LOGIN_SHELL_RESOLVE, defaultRemoteCommandForMode } from '../src/remote-hosts.js';
 import { buildRemoteLaunchCommand, ManualRecoveryRequiredError } from '../src/tmux-manager.js';
 import type { SessionRemote } from '../src/types.js';
 
@@ -56,7 +56,7 @@ describe('COD-104 buildRemoteLaunchCommand — remote tmux attach-or-create', ()
     });
 
     expect(command).toContain('/home/ubuntu/work');
-    expect(command).toContain(`${REMOTE_LOGIN_SHELL_RESOLVE}exec "$login_shell" -i -l`);
+    expect(command).toContain(`${REMOTE_LOGIN_SHELL_RESOLVE}set -- -i -l`);
     expect(command).toContain(`set -t ${EXPECTED_NAME} status off`);
     expect(command).toContain(`set -t ${EXPECTED_NAME} mouse off`);
     expect(command).toContain('set -s escape-time 0');
@@ -212,10 +212,8 @@ describe('COD-104 buildRemoteLaunchCommand — remote tmux attach-or-create', ()
     // The pane command is one tmux argument; the path is still single-quoted for
     // the /bin/sh -c that tmux runs it under, so the deepest `cd` gets the space
     // path intact and the login-shell launch follows.
-    const paneCmd = tmuxArgs.find((a) => a.includes('&& export PATH='));
-    expect(paneCmd).toBe(
-      `cd '${spacePath}' && ${REMOTE_PATH_BOOTSTRAP}; ${REMOTE_LOGIN_SHELL_RESOLVE}exec "$login_shell" -i -l`
-    );
+    const paneCmd = tmuxArgs.find((a) => a.includes('&& { export PATH='));
+    expect(paneCmd).toBe(`cd '${spacePath}' && { ${REMOTE_PATH_BOOTSTRAP}; ${defaultRemoteCommandForMode('shell')}; }`);
   });
 
   it('derives a deterministic, reattach-stable session name from sessionId', () => {

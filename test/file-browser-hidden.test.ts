@@ -38,7 +38,7 @@ interface FakeElement {
   textContent: string;
   classes: Set<string>;
   attrs: Record<string, string>;
-  classList: { toggle: (name: string, on: boolean) => void };
+  classList: { toggle: (name: string, on: boolean) => void; contains: (name: string) => boolean };
   setAttribute: (name: string, value: string) => void;
 }
 
@@ -51,6 +51,7 @@ function fakeElement(): FakeElement {
     classes,
     attrs,
     classList: {
+      contains: (name: string) => classes.has(name),
       toggle(name: string, on: boolean) {
         if (on) classes.add(name);
         else classes.delete(name);
@@ -92,10 +93,12 @@ function loadPanel(store: Map<string, string> | null) {
   vm.runInContext(panelsJs, context, { filename: 'panels-ui.js' });
 
   const elements: Record<string, FakeElement> = {
+    fileBrowserPanel: fakeElement(),
     fileBrowserTree: fakeElement(),
     fileBrowserStatus: fakeElement(),
     fileBrowserHiddenBtn: fakeElement(),
   };
+  elements.fileBrowserPanel.classes.add('visible');
   const requests: string[] = [];
   const app = new CodemanApp() as Record<string, any>;
   app.$ = (id: string) => elements[id] ?? null;

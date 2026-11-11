@@ -33,11 +33,10 @@ import type { SessionMode } from '../src/types/session.js';
 // the tmux SERVER's shell (bash here), so a zsh user's ~/.zshrc was never sourced. The shell
 // arm resolves the REAL login shell from the passwd entry (getent/dscl) at runtime instead,
 // which is why this one golden differs from upstream's.
-const REMOTE_LOGIN_SHELL = 'login_shell';
 
 it('pins every remote pane command', () => {
   const expected: Record<string, string> = {
-    shell: `${REMOTE_LOGIN_SHELL_RESOLVE}exec "$${REMOTE_LOGIN_SHELL}" -i -l`,
+    shell: `{ ${REMOTE_LOGIN_SHELL_RESOLVE}set -- -i -l; case \${login_shell##*/} in csh|tcsh) set --;; esac; exec "$login_shell" "$@"; }`,
     claude: remoteLoginShellCommand('claude --dangerously-skip-permissions'),
     opencode: remoteLoginShellCommand('opencode'),
     codex: remoteLoginShellCommand('codex'),

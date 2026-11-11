@@ -1,5 +1,118 @@
 # aicodeman
 
+## 1.50.1
+
+### Patch Changes
+
+- e06257c: ### Thanks
+  - @opticon454 for syncing case options and the picked case across devices, over five review rounds (#732).
+  - @ludovicfourrage for dictation that survives a thinking pause and the Android dictation fixes, over three review rounds (#705).
+  - @johoja12 for the log viewer reconnect fix (#720).
+  - @shenlvkang-collab for the image zoom (#608) and the Files panel delete button (#529), both carried forward in #791 and #792, and for the foldable phone report (#702).
+
+  **A MacBook keeps working with the lid closed (#795).** The Codeman app for Mac has a new menu, Codeman > Keep This Mac Awake: Off, While Agents Work (and 5 minutes after the last one stops) or Always. It only acts for a Codeman running on this Mac, and pauses on battery unless you untick Only When Plugged In. On a MacBook, With the Lid Closed… keeps a closed Mac awake on its power adapter. It asks for your administrator password once and installs a small helper; unticking it removes the helper. Behaviour change: while it keeps watch for a Codeman on this Mac, closing the Codeman window hides the app instead of quitting it, so the Mac stays awake; click the Dock icon to bring it back, and quit with Cmd+Q (#800). With no server open, or one on another machine, closing the window still quits.
+
+  **The lid logo breathes while agents work (#794).** The Apple logo blink from 1.50.0 now has one switch, View > Blink Apple Logo. It breathes while agents work, blinks for a yellow tab and flashes for a red one: the more it moves, the more it needs you. It now moves on the logo's own hardware fades, so a blink no longer writes a system setting. Styles you picked in 1.50.0 are kept.
+
+  **The logo keeps blinking with the lid closed (#801).** While the Mac stays awake behind a closed lid on its power adapter (Keep This Mac Awake > With the Lid Closed…, or an external display), the logo goes on showing your agents, and the keyboard stays dark. macOS keeps the logo dark under a closed lid, so the app tells the logo the lid is open, the way LogoLight 1.3.1 does. A line under View > Apple Logo Blink Styles says what the closed lid did last: blinking, or why not. On battery nothing changes: the Mac sleeps when you close it.
+
+  **Codeman and LogoLight take turns on the logo (#802).** With LogoLight 1.3 or later running, LogoLight steps aside while Codeman shows its agents on the logo, and takes the logo back afterwards. Until now Codeman left the logo alone whenever LogoLight ran. An older LogoLight still keeps the logo, and Codeman tells you to update it when you turn the switch on.
+
+  **Dictation survives a thinking pause (#705).** A new Voice setting, Stop after silence, sets how long a pause may last before dictation stops: the provider's default, 3, 6, 15 or 30 seconds, or Manual. Claude dictation keeps going from one sentence to the next until you press Stop, and keeps your last words. On Chrome for Android, words are no longer repeated or lost at the end. Behaviour change: on iOS Safari dictation no longer stops after 750 ms without new words; it stops at the silence deadline like everywhere else.
+
+  **Sync cases across devices (#732).** A new setting, off by default, keeps each case's Agent Teams and Opus 1M options on the server instead of in each browser. When you come back to a tab, the case picker follows the case you last picked on another device.
+
+  **Delete a file from the Files panel (#792).** File rows in the Files panel, tree and search results, have a delete button that asks first. Symbolic links, `.git`, sensitive files and remote or adopted sessions are refused.
+
+  **Zoom the path picker's image preview (#791).** Pinch and drag on a phone, the mouse wheel or a trackpad on a desktop, double-click for 2x, or the zoom buttons. A small image now shows at its own size instead of stretched.
+
+  **Fixes.**
+  - **The phone overview appears on a fold (#790).** Folding a phone, or narrowing a window below 600px, left the welcome screen up when the page had loaded wide. Refs #702.
+  - **The log viewer stops reconnecting after a startup error (#720).** A refused path, a missing or too large file, the stream limit or a failed tail made the floating log viewer reconnect every few seconds.
+  - **The local model install view no longer flashes Paused at the end.** A view read while the install job finished could show the job as paused.
+
+  **Fixes applied while landing.** #720 keeps the browser's own retry after a network error before the stream connects. The Mac app's window-close change (#800) came from checking #795 against how people quit the app. #705: the green Send button now stays up for the words saved when dictation is cut off by a reconnect, and the API reference says what a voice transcript frame holds.
+
+  **Docs and tests.** Both READMEs have a Download for Mac button at the top. The Mac app's code was reorganised into smaller modules (#789) with no change in behaviour.
+
+## 1.50.0
+
+### Minor Changes
+
+- ### Thanks
+  - @irisitymichaelgrundberg for the Files panel following an agent into a worktree outside the session's folder, and for the rules that keep that second folder narrow (#780).
+  - @Randalix for keeping two tests independent of the host's locale and git ignore file (#776).
+
+  **Codeman for Mac (#763).** A small native macOS app opens Codeman in its own window: it opens the Codeman running on this Mac, starts it when it is stopped, installs it when it is missing, or connects to Codeman on another machine, with that password kept in the Keychain. It is one universal app for Apple Silicon and Intel on macOS 11.3 or later, and a client of the web UI like a browser tab, so the server and the API do not change for it. Every release from this one carries it as `Codeman.dmg`, signed with a Developer ID and notarized, so it opens after macOS's usual question about a downloaded app ([1.50.0's copy](https://github.com/Ark0N/Codeman/releases/download/codeman@1.50.0/Codeman.dmg)). The app keeps its own version (0.1.0) and does not update itself yet.
+
+  **Your MacBook's Apple logo blinks with your agents (#781).** On a MacBook Pro with a PROLED XDR display, whose lid logo lights up, _View > Blink Apple Logo_ gives each agent state its own rhythm: one for _While Working_, one for _Waiting for You_ (a yellow tab) and one for _Needs Permission_ (a red tab), each picked from Calm, Slow, Wink, Heartbeat, Fast and Alarm. Set Heartbeat for work, Wink for a finished turn and Alarm (three sharp flashes, then a rest) for a permission dialog, and the lid tells you from across the room which one it is. All three are off until you choose one, the menu shows only on a Mac with that logo, and no style flashes more than three times a second. It uses a private macOS setting, so a macOS update can take the menu away.
+
+  **Install from the app, with no Terminal and no password (#773).** On a Mac without Codeman, the app runs the installer's no-admin route in its own window, shows the steps as a checklist and opens Codeman once it answers. If the Mac has no coding agent it offers one, and _Add a coding agent_ (also in the app menu) adds one later without touching a running Codeman. The This Mac tab now lists every Codeman of this user already running on the Mac. The install needs macOS 15 or a tmux that is already there; on an older Mac the app offers Terminal instead. For this, `install.sh` gained `preflight`, `agent <id>`, `--ai-cli` and `--progress`.
+
+  **The Files panel follows a worktree outside the session's folder (#780).** Since 1.49.0 the panel follows an agent into a worktree inside the session's folder. It now also follows one of the same repository beside it, such as `git worktree add ../feature`, when the session's own repository vouches for it, and files there preview, edit and open from terminal links like workspace files. It follows none while attachment workspace confinement is on, and none at or around a blocked or sensitive folder, in a Docker case workspace, at the home folder or above, or outside the owner's space in multi-user mode. The API stays compatible: `liveWorktree` and `root=live` keep their 1.49.0 meaning, and an outside worktree comes as the new `outsideWorktree` field, listed by `root=live-any` with absolute paths.
+
+  **A coding model that runs on your Mac (#784, experimental).** On an Apple silicon Mac, **Run a local model** on the welcome screen opens a window that shows which local coding model fits the machine and with which agent, installs a pinned Ollama runtime and the model, checks it, and ends on an agent session that runs on it through a Custom Model Endpoint. The catalogue covers every Apple silicon memory size from 8 to 512 GB, and every model carries memory figures of its own: a 9B coding model (labelled limited) from 18 GB, Qwen3.8 27B or Qwen3.6 35B-A3B from 36 GB, Ornith 1.5 122B from 128 GB, while 8 and 16 GB get a plain sentence on why nothing fits. _Recommended_ appears only for a pairing run on a Mac like yours, so far Qwen3.6 35B-A3B with OpenCode on an M5 Pro with 48 GB; every other figure is computed from the model's architecture and shown as an estimate. No account or API key is needed, and the session's prompts go to the model on this Mac rather than a cloud provider. On any other machine nothing is offered, and in multi-user mode only an admin can install. A weekly check in CI compares every catalogue model and the pinned runtime with what a Mac would download and opens one issue when something moved. The routes and their payloads may change in any release; the guide is `docs/local-models.md`.
+
+  **Claude in the cloud, a model on your Mac (#784, experimental).** The codeman skill can hand work to that local model: `local_model` says what is installed and whether it runs, `spawn_worker <name> local` starts a worker on it (and the runtime, when it is stopped), and `sendmark` gives the worker a task and reads back the answer it writes. A Claude Code session plans and reviews while the Mac does the bulk: summaries, first drafts, files that should stay on the machine.
+
+  **Ralph starts from Session Options (#783).** The start screen no longer has a Start Ralph Loop button. Behaviour change: start a Ralph loop from Session Options, Ralph / Todo. The wizard that button opened can no longer be reached.
+
+  **The Codeman agent skill is on by default (#787).** New sessions get the skill where their CLI looks for skills (`.claude/skills/codeman/` for Claude Code, `.agents/skills/codeman/` for Codex, Gemini CLI, OpenCode, Antigravity, Grok, DeepSeek and OMP; none for Pi, GitHub Copilot or a plain shell), so an agent can start and drive workers without an install step. The copy ignores itself in git (a `.gitignore` of `*` inside it, written once and never overwritten), so it never shows up as a new file in your repository, and a symlinked `reference/` folder inside it is refused. **Behaviour change:** every App Settings save on 1.49.0 or earlier stored this switch as off whether or not you touched it, so the first start of 1.50.0 switches a stored off on, once per data directory, and the startup log says when it did. Turn it off under App Settings, Agents & CLIs, All agent CLIs, **Codeman Agent Skill**: an off set after that first start stays off. Reload any tab left open from before the upgrade before you save App Settings there. Turning it off removes no copy already written; `codeman skill uninstall --case <name>` does.
+
+  **Fixes.**
+  - **No developer tools window on a Mac without Xcode (#779).** There `/usr/bin/git` is Apple's placeholder, and the server ran it on the first page load, so a 1.49.0 no-admin install opened macOS's "install the command line developer tools" window right after it finished, and again after every server start. Every git the server starts now checks first and treats that placeholder as no git, and installing the tools later needs no restart.
+  - **A new agent shows up as soon as the installer adds it (#778).** A running Codeman remembered a missing CLI for up to 5 minutes, so Run still said it was not installed after `install.sh agent <id>` or the app had added it. The installer now touches `~/.codeman/cli-installed`, and the server looks again when that file changes.
+  - **The approvals list leaves a brand-new dialog alone (#782).** In a dialog's first 3 seconds, before Claude Code has drawn it, `GET /api/approvals` could resolve it, which cleared its red tab on every device and left the push notification's Approve button with nothing to answer. The list now waits as long as the inbox does.
+  - **Custom model endpoints survive concurrent writes.** The endpoint routes and the 5-minute discovery sweep wrote `custom-model-hosts.json` through one shared temp file, so two at once could tear it or drop a record. Every write is serialized now, and a file that does not parse is refused with 409 instead of replaced. Behaviour change: the endpoint id `local-ollama` is reserved for the model Codeman runs on this Mac.
+  - **Clearing a custom endpoint relaunches on the session's own model.** A selection no longer writes its launch model into the session's stored CLI config, so a cleared session starts on the model it was created with, not on the endpoint's model id against the CLI's own backend. Only API callers could reach this.
+
+  **Fixes applied while landing.** An adopted session never follows a worktree outside its folder, like a remote or Docker session (#780). The worktree test also keeps the system gitconfig away from the code under test (#776).
+
+  The Release workflow now builds, signs, notarizes and attaches `Codeman.dmg` (`.github/workflows/desktop-dmg.yml`, #785), publishes each version to the official MCP registry (`io.github.Ark0N/codeman`) with GitHub's OIDC token, and rebuilds the GitHub release page from this changelog. Pull requests that touch `packages/desktop` run `cargo fmt`, clippy and `cargo test` on macOS.
+
+  **Docs and tests.** The README, the Chinese README and the wiki's Installation page gained a section on the Mac app (#786), the Autonomous Loops page no longer points at the removed wizard, and `docs/local-models.md` covers the local model install. Two tests no longer depend on the host's locale or git ignore file (#776).
+
+## 1.49.0
+
+### Minor Changes
+
+- 12024cc: ### Thanks
+  - @dignfei for letting Codeman open the tmux sessions you started by hand, on this machine, in a container or over ssh (#510).
+  - @Randalix for the remote launch fix (#770) and the pi wheel fix (#771), both from their own reports (#760, #758), and for Edit history on remote sessions (#766).
+  - @opticon454 for the New folder button in Create New's picker (#761) and for Clone Repo's parent folder (#774).
+  - @shenlvkang-collab for a Files panel scan that no longer lets one folder use up the limit (#614).
+  - @irisitymichaelgrundberg for reporting that the Files panel stayed on the main checkout (#765), and for catching a `.git` open race in the fix.
+  - @maminmsh for reporting right-to-left text in the Response Viewer (#715).
+
+  **Open the tmux sessions you started yourself (#510).** Tmux sessions you started by hand now show up on the home screen under Opened outside Codeman, and one click opens one as a tab, on this machine, in a container or over ssh. Closing the tab only detaches, so the session keeps running. Codeman did not start it, so respawn, Ralph, auto-clear, one-shot prompts and prompt uploads are refused for it, and when the session ends the tab lets go of it. Adoption is admin-only in multi-user mode. The scan runs only while the home screen is in a visible tab. Close adopted tabs before going back to 1.48.0 or older: an older server does not know a tab is adopted and drops all of those guards.
+
+  **Install without administrator rights (#768).** The installer can now finish on an account without admin rights: Node.js and tmux go in your home folder, the source comes as an archive when no working git is available, and `--no-admin` forces this route. An install without git updates by re-running the install line, and Linux still needs make, a C++ compiler and python3.
+
+  **Docker Compose starts in two commands (#573).** `bash docker/Start-Codeman.sh` asks three questions, writes `docker/.env`, starts the container and prints the URL once Codeman answers. It now waits for the server and exits 1 if it does not come up (`--no-wait` skips that). Behaviour change: `Start-Codeman.sh` and `Update-Codeman.sh` refuse to run while `CODEMAN_PASSWORD` is still the example value `changeme`, so a deployment on that value has to set a real password before its next restart.
+
+  **Codex sessions can drive other sessions (#753).** A new opt-in setting, **Allow network access** (App Settings, Codex, off by default), starts new local Codex sessions with `sandbox_workspace_write.network_access=true`, so the Codeman skill's calls reach this server. It has a real cost: commands in Codex's sandbox can then call Codeman's API, which can start a session outside the sandbox with no approval prompt, even with a password set, so the sandbox no longer contains a prompt-injected command. It is forced off without the privileged-commands grant in multi-user mode, scheduled jobs do not use it, and it does not change Codex's sandbox mode. A local Codex 0.162 or later also starts with `--no-daemon`, so a shared background server no longer stops a launch on an "incompatible feature settings" dialog, and commands inside Codex see their own session's `CODEMAN_*` variables. Version gates in the CLI registry are now measured against each CLI's own version.
+
+  **Persian, Arabic and Hebrew read right to left (#715).** In the Response Viewer and the File Viewer's markdown view, each paragraph, heading, list, quote and table takes its direction from its own first letter, so a right-to-left answer lines up on the right while an English paragraph beside it stays left to right. Code blocks, inline code and the file paths the viewer links on its own stay left to right and no longer decide a sentence's direction. The phone's Compose dialog does the same. The terminal pane is unchanged: xterm.js has no right-to-left support yet (xtermjs/xterm.js#701).
+
+  **Edit history for remote sessions (#766).** The Edit history panel now works for remote (SSH) Claude sessions. It reads transcripts over ssh only while the panel is open, keeps the diffs in the same private local store and never wakes a sleeping host. An unreachable host shows the saved edits with the ssh error, and images preview on click rather than as thumbnails.
+
+  **The Files panel follows the agent into a git worktree (#772, #765).** When an agent moves into a worktree part way through a session, the panel lists that worktree, follows the agent back out and shows a strip that names it, with a button to switch to the session's folder. Only a worktree inside the session's folder is followed, and file access stays confined to that folder.
+
+  **One big folder no longer hides the rest (#614).** The Files panel and its search now walk folders in a per-directory round-robin, so one large folder no longer uses up the 5,000-entry limit, and search results come back shallow-first. One listing stops opening folders after reading 250,000 entries. A folder the scan stopped short of, or one that did not answer, no longer looks empty: `GET /api/sessions/:id/files` marks it `incomplete: true` (additive), sets `truncated`, and the panel shows a dim "Not fully scanned" row.
+
+  **Fixes.**
+  - **Remote sessions start when the remote home differs (#770, #760).** New sessions no longer die with `tmux: command not found` (exit 127). The launch line reached the local shell in double quotes, so `$HOME` and `$PATH` expanded on the Codeman host before ssh ran. Launches now reach the far end verbatim, and a remote session starts in the remote user's own shell. Behaviour changes: in a per-host `commands.*` override, `$` now expands on the far end; a bare `$VAR` in a Docker `extraCreateArgs`/`extraExecArgs` value or a remote host's `extraSshOptions` is passed literally, so write the value out. `commands.omp` and `commands.copilot` are accepted now, like every other mode. A csh or tcsh login shell starts without `-i -l`, which tcsh refuses, so it reads `.tcshrc` and not `.login`.
+  - **Remote file reads work on fish, csh and tcsh hosts.** The Files panel, previews and Edit history failed on those login shells, because their reads were parsed by the login shell before `sh` saw them. Every remote file read now crosses it as one word of text. This also ends a case where a file name holding shell syntax ran as a command on those hosts, as the same ssh user the agent runs as.
+  - **The pi mouse wheel survives a tab switch or reload (#771, #758).** pi now takes the same path as Copilot: the server strips the mouse enables and remembers them, and the wheel is forwarded from that record, on the primary pane, tiles, split Pane B and phones. A drag in fullscreen pi now selects text in the browser instead of using pi's own selection, and with Wheel Scrolls Local History on the wheel does nothing there. A pi in `tuiMode: regular` is unaffected.
+  - **Clone Repo's custom folder is a parent now (#774).** The repository lands in `<folder>/<case name>`, as it does with Create New, and the preview shows the joined path. Behaviour change: 1.48.0 cloned straight into the folder you picked, so a name the case-name rule refuses, such as `/mnt/my.repo`, can no longer be reached from the tab. `path` on `POST /api/cases/clone` stays the exact target for scripts and mount points.
+  - **New folder in the Create New and Clone Repo pickers (#761).** You can make the parent folder without leaving the dialog. Asking for one directly in the cases folder is refused, and the refusal points at the right tab.
+  - **Linked cases hold up under concurrent writes (#764).** Every write to `linked-cases.json` is serialized, so two requests can no longer claim one name or lose each other's entry, and a damaged file is refused with a clear error instead of being overwritten, which used to unlink every other case. A local case's rename racing a new link is not covered.
+  - **A session keeps its own home and account variables (#767).** A session that set `CLAUDE_CONFIG_DIR`, `DSH_HOME` or the like keeps it when a custom endpoint selection is cleared or switched, also after a Codeman restart. With its own `CLAUDE_CONFIG_DIR` it keeps both its conversation and its account.
+
+  **Fixes applied while landing.** An adopted session never falls back to a direct terminal when its wrapper cannot start, which would have run a local agent in `/tmp` (#510). Output from a foreign pane, container or ssh host is parsed in linear time, so it cannot stall the server (#510). A `.git` swapped for a FIFO or a symlink is refused at open (#772). A folder listing that does not answer is flagged instead of shown as empty (#614).
+
+  **Docs and tests.** Adoption, the no-admin install, the Compose first run and the new remote shell rows in the guides, wiki and READMEs, new zh-CN strings for the Allow network access warning, and the Playwright bump to 1.64.1 with the browser suite unpinned.
+
 ## 1.48.0
 
 ### Minor Changes

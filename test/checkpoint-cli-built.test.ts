@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { execFile, spawn } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
 import { promisify } from 'node:util';
+import { createIsolatedBuild } from './isolated-build-fixture.js';
 
 const execFileAsync = promisify(execFile);
 const CHILD_TIMEOUT_MS = 10_000;
@@ -15,6 +16,7 @@ const CHILD_KILL_GRACE_MS = 500;
 
 describe('built checkpoint CLI', () => {
   let server: Server | undefined;
+  let fixture: ReturnType<typeof createIsolatedBuild> | undefined;
   let apiUrl = '';
   let response: { status: number; body: string; contentType?: string };
   let responseForRequest:
@@ -24,7 +26,8 @@ describe('built checkpoint CLI', () => {
   const children = new Set<ReturnType<typeof spawn>>();
 
   beforeAll(async () => {
-    await execFileAsync('npm', ['run', 'build'], { timeout: 120_000 });
+    fixture = createIsolatedBuild();
+    await execFileAsync(process.execPath, ['scripts/build.mjs'], { cwd: fixture.root, timeout: 120_000 });
     response = { status: 200, body: 'null' };
     const candidate = createServer((req, res) => {
       req.resume();
@@ -81,6 +84,7 @@ describe('built checkpoint CLI', () => {
       )
     );
 
+    fixture?.dispose();
     if (!server) return;
     server.closeAllConnections();
     if (!server.listening) return;
@@ -96,7 +100,7 @@ describe('built checkpoint CLI', () => {
         process.execPath,
         ['dist/index.js', 'checkpoint', '--session', 'built-cli-test', '--url', apiUrl, ...extraArgs],
         {
-          cwd: process.cwd(),
+          cwd: fixture!.root,
           env: { ...process.env, CODEMAN_HOOK_SECRET_FILE: '', ...envOverrides },
           stdio: ['ignore', 'pipe', 'pipe'],
         }

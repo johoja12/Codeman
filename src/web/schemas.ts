@@ -372,6 +372,7 @@ const CodexConfigSchema = z
       .optional(),
     dangerouslyBypassApprovals: z.boolean().optional(),
     dangerouslyBypassHookTrust: z.boolean().optional(),
+    networkAccess: z.boolean().optional(),
     animations: z.boolean().optional(),
     renderMode: z
       .enum(['scrollback', 'hybrid'])
@@ -903,6 +904,8 @@ const RemoteCommandOverridesSchema = z
     pi: z.string().min(1).max(300).optional(),
     grok: z.string().min(1).max(300).optional(),
     deepseek: z.string().min(1).max(300).optional(),
+    omp: z.string().min(1).max(300).optional(),
+    copilot: z.string().min(1).max(300).optional(),
   })
   .strict()
   .optional();
@@ -914,10 +917,11 @@ const RemoteCommandOverridesSchema = z
 const NO_SHELL_INJECTION = /^[^\n\r\0`]*$/;
 const noCommandSubstitution = (s: string) => !s.includes('$(');
 
-// Docker fields are shell-escaped, then the whole launch command is embedded via
-// `JSON.stringify(...)` inside `bash -c "..."` (tmux-manager). That outer DOUBLE-quote
-// layer re-exposes `$(...)`, backticks, and `$VAR`, so they carry NO_SHELL_META
-// (rejects `$`/backtick that survive the outer quoting) as defense-in-depth.
+// `remotePath`/`identityFile` are shell-escaped, and a remote launch reaches `bash -c`
+// single-quoted (`bashCArg()` in tmux-manager). They are also pasted into strings the
+// far end's shells parse, and hosts stored before a launch-quoting change are read with
+// no schema, so `$` and backtick (and newline/CR/NUL) stay rejected at the boundary as
+// defense in depth, whatever the current quoting does with them.
 const NO_SHELL_META = /^[^\n\r\0`$]*$/;
 
 export const RemoteHostSchema = z.object({
@@ -1100,10 +1104,10 @@ export const BrowseDirectoryQuerySchema = z.object({
 //
 // Docker mode is a location overlay on cases (see docs/docker-cases-plan.md),
 // the analog of the remote-SSH schemas above. `image`, `hostWorkspacePath`,
-// `containerWorkdir`, and `container` all reach the outer `bash -c "..."` launch
-// layer, so they carry NO_SHELL_META (rejects `$`/backtick that survive the
-// double-quote layer) exactly like remotePath/identityFile. `--privileged` and
-// any docker-socket mount are structurally unrepresentable (never accepted).
+// `containerWorkdir`, and `container` all reach the `bash -c` launch layer, so they
+// carry NO_SHELL_META (rejects `$`/backtick) exactly like remotePath/identityFile.
+// `--privileged` and any docker-socket mount are structurally unrepresentable
+// (never accepted).
 
 const DockerResourceLimitsSchema = z
   .object({
@@ -1579,6 +1583,18 @@ export const SettingsUpdateSchema = z
     defaultClaudeMdPath: z.string().max(500).optional(),
     defaultWorkingDir: z.string().max(500).optional(),
     lastUsedCase: z.string().max(200).optional(),
+    /** The case a person last picked in a case picker; what other devices follow while `syncCaseState` is on. */
+    lastPickedCase: z.string().max(200).optional(),
+    /**
+     * Opt-in, SYNCED, default OFF: per-case run options (Agent Teams, Opus 1M) are kept here instead of
+     * only in each browser, and a device follows the selected case another device chose.
+     */
+    syncCaseState: z.boolean().optional(),
+    /** Per-case run options, by case name; read and written only while `syncCaseState` is on. */
+    caseSettings: z
+      .record(z.string().max(200), z.object({ agentTeams: z.boolean(), opusContext1m: z.boolean() }).strict())
+      .refine((m) => Object.keys(m).length <= 500, 'too many cases')
+      .optional(),
     // Feature toggles
     ralphTrackerEnabled: z.boolean().optional(),
     subagentTrackingEnabled: z.boolean().optional(),
@@ -1589,11 +1605,13 @@ export const SettingsUpdateSchema = z
     ultracodeFloatingWindows: z.boolean().optional(),
     imageWatcherEnabled: z.boolean().optional(),
     /**
-     * Inject the Codeman agent skill (`skills/codeman`) into `<case>/.claude/skills/`
-     * on Claude session create, so an agent inside the session can drive the API
-     * (see docs/agent-control-plan.md §2). SYNCED, default OFF: every skill's
-     * name+description costs context on every turn, so it is opt-in. Injection is
-     * add-only at create; a marker keeps user-authored copies untouched.
+     * Inject the Codeman agent skill (`skills/codeman`) into each new session's case, in
+     * the directory its CLI scans for skills (`capabilities.agentSkillDir`), so an agent
+     * inside the session can drive the API (see docs/agent-control-plan.md §2). SYNCED,
+     * default ON since 1.50.0: an absent key is on, only an explicit false is off, and a
+     * false stored by 1.49.0 or earlier is switched on once at the first 1.50.0 start
+     * (agent-skill-default-migration.ts). Injection is add-only at create; a marker keeps
+     * user-authored copies untouched.
      */
     agentSkillEnabled: z.boolean().optional(),
     /**
@@ -1880,6 +1898,7 @@ export const SettingsUpdateSchema = z
       .optional(),
     codexReasoningEffort: z.enum(['', ...CODEX_REASONING_EFFORTS]).optional(),
     codexDangerouslyBypassApprovals: z.boolean().optional(),
+    codexNetworkAccess: z.boolean().optional(),
     codexAnimationsEnabled: z.boolean().nullable().optional(),
     // Terminal history and retention
     terminalScrollbackLines: z
@@ -1936,6 +1955,8 @@ export const SettingsUpdateSchema = z
         language: z.string().max(20).optional(),
         keyterms: z.string().max(500).optional(),
         insertMode: z.string().max(20).optional(),
+        /** Silence timeout in seconds; 0 disables automatic stopping. Omitted keeps provider defaults. */
+        silenceTimeout: z.union([z.literal(0), z.literal(3), z.literal(6), z.literal(15), z.literal(30)]).optional(),
       })
       .optional(),
     // Run mode preference (cross-device sync)
@@ -2663,6 +2684,43 @@ export const CustomModelHostSchema = z.object({
   defaultContextLength: z.number().int().positive().max(MAX_DISCOVERED_CONTEXT_TOKENS).optional(),
 });
 
+// ---------- Local model install (src/web/routes/local-model-routes.ts) ----------
+
+/**
+ * A model id as the local model catalogue writes it: `name:tag`, lowercase, no slash. The
+ * same pattern as `LOCAL_MODEL_ID_PATTERN` in config/local-model-catalog.ts, repeated here as
+ * a request-shape check: without a slash an id can never name another registry host. The
+ * real gate is the route's own lookup of the id in what the server offers.
+ */
+const localModelId = z
+  .string()
+  .max(200)
+  .regex(/^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/, 'Invalid model id');
+
+/** POST /api/local-model/install: the row the person chose and the size they confirmed. */
+export const LocalModelInstallSchema = z
+  .object({
+    modelId: localModelId,
+    cli: z
+      .string()
+      .max(64)
+      .regex(/^[a-z0-9][a-z0-9_-]*$/, 'Invalid coding agent id'),
+    context: z.number().int().positive().max(MAX_DISCOVERED_CONTEXT_TOKENS),
+    acknowledgedBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  })
+  .strict();
+
+/** POST /api/local-model/resume. The body may be empty. */
+export const LocalModelResumeSchema = z.object({ newPort: z.boolean().optional() }).strict();
+
+/** POST /api/local-model/runtime. */
+export const LocalModelRuntimeSchema = z
+  .object({ action: z.enum(['start', 'stop']), newPort: z.boolean().optional() })
+  .strict();
+
+/** DELETE /api/local-model. The body may be empty. */
+export const LocalModelRemoveSchema = z.object({ removeModel: z.boolean().optional() }).strict();
+
 /**
  * A shell-safe bare word, mirroring `config/cli-registry/schema.ts`'s own `shellToken` —
  * duplicated rather than imported, since the REAL safety boundary for anything built from
@@ -2720,6 +2778,27 @@ export const CustomModelSelectionSchema = z.union([
   }),
   z.object({ clear: z.literal(true) }),
 ]);
+/**
+ * Adopt a FOREIGN tmux session (one a human started outside Codeman).
+ *
+ * ⚠️ The body carries ONLY the opaque candidate id from `GET /api/mux/foreign`.
+ * The socket path, session name and host are re-resolved server-side by re-running
+ * discovery, so a browser can never hand the launch chain a path or a session name
+ * to interpolate. That is the same discipline that keeps the docker-adopt and
+ * remote-attach paths free of caller-supplied command fragments.
+ */
+export const AdoptForeignSessionSchema = z
+  .object({
+    id: z.string().min(1).max(64),
+    /** Optional tab name; defaults to the foreign session's own name. */
+    name: z.string().max(128).optional(),
+    /** Include docker locations in the re-resolve (must match the listing call). */
+    docker: z.boolean().optional(),
+    /** Include remote locations in the re-resolve. */
+    remote: z.boolean().optional(),
+    parentSessionId: z.string().max(64).optional(),
+  })
+  .strict();
 
 /** Agent inspection bounds are bytes of evidence, independent of the JSON envelope. */
 export const AgentInspectQuerySchema = z

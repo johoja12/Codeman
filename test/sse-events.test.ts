@@ -3,8 +3,15 @@ import { WebServer } from '../src/web/server.js';
 import { SseEvent, approvalResolvedEventPayload } from '../src/web/sse-events.js';
 import { EventEmitter } from 'node:events';
 import { safeRmHomeTree } from './mocks/index.js';
-import { homedir } from 'node:os';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// A folder of this file's own for the sessions below, never the machine's real `/tmp`:
+// a create writes the workspace hooks and the agent skill (on by default) into its
+// working dir, and those would outlive the run there.
+const WORK_DIR = mkdtempSync(join(tmpdir(), 'codeman-sse-events-'));
+afterAll(() => rmSync(WORK_DIR, { recursive: true, force: true }));
 
 // Helper to parse SSE events
 function parseSSEEvents(text: string): Array<{ event: string; data: unknown }> {
@@ -155,7 +162,7 @@ describe('SSE Events', () => {
       await fetch(`${baseUrl}/api/sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workingDir: '/tmp' }),
+        body: JSON.stringify({ workingDir: WORK_DIR }),
       });
 
       // Wait a bit for the event
@@ -193,7 +200,7 @@ describe('SSE Events', () => {
       await fetch(`${baseUrl}/api/sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workingDir: '/tmp' }),
+        body: JSON.stringify({ workingDir: WORK_DIR }),
       });
 
       const response = await fetch(`${baseUrl}/api/status`);
@@ -246,7 +253,7 @@ describe('SSE Event Types', () => {
       const createRes = await fetch(`${baseUrl}/api/sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ workingDir: '/tmp' }),
+        body: JSON.stringify({ workingDir: WORK_DIR }),
       });
       const createData = await createRes.json();
 

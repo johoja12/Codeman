@@ -2772,7 +2772,16 @@ Object.assign(CodemanApp.prototype, {
       // Show in a modal or new window
       const displayId = this.subagents.get(agentKey)?.agentId || 'agent';
       const content = data.data.formatted.join('\n');
-      const win = window.open('', '_blank', 'width=800,height=600');
+      // This open runs after the fetch above, so a pop-up blocker that wants a
+      // click can refuse it, and the Codeman desktop app always refuses an
+      // empty window. Both return null; say so instead of throwing into the
+      // catch below, whose 'Failed to load transcript' would be wrong.
+      let win = null;
+      try { win = window.open('', '_blank', 'width=800,height=600'); } catch {}
+      if (!win) {
+        this.showToast('Could not open the transcript window: pop-up windows are blocked here', 'error');
+        return;
+      }
       win.document.write(`
         <html>
           <head>
@@ -4111,7 +4120,7 @@ Object.assign(CodemanApp.prototype, {
     }
     this._wireFileBrowserDrop?.();
     // Load LAST: panel + #fileBrowserTree now exist, so loadFileBrowser won't early-return.
-    this.loadFileBrowser(sessionId);
+    this.loadFileBrowser(sessionId, { adoptOwner: true });
   },
 
   // Hidden files/folders (dot-prefixed) are filtered SERVER-side by
@@ -4139,69 +4148,1361 @@ Object.assign(CodemanApp.prototype, {
     btn.setAttribute('aria-label', label);
   },
 
+  _ensureFileBrowserState() {
+    if (!this._fileBrowserState) {
+      const ownerSessionId = this.fileBrowserSessionId || this.activeSessionId || null;
+      const showHidden = this.fileBrowserShowHidden === true;
+      this._fileBrowserState = {
+        treeEpoch: 0,
+        searchEpoch: 0,
+        ownerSessionId,
+        view: 'normal',
+        normalState: this.fileBrowserData
+          ? { sessionId: ownerSessionId, showHidden, treeEpoch: 0, phase: 'ready', data: this.fileBrowserData }
+          : null,
+        treeInFlight: null,
+        inFlight: null,
+        matches: [],
+        deferredDirectoryTarget: null,
+        filter: typeof this.fileBrowserFilter === 'string' ? this.fileBrowserFilter : '',
+        // The person asked for the session folder while the agent is in a worktree (#765).
+        sessionRootPinned: false,
+        // The worktree on screen when the pin was set: a pinned listing omits an outside worktree.
+        pinnedWorktree: null,
+      };
+    }
+    return this._fileBrowserState;
+  },
+
+  _activateFileBrowserSession(sessionId, load = true) {
+    if (!sessionId) return;
+
+    const state = this._ensureFileBrowserState();
+    if (state.inFlight?.timer !== undefined && state.inFlight?.timer !== null) {
+      clearTimeout(state.inFlight.timer);
+    }
+    state.searchEpoch++;
+    state.treeEpoch++;
+    state.ownerSessionId = sessionId;
+    state.explicitOwner = false;
+    this.fileBrowserSessionId = sessionId;
+    this.fileBrowserLoadGeneration = (this.fileBrowserLoadGeneration || 0) + 1;
+    this.fileBrowserLoadedDirs?.clear?.();
+    state.treeInFlight = null;
+    state.inFlight = null;
+    state.normalState = null;
+    state.matches = [];
+    state.deferredDirectoryTarget = null;
+    state.filter = '';
+    state.view = 'normal';
+    state.sessionRootPinned = false;
+    state.pinnedWorktree = null;
+    this.fileBrowserData = null;
+    this.fileBrowserFilter = '';
+    this.fileBrowserExpandedDirs?.clear?.();
+    this.fileBrowserAllExpanded = false;
+
+    const searchInput = this.$?.('fileBrowserSearch');
+    if (searchInput) searchInput.value = '';
+    this._syncFileBrowserExpandBtn();
+    const expandBtn = this.$?.('fileBrowserExpandBtn');
+    if (expandBtn) expandBtn.innerHTML = '\u229E';
+    this._renderFileBrowserRoot(null);
+
+    const panel = this.$?.('fileBrowserPanel');
+    const treeEl = this.$?.('fileBrowserTree');
+    const statusEl = this.$?.('fileBrowserStatus');
+    const visible = panel?.classList.contains('visible') === true;
+    if (treeEl) {
+      treeEl.innerHTML = visible
+        ? `<div class="file-browser-loading">${escapeHtml('Loading files...')}</div>`
+        : '';
+    }
+    if (statusEl) statusEl.textContent = visible ? 'Loading files...' : '';
+
+    if (visible && load) {
+      const load = this.loadFileBrowser?.(sessionId);
+      load?.catch?.(() => {});
+    }
+  },
+
+  _resetFileBrowserForHide() {
+    const state = this._ensureFileBrowserState();
+    if (state.inFlight?.timer !== undefined && state.inFlight?.timer !== null) {
+      clearTimeout(state.inFlight.timer);
+    }
+    state.searchEpoch++;
+    state.treeEpoch++;
+    state.treeInFlight = null;
+    state.inFlight = null;
+    state.normalState = null;
+    state.matches = [];
+    state.deferredDirectoryTarget = null;
+    state.filter = '';
+    state.view = 'normal';
+    state.sessionRootPinned = false;
+    state.pinnedWorktree = null;
+    this.fileBrowserData = null;
+    this.fileBrowserFilter = '';
+    this.fileBrowserExpandedDirs?.clear?.();
+    this.fileBrowserAllExpanded = false;
+
+    const searchInput = this.$?.('fileBrowserSearch');
+    if (searchInput) searchInput.value = '';
+    this._syncFileBrowserExpandBtn();
+    const expandBtn = this.$?.('fileBrowserExpandBtn');
+    if (expandBtn) expandBtn.innerHTML = '\u229E';
+    this._renderFileBrowserRoot(null);
+    const treeEl = this.$?.('fileBrowserTree');
+    if (treeEl) treeEl.innerHTML = '';
+    const statusEl = this.$?.('fileBrowserStatus');
+    if (statusEl) statusEl.textContent = '';
+  },
+
+  _setFileBrowserExpandDisabled(disabled) {
+    const btn = this.$('fileBrowserExpandBtn');
+    if (btn) btn.disabled = disabled;
+  },
+
+  _hasFileBrowserQuery() {
+    const state = this._ensureFileBrowserState();
+    const input = this.$?.('fileBrowserSearch');
+    const inputValue = typeof input?.value === 'string' ? input.value : '';
+    const filterValue = typeof state.filter === 'string' ? state.filter : '';
+    return inputValue.trim() !== '' || filterValue.trim() !== '';
+  },
+
+  _syncFileBrowserExpandBtn() {
+    this._setFileBrowserExpandDisabled(this._hasFileBrowserQuery());
+  },
+
+  _renderFileBrowserNormalStatus(data, showHidden) {
+    const statusEl = this.$('fileBrowserStatus');
+    if (!statusEl || !data) return;
+    const { totalFiles, totalDirectories, truncated } = data;
+    statusEl.textContent = `${totalFiles} files, ${totalDirectories} dirs${truncated ? ' (truncated)' : ''}${showHidden ? ' · hidden shown' : ''}`;
+  },
+
+  _isFileBrowserNormalCompatible(candidate, sessionId, showHidden, treeEpoch) {
+    return (
+      candidate?.sessionId === sessionId &&
+      candidate.showHidden === showHidden &&
+      candidate.treeEpoch === treeEpoch
+    );
+  },
+
+  _isFileBrowserTreeContextCurrent(request, requireCurrentRecord = false) {
+    const state = this._ensureFileBrowserState();
+    return (
+      (!requireCurrentRecord || state.treeInFlight === request) &&
+      state.ownerSessionId === request.sessionId &&
+      state.treeEpoch === request.treeEpoch &&
+      (this.fileBrowserShowHidden === true) === request.showHidden
+    );
+  },
+
+  _canRenderFileBrowserNormal(normalState) {
+    const state = this._ensureFileBrowserState();
+    return (
+      state.view === 'normal' &&
+      state.ownerSessionId === normalState?.sessionId &&
+      this._isFileBrowserNormalCompatible(
+        normalState,
+        state.ownerSessionId,
+        this.fileBrowserShowHidden === true,
+        state.treeEpoch,
+      ) &&
+      this.$('fileBrowserPanel')?.classList.contains('visible') === true
+    );
+  },
+
+  _renderFileBrowserNormalState(normalState) {
+    if (!normalState || !this._canRenderFileBrowserNormal(normalState)) return;
+    const treeEl = this.$('fileBrowserTree');
+    const statusEl = this.$('fileBrowserStatus');
+    if (!treeEl) return;
+
+    if (normalState.phase === 'loading') {
+      this.fileBrowserData = null;
+      treeEl.innerHTML = `<div class="file-browser-loading">${escapeHtml('Loading files...')}</div>`;
+      if (statusEl) statusEl.textContent = 'Loading files...';
+      return;
+    }
+
+    if (normalState.phase === 'error') {
+      this.fileBrowserData = null;
+      const detail = normalState.error && normalState.error !== 'Failed to load files'
+        ? `: ${normalState.error}`
+        : '';
+      const message = `Failed to load files${detail}`;
+      treeEl.innerHTML = `<div class="file-browser-empty">${escapeHtml(message)}</div>`;
+      if (statusEl) statusEl.textContent = message;
+      return;
+    }
+
+    if (normalState.phase !== 'ready') return;
+    this.fileBrowserData = normalState.data;
+    this._syncFileBrowserExpandBtn();
+    this.renderFileBrowserTree(normalState.sessionId);
+    this._renderFileBrowserNormalStatus(normalState.data, normalState.showHidden);
+    this._renderFileBrowserRoot(normalState.data);
+  },
+
+  // The strip under the panel header, present only while the session's pane is in a linked
+  // worktree (#765): it says which of the two folders is listed and switches between them.
+  // Everything here comes from GET .../files, so the strip describes the tree on screen rather
+  // than the session's state a moment later.
+  _renderFileBrowserRoot(data) {
+    const strip = this.$?.('fileBrowserRoot');
+    if (!strip) return;
+    const worktree =
+      data?.worktree ?? (this._fileBrowserState?.sessionRootPinned ? this._fileBrowserState.pinnedWorktree : null);
+    if (typeof worktree?.path !== 'string' || typeof worktree?.name !== 'string') {
+      strip.hidden = true;
+      return;
+    }
+    const inWorktree = data?.root === worktree.path;
+    const label = this.$?.('fileBrowserRootLabel');
+    const name = this.$?.('fileBrowserRootName');
+    const button = this.$?.('fileBrowserRootSwitch');
+    if (label) label.textContent = inWorktree ? 'Worktree' : 'Session folder';
+    if (name) name.textContent = inWorktree ? worktree.name : '';
+    if (button) button.textContent = inWorktree ? 'Session folder' : 'Back to worktree';
+    strip.title = typeof data?.root === 'string' ? data.root : '';
+    strip.hidden = false;
+  },
+
+  // The `root` parameter of a listing or search. The server ignores it while the pane is not in
+  // a worktree, so the panel always asks unless the person chose the session folder.
+  _fileBrowserRootParam() {
+    return this._ensureFileBrowserState().sessionRootPinned ? '' : '&root=live-any';
+  },
+
+  toggleFileBrowserRoot() {
+    const state = this._ensureFileBrowserState();
+    state.sessionRootPinned = !state.sessionRootPinned;
+    const shown = this.fileBrowserData?.worktree;
+    state.pinnedWorktree =
+      state.sessionRootPinned && typeof shown?.path === 'string' && typeof shown?.name === 'string'
+        ? { name: shown.name, path: shown.path }
+        : null;
+    return this._reloadFileBrowserKeepingQuery();
+  },
+
+  // Called on every session update of the active session. Compares with what the listing on
+  // screen reported rather than with the previous update, so a load already in flight when the
+  // pane moved is corrected by the next update, and an answer that matches ends it. A listing
+  // reports the session's worktree whichever folder it walked, except that a listing without
+  // root=live-any omits an outside worktree. While the person has pinned the session folder, the
+  // panel compares with the worktree it pinned away from, so this cannot loop.
+  _followFileBrowserWorktree(session) {
+    const state = this._fileBrowserState;
+    if (!state || state.ownerSessionId !== session.id) return;
+    if (this.$?.('fileBrowserPanel')?.classList.contains('visible') !== true) return;
+    const normal = state.normalState;
+    if (normal?.phase !== 'ready' || normal.sessionId !== session.id) return;
+    const live = (session.liveWorktree ?? session.outsideWorktree)?.path ?? null;
+    const listed = (normal.data?.worktree ?? (state.sessionRootPinned ? state.pinnedWorktree : null))?.path ?? null;
+    if (live === listed) return;
+    // The pin was about the worktree the agent has just left.
+    state.sessionRootPinned = false;
+    state.pinnedWorktree = null;
+    this._reloadFileBrowserKeepingQuery();
+  },
+
+  _validateFileBrowserTreeEnvelope(result) {
+    if (!result || typeof result !== 'object' || result.success !== true) return null;
+    const data = result.data;
+    if (!data || typeof data !== 'object' || !Array.isArray(data.tree)) return null;
+    if (data.mode === 'search') return null;
+    if (
+      typeof data.totalFiles !== 'number' ||
+      !Number.isFinite(data.totalFiles) ||
+      data.totalFiles < 0 ||
+      typeof data.totalDirectories !== 'number' ||
+      !Number.isFinite(data.totalDirectories) ||
+      data.totalDirectories < 0 ||
+      typeof data.truncated !== 'boolean'
+    ) {
+      return null;
+    }
+
+    const validNodes = nodes => nodes.every(node => {
+      if (!node || typeof node !== 'object') return false;
+      if (typeof node.name !== 'string' || typeof node.path !== 'string') return false;
+      if (node.type !== 'file' && node.type !== 'directory') return false;
+      if (node.size !== undefined && (typeof node.size !== 'number' || !Number.isFinite(node.size))) return false;
+      if (node.extension !== undefined && typeof node.extension !== 'string') return false;
+      if (node.children !== undefined && (!Array.isArray(node.children) || !validNodes(node.children))) return false;
+      return true;
+    });
+
+    return validNodes(data.tree) ? data : null;
+  },
+
+  _normalizeFileBrowserTreeError(error) {
+    return typeof error?.message === 'string' && error.message ? error.message : 'Failed to load files';
+  },
+
+  _validateFileBrowserSearchEnvelope(result) {
+    if (!result || typeof result !== 'object' || result.success !== true) return null;
+    const data = result.data;
+    if (!data || typeof data !== 'object' || data.mode !== 'search' || !Array.isArray(data.matches)) return null;
+    if (typeof data.truncated !== 'boolean') return null;
+    if (
+      data.matchCount !== undefined &&
+      (typeof data.matchCount !== 'number' || !Number.isFinite(data.matchCount) || data.matchCount < 0)
+    ) {
+      return null;
+    }
+    for (const match of data.matches) {
+      if (!match || typeof match !== 'object') return null;
+      if (typeof match.name !== 'string' || typeof match.path !== 'string') return null;
+      if (match.type !== 'file' && match.type !== 'directory') return null;
+      if (match.size !== undefined && (typeof match.size !== 'number' || !Number.isFinite(match.size))) return null;
+      if (match.extension !== undefined && typeof match.extension !== 'string') return null;
+    }
+    return data;
+  },
+
+  _canRenderFileBrowserSearch(request) {
+    const state = this._ensureFileBrowserState();
+    const panel = this.$('fileBrowserPanel');
+    return (
+      state.searchEpoch === request.epoch &&
+      state.ownerSessionId === request.ownerSessionId &&
+      (this.activeSessionId === request.ownerSessionId || state.explicitOwner === true) &&
+      (this.fileBrowserShowHidden === true) === request.showHidden &&
+      state.filter === request.rawInput &&
+      panel?.classList.contains('visible') === true
+    );
+  },
+
+  _renderFileBrowserSearchError() {
+    const treeEl = this.$('fileBrowserTree');
+    const statusEl = this.$('fileBrowserStatus');
+    const message = 'Search failed';
+    if (treeEl) treeEl.innerHTML = `<div class="file-browser-empty">${escapeHtml(message)}</div>`;
+    if (statusEl) statusEl.textContent = message;
+  },
+
+  _canContinueFileBrowserHiddenReload(continuation, normalState) {
+    const state = this._ensureFileBrowserState();
+    const input = this.$?.('fileBrowserSearch');
+    const currentInput = typeof input?.value === 'string' ? input.value : state.filter;
+    return (
+      state.view === 'normal' &&
+      state.searchEpoch === continuation.searchEpoch &&
+      state.treeEpoch === continuation.treeEpoch &&
+      state.ownerSessionId === continuation.ownerSessionId &&
+      this.activeSessionId === continuation.ownerSessionId &&
+      (this.fileBrowserShowHidden === true) === continuation.showHidden &&
+      state.filter === continuation.rawInput &&
+      currentInput === continuation.rawInput &&
+      currentInput.trim() === continuation.query &&
+      this.$?.('fileBrowserPanel')?.classList.contains('visible') === true &&
+      normalState?.phase === 'ready' &&
+      this._isFileBrowserNormalCompatible(
+        normalState,
+        continuation.ownerSessionId,
+        continuation.showHidden,
+        continuation.treeEpoch,
+      )
+    );
+  },
+
   async toggleFileBrowserHidden() {
     this.fileBrowserShowHidden = !this.fileBrowserShowHidden;
     try {
       localStorage.setItem(FILE_BROWSER_SHOW_HIDDEN_KEY, this.fileBrowserShowHidden ? '1' : '0');
     } catch {}
     this._syncFileBrowserHiddenBtn();
-    // Expanded-directory state is deliberately preserved so toggling does not
-    // collapse the tree the user just navigated.
-    if (this.activeSessionId) await this.loadFileBrowser(this.activeSessionId);
+    return this._reloadFileBrowserKeepingQuery();
   },
 
-  async loadFileBrowser(sessionId) {
-    if (!sessionId) return;
+  // Re-fetch the tree after something the server filters on changed (hidden files, the listing's
+  // root), then re-run the search in the box against the new tree.
+  async _reloadFileBrowserKeepingQuery() {
+    const state = this._ensureFileBrowserState();
+    const rawInput = typeof state.filter === 'string' ? state.filter : '';
+    const query = rawInput.trim();
 
-    const treeEl = this.$('fileBrowserTree');
-    const statusEl = this.$('fileBrowserStatus');
-    // Optional-call for the same reason as updateFileBrowserHeaderButton?.() above:
-    // the COD-231 ownership tests drive this method on partial host objects.
-    this._syncFileBrowserHiddenBtn?.();
-    if (!treeEl) return;
+    if (state.inFlight?.timer !== undefined && state.inFlight?.timer !== null) {
+      clearTimeout(state.inFlight.timer);
+    }
+    state.searchEpoch++;
+    state.inFlight = null;
+    state.matches = [];
+    state.deferredDirectoryTarget = null;
+    state.normalState = null;
+    this.fileBrowserData = null;
+    if (query.length <= 256) state.view = 'normal';
+    this._syncFileBrowserExpandBtn();
 
-    const loadGeneration = ++this.fileBrowserLoadGeneration;
+    // Expanded-directory state is deliberately preserved so toggling does not
+    // collapse the tree the user just navigated.
+    const ownerSessionId = state.ownerSessionId || this.activeSessionId;
+    if (!ownerSessionId || this.activeSessionId !== ownerSessionId) return;
 
-    // A fresh tree load supersedes any in-flight search state (COD-236).
-    this.fileBrowserSearchMode = false;
-    this.fileBrowserMatches = null;
+    const searchEpoch = state.searchEpoch;
+    const showHidden = this.fileBrowserShowHidden === true;
+    const load = this.loadFileBrowser(ownerSessionId, { force: true });
+    const treeEpoch = state.treeEpoch;
+    if (!load?.then) return;
+    await load;
 
-    // Show loading state
-    treeEl.innerHTML = '<div class="file-browser-loading">Loading files...</div>';
-
-    try {
-      const showHidden = this.fileBrowserShowHidden === true;
-      const res = await fetch(`/api/sessions/${sessionId}/files?depth=5&showHidden=${showHidden}`);
-      if (!res.ok) throw new Error('Failed to load files');
-
-      const result = await res.json();
-      if (!result.success) throw new Error(result.error || 'Failed to load files');
-      if (loadGeneration !== this.fileBrowserLoadGeneration) return;
-
-      // Keep the rendered tree bound to the session that produced it. The active
-      // terminal tab can change independently while this panel remains open.
-      const isNewSession = this.fileBrowserSessionId !== sessionId;
-      this.fileBrowserSessionId = sessionId;
-      this.fileBrowserData = result.data;
-      this.fileBrowserLoadedDirs = new Set();
-      if (isNewSession) this.fileBrowserCurrentDir = '';
-      this.renderFileBrowserTree();
-
-      // Update status — include current dir if set
-      if (statusEl) {
-        const { totalFiles, totalDirectories, truncated } = result.data;
-        const base = `${totalFiles} files, ${totalDirectories} dirs${truncated ? ' (truncated)' : ''}`;
-        const dir = this.fileBrowserCurrentDir || '';
-        statusEl.textContent = dir ? `${base} · in ${dir}${showHidden ? ' · hidden shown' : ''}` : `${base}${showHidden ? ' · hidden shown' : ''}`;
-      }
-    } catch (err) {
-      if (loadGeneration !== this.fileBrowserLoadGeneration) return;
-      console.error('Failed to load file browser:', err);
-      treeEl.innerHTML = `<div class="file-browser-empty">Failed to load files: ${escapeHtml(err.message)}</div>`;
+    if (!query || query.length > 256) return;
+    const continuation = { ownerSessionId, showHidden, treeEpoch, searchEpoch, rawInput, query };
+    if (this._canContinueFileBrowserHiddenReload(continuation, state.normalState)) {
+      this.filterFileBrowser(rawInput);
     }
   },
 
-  renderFileBrowserTree() {
+  loadFileBrowser(sessionId, { force = false, adoptOwner = false } = {}) {
+    if (force) this.fileBrowserLoadedDirs?.clear?.();
+    if (!sessionId) return undefined;
+
+    const state = this._ensureFileBrowserState();
+    const treeEl = this.$('fileBrowserTree');
+    this._syncFileBrowserHiddenBtn();
+    if (!treeEl) return undefined;
+    if (!state.ownerSessionId) state.ownerSessionId = sessionId;
+    if (state.ownerSessionId !== sessionId) {
+      if (!adoptOwner) return undefined;
+      this._activateFileBrowserSession(sessionId, false);
+    }
+    state.explicitOwner = this.activeSessionId !== sessionId;
+    this.fileBrowserSessionId = sessionId;
+
+    if (force) state.treeEpoch++;
+    const showHidden = this.fileBrowserShowHidden === true;
+    const treeEpoch = state.treeEpoch;
+    const inFlight = state.treeInFlight;
+    if (
+      !force &&
+      this._isFileBrowserNormalCompatible(inFlight, sessionId, showHidden, treeEpoch)
+    ) {
+      return inFlight.promise;
+    }
+
+    const settled = state.normalState;
+    if (
+      !force &&
+      this._isFileBrowserNormalCompatible(settled, sessionId, showHidden, treeEpoch) &&
+      (settled.phase === 'ready' || settled.phase === 'error')
+    ) {
+      if (settled.phase === 'ready') this.fileBrowserData = settled.data;
+      this._renderFileBrowserNormalState(settled);
+      return Promise.resolve(settled);
+    }
+
+    this.fileBrowserLoadGeneration = (this.fileBrowserLoadGeneration || 0) + 1;
+    const loadingState = { sessionId, showHidden, treeEpoch, phase: 'loading' };
+    state.normalState = loadingState;
+    this.fileBrowserData = null;
+    this._renderFileBrowserNormalState(loadingState);
+
+    const record = { sessionId, showHidden, treeEpoch, promise: null };
+    const request = (async () => {
+      try {
+        const res = await fetch(
+          `/api/sessions/${encodeURIComponent(sessionId)}/files?depth=5&showHidden=${showHidden}${this._fileBrowserRootParam()}`,
+        );
+        if (!res.ok) throw new Error('Failed to load files');
+        const result = await res.json();
+        const data = this._validateFileBrowserTreeEnvelope(result);
+        if (!data) {
+          const detail = result && typeof result === 'object' && typeof result.error === 'string'
+            ? result.error
+            : 'Failed to load files';
+          throw new Error(detail);
+        }
+        if (!this._isFileBrowserTreeContextCurrent(record, true)) return;
+
+        const nextNormalState = { sessionId, showHidden, treeEpoch, phase: 'ready', data };
+        state.normalState = nextNormalState;
+        this.fileBrowserData = data;
+        const deferredRendered = this._completeDeferredFileBrowserDirectory?.(nextNormalState) === true;
+        if (!deferredRendered) this._renderFileBrowserNormalState(nextNormalState);
+      } catch (error) {
+        if (!this._isFileBrowserTreeContextCurrent(record, true)) return;
+        const nextNormalState = {
+          sessionId,
+          showHidden,
+          treeEpoch,
+          phase: 'error',
+          error: this._normalizeFileBrowserTreeError(error),
+        };
+        state.normalState = nextNormalState;
+        this.fileBrowserData = null;
+        this._completeDeferredFileBrowserDirectory?.(nextNormalState);
+        console.error('Failed to load file browser:', error);
+        this._renderFileBrowserNormalState(nextNormalState);
+      }
+    })();
+    record.promise = request.finally(() => {
+      if (state.treeInFlight === record) state.treeInFlight = null;
+    });
+    state.treeInFlight = record;
+    return record.promise;
+  },
+
+  renderFileBrowserTree(ownerSessionId) {
+    if (this.fileBrowserData?.lazy) return this._legacyRenderFileBrowserTree();
+    const treeEl = this.$('fileBrowserTree');
+    if (!treeEl || !this.fileBrowserData) return;
+
+    const state = this._ensureFileBrowserState();
+    const owner = ownerSessionId || state.normalState?.sessionId || state.ownerSessionId || this.activeSessionId;
+    if (!owner) return;
+
+    const { tree } = this.fileBrowserData;
+    if (!tree || tree.length === 0) {
+      treeEl.innerHTML = '<div class="file-browser-empty">No files found</div>';
+      return;
+    }
+
+    const html = [];
+    const canDelete = this._fileBrowserCanDelete(owner);
+
+    const renderNode = (node, depth) => {
+      const isDir = node.type === 'directory';
+      const isExpanded = this.fileBrowserExpandedDirs.has(node.path);
+
+      const icon = isDir
+        ? (isExpanded ? '\uD83D\uDCC2' : '\uD83D\uDCC1')
+        : this.getFileIcon(node.extension);
+
+      const expandIcon = isDir
+        ? `<span class="file-tree-expand${isExpanded ? ' expanded' : ''}">\u25B6</span>`
+        : '<span class="file-tree-expand"></span>';
+
+      const sizeStr = !isDir && node.size !== undefined
+        ? `<span class="file-tree-size">${this.formatFileSize(node.size)}</span>`
+        : '';
+
+      const nameClass = isDir ? 'file-tree-name directory' : 'file-tree-name';
+
+      const downloadBtn = !isDir
+        ? `<a class="file-tree-download" href="${escapeHtml(CodemanBase.url(`/api/sessions/${encodeURIComponent(owner)}/file-raw?path=${encodeURIComponent(node.path)}&download=true`))}" title="Download">&#x2B07;</a>`
+        : '';
+      // No inline handler: the path is a workspace file name, which an agent or a cloned repo
+      // chose, and `encodeURIComponent` leaves `'` alone, so a quoted string in an onclick ran
+      // whatever a file name like `x'-alert(1)-'.txt` held (#529's review). The click is bound
+      // below from the row's already-escaped `data-path`.
+      const renameBtn = canDelete ? `<button type="button" class="file-tree-rename" title="Rename" aria-label="Rename ${escapeHtml(node.name)}">&#x270e;</button>` : '';
+      const deleteBtn = canDelete
+        ? `<button type="button" class="file-tree-delete" title="Delete" aria-label="Delete ${escapeHtml(node.name)}">&times;</button>`
+        : '';
+
+      html.push(`
+        <div class="file-tree-item" data-path="${escapeHtml(node.path)}" data-type="${escapeHtml(node.type)}" data-depth="${depth}">
+          ${expandIcon}
+          <span class="file-tree-icon">${icon}</span>
+          <span class="${nameClass}">${escapeHtml(node.name)}</span>
+          ${sizeStr}
+          ${downloadBtn}${renameBtn}
+          ${deleteBtn}
+        </div>
+      `);
+
+      // Render children if directory is expanded
+      if (isDir && isExpanded && node.children) {
+        for (const child of node.children) {
+          renderNode(child, depth + 1);
+        }
+      }
+
+      // The scan stopped at a limit or the folder did not answer, so what is listed above is not all
+      // of it. Not a .file-tree-item: the click wiring below would try to open it as a file.
+      if (isDir && isExpanded && node.incomplete === true) {
+        html.push(`<div class="file-tree-incomplete" data-depth="${depth + 1}">${escapeHtml('Not fully scanned')}</div>`);
+      }
+    };
+
+    for (const node of tree) {
+      renderNode(node, 0);
+    }
+
+    treeEl.innerHTML = html.join('');
+
+    treeEl.querySelectorAll('.file-tree-item').forEach(item => {
+      const path = item.dataset.path;
+      item.querySelector('.file-tree-rename')?.addEventListener('click', (event) => {
+        event.stopPropagation();
+        this.renameFileBrowserEntry(path);
+      });
+      item.querySelector('.file-tree-download')?.addEventListener('click', (event) => {
+        event.preventDefault(); event.stopPropagation();
+        this.downloadWorkspaceFile(owner, path);
+      });
+    });
+    // Add click handlers
+    treeEl.querySelectorAll('.file-tree-item').forEach(item => {
+      item.addEventListener('click', () => {
+        const path = item.dataset.path;
+        const type = item.dataset.type;
+
+        if (type === 'directory') {
+          this.toggleFileBrowserFolder(path);
+        } else {
+          this.openFilePreview(path, owner);
+        }
+      });
+      item.querySelector('.file-tree-delete')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (item.dataset.type === 'directory') this.deleteFileBrowserEntry(item.dataset.path);
+        else this.deleteFileFromBrowser(owner, item.dataset.path);
+      });
+    });
+  },
+
+  // The delete button is offered only where the route can act: never for a remote (SSH) session,
+  // whose files live on another host, nor for an adopted one, whose folder is not a workspace of
+  // ours (`session.remote` is undefined on an adopted session, so both are tested).
+  _fileBrowserCanDelete(sessionId) {
+    const session = this.sessions?.get?.(sessionId);
+    return !session?.remote && !session?.adopt;
+  },
+
+  toggleFileBrowserFolder(path) {
+    if (this.fileBrowserData?.lazy) return this._legacyToggleFileBrowserFolder(path);
+    if (this.fileBrowserExpandedDirs.has(path)) {
+      this.fileBrowserExpandedDirs.delete(path);
+    } else {
+      this.fileBrowserExpandedDirs.add(path);
+    }
+    this.renderFileBrowserTree();
+  },
+
+  filterFileBrowser(value) {
+    if (this.fileBrowserData?.lazy) return this._legacyFilterFileBrowser(value);
+    const state = this._ensureFileBrowserState();
+    const rawInput = String(value ?? '');
+    const query = rawInput.trim();
+    state.searchEpoch++;
+    state.filter = rawInput;
+    state.deferredDirectoryTarget = null;
+    this.fileBrowserFilter = rawInput;
+    this._syncFileBrowserExpandBtn();
+
+    if (state.inFlight?.timer !== undefined && state.inFlight?.timer !== null) {
+      clearTimeout(state.inFlight.timer);
+    }
+    state.inFlight = null;
+
+    if (!state.ownerSessionId && this.activeSessionId) state.ownerSessionId = this.activeSessionId;
+    const ownerSessionId = state.ownerSessionId || null;
+    if (!this.activeSessionId || !ownerSessionId || this.activeSessionId !== ownerSessionId) return;
+    if (!query) {
+      state.view = 'normal';
+      state.matches = [];
+      this._syncFileBrowserExpandBtn();
+      const normal = state.normalState;
+      if (
+        ownerSessionId &&
+        this._isFileBrowserNormalCompatible(
+          normal,
+          ownerSessionId,
+          this.fileBrowserShowHidden === true,
+          state.treeEpoch,
+        )
+      ) {
+        this._renderFileBrowserNormalState(normal);
+      }
+      return;
+    }
+
+    if (query.length > 256) {
+      const message = 'Search queries are limited to 256 characters';
+      state.view = 'query-error';
+      state.matches = [];
+      this._syncFileBrowserExpandBtn();
+      const treeEl = this.$('fileBrowserTree');
+      const statusEl = this.$('fileBrowserStatus');
+      if (treeEl) treeEl.innerHTML = `<div class="file-browser-empty">${escapeHtml(message)}</div>`;
+      if (statusEl) statusEl.textContent = message;
+      return;
+    }
+
+    const panel = this.$('fileBrowserPanel');
+    const treeEl = this.$('fileBrowserTree');
+    if (!ownerSessionId || !panel || !treeEl) return;
+
+    const request = {
+      epoch: state.searchEpoch,
+      treeEpoch: state.treeEpoch,
+      ownerSessionId,
+      showHidden: this.fileBrowserShowHidden === true,
+      rawInput,
+      query,
+      rootParam: this._fileBrowserRootParam(),
+      timer: null,
+    };
+    state.view = 'search-pending';
+    state.matches = [];
+    state.inFlight = request;
+    this._syncFileBrowserExpandBtn();
+    treeEl.innerHTML = `<div class="file-browser-loading">${escapeHtml('Searching...')}</div>`;
+    const statusEl = this.$('fileBrowserStatus');
+    if (statusEl) statusEl.textContent = 'Searching...';
+
+    request.timer = setTimeout(async () => {
+      request.timer = null;
+      try {
+        const res = await fetch(
+          `/api/sessions/${encodeURIComponent(ownerSessionId)}/files?depth=5&showHidden=${request.showHidden}&q=${encodeURIComponent(query)}${request.rootParam}`,
+        );
+        if (!res.ok) throw new Error('Search failed');
+        const result = await res.json();
+        const data = this._validateFileBrowserSearchEnvelope(result);
+        if (!data) throw new Error('Search failed');
+        const canRender = this._canRenderFileBrowserSearch(request);
+        if (state.inFlight === request) state.inFlight = null;
+        if (!canRender) return;
+        state.view = 'search-results';
+        state.matches = data.matches;
+        this._renderFileBrowserSearchResults(data.matches, ownerSessionId, data);
+      } catch (err) {
+        const canRender = this._canRenderFileBrowserSearch(request);
+        if (state.inFlight === request) state.inFlight = null;
+        if (!canRender) return;
+        console.error('Failed to search file browser:', err);
+        state.view = 'search-error';
+        state.matches = [];
+        this._renderFileBrowserSearchError();
+      }
+    }, 250);
+  },
+
+  _renderFileBrowserSearchResults(matches, ownerSessionId, data) {
+    const treeEl = this.$('fileBrowserTree');
+    if (!treeEl || !ownerSessionId) return;
+    const state = this._ensureFileBrowserState();
+    const searchContext = {
+      ownerSessionId,
+      showHidden: this.fileBrowserShowHidden === true,
+      treeEpoch: state.treeEpoch,
+      searchEpoch: state.searchEpoch,
+      rawInput: state.filter,
+      query: state.filter.trim(),
+      view: state.view,
+    };
+    if (matches.length === 0) {
+      treeEl.innerHTML = `<div class="file-browser-empty">${escapeHtml('No matches')}</div>`;
+    } else {
+      const ownerPath = encodeURIComponent(ownerSessionId);
+      const canDelete = this._fileBrowserCanDelete(ownerSessionId);
+      treeEl.innerHTML = matches
+        .map(match => {
+          const isDir = match.type === 'directory';
+          const icon = isDir ? '📁' : this.getFileIcon(match.extension || '');
+          const sizeStr = !isDir && match.size !== undefined
+            ? `<span class="file-tree-size">${this.formatFileSize(match.size)}</span>`
+            : '';
+          const nameClass = isDir ? 'file-tree-name directory' : 'file-tree-name';
+          const downloadBtn = !isDir
+            ? `<a class="file-tree-download" href="${escapeHtml(CodemanBase.url(`/api/sessions/${ownerPath}/file-raw?path=${encodeURIComponent(match.path)}&download=true`))}" title="Download">&#x2B07;</a>`
+            : '';
+          // Bound below from `data-path`, never an inline handler (see renderFileBrowserTree).
+          const deleteBtn = !isDir && canDelete
+            ? `<button type="button" class="file-tree-delete" title="Delete" aria-label="Delete ${escapeHtml(match.name)}">&times;</button>`
+            : '';
+          return `
+            <div class="file-tree-item" data-path="${escapeHtml(match.path)}" data-type="${escapeHtml(match.type)}" data-owner="${escapeHtml(ownerSessionId)}">
+              <span class="file-tree-expand"></span>
+              <span class="file-tree-icon">${icon}</span>
+              <span class="${nameClass}">${escapeHtml(match.name)}</span>
+              ${sizeStr}
+              ${downloadBtn}
+              ${deleteBtn}
+            </div>
+          `;
+        })
+        .join('');
+    }
+
+    treeEl.querySelectorAll('.file-tree-item').forEach(item => {
+      item.querySelector('.file-tree-download')?.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        this.downloadWorkspaceFile(ownerSessionId, item.dataset.path);
+      });
+      item.addEventListener('click', () => {
+        const path = item.dataset.path;
+        if (item.dataset.type === 'directory') {
+          this._openFileBrowserSearchDirectory({ ...searchContext, path });
+        } else {
+          this.openFilePreview(path, ownerSessionId);
+        }
+      });
+      item.querySelector('.file-tree-delete')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.deleteFileFromBrowser(ownerSessionId, item.dataset.path);
+      });
+    });
+
+    const statusEl = this.$('fileBrowserStatus');
+    if (statusEl) {
+      const count = data.matchCount === undefined ? matches.length : data.matchCount;
+      statusEl.textContent = `${count} ${count === 1 ? 'match' : 'matches'}${data.truncated ? ' (truncated)' : ''}`;
+    }
+  },
+
+  // The Files panel's delete button (DELETE .../files?path=): asks first, in the same native
+  // dialog the panel's other destructive actions use, then reloads the listing. With a search in
+  // the box the reload re-runs it, so the deleted row leaves the results too; a plain reload
+  // would refresh the tree behind them and leave the row on screen.
+  async deleteFileFromBrowser(sessionId, filePath) {
+    if (!sessionId || !filePath) return;
+    if (!confirm(`Delete the file ${filePath}? This cannot be undone.`)) return;
+    let result = null;
+    try {
+      const response = await fetch(
+        `/api/sessions/${encodeURIComponent(sessionId)}/files?path=${encodeURIComponent(filePath)}&fileOnly=true`,
+        { method: 'DELETE' },
+      );
+      result = await response.json().catch(() => null);
+      if (!response.ok || result?.success !== true) {
+        throw new Error(result?.error || `HTTP ${response.status}`);
+      }
+    } catch (error) {
+      console.error('File browser delete failed:', error);
+      this.showToast(`Delete failed: ${error?.message || 'network error'}`, 'error');
+      return;
+    }
+    this.showToast(`File deleted: ${filePath}`, 'success');
+    const state = this._ensureFileBrowserState();
+    if (state.ownerSessionId === sessionId) await this._reloadFileBrowserKeepingQuery();
+  },
+
+  _findFileBrowserDirectory(nodes, targetPath, ancestors = []) {
+    if (!Array.isArray(nodes)) return null;
+    for (const node of nodes) {
+      if (!node || typeof node !== 'object') continue;
+      if (node.type === 'directory' && node.path === targetPath) {
+        return { target: node, ancestors: [...ancestors] };
+      }
+      if (node.type !== 'directory' || !Array.isArray(node.children)) continue;
+      const found = this._findFileBrowserDirectory(node.children, targetPath, [...ancestors, node.path]);
+      if (found) return found;
+    }
+    return null;
+  },
+
+  _isFileBrowserDirectoryContextCurrent(target) {
+    const state = this._ensureFileBrowserState();
+    const input = this.$?.('fileBrowserSearch');
+    const currentInput = typeof input?.value === 'string' ? input.value : state.filter;
+    return (
+      target &&
+      state.ownerSessionId === target.ownerSessionId &&
+      this.activeSessionId === target.ownerSessionId &&
+      state.treeEpoch === target.treeEpoch &&
+      state.searchEpoch === target.searchEpoch &&
+      (this.fileBrowserShowHidden === true) === target.showHidden &&
+      state.filter === target.rawInput &&
+      currentInput === target.rawInput &&
+      currentInput.trim() === target.query &&
+      state.view === target.view &&
+      this.$?.('fileBrowserPanel')?.classList.contains('visible') === true
+    );
+  },
+
+  _promptFileBrowserDirectoryReload() {
+    this.showToast?.('Reload files before opening this folder', 'info');
+  },
+
+  _openFileBrowserSearchDirectory(target) {
+    if (!this._isFileBrowserDirectoryContextCurrent(target)) return;
+    const state = this._ensureFileBrowserState();
+    const normalState = state.normalState;
+    if (
+      !this._isFileBrowserNormalCompatible(
+        normalState,
+        target.ownerSessionId,
+        target.showHidden,
+        target.treeEpoch,
+      )
+    ) {
+      state.deferredDirectoryTarget = null;
+      this._promptFileBrowserDirectoryReload();
+      return;
+    }
+
+    if (normalState.phase === 'loading') {
+      state.deferredDirectoryTarget = { ...target };
+      return;
+    }
+
+    state.deferredDirectoryTarget = null;
+    if (normalState.phase !== 'ready') {
+      this._promptFileBrowserDirectoryReload();
+      return;
+    }
+
+    const found = this._findFileBrowserDirectory(normalState.data?.tree, target.path);
+    if (!found) {
+      this._promptFileBrowserDirectoryReload();
+      return;
+    }
+    this._leaveFileBrowserSearchForDirectory([...found.ancestors, found.target.path], normalState);
+  },
+
+  _completeDeferredFileBrowserDirectory(normalState) {
+    const state = this._ensureFileBrowserState();
+    const target = state.deferredDirectoryTarget;
+    if (!target) return false;
+    if (!this._isFileBrowserDirectoryContextCurrent(target)) {
+      if (state.deferredDirectoryTarget === target) state.deferredDirectoryTarget = null;
+      return false;
+    }
+    if (
+      !this._isFileBrowserNormalCompatible(
+        normalState,
+        target.ownerSessionId,
+        target.showHidden,
+        target.treeEpoch,
+      ) ||
+      (normalState.phase !== 'ready' && normalState.phase !== 'error')
+    ) {
+      return false;
+    }
+
+    state.deferredDirectoryTarget = null;
+    if (normalState.phase === 'error') {
+      this._promptFileBrowserDirectoryReload();
+      return false;
+    }
+
+    const found = this._findFileBrowserDirectory(normalState.data?.tree, target.path);
+    if (!found) {
+      this._promptFileBrowserDirectoryReload();
+      return false;
+    }
+    this._leaveFileBrowserSearchForDirectory([...found.ancestors, found.target.path], normalState);
+    return true;
+  },
+
+  _leaveFileBrowserSearchForDirectory(paths, normalState) {
+    const state = this._ensureFileBrowserState();
+    if (state.inFlight?.timer !== undefined && state.inFlight?.timer !== null) {
+      clearTimeout(state.inFlight.timer);
+    }
+    state.searchEpoch++;
+    state.inFlight = null;
+    state.filter = '';
+    state.matches = [];
+    state.deferredDirectoryTarget = null;
+    state.view = 'normal';
+    this.fileBrowserFilter = '';
+
+    const input = this.$?.('fileBrowserSearch');
+    if (input) input.value = '';
+    this._syncFileBrowserExpandBtn();
+    for (const path of paths) {
+      if (typeof path === 'string') this.fileBrowserExpandedDirs?.add?.(path);
+    }
+    this.fileBrowserData = normalState.data;
+    this._renderFileBrowserNormalState(normalState);
+  },
+
+  expandAllDirectories(nodes) {
+    for (const node of nodes) {
+      if (node.type === 'directory') {
+        this.fileBrowserExpandedDirs.add(node.path);
+        if (node.children) {
+          this.expandAllDirectories(node.children);
+        }
+      }
+    }
+  },
+
+  collapseAllDirectories() {
+    this.fileBrowserExpandedDirs.clear();
+  },
+
+  toggleFileBrowserExpand() {
+    if (this._hasFileBrowserQuery()) {
+      this._syncFileBrowserExpandBtn();
+      return;
+    }
+    this.fileBrowserAllExpanded = !this.fileBrowserAllExpanded;
+    const btn = this.$('fileBrowserExpandBtn');
+
+    if (this.fileBrowserAllExpanded) {
+      this.expandAllDirectories(this.fileBrowserData?.tree || []);
+      if (btn) btn.innerHTML = '\u229F'; // Collapse icon
+    } else {
+      this.collapseAllDirectories();
+      if (btn) btn.innerHTML = '\u229E'; // Expand icon
+    }
+    this.renderFileBrowserTree();
+  },
+
+  refreshFileBrowser() {
+    const state = this._ensureFileBrowserState();
+    if (state.inFlight?.timer !== undefined && state.inFlight?.timer !== null) {
+      clearTimeout(state.inFlight.timer);
+    }
+    state.inFlight = null;
+    state.searchEpoch++;
+    state.filter = '';
+    state.matches = [];
+    state.deferredDirectoryTarget = null;
+    state.view = 'normal';
+    this.fileBrowserFilter = '';
+    this.fileBrowserExpandedDirs.clear();
+    this.fileBrowserAllExpanded = false;
+    const expandBtn = this.$('fileBrowserExpandBtn');
+    if (expandBtn) expandBtn.innerHTML = '\u229E';
+    const searchInput = this.$('fileBrowserSearch');
+    if (searchInput) searchInput.value = '';
+    this._syncFileBrowserExpandBtn();
+
+    const ownerSessionId = state.ownerSessionId || this.activeSessionId;
+    if (!ownerSessionId) return undefined;
+    return this.loadFileBrowser(ownerSessionId, { force: true });
+  },
+
+  // Header "File Viewer" button (opt-in via App Settings → Header Displays →
+  // File Viewer). Toggles the file browser panel open/closed without a trip
+  // through settings. Persists via the same `showFileBrowser` flag the Panels
+  // section + the panel's own close (X) use, so the three stay in sync.
+  async downloadWorkspaceFile(sessionId, path) {
+    if (!sessionId || !path) return;
+    const url = `/api/sessions/${encodeURIComponent(sessionId)}/file-raw?path=${encodeURIComponent(path)}&download=true`;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) {
+        let message = `Download failed (${res.status})`;
+        try {
+          const body = await res.json();
+          if (body && body.error) message = body.error;
+        } catch {
+          // Non-JSON error body; keep the status-based message.
+        }
+        this.showToast(message, 'error');
+        return;
+      }
+      const blob = await res.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = objectUrl;
+      a.download = path.split('/').pop() || 'download';
+      a.rel = 'noopener';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(objectUrl);
+    } catch (err) {
+      this.showToast(`Download failed: ${err && err.message ? err.message : err}`, 'error');
+    }
+  },
+
+  // ──────────────────────────────────────────────────────────────────
+  // File Browser Upload (COD-317)
+  // ──────────────────────────────────────────────────────────────────
+  _maxBatchFileUploads: 10,
+  _fileBrowserUploadConcurrency: 3,
+
+  triggerFileBrowserUpload(targetDir = '') {
+    if (!this.activeSessionId && !this.fileBrowserSessionId) {
+      this.showToast('No active session', 'error');
+      return;
+    }
+    // Default to current folder when no explicit target (e.g. header button)
+    const effectiveDir =
+      typeof targetDir === 'string' && targetDir !== '' ? targetDir : this.fileBrowserCurrentDir || '';
+    this._ensureFileBrowserUploadInput(effectiveDir);
+    if (this._fileBrowserUploadInput) {
+      this._fileBrowserUploadTargetDir = effectiveDir;
+      this._fileBrowserUploadInput.click();
+    }
+  },
+
+  _ensureFileBrowserUploadInput(initialDir = '') {
+    if (this._fileBrowserUploadInput) {
+      this._fileBrowserUploadTargetDir = initialDir;
+      return;
+    }
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.multiple = true;
+    input.style.display = 'none';
+    // No accept filter — File Manager is open (any file except blocked/sensitive guard)
+    input.addEventListener('change', () => {
+      const files = Array.from(input.files || []);
+      const targetDir = this._fileBrowserUploadTargetDir || '';
+      input.value = '';
+      if (files.length) this._uploadFilesToFileBrowser(files, targetDir);
+    });
+    document.body.appendChild(input);
+    this._fileBrowserUploadInput = input;
+    this._fileBrowserUploadTargetDir = initialDir;
+  },
+
+  async _uploadFilesToFileBrowser(fileList, targetDir = '') {
+    const sessionId = this.fileBrowserSessionId || this.activeSessionId;
+    if (!sessionId) {
+      this.showToast('No active session', 'error');
+      return;
+    }
+    let files = Array.from(fileList || []);
+    if (files.length === 0) return;
+    let capped = false;
+    if (files.length > this._maxBatchFileUploads) {
+      files = files.slice(0, this._maxBatchFileUploads);
+      capped = true;
+    }
+    const total = files.length;
+    let done = 0;
+    let failed = 0;
+    const results = new Array(total);
+    const progress = () => this.showToast(`Uploading ${Math.min(done + 1, total)}/${total} file${total > 1 ? 's' : ''}…`, 'info');
+    progress();
+    let next = 0;
+    const worker = async () => {
+      for (;;) {
+        const i = next++;
+        if (i >= total) return;
+        try {
+          results[i] = await this._uploadFileToWorkspace(sessionId, files[i], targetDir);
+        } catch (err) {
+          failed++;
+          console.warn('File upload failed:', err);
+          results[i] = null;
+        } finally {
+          done++;
+          if (done < total) progress();
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(this._fileBrowserUploadConcurrency, total) }, () => worker())
+    );
+    const succeeded = results.filter(Boolean).length;
+    // Refresh tree preserves expanded state; loadFileBrowser already does that
+    try {
+      await this.loadFileBrowser(sessionId, { force: true });
+      if (succeeded > 0 && targetDir) {
+        // Ensure uploaded-to folder is visible after reload
+        this.fileBrowserExpandedDirs.add(targetDir);
+        // Walk up to ensure parents are expanded as well
+        let p = targetDir;
+        while (p.includes('/')) {
+          p = p.split('/').slice(0, -1).join('/');
+          if (p) this.fileBrowserExpandedDirs.add(p);
+        }
+        this.fileBrowserCurrentDir = targetDir;
+        this.renderFileBrowserTree();
+        this._updateFileBrowserStatus?.();
+      }
+    } catch {}
+    const parts = [];
+    if (succeeded > 0) parts.push(`${succeeded} file${succeeded > 1 ? 's' : ''} uploaded`);
+    if (failed > 0) parts.push(`${failed} failed`);
+    if (capped) parts.push(`max ${this._maxBatchFileUploads} per batch`);
+    const tone = succeeded > 0 ? (failed > 0 || capped ? 'info' : 'success') : 'error';
+    this.showToast(parts.join(' · ') || 'No files uploaded', tone);
+  },
+
+  async _uploadFileToWorkspace(sessionId, file, targetDir = '') {
+    const form = new FormData();
+    form.append('file', file);
+    const query = targetDir ? `?path=${encodeURIComponent(targetDir)}` : '';
+    const url = `/api/sessions/${encodeURIComponent(sessionId)}/files/upload${query}`;
+    const resp = await fetch(url, { method: 'POST', body: form });
+    if (!resp.ok) {
+      let msg = `HTTP ${resp.status}`;
+      try {
+        const data = await resp.json();
+        if (data && data.error) msg = data.error;
+      } catch {}
+      throw new Error(msg);
+    }
+    const data = await resp.json();
+    if (!data.success) throw new Error(data.error || 'Upload failed');
+    return data.data && data.data.path;
+  },
+
+  _wireFileBrowserDrop() {
+    const treeEl = this.$('fileBrowserTree');
+    const panel = this.$('fileBrowserPanel');
+    if (!treeEl || !panel || this._fileBrowserDropWired) return;
+    this._fileBrowserDropWired = true;
+    let dragDepth = 0;
+    treeEl.addEventListener('dragover', (e) => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+      if (dragDepth === 0) treeEl.classList.add('file-browser-drag-active');
+    });
+    treeEl.addEventListener('dragenter', (e) => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+      dragDepth++;
+    });
+    treeEl.addEventListener('dragleave', (e) => {
+      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (dragDepth === 0) treeEl.classList.remove('file-browser-drag-active');
+      // Also handle leaving panel entirely
+      if (!panel.contains(e.relatedTarget)) {
+        dragDepth = 0;
+        treeEl.classList.remove('file-browser-drag-active');
+      }
+    });
+    treeEl.addEventListener('drop', (e) => {
+      dragDepth = 0;
+      treeEl.classList.remove('file-browser-drag-active');
+      if (!e.dataTransfer || !e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
+      const files = Array.from(e.dataTransfer.files);
+      if (files.length === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      let targetDir = '';
+      const folderEl = e.target && e.target.closest ? e.target.closest('.file-tree-item[data-type="directory"]') : null;
+      if (folderEl && folderEl.dataset && folderEl.dataset.path) targetDir = folderEl.dataset.path;
+      this._uploadFilesToFileBrowser(files, targetDir);
+    });
+  },
+
+  _updateFileBrowserStatus() {
+    const statusEl = this.$('fileBrowserStatus');
+    if (!statusEl || !this.fileBrowserData) return;
+    const { totalFiles, totalDirectories, truncated } = this.fileBrowserData;
+    const base = `${totalFiles} files, ${totalDirectories} dirs${truncated ? ' (truncated)' : ''}`;
+    const dir = this.fileBrowserCurrentDir || '';
+    const showHidden = this.fileBrowserShowHidden === true ? ' · hidden shown' : '';
+    statusEl.textContent = dir ? `${base} · in ${dir}${showHidden}` : `${base}${showHidden}`;
+  },
+
+  async createFileBrowserFolder() {
+    const sessionId = this.fileBrowserSessionId || this.activeSessionId;
+    if (!sessionId) {
+      this.showToast('No active session', 'error');
+      return;
+    }
+    const hint = this.fileBrowserCurrentDir ? ` (in ${this.fileBrowserCurrentDir}/)` : '';
+    const input = window.prompt(`New folder name${hint} (e.g. myFolder or a/b/c):`);
+    if (input == null) return;
+    const name = String(input).trim();
+    if (!name) return;
+    // Allow nested like a/b/c but strip leading/trailing slashes
+    const sanitized = name.replace(/^\/+/, '').replace(/\\/g, '/').trim();
+    if (!sanitized) {
+      this.showToast('Invalid folder name', 'error');
+      return;
+    }
+    const finalPath = this.fileBrowserCurrentDir ? `${this.fileBrowserCurrentDir}/${sanitized}` : sanitized;
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/files/mkdir`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: finalPath }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) throw new Error(data.error || `Failed (${res.status})`);
+      this.showToast(`Folder "${finalPath}" created`, 'success');
+      await this.loadFileBrowser(sessionId, { force: true });
+      // Auto-expand current dir and parent so new folder is visible
+      if (this.fileBrowserCurrentDir) this.fileBrowserExpandedDirs.add(this.fileBrowserCurrentDir);
+      const parent = finalPath.includes('/') ? finalPath.split('/').slice(0, -1).join('/') : null;
+      if (parent) this.fileBrowserExpandedDirs.add(parent);
+      this.fileBrowserExpandedDirs.add(finalPath);
+      this.fileBrowserCurrentDir = finalPath;
+      this._updateFileBrowserStatus?.();
+      this.renderFileBrowserTree();
+    } catch (err) {
+      this.showToast(`Create folder failed: ${err && err.message ? err.message : err}`, 'error');
+    }
+  },
+
+  async renameFileBrowserEntry(oldPath) {
+    const sessionId = this.fileBrowserSessionId || this.activeSessionId;
+    if (!sessionId || !oldPath) return;
+    const base = oldPath.split('/').pop() || oldPath;
+    const next = window.prompt(`Rename "${oldPath}" to:`, base);
+    if (next == null) return;
+    const newBase = String(next).trim();
+    if (!newBase || newBase === base) return;
+    if (newBase.includes('/') || newBase.includes('\\')) {
+      this.showToast('Name must not contain path separators', 'error');
+      return;
+    }
+    const dir = oldPath.includes('/') ? oldPath.split('/').slice(0, -1).join('/') : '';
+    const newPath = dir ? `${dir}/${newBase}` : newBase;
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/files/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from: oldPath, to: newPath }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) throw new Error(data.error || `Failed (${res.status})`);
+      this.showToast(`Renamed to "${newPath}"`, 'success');
+      // If renamed directory was expanded, move expanded state
+      if (this.fileBrowserExpandedDirs.has(oldPath)) {
+        this.fileBrowserExpandedDirs.delete(oldPath);
+        this.fileBrowserExpandedDirs.add(newPath);
+      }
+      // Move current dir if it was the renamed path or a child
+      if (this.fileBrowserCurrentDir === oldPath) this.fileBrowserCurrentDir = newPath;
+      else if ((this.fileBrowserCurrentDir || '').startsWith(oldPath + '/')) {
+        this.fileBrowserCurrentDir = newPath + this.fileBrowserCurrentDir.slice(oldPath.length);
+      }
+      // Also update loaded dirs
+      if (this.fileBrowserLoadedDirs && this.fileBrowserLoadedDirs.has(oldPath)) {
+        this.fileBrowserLoadedDirs.delete(oldPath);
+      }
+      await this.loadFileBrowser(sessionId, { force: true });
+      // Preserve moved current dir across reload (load would otherwise keep old)
+      if (this.fileBrowserCurrentDir === newPath || (this.fileBrowserCurrentDir || '').startsWith(newPath + '/')) {
+        this._updateFileBrowserStatus?.();
+      }
+    } catch (err) {
+      this.showToast(`Rename failed: ${err && err.message ? err.message : err}`, 'error');
+    }
+  },
+
+  async deleteFileBrowserEntry(targetPath) {
+    const sessionId = this.fileBrowserSessionId || this.activeSessionId;
+    if (!sessionId || !targetPath) return;
+    const isDir = targetPath && this.fileBrowserData && (() => {
+      const find = (nodes) => {
+        for (const n of nodes || []) {
+          if (n.path === targetPath) return n;
+          const c = find(n.children);
+          if (c) return c;
+        }
+        return null;
+      };
+      const node = find(this.fileBrowserData.tree || []);
+      return node ? node.type === 'directory' : false;
+    })();
+    const label = isDir ? 'folder' : 'file';
+    if (!window.confirm(`Delete ${label} "${targetPath}"?${isDir ? ' This will delete its contents.' : ''}`)) return;
+    try {
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/files?path=${encodeURIComponent(targetPath)}`, {
+        method: 'DELETE',
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success) throw new Error(data.error || `Failed (${res.status})`);
+      this.showToast(`Deleted "${targetPath}"`, 'success');
+      this.fileBrowserExpandedDirs.delete(targetPath);
+      // If deleted path was current dir or ancestor, move current up
+      if (this.fileBrowserCurrentDir === targetPath || (this.fileBrowserCurrentDir || '').startsWith(targetPath + '/')) {
+        const parent = targetPath.includes('/') ? targetPath.split('/').slice(0, -1).join('/') : '';
+        this.fileBrowserCurrentDir = parent;
+      }
+      if (this.fileBrowserLoadedDirs) this.fileBrowserLoadedDirs.delete(targetPath);
+      await this.loadFileBrowser(sessionId, { force: true });
+    } catch (err) {
+      this.showToast(`Delete failed: ${err && err.message ? err.message : err}`, 'error');
+    }
+  },
+
+  _legacyRenderFileBrowserTree() {
     const treeEl = this.$('fileBrowserTree');
     if (!treeEl || !this.fileBrowserData || !this.fileBrowserSessionId) return;
 
@@ -4325,349 +5626,7 @@ Object.assign(CodemanApp.prototype, {
    * instead of a top-level navigation that replaces the terminal with raw JSON.
    * On success the blob is saved through a temporary download anchor.
    */
-  async downloadWorkspaceFile(sessionId, path) {
-    if (!sessionId || !path) return;
-    const url = `/api/sessions/${encodeURIComponent(sessionId)}/file-raw?path=${encodeURIComponent(path)}&download=true`;
-    try {
-      const res = await fetch(url);
-      if (!res.ok) {
-        let message = `Download failed (${res.status})`;
-        try {
-          const body = await res.json();
-          if (body && body.error) message = body.error;
-        } catch {
-          // Non-JSON error body; keep the status-based message.
-        }
-        this.showToast(message, 'error');
-        return;
-      }
-      const blob = await res.blob();
-      const objectUrl = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = objectUrl;
-      a.download = path.split('/').pop() || 'download';
-      a.rel = 'noopener';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(objectUrl);
-    } catch (err) {
-      this.showToast(`Download failed: ${err && err.message ? err.message : err}`, 'error');
-    }
-  },
-
-  // ──────────────────────────────────────────────────────────────────
-  // File Browser Upload (COD-317)
-  // ──────────────────────────────────────────────────────────────────
-  _maxBatchFileUploads: 10,
-  _fileBrowserUploadConcurrency: 3,
-
-  triggerFileBrowserUpload(targetDir = '') {
-    if (!this.activeSessionId && !this.fileBrowserSessionId) {
-      this.showToast('No active session', 'error');
-      return;
-    }
-    // Default to current folder when no explicit target (e.g. header button)
-    const effectiveDir =
-      typeof targetDir === 'string' && targetDir !== '' ? targetDir : this.fileBrowserCurrentDir || '';
-    this._ensureFileBrowserUploadInput(effectiveDir);
-    if (this._fileBrowserUploadInput) {
-      this._fileBrowserUploadTargetDir = effectiveDir;
-      this._fileBrowserUploadInput.click();
-    }
-  },
-
-  _ensureFileBrowserUploadInput(initialDir = '') {
-    if (this._fileBrowserUploadInput) {
-      this._fileBrowserUploadTargetDir = initialDir;
-      return;
-    }
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.multiple = true;
-    input.style.display = 'none';
-    // No accept filter — File Manager is open (any file except blocked/sensitive guard)
-    input.addEventListener('change', () => {
-      const files = Array.from(input.files || []);
-      const targetDir = this._fileBrowserUploadTargetDir || '';
-      input.value = '';
-      if (files.length) this._uploadFilesToFileBrowser(files, targetDir);
-    });
-    document.body.appendChild(input);
-    this._fileBrowserUploadInput = input;
-    this._fileBrowserUploadTargetDir = initialDir;
-  },
-
-  async _uploadFilesToFileBrowser(fileList, targetDir = '') {
-    const sessionId = this.fileBrowserSessionId || this.activeSessionId;
-    if (!sessionId) {
-      this.showToast('No active session', 'error');
-      return;
-    }
-    let files = Array.from(fileList || []);
-    if (files.length === 0) return;
-    let capped = false;
-    if (files.length > this._maxBatchFileUploads) {
-      files = files.slice(0, this._maxBatchFileUploads);
-      capped = true;
-    }
-    const total = files.length;
-    let done = 0;
-    let failed = 0;
-    const results = new Array(total);
-    const progress = () => this.showToast(`Uploading ${Math.min(done + 1, total)}/${total} file${total > 1 ? 's' : ''}…`, 'info');
-    progress();
-    let next = 0;
-    const worker = async () => {
-      for (;;) {
-        const i = next++;
-        if (i >= total) return;
-        try {
-          results[i] = await this._uploadFileToWorkspace(sessionId, files[i], targetDir);
-        } catch (err) {
-          failed++;
-          console.warn('File upload failed:', err);
-          results[i] = null;
-        } finally {
-          done++;
-          if (done < total) progress();
-        }
-      }
-    };
-    await Promise.all(
-      Array.from({ length: Math.min(this._fileBrowserUploadConcurrency, total) }, () => worker())
-    );
-    const succeeded = results.filter(Boolean).length;
-    // Refresh tree preserves expanded state; loadFileBrowser already does that
-    try {
-      await this.loadFileBrowser(sessionId);
-      if (succeeded > 0 && targetDir) {
-        // Ensure uploaded-to folder is visible after reload
-        this.fileBrowserExpandedDirs.add(targetDir);
-        // Walk up to ensure parents are expanded as well
-        let p = targetDir;
-        while (p.includes('/')) {
-          p = p.split('/').slice(0, -1).join('/');
-          if (p) this.fileBrowserExpandedDirs.add(p);
-        }
-        this.fileBrowserCurrentDir = targetDir;
-        this.renderFileBrowserTree();
-        this._updateFileBrowserStatus?.();
-      }
-    } catch {}
-    const parts = [];
-    if (succeeded > 0) parts.push(`${succeeded} file${succeeded > 1 ? 's' : ''} uploaded`);
-    if (failed > 0) parts.push(`${failed} failed`);
-    if (capped) parts.push(`max ${this._maxBatchFileUploads} per batch`);
-    const tone = succeeded > 0 ? (failed > 0 || capped ? 'info' : 'success') : 'error';
-    this.showToast(parts.join(' · ') || 'No files uploaded', tone);
-  },
-
-  async _uploadFileToWorkspace(sessionId, file, targetDir = '') {
-    const form = new FormData();
-    form.append('file', file);
-    const query = targetDir ? `?path=${encodeURIComponent(targetDir)}` : '';
-    const url = `/api/sessions/${encodeURIComponent(sessionId)}/files/upload${query}`;
-    const resp = await fetch(url, { method: 'POST', body: form });
-    if (!resp.ok) {
-      let msg = `HTTP ${resp.status}`;
-      try {
-        const data = await resp.json();
-        if (data && data.error) msg = data.error;
-      } catch {}
-      throw new Error(msg);
-    }
-    const data = await resp.json();
-    if (!data.success) throw new Error(data.error || 'Upload failed');
-    return data.data && data.data.path;
-  },
-
-  _wireFileBrowserDrop() {
-    const treeEl = this.$('fileBrowserTree');
-    const panel = this.$('fileBrowserPanel');
-    if (!treeEl || !panel || this._fileBrowserDropWired) return;
-    this._fileBrowserDropWired = true;
-    let dragDepth = 0;
-    treeEl.addEventListener('dragover', (e) => {
-      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
-      e.preventDefault();
-      e.dataTransfer.dropEffect = 'copy';
-      if (dragDepth === 0) treeEl.classList.add('file-browser-drag-active');
-    });
-    treeEl.addEventListener('dragenter', (e) => {
-      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
-      dragDepth++;
-    });
-    treeEl.addEventListener('dragleave', (e) => {
-      if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
-      dragDepth = Math.max(0, dragDepth - 1);
-      if (dragDepth === 0) treeEl.classList.remove('file-browser-drag-active');
-      // Also handle leaving panel entirely
-      if (!panel.contains(e.relatedTarget)) {
-        dragDepth = 0;
-        treeEl.classList.remove('file-browser-drag-active');
-      }
-    });
-    treeEl.addEventListener('drop', (e) => {
-      dragDepth = 0;
-      treeEl.classList.remove('file-browser-drag-active');
-      if (!e.dataTransfer || !e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
-      const files = Array.from(e.dataTransfer.files);
-      if (files.length === 0) return;
-      e.preventDefault();
-      e.stopPropagation();
-      let targetDir = '';
-      const folderEl = e.target && e.target.closest ? e.target.closest('.file-tree-item[data-type="directory"]') : null;
-      if (folderEl && folderEl.dataset && folderEl.dataset.path) targetDir = folderEl.dataset.path;
-      this._uploadFilesToFileBrowser(files, targetDir);
-    });
-  },
-
-  _updateFileBrowserStatus() {
-    const statusEl = this.$('fileBrowserStatus');
-    if (!statusEl || !this.fileBrowserData) return;
-    const { totalFiles, totalDirectories, truncated } = this.fileBrowserData;
-    const base = `${totalFiles} files, ${totalDirectories} dirs${truncated ? ' (truncated)' : ''}`;
-    const dir = this.fileBrowserCurrentDir || '';
-    const showHidden = this.fileBrowserShowHidden === true ? ' · hidden shown' : '';
-    statusEl.textContent = dir ? `${base} · in ${dir}${showHidden}` : `${base}${showHidden}`;
-  },
-
-  async createFileBrowserFolder() {
-    const sessionId = this.fileBrowserSessionId || this.activeSessionId;
-    if (!sessionId) {
-      this.showToast('No active session', 'error');
-      return;
-    }
-    const hint = this.fileBrowserCurrentDir ? ` (in ${this.fileBrowserCurrentDir}/)` : '';
-    const input = window.prompt(`New folder name${hint} (e.g. myFolder or a/b/c):`);
-    if (input == null) return;
-    const name = String(input).trim();
-    if (!name) return;
-    // Allow nested like a/b/c but strip leading/trailing slashes
-    const sanitized = name.replace(/^\/+/, '').replace(/\\/g, '/').trim();
-    if (!sanitized) {
-      this.showToast('Invalid folder name', 'error');
-      return;
-    }
-    const finalPath = this.fileBrowserCurrentDir ? `${this.fileBrowserCurrentDir}/${sanitized}` : sanitized;
-    try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/files/mkdir`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: finalPath }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.success) throw new Error(data.error || `Failed (${res.status})`);
-      this.showToast(`Folder "${finalPath}" created`, 'success');
-      await this.loadFileBrowser(sessionId);
-      // Auto-expand current dir and parent so new folder is visible
-      if (this.fileBrowserCurrentDir) this.fileBrowserExpandedDirs.add(this.fileBrowserCurrentDir);
-      const parent = finalPath.includes('/') ? finalPath.split('/').slice(0, -1).join('/') : null;
-      if (parent) this.fileBrowserExpandedDirs.add(parent);
-      this.fileBrowserExpandedDirs.add(finalPath);
-      this.fileBrowserCurrentDir = finalPath;
-      this._updateFileBrowserStatus?.();
-      this.renderFileBrowserTree();
-    } catch (err) {
-      this.showToast(`Create folder failed: ${err && err.message ? err.message : err}`, 'error');
-    }
-  },
-
-  async renameFileBrowserEntry(oldPath) {
-    const sessionId = this.fileBrowserSessionId || this.activeSessionId;
-    if (!sessionId || !oldPath) return;
-    const base = oldPath.split('/').pop() || oldPath;
-    const next = window.prompt(`Rename "${oldPath}" to:`, base);
-    if (next == null) return;
-    const newBase = String(next).trim();
-    if (!newBase || newBase === base) return;
-    if (newBase.includes('/') || newBase.includes('\\')) {
-      this.showToast('Name must not contain path separators', 'error');
-      return;
-    }
-    const dir = oldPath.includes('/') ? oldPath.split('/').slice(0, -1).join('/') : '';
-    const newPath = dir ? `${dir}/${newBase}` : newBase;
-    try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/files/rename`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ from: oldPath, to: newPath }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.success) throw new Error(data.error || `Failed (${res.status})`);
-      this.showToast(`Renamed to "${newPath}"`, 'success');
-      // If renamed directory was expanded, move expanded state
-      if (this.fileBrowserExpandedDirs.has(oldPath)) {
-        this.fileBrowserExpandedDirs.delete(oldPath);
-        this.fileBrowserExpandedDirs.add(newPath);
-      }
-      // Move current dir if it was the renamed path or a child
-      if (this.fileBrowserCurrentDir === oldPath) this.fileBrowserCurrentDir = newPath;
-      else if ((this.fileBrowserCurrentDir || '').startsWith(oldPath + '/')) {
-        this.fileBrowserCurrentDir = newPath + this.fileBrowserCurrentDir.slice(oldPath.length);
-      }
-      // Also update loaded dirs
-      if (this.fileBrowserLoadedDirs && this.fileBrowserLoadedDirs.has(oldPath)) {
-        this.fileBrowserLoadedDirs.delete(oldPath);
-      }
-      await this.loadFileBrowser(sessionId);
-      // Preserve moved current dir across reload (load would otherwise keep old)
-      if (this.fileBrowserCurrentDir === newPath || (this.fileBrowserCurrentDir || '').startsWith(newPath + '/')) {
-        this._updateFileBrowserStatus?.();
-      }
-    } catch (err) {
-      this.showToast(`Rename failed: ${err && err.message ? err.message : err}`, 'error');
-    }
-  },
-
-  async deleteFileBrowserEntry(targetPath) {
-    const sessionId = this.fileBrowserSessionId || this.activeSessionId;
-    if (!sessionId || !targetPath) return;
-    const isDir = targetPath && this.fileBrowserData && (() => {
-      const find = (nodes) => {
-        for (const n of nodes || []) {
-          if (n.path === targetPath) return n;
-          const c = find(n.children);
-          if (c) return c;
-        }
-        return null;
-      };
-      const node = find(this.fileBrowserData.tree || []);
-      return node ? node.type === 'directory' : false;
-    })();
-    const label = isDir ? 'folder' : 'file';
-    if (!window.confirm(`Delete ${label} "${targetPath}"?${isDir ? ' This will delete its contents.' : ''}`)) return;
-    try {
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/files?path=${encodeURIComponent(targetPath)}`, {
-        method: 'DELETE',
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.success) throw new Error(data.error || `Failed (${res.status})`);
-      this.showToast(`Deleted "${targetPath}"`, 'success');
-      this.fileBrowserExpandedDirs.delete(targetPath);
-      // If deleted path was current dir or ancestor, move current up
-      if (this.fileBrowserCurrentDir === targetPath || (this.fileBrowserCurrentDir || '').startsWith(targetPath + '/')) {
-        const parent = targetPath.includes('/') ? targetPath.split('/').slice(0, -1).join('/') : '';
-        this.fileBrowserCurrentDir = parent;
-      }
-      if (this.fileBrowserLoadedDirs) this.fileBrowserLoadedDirs.delete(targetPath);
-      await this.loadFileBrowser(sessionId);
-    } catch (err) {
-      this.showToast(`Delete failed: ${err && err.message ? err.message : err}`, 'error');
-    }
-  },
-
-  hasMatchingChild(node, filter) {
-    if (!node.children) return false;
-    for (const child of node.children) {
-      if (child.name.toLowerCase().includes(filter)) return true;
-      if (child.type === 'directory' && this.hasMatchingChild(child, filter)) return true;
-    }
-    return false;
-  },
-
-  async toggleFileBrowserFolder(path) {
+  async _legacyToggleFileBrowserFolder(path) {
     if (this.fileBrowserExpandedDirs.has(path)) {
       this.fileBrowserExpandedDirs.delete(path);
       if (this.fileBrowserCurrentDir === path || (this.fileBrowserCurrentDir || '').startsWith(path + '/')) {
@@ -4735,7 +5694,7 @@ Object.assign(CodemanApp.prototype, {
   // instead of shipping/rendering the whole tree. An empty query restores the
   // cached tree. The old client-side tree filter (renderFileBrowserTree's
   // filter branch) stays intact for the no-query case.
-  filterFileBrowser(value) {
+  _legacyFilterFileBrowser(value) {
     this.fileBrowserFilter = value;
     if (this._fileBrowserSearchTimer) {
       clearTimeout(this._fileBrowserSearchTimer);
@@ -4760,7 +5719,7 @@ Object.assign(CodemanApp.prototype, {
     }, 250);
   },
 
-  async searchFileBrowser(q) {
+  async _legacySearchFileBrowser(q) {
     const sid = this.fileBrowserSessionId;
     if (!sid) return;
     const treeEl = this.$('fileBrowserTree');
@@ -4793,7 +5752,7 @@ Object.assign(CodemanApp.prototype, {
 
       this.fileBrowserSearchMode = true;
       this.fileBrowserMatches = result.data.matches || [];
-      this.renderFileBrowserMatches();
+      this._legacyRenderFileBrowserMatches();
 
       if (statusEl) {
         const truncated = result.data.truncated;
@@ -4806,7 +5765,7 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
-  renderFileBrowserMatches() {
+  _legacyRenderFileBrowserMatches() {
     const treeEl = this.$('fileBrowserTree');
     if (!treeEl || !this.fileBrowserSessionId) return;
     const fileBrowserSessionId = this.fileBrowserSessionId;
@@ -4898,57 +5857,15 @@ Object.assign(CodemanApp.prototype, {
     });
   },
 
-  expandAllDirectories(nodes) {
-    for (const node of nodes) {
-      if (node.type === 'directory') {
-        this.fileBrowserExpandedDirs.add(node.path);
-        if (node.children) {
-          this.expandAllDirectories(node.children);
-        }
-      }
+  _legacyHasMatchingChild(node, filter) {
+    if (!node.children) return false;
+    for (const child of node.children) {
+      if (child.name.toLowerCase().includes(filter)) return true;
+      if (child.type === 'directory' && this.hasMatchingChild(child, filter)) return true;
     }
+    return false;
   },
 
-  collapseAllDirectories() {
-    this.fileBrowserExpandedDirs.clear();
-  },
-
-  toggleFileBrowserExpand() {
-    this.fileBrowserAllExpanded = !this.fileBrowserAllExpanded;
-    const btn = this.$('fileBrowserExpandBtn');
-
-    if (this.fileBrowserAllExpanded) {
-      this.expandAllDirectories(this.fileBrowserData?.tree || []);
-      if (btn) btn.innerHTML = '\u229F'; // Collapse icon
-    } else {
-      this.collapseAllDirectories();
-      if (btn) btn.innerHTML = '\u229E'; // Expand icon
-    }
-    this.renderFileBrowserTree();
-  },
-
-  refreshFileBrowser() {
-    if (this.fileBrowserSessionId) {
-      if (this._fileBrowserSearchTimer) {
-        clearTimeout(this._fileBrowserSearchTimer);
-        this._fileBrowserSearchTimer = null;
-      }
-      this.fileBrowserExpandedDirs.clear();
-      this.fileBrowserLoadedDirs?.clear();
-      this.fileBrowserFilter = '';
-      this.fileBrowserSearchMode = false;
-      this.fileBrowserMatches = null;
-      this.fileBrowserAllExpanded = false;
-      const searchInput = this.$('fileBrowserSearch');
-      if (searchInput) searchInput.value = '';
-      this.loadFileBrowser(this.fileBrowserSessionId);
-    }
-  },
-
-  // Header "File Viewer" button (opt-in via App Settings → Header Displays →
-  // File Viewer). Toggles the file browser panel open/closed without a trip
-  // through settings. Persists via the same `showFileBrowser` flag the Panels
-  // section + the panel's own close (X) use, so the three stay in sync.
   toggleFileBrowserButton() {
     const panel = this.$('fileBrowserPanel');
     const isOpen = panel?.classList.contains('visible');
@@ -4972,6 +5889,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   closeFileBrowserPanel() {
+    this._resetFileBrowserForHide?.();
     const panel = this.$('fileBrowserPanel');
     if (panel) {
       panel.classList.remove('visible');
@@ -5200,10 +6118,12 @@ Object.assign(CodemanApp.prototype, {
   /**
    * Whether a path is absolute and provably OUTSIDE this session's workspace.
    *
-   * `file-content` / `file-raw` resolve every path against `workingDir` and
-   * refuse anything that escapes it, so an absolute path elsewhere on the host
-   * (an agent's `/tmp` scratchpad capture, a screenshot, another checkout) can
-   * only ever 404 there — it has to go through the attachment routes instead.
+   * `file-content` / `file-raw` serve paths inside `workingDir` and, as a second
+   * root, an absolute path inside a followed worktree outside it
+   * (`outsideWorktree`). They refuse every other path that escapes
+   * `workingDir`, so an absolute path elsewhere on the host (an agent's `/tmp`
+   * scratchpad capture, a screenshot, another checkout) can only ever 404 there
+   * — it has to go through the attachment routes instead.
    *
    * A string compare is enough for ROUTING; the real containment decision stays
    * server-side (realpath + guard) on whichever route the request lands on. An
@@ -5220,7 +6140,24 @@ Object.assign(CodemanApp.prototype, {
     const workingDir = this.sessions.get(sessionId)?.workingDir;
     if (!workingDir) return false;
     const root = workingDir.endsWith('/') ? workingDir : `${workingDir}/`;
-    return filePath !== workingDir && !filePath.startsWith(root);
+    if (filePath === workingDir || filePath.startsWith(root)) return false;
+    // A worktree outside `workingDir` that the agent is in (#765) is a second root the file
+    // routes serve, so a path inside it previews (and edits) like a workspace path.
+    return this._isOutsideWorktreePath(filePath, sessionId) !== true;
+  },
+
+  /**
+   * Whether an absolute path lies inside the worktree OUTSIDE `workingDir` that the session's agent
+   * is in (`outsideWorktree`, #765). The file routes serve it as a second root, while the log
+   * viewer's `tail-file` stays confined to `workingDir`, so the terminal opens such a path in the
+   * file preview.
+   */
+  _isOutsideWorktreePath(filePath, sessionId) {
+    if (typeof filePath !== 'string' || !filePath.startsWith('/')) return false;
+    const worktree = this.sessions.get(sessionId)?.outsideWorktree;
+    if (worktree?.outside !== true || typeof worktree.path !== 'string' || !worktree.path) return false;
+    const root = worktree.path.endsWith('/') ? worktree.path : `${worktree.path}/`;
+    return filePath === worktree.path || filePath.startsWith(root);
   },
 
   /**
@@ -6042,6 +6979,7 @@ Object.assign(CodemanApp.prototype, {
         prose = tmpl.content.firstElementChild;
         this._rebaseFilePreviewMarkdownRefs?.(prose, this.filePreviewText);
         this._linkifyFilePaths?.(prose);
+        this._applyBlockDirection?.(prose);
         for (const a of prose.querySelectorAll('a.rv-path:not([data-session-id])')) a.dataset.sessionId = sessionId;
         bodyEl.replaceChildren(prose);
         const nav = this._buildDocumentOutline(prose);
@@ -7929,6 +8867,7 @@ Object.assign(CodemanApp.prototype, {
       const doc = tmpl.content.firstElementChild;
       this._rebaseFilePreviewMarkdownRefs(doc, info);
       this._linkifyFilePaths(doc);
+      this._applyBlockDirection(doc);
       // The linkifier's absolute paths name no session; give them the
       // preview's, like the rebased links, or they open in the active tab's.
       for (const a of doc.querySelectorAll('a.rv-path:not([data-session-id])')) a.dataset.sessionId = info.sessionId;
@@ -7981,6 +8920,13 @@ Object.assign(CodemanApp.prototype, {
   _rebaseFilePreviewMarkdownRefs(root, { sessionId, filePath, attachmentId }) {
     const dir = filePath.includes('/') ? filePath.slice(0, filePath.lastIndexOf('/') + 1) : '';
     const unresolvable = !!attachmentId && !filePath.startsWith('/');
+    // A root-relative ref (`/docs/x.png`) resolves from the workspace root, as on GitHub, or from
+    // the top of the worktree outside the workspace that the agent is in (#765).
+    const worktree = this.sessions.get(sessionId)?.outsideWorktree;
+    const rootPrefix =
+      worktree?.outside === true && this._isOutsideWorktreePath(filePath, sessionId)
+        ? `${worktree.path.replace(/\/+$/, '')}/`
+        : '';
     // Workspace ref = no scheme, not protocol-relative (//host), not a fragment.
     const isWorkspaceRef = (ref) =>
       !!ref && !/^[a-z][a-z0-9+.-]*:/i.test(ref) && !ref.startsWith('//') && !ref.startsWith('#');
@@ -8000,7 +8946,7 @@ Object.assign(CodemanApp.prototype, {
         /* malformed escape: keep the ref as written */
       }
       const parts = [];
-      for (const seg of (rel.startsWith('/') ? rel.slice(1) : dir + rel).split('/')) {
+      for (const seg of (rel.startsWith('/') ? rootPrefix + rel.slice(1) : dir + rel).split('/')) {
         if (seg === '.' || (seg === '' && parts.length)) continue;
         if (seg === '..' && parts.length && parts[parts.length - 1] !== '..' && parts[parts.length - 1] !== '') parts.pop();
         else parts.push(seg);
@@ -8348,6 +9294,7 @@ Object.assign(CodemanApp.prototype, {
     );
 
     let permissionDenied = false;
+    let connected = false;
     eventSource.onmessage = (e) => {
       const data = JSON.parse(e.data);
       const body = document.getElementById(`log-viewer-body-${windowId}`);
@@ -8355,6 +9302,7 @@ Object.assign(CodemanApp.prototype, {
 
       switch (data.type) {
         case 'connected':
+          connected = true;
           body.innerHTML = '';
           break;
         case 'data':
@@ -8403,6 +9351,7 @@ Object.assign(CodemanApp.prototype, {
             }
             break;
           }
+          if (!connected) eventSource.close();
           body.innerHTML += `<div class="log-error">${escapeHtml(data.error)}</div>`;
           this.updateLogViewerStatus(windowId, 'error', 'error');
           break;

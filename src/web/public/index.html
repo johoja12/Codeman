@@ -540,6 +540,17 @@
                it sits under them as a quiet link; settings-ui.js rewrites its
                contents on every state change and owns its inline display. -->
           <div class="welcome-actions">
+            <!-- A model that runs on the Mac the server runs on (local-model-ui.js).
+                 The first thing on the start screen, above the launchers, in the size of
+                 the primary button. A sibling of the launcher slot and never inside it (renderWelcomeCliActions empties that slot on every
+                 state change). Ships `hidden`: only that module reveals it, once the
+                 server has answered for a Mac. It opens the chooser window
+                 (#localModelModal) and the module writes its label through its own
+                 translator call, hence data-i18n-skip. -->
+            <button type="button" class="welcome-chip welcome-local-model" id="welcomeLocalModelBtn" data-i18n-skip hidden onclick="app.openLocalModelWindow()">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9.5 2.5v3.5M14.5 2.5v3.5M9.5 18v3.5M14.5 18v3.5M2.5 9.5H6M2.5 14.5H6M18 9.5h3.5M18 14.5h3.5"/></svg>
+              <span class="welcome-label" id="welcomeLocalModelLabel">Run a local model</span>
+            </button>
             <div class="welcome-cli-actions" id="welcomeCliActions"></div>
             <button type="button" class="welcome-tunnel-link" id="welcomeTunnelBtn" style="display: none;" onclick="app.toggleTunnelFromWelcome()">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
@@ -613,8 +624,13 @@
             </div>
             <div class="history-list" id="historyList"></div>
           </div>
-          <p class="welcome-hint">Choose a tool to start</p>
-          <button class="welcome-ralph-link" onclick="app.showRalphWizard()">Start Ralph Loop &rarr;</button>
+          <!-- Sessions a human started outside Codeman (foreign-sessions.js).
+               Hidden until a scan finds one; never rendered empty on a fresh
+               install, where an empty block reads as a broken feature. -->
+          <div class="welcome-foreign">
+            <div class="foreign-sessions" id="foreignSessions" hidden></div>
+          </div>
+          <p class="welcome-hint">Or click Run to start</p>
         </div>
       </div>
 
@@ -648,6 +664,11 @@
           <button class="btn-icon-sm" onclick="app.toggleFileBrowserExpand()" title="Expand/Collapse All" id="fileBrowserExpandBtn">&#x229E;</button>
           <button class="btn-icon-sm" onclick="app.closeFileBrowserPanel()" title="Close">&times;</button>
         </div>
+      </div>
+      <div class="file-browser-root" id="fileBrowserRoot" hidden>
+        <span class="file-browser-root-label" id="fileBrowserRootLabel"></span>
+        <span class="file-browser-root-name" id="fileBrowserRootName" data-i18n-skip></span>
+        <button type="button" class="file-browser-root-switch" id="fileBrowserRootSwitch" onclick="app.toggleFileBrowserRoot()">Session folder</button>
       </div>
       <div class="file-browser-search">
         <input type="text" id="fileBrowserSearch" placeholder="Filter files..." oninput="app.filterFileBrowser(this.value)">
@@ -1913,11 +1934,11 @@
           <p class="modal-session-name" id="closeConfirmSessionName"></p>
         </div>
         <div class="close-options">
-          <button class="close-option" onclick="app.confirmCloseSession(false)">
-            <span class="close-option-title">Remove Tab</span>
-            <span class="close-option-desc">Tmux session keeps running in background</span>
+          <button class="close-option" onclick="app.confirmCloseSession(false)" id="closeConfirmKeepBtn">
+            <span class="close-option-title" id="closeConfirmKeepTitle">Remove Tab</span>
+            <span class="close-option-desc" id="closeConfirmKeepDesc">Tmux session keeps running in background</span>
           </button>
-          <button class="close-option close-option-danger" onclick="app.confirmCloseSession(true)">
+          <button class="close-option close-option-danger" onclick="app.confirmCloseSession(true)" id="closeConfirmKillBtn">
             <span class="close-option-title" id="closeConfirmKillTitle">Kill Tmux & Claude Code</span>
             <span class="close-option-desc">Terminate the session completely</span>
           </button>
@@ -3018,6 +3039,28 @@
                   </div>
                 </div>
               </div>
+
+              <!-- The model that runs on the Mac the server runs on (local-model-ui.js). One row:
+                   the state in a few words, written by the module from GET /api/local-model
+                   through its own translator call (hence data-i18n-skip on the text and on the
+                   button), and a button that opens the chooser window (#localModelModal), where
+                   everything happens. The module shows the group only once the server has
+                   answered for a Mac: it hides it for a server on another system (the title
+                   and hint are about "this Mac"), while the first request is in flight, and
+                   for a non-admin in multi-user mode (the routes are admin-only). Not gated on
+                   the endpoints toggle above: an install switches that on itself. -->
+              <div class="set-group" id="localModelGroup">
+                <div class="set-group-head"><h4>Model on this Mac</h4></div>
+                <p class="set-group-hint">Run a coding model on the Mac that Codeman runs on. No account and no API key.</p>
+                <div class="set-group-body">
+                  <div class="set-row" data-search="local model mac apple silicon memory llm offline install download ollama">
+                    <div class="set-row-text" id="localModelSettings" data-i18n-skip aria-live="polite"></div>
+                    <div class="set-row-actions">
+                      <button type="button" class="btn-toolbar btn-sm" id="localModelSettingsOpen" data-i18n-skip onclick="app.openLocalModelWindow()">Open</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
             </section>
 
             <!-- ══ Agents &amp; CLIs ═════════════════════════════════════════ -->
@@ -3092,7 +3135,7 @@
                   <div class="set-row" data-search="agent skill codeman api workers codex gemini opencode pi grok deepseek omp antigravity">
                     <div class="set-row-text">
                       <span class="set-row-label">Codeman Agent Skill</span>
-                      <span class="set-row-desc">Write Codeman's agent skill into each new session's folder, where that CLI looks for skills, so the agent in it can start workers in any installed CLI, send them prompts and wait for results. Every CLI except Pi and a plain shell.</span>
+                      <span class="set-row-desc">Write Codeman's agent skill into each new session's folder, where that CLI looks for skills, so the agent in it can start workers in any installed CLI, send them prompts and wait for results. Every CLI except Pi, GitHub Copilot and a plain shell. On by default. The copy ignores itself in git, so your repository never lists it as a new file. Off stops new copies but removes none: <code>codeman skill uninstall --case &lt;name&gt;</code> does that.</span>
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="appSettingsAgentSkill"><span class="slider"></span></label>
                   </div>
@@ -3213,6 +3256,13 @@
                       <span class="set-row-desc">Start new Codex sessions with --dangerously-bypass-approvals-and-sandbox.</span>
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="appSettingsCodexDangerouslyBypassApprovals"><span class="slider"></span></label>
+                  </div>
+                  <div class="set-row" data-search="codex network access sandbox loopback codeman skill orchestrate spawn">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Allow network access</span>
+                      <span class="set-row-desc">Lets commands in Codex's workspace-write sandbox use the network, which the Codeman skill needs to reach this server. Those commands can then call Codeman's API, which can start a session outside the sandbox with no approval prompt, even when a password is set. So with this on, Codex's sandbox does not contain a prompt-injected command: treat it as close to Bypass. Applies to every new local Codex session, not scheduled jobs. It does not change Codex's sandbox mode: a folder Codex runs read-only (one it does not trust) keeps the network closed and asks per command.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsCodexNetworkAccess"><span class="slider"></span></label>
                   </div>
                   <div class="set-row" data-search="codex animations status effects">
                     <div class="set-row-text">
@@ -3664,6 +3714,20 @@
                       <option value="compose">Compose dialog</option>
                     </select>
                   </div>
+                  <div class="set-row has-field" data-search="voice silence pause timeout manual stop recording">
+                    <div class="set-row-text">
+                      <label class="set-row-label" for="voiceSilenceTimeout">Stop after silence</label>
+                      <span class="set-row-desc">Allow time to think between phrases. Manual keeps listening until you tap the mic again.</span>
+                    </div>
+                    <select id="voiceSilenceTimeout" class="set-select">
+                      <option value="default">Provider default</option>
+                      <option value="3">3 seconds</option>
+                      <option value="6">6 seconds</option>
+                      <option value="15">15 seconds</option>
+                      <option value="30">30 seconds</option>
+                      <option value="0">Manual</option>
+                    </select>
+                  </div>
                   <div class="set-row has-field" data-search="voice language">
                     <div class="set-row-text">
                       <span class="set-row-label">Language</span>
@@ -3818,6 +3882,13 @@
                     </div>
                     <input type="text" id="appSettingsDefaultDir" class="set-input" placeholder="~/projects">
                   </div>
+                  <div class="set-row" data-search="sync cases across devices selected case agent teams opus 1m">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Sync cases across devices</span>
+                      <span class="set-row-desc">Keeps each case's Agent Teams and Opus 1M options on the server and switches this device to the case you last chose on another one when you return to the tab. Off by default: each browser keeps its own. The case names are stored in the shared settings file.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsSyncCaseState" aria-label="Sync cases across devices"><span class="slider"></span></label>
+                  </div>
                 </div>
               </div>
 
@@ -3920,6 +3991,27 @@
           <button class="btn-toolbar" onclick="app.applyAppSettings()" title="Save and keep Settings open">Apply</button>
           <button class="btn-toolbar btn-primary" onclick="app.saveAppSettings()">Save</button>
         </div>
+      </div>
+    </div>
+
+    <!-- The local model window (local-model-ui.js): choose a model, confirm the sizes,
+         watch the download, start a session. Opened by the welcome button and by the
+         row in App Settings > Models; placed AFTER #appSettingsModal so it stacks above
+         it when opened from there. The module fills the body from GET /api/local-model
+         through its own translator call (model, agent and chip names are someone
+         else's text), hence data-i18n-skip on the body; the title and the close button
+         are static and go through the page translator. -->
+    <div class="modal" id="localModelModal" role="dialog" aria-modal="true" aria-labelledby="localModelModalTitle">
+      <div class="modal-backdrop" onclick="app.closeLocalModelWindow()"></div>
+      <div class="modal-content local-model-window">
+        <div class="modal-header">
+          <h3 id="localModelModalTitle">Run a model on this Mac</h3>
+          <button class="modal-close" onclick="app.closeLocalModelWindow()" aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body lm-body" id="localModelWindowBody" data-i18n-skip></div>
+        <!-- The buttons of the current screen. Outside the body, so they keep their
+             place while the body changes and scrolls. -->
+        <div class="lm-foot-slot" id="localModelWindowFoot" data-i18n-skip></div>
       </div>
     </div>
 
@@ -4094,15 +4186,15 @@
             </div>
             <div class="form-row" id="cloneCustomPathToggleRow">
               <label class="checkbox-row"><input type="checkbox" id="cloneCustomPathToggle" onchange="app.toggleCloneCustomPath()"> 📁 Clone into a custom folder</label>
-              <span class="form-hint">By default the clone goes under ~/codeman-cases. Choose a folder and the repository is cloned into that folder itself (an empty folder, or one that does not exist yet); it is listed like any other case, and deleting the case only unlinks it (your files stay).</span>
+              <span class="form-hint">By default the clone goes under ~/codeman-cases. Choose a folder instead and the repository is cloned into a subfolder of it named after the case, the same way it goes under ~/codeman-cases; it is listed like any other case, and deleting the case only unlinks it (your files stay).</span>
             </div>
             <div class="form-row" id="cloneCustomPathRow" style="display:none">
-              <label>Folder</label>
+              <label>Parent Folder</label>
               <div class="path-input-group">
                 <input type="text" id="cloneCasePath" placeholder="~/projects" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" oninput="app.updateCloneCasePathPreview()">
                 <button type="button" class="btn path-input-browse" onclick="app.openCloneCasePathPicker()">Browse&hellip;</button>
               </div>
-              <span class="form-hint" id="cloneCasePathPreview">Pick an empty folder, or one that does not exist yet, to clone into.</span>
+              <span class="form-hint" id="cloneCasePathPreview">Pick the folder the repository should be cloned inside. It goes into a subfolder named after the case.</span>
             </div>
             <div class="form-row">
               <label>Branch or Tag (optional)</label>
@@ -5145,8 +5237,10 @@
   <script defer src="mobile-tabs.js"></script>
   <script defer src="mobile-overview.js"></script>
   <script defer src="home-sessions.js"></script>
+  <script defer src="foreign-sessions.js"></script>
   <script defer src="git-status-ui.js"></script>
   <script defer src="edit-history-ui.js"></script>
+  <script defer src="local-model-ui.js"></script>
   <script defer src="entrance-animations.js"></script>
   <script defer src="ralph-wizard.js"></script>
   <script defer src="api-client.js"></script>

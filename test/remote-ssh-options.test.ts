@@ -136,7 +136,7 @@ describe('COD-107 buildSshConnectionArgs — shared ssh connection tokens', () =
 });
 
 describe('COD-107 buildRemoteLaunchCommand — threads connection args', () => {
-  it('bootstraps common remote binary paths before tmux and the pane command', () => {
+  it('bootstraps tmux while leaving an explicit override to the remote default shell', () => {
     const command = buildRemoteLaunchCommand({
       mode: 'codex',
       remote: { ...baseRemote, commands: { codex: 'exec /Users/me/.local/bin/codx personal' } },
@@ -144,7 +144,7 @@ describe('COD-107 buildRemoteLaunchCommand — threads connection args', () => {
     });
 
     expect(command).toContain(`${REMOTE_PATH_BOOTSTRAP}; tmux -L codeman`);
-    expect(command).toContain(`&& ${REMOTE_PATH_BOOTSTRAP}; exec /Users/me/.local/bin/codx personal`);
+    expect(command).toContain(`&& exec /Users/me/.local/bin/codx personal`);
   });
 
   it('emits the aa-desktop ssh connection options ahead of -t and the target', () => {
@@ -172,9 +172,9 @@ describe('COD-107 buildRemoteLaunchCommand — threads connection args', () => {
     const sh = (s: string) => "'" + s.replace(/'/g, "'\\''") + "'";
     const remoteName = `codeman-ssh-${SESSION_ID.slice(0, 8)}`;
     const path = sh('/home/ubuntu/work');
-    const paneCommand = `cd ${path} && ${REMOTE_PATH_BOOTSTRAP}; ${REMOTE_LOGIN_SHELL_RESOLVE}exec "$login_shell" -i -l`;
+    const paneCommand = `cd ${path} && { ${REMOTE_PATH_BOOTSTRAP}; { ${REMOTE_LOGIN_SHELL_RESOLVE}set -- -i -l; case \${login_shell##*/} in csh|tcsh) set --;; esac; exec "$login_shell" "$@"; }; }`;
     const tmuxInvocation = `${REMOTE_PATH_BOOTSTRAP}; ${[
-      `tmux -L codeman-remote new-session -A -s ${remoteName} -c ${path} ${sh(paneCommand)}`,
+      `tmux -L codeman-remote new-session -A -s ${remoteName} -c ${path} /bin/sh -c ${sh(paneCommand)}`,
       `set -t ${remoteName} status off`,
       `set -t ${remoteName} mouse off`,
       `set -t ${remoteName} prefix C-q`,
@@ -245,7 +245,9 @@ describe('buildRemoteCliVersionProbeCommand: remote CLI version over the same co
     // the LAUNCH uses, not one particular spelling of it.
     expect(cmd).toContain('ssh -o BatchMode=yes -o ConnectTimeout=10 ubuntu@10.0.0.42 ');
     expect(cmd).toContain(REMOTE_LOGIN_SHELL_RESOLVE.slice(0, 40));
-    expect(cmd.endsWith(`'${remoteLoginShellCommand('claude --version').replace(/'/g, "'\\''")}'`)).toBe(true);
+    expect(cmd).toContain('/bin/sh -c ');
+    expect(cmd).toContain('claude --version');
+    expect(cmd).toContain('exec "$login_shell" "$@" -c');
   });
 
   it('uses the shared connection args (proxy/identity/port), so it reaches what the launch reaches', () => {

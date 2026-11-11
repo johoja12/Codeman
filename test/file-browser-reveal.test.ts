@@ -104,7 +104,7 @@ describe('COD-141 showFileBrowserPanel — canonical reveal helper', () => {
     expect(panel.classList.add).toHaveBeenCalledTimes(1);
     expect(panel.classList.add).toHaveBeenCalledWith('visible');
     expect(host.loadFileBrowser).toHaveBeenCalledTimes(1);
-    expect(host.loadFileBrowser).toHaveBeenCalledWith('sess-1');
+    expect(host.loadFileBrowser).toHaveBeenCalledWith('sess-1', { adoptOwner: true });
 
     // Order: the panel must be revealed BEFORE loadFileBrowser runs (else it early-returns).
     const addOrder = panel.classList.add.mock.invocationCallOrder[0];
@@ -127,7 +127,7 @@ describe('COD-141 showFileBrowserPanel — canonical reveal helper', () => {
     host.showFileBrowserPanel('other-sess');
 
     expect(host.loadFileBrowser).toHaveBeenCalledTimes(1);
-    expect(host.loadFileBrowser).toHaveBeenCalledWith('other-sess');
+    expect(host.loadFileBrowser).toHaveBeenCalledWith('other-sess', { adoptOwner: true });
     expect(host.loadFileBrowser).not.toHaveBeenCalledWith('active-sess');
   });
 
@@ -140,6 +140,6 @@ describe('COD-141 showFileBrowserPanel — canonical reveal helper', () => {
     host.showFileBrowserPanel('sess-1');
 
     expect(panel.classList.add).toHaveBeenCalledWith('visible');
-    expect(host.loadFileBrowser).toHaveBeenCalledWith('sess-1');
+    expect(host.loadFileBrowser).toHaveBeenCalledWith('sess-1', { adoptOwner: true });
   });
 });

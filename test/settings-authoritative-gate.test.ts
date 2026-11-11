@@ -53,6 +53,7 @@ describe('App Settings authoritative checkpoint gate', () => {
       AUTO_CLOSE_NOTIFICATION_MS: 5000,
       MobileDetection: { getDeviceType: () => 'desktop', isHandheldDevice: () => false, isTouchDevice: () => false },
       VoiceInput: {
+        SILENCE_TIMEOUT_SECONDS: [0, 3, 6, 15, 30],
         _getDeepgramConfig: () => ({}),
         getActiveProviderName: () => 'Web Speech',
         // Added upstream (voice provider status rows); openAppSettings calls them.

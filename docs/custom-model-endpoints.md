@@ -384,7 +384,10 @@ size`. Neither a `modelContextLengths` entry nor a `defaultContextLength`
   included), user-level agents and commands, and the MCP servers configured
   in `~/.claude.json` — none of those are symlinked back, only `projects` is.
   A fine trade for "point this session at my local llama.cpp," but worth
-  knowing before it surprises you mid-session.
+  knowing before it surprises you mid-session. A session on its own
+  `CLAUDE_CONFIG_DIR` links `projects` from that directory instead, so its
+  conversation, and what the endpoint run adds to it, stay on its own account
+  across an apply and a clear.
 
 **That isolated directory needed one more fix to actually be usable
 non-interactively.** An otherwise-empty `CLAUDE_CONFIG_DIR` has none of a
@@ -535,13 +538,31 @@ id, model and injected key NAMES are persisted, the values are re-derived
 from the endpoint store on recovery, and the pane keeps running against the
 endpoint in between because tmux retains its environment.
 
-⚠️ Clearing removes injected keys **by name**, and `CLAUDE_CONFIG_DIR` is one
-of the names claude's selection injects — so a session that ALSO had
-`CLAUDE_CONFIG_DIR` set through the generic `envOverrides` field (the
-per-client-account case) loses that override on clear too, and silently
-falls back to the server's default Claude account. If you route a session
-to a specific account this way, re-apply the override after clearing a
-custom-model selection from it.
+A value the session set itself under an injected key comes back when the
+selection goes, on a clear or a switch to another endpoint. That is what
+keeps a session on its own `DSH_HOME`, `CODEX_HOME` or `GROK_HOME`, and on
+its own account through `CLAUDE_CONFIG_DIR` (the per-client-account case).
+
+The launch model goes the same way: a clear relaunches on the model the session
+was created with, or with none if it was created without one. A session an
+older build launched straight onto an endpoint saved that endpoint's model in
+its config, so its clear still relaunches on that id.
+
+⚠️ Across a Codeman restart only the home directory comes back, and only as
+an absolute path. The selection overwrote the tmux `setenv` that held it, so
+its record in `state.json` keeps that one path (`ownEnv`), and a non-granted
+owner loses it at recovery like any other privileged override. Any other own
+value can be a credential and stays in memory: a session that set its own
+`GEMINI_API_KEY`, picked an endpoint and then outlived a restart falls back to
+the server's key on clear. A selection saved by an older build has no such
+record, so its first clear still falls back to the server's default.
+
+⚠️ That record only exists when the selection was made before the restart. An
+own `DSH_HOME`, `CODEX_HOME` or `GROK_HOME` on a session with no selection is
+not persisted at all (a session's overrides keep only `CLAUDE_CODE_*` and
+`CLAUDE_CONFIG_DIR`), so a Codeman restart leaves nothing to record: an
+endpoint picked after it, and cleared later, falls back to the server's
+default. `CLAUDE_CONFIG_DIR` does not have this gap.
 
 **New sessions always default back to the harness's native backend.** A
 custom-endpoint selection is a per-session choice, never a sticky global
@@ -641,6 +662,45 @@ See the confidence table in `custom-model-endpoints-plan.md` for the full detail
 each result. `scripts/test-local-llm-harnesses.ts` is the standalone script
 used to check a harness against a real endpoint outside the web UI
 entirely; see its own `--help` for usage.
+
+## The endpoint store has one writer
+
+`~/.codeman/custom-model-hosts.json` is written only through `mutateCustomModelHosts()`
+(`src/custom-model-hosts-writer.ts`): the create, update, delete and discover routes, the
+five-minute re-discovery sweep and the local model install all go through it.
+
+- **One at a time.** Changes run on one queue, and the check a route makes ("this id is
+  free", "this endpoint still exists") runs in the same step as its write. Before, each
+  writer read the file, changed its copy and wrote it back on its own, all through one temp
+  file name: a route and the sweep, or two requests sent together, could lose each other's
+  change or fail outright.
+- **Atomic.** A temp file with a random name beside the target, then a rename. Mode 0600.
+- **A file that does not parse is refused, not replaced.** The writing routes answer
+  `409 CONFLICT` with the fix (repair or delete the file, or restore it from a config
+  backup) and leave it byte for byte. Before, such a file read as an empty list, and the next
+  save replaced every stored endpoint and its API key with one record. The message never
+  quotes the file, which holds keys.
+
+The one direct writer left is config-backup restore, which must work on a file that does
+not parse.
+
+## The endpoint of the model on this Mac
+
+Installing a local model from Codeman ([local-models.md](local-models.md)) saves one endpoint
+with the reserved id `local-ollama` and the label "This Mac". It shows up in the list and in
+the Run menu like any other endpoint. Three things are different:
+
+- A new endpoint cannot be given the id `local-ollama`.
+- While it is the endpoint the install manages, it cannot be edited or deleted here, and
+  "Discover" answers its stored model list without asking the runtime. Its model list must
+  stay the one model the install checked, and its address the port of the runtime Codeman
+  supervises. Change or remove it in the local model window.
+- A session is started on it only while Codeman's own runtime is running and the model is
+  still the one that was installed (its digest is compared). Otherwise the launch answers
+  with one sentence.
+
+An endpoint with that id that somebody made by hand, with no model installed by Codeman, is
+an ordinary endpoint: it can be edited and deleted as before.
 
 ## Security note
 

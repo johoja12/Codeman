@@ -101,3 +101,10 @@ describe('publishWithReadmeAside', () => {
     expect(pkg.scripts.release).toBe('node scripts/npm-release.mjs');
   });
 });
+
+it('keeps upstream npm and MCP publishing disabled in the working fork', () => {
+  for (const file of ['release.yml', 'publish-mcp.yml']) {
+    const workflow = readFileSync(join(import.meta.dirname, '..', '.github', 'workflows', file), 'utf8');
+    expect(workflow).toContain("if: github.repository == 'Ark0N/Codeman'");
+  }
+});

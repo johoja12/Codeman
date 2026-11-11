@@ -330,8 +330,10 @@ const ID_ALT = IDS.join('|');
  */
 const BRANCH_PATTERN = new RegExp(
   [
-    // mode === 'codex'  /  mode !== 'codex'
-    `\\b(?:mode|id|agentType)\\s*[!=]==\\s*'(?:${ID_ALT})'`,
+    // mode === 'codex'  /  mode !== 'codex'. `cli` is the name the local model catalogue gives
+    // the same thing (`LocalHarnessEntry.cli`, `Candidate.cli`), so `harness.cli === 'claude'`
+    // is the same banned branch under another field name.
+    `\\b(?:mode|id|agentType|cli)\\s*[!=]==\\s*'(?:${ID_ALT})'`,
     // case 'codex':
     `\\bcase\\s+'(?:${ID_ALT})'\\s*:`,
     // ['codex', 'gemini'].includes(mode) — the id list IS the branch, wherever `mode` sits
@@ -385,7 +387,7 @@ function scan(): { findings: Finding[]; filesScanned: number } {
     lines.forEach((line, i) => {
       BRANCH_PATTERN.lastIndex = 0; // shared /g regex — see utils/regex-patterns.ts
       for (const match of line.matchAll(BRANCH_PATTERN)) {
-        const expression = match[0].replace(/\s+/g, ' ').replace(/^(?:id|agentType)/, 'mode');
+        const expression = match[0].replace(/\s+/g, ' ').replace(/^(?:id|agentType|cli)/, 'mode');
         const posix = rel.split(sep).join('/');
         findings.push({ file: posix, expression, line: i + 1, key: `${posix}::${expression}` });
       }
@@ -455,6 +457,8 @@ describe('no CLI-id branching outside the stock catalog', () => {
       "if (mode !== 'shell' && mode !== 'deepseek') { doSomething(); }",
       "switch (mode) { case 'gemini': return 1; }",
       "if (['codex', 'gemini'].includes(mode)) { doSomething(); }",
+      "if (harness.cli === 'claude') { doSomething(); }",
+      "const others = candidates.filter((c) => c.cli !== 'opencode');",
     ];
     for (const sample of samples) {
       BRANCH_PATTERN.lastIndex = 0;

@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
+import { createIsolatedBuild } from './isolated-build-fixture.js';
 
 const read = (path: string) => readFileSync(resolve(import.meta.dirname, '..', path), 'utf8');
 const indexSource = read('src/web/public/index.html');
@@ -10,7 +11,6 @@ const buildSource = read('scripts/build.mjs');
 const terminalSource = read('src/web/public/terminal-ui.js');
 const appSource = read('src/web/public/app.js');
 const cssSource = read('src/web/public/styles.css');
-const repositoryRoot = resolve(import.meta.dirname, '..');
 
 function loadMixin(globals: Record<string, unknown> = {}) {
   const FakeCodemanApp = function () {} as unknown as { prototype: Record<string, unknown> };
@@ -233,11 +233,16 @@ describe('mobile IME preview delivery graph', () => {
   });
 
   it('emits the exact hashed controller referenced by built HTML', () => {
-    execFileSync('npm', ['run', 'build'], { cwd: repositoryRoot, stdio: 'pipe', timeout: 120_000 });
-    const builtHtml = read('dist/web/public/index.html');
-    const match = builtHtml.match(/mobile-ime-preview\.([a-f0-9]{8})\.js/);
-    expect(match).not.toBeNull();
-    expect(existsSync(resolve(import.meta.dirname, '../dist/web/public', match![0]))).toBe(true);
+    const fixture = createIsolatedBuild();
+    try {
+      execFileSync(process.execPath, ['scripts/build.mjs'], { cwd: fixture.root, stdio: 'pipe', timeout: 120_000 });
+      const builtHtml = readFileSync(resolve(fixture.root, 'dist/web/public/index.html'), 'utf8');
+      const match = builtHtml.match(/mobile-ime-preview\.([a-f0-9]{8})\.js/);
+      expect(match).not.toBeNull();
+      expect(existsSync(resolve(fixture.root, 'dist/web/public', match![0]))).toBe(true);
+    } finally {
+      fixture.dispose();
+    }
   }, 120_000);
 
   it('scopes preview presentation and native composition suppression to touch ownership', () => {

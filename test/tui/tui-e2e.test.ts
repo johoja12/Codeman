@@ -681,6 +681,8 @@ describe('codeman tui (under a pty)', () => {
     term.write('y');
     await waitFor(() => answered.length > 1, 'the approve POST');
     expect(answered[1]).toEqual({ id: `${BETA}:2`, body: { action: 'approve' } });
+    // Wait for this answer to settle before the next test presents an identical card.
+    await waitFor(() => !previewText(output).includes('requests: Bash'), 'the approved card to clear');
   });
 
   it('says so when the dialog has already left the screen', async () => {

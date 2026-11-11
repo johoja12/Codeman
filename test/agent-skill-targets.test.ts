@@ -81,6 +81,8 @@ describe('applyAgentSkill with a directory', () => {
     expect(skillMd.startsWith('---\nname: codeman')).toBe(true);
     expect(skillMd).toContain(MARKER_PREFIX);
     expect(existsSync(join(skillDir, 'reference', 'endpoints.md'))).toBe(true);
+    // It ignores itself in git there too, like the Claude Code copy.
+    expect(await readFile(join(skillDir, '.gitignore'), 'utf-8')).toBe('*\n');
     expect(existsSync(join(casePath, '.claude'))).toBe(false);
     expect(await applyAgentSkill(casePath, true, AGENTS_DIR)).toBe('unchanged');
   });
@@ -176,7 +178,9 @@ describe('codeman skill install|uninstall follow the registry', () => {
 
   it('--mode codex installs per case into .agents/skills, and points a user-level install at npx skills', () => {
     expect(resolveSkillInstallDir({ mode: 'codex', case: 'x' })).toEqual({ skillDir: AGENTS_DIR });
-    expect(resolveSkillInstallDir({ mode: 'codex' }).error).toContain('npx skills add Ark0N/Codeman --skill codeman -g');
+    expect(resolveSkillInstallDir({ mode: 'codex' }).error).toContain(
+      'npx skills add Ark0N/Codeman --skill codeman -g'
+    );
   });
 
   it('refuses a mode without a skill and an unknown mode', () => {

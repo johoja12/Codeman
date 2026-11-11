@@ -233,6 +233,11 @@ export function registerDiscordRoutes(app: FastifyInstance, deps: DiscordRouteDe
     }
     let upload: { name: string; data: Uint8Array } | undefined;
     if (file !== undefined) {
+      if (session.isAdopted) {
+        refundNotifyToken(session.id);
+        reply.code(400);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Files are unavailable for adopted sessions');
+      }
       const problem = await fileProblem(session.workingDir, session.remote, file);
       if (typeof problem === 'string') {
         refundNotifyToken(session.id);

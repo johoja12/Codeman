@@ -73,6 +73,10 @@ vi.mock('node:fs/promises', () => ({
       throw err;
     }),
     writeFile: vi.fn(async () => {}),
+    // What the linked-cases writer needs to replace the registry atomically (temp file + rename).
+    realpath: vi.fn(async (p: string) => p),
+    mkdir: vi.fn(async () => undefined),
+    chmod: vi.fn(async () => {}),
     rename: vi.fn(async () => {}),
     rm: vi.fn(async () => {}),
   },
@@ -1108,6 +1112,7 @@ describe('case-routes', () => {
       });
       // linked-cases.json doesn't exist yet
       mockedReadFile.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+      mockedStat.mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
 
       const res = await harness.app.inject({
         method: 'POST',
@@ -1456,6 +1461,14 @@ describe('case-routes', () => {
     it('migrates and clears linked-local case defaults after successful operations', async () => {
       const registry = new Map<string, string>();
       registry.set('linked-cases.json', JSON.stringify({ linked: '/projects/linked' }));
+      vi.mocked(fs.rename).mockImplementation(async (from, to) => {
+        const source = String(from).split('/').at(-1)!;
+        const target = String(to).split('/').at(-1)!;
+        if (registry.has(source)) {
+          registry.set(target, registry.get(source)!);
+          registry.delete(source);
+        }
+      });
       mockedReadFile.mockImplementation(async (path) => {
         const value = [...registry.entries()].find(([suffix]) => String(path).endsWith(suffix))?.[1];
         if (value !== undefined) return value;

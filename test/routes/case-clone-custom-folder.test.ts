@@ -220,6 +220,20 @@ describe.skipIf(!isGitAvailable())('POST /api/cases/clone with a custom folder',
     }
   });
 
+  it('a registry that is not a JSON object is a 409 that keeps the folder, names it and leaves the file alone', async () => {
+    const { app } = await createRouteTestHarness(registerCaseRoutes);
+    const target = join(workDir, 'refused');
+    mkdirSync(dirname(LINKED()), { recursive: true });
+    writeFileSync(LINKED(), '[]');
+    const res = await clone(app, { name: 'refused', repository: origin, path: target });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().errorCode).toBe('CONFLICT');
+    expect(res.json().error).toContain(target);
+    expect(res.json().error).toContain('Use Link Existing');
+    expect(existsSync(join(target, 'README.md'))).toBe(true);
+    expect(readFileSync(LINKED(), 'utf8')).toBe('[]');
+  });
+
   it('a direct clone whose git-slot wait times out leaves what was written into the folder meanwhile', async () => {
     const target = join(workDir, 'queued');
     mkdirSync(target);

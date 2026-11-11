@@ -26,6 +26,7 @@ import type {
   SessionRemote,
   SessionDocker,
   PaneExit,
+  SessionAdopt,
   StatusLineExporter,
 } from './types.js';
 import type { CodexProviderEnvironment } from './codex-provider-identity.js';
@@ -58,6 +59,13 @@ export interface MuxSession {
   remoteRecoverySuppressed?: boolean;
   /** Docker execution metadata for local tmux sessions wrapping `docker exec` */
   docker?: SessionDocker;
+  /**
+   * Adoption metadata for a wrapper session around a human-started tmux session.
+   * Round-trips through `mux-sessions.json` like remote/docker: without it a
+   * restored wrapper would not know what to re-attach to, and `killSession`
+   * would lose the detach-not-kill guard.
+   */
+  adopt?: SessionAdopt;
   /** Owning username in multi-user mode (round-tripped through recovery like remote/docker) */
   owner?: string;
   /** Session mode */
@@ -161,6 +169,8 @@ export interface CreateSessionOptions {
   initialRows?: number;
   /** Docker execution metadata for local tmux sessions wrapping `docker exec` */
   docker?: SessionDocker;
+  /** Adoption metadata; its presence selects the foreign-attach launch command. */
+  adopt?: SessionAdopt;
   /** Owning username in multi-user mode; persisted for recovery. */
   owner?: string;
 }
@@ -222,6 +232,8 @@ export interface RespawnPaneOptions {
   remote?: SessionRemote;
   /** Docker execution metadata for local tmux sessions wrapping `docker exec` */
   docker?: SessionDocker;
+  /** Adoption metadata; a respawn of an adopted wrapper RE-ATTACHES, it never relaunches an agent. */
+  adopt?: SessionAdopt;
   /** Owning username (multi-user); redundant on respawn since the Session object survives, kept for shape parity. */
   owner?: string;
 }

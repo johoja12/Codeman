@@ -53,14 +53,12 @@ describe('COD-257 checkpoint default', () => {
     const sessionRoutes = readFileSync(new URL('../src/web/routes/session-routes.ts', import.meta.url), 'utf8');
     const ralphRoutes = readFileSync(new URL('../src/web/routes/ralph-routes.ts', import.meta.url), 'utf8');
     const planRoutes = readFileSync(new URL('../src/web/routes/plan-routes.ts', import.meta.url), 'utf8');
-    const systemRoutes = readFileSync(new URL('../src/web/routes/system-routes.ts', import.meta.url), 'utf8');
     const cronService = readFileSync(new URL('../src/cron/cron-service.ts', import.meta.url), 'utf8');
     const planOrchestrator = readFileSync(new URL('../src/plan-orchestrator.ts', import.meta.url), 'utf8');
     const sessionManager = readFileSync(new URL('../src/session-manager.ts', import.meta.url), 'utf8');
 
     expect(configPort).toContain('getCheckpointDefaultEnabled(): Promise<boolean>');
     expect(server).toContain('return settings.checkpointDefaultEnabled !== false;');
-    expect(systemRoutes).toContain('const merged = { ...existing, ...settingsToStore };');
     expect(sessionRoutes.match(/getCheckpointDefaultEnabled\(\)/g)?.length).toBeGreaterThanOrEqual(3);
     expect(ralphRoutes).toContain('checkpointEnabled: await ctx.getCheckpointDefaultEnabled()');
     expect(planRoutes).toContain('checkpointEnabled: await ctx.getCheckpointDefaultEnabled()');

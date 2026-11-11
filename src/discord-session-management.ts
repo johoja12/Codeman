@@ -1,3 +1,4 @@
+import { getCli } from './config/cli-registry/registry.js';
 /** Explicit session lifecycle choices using shared web/backend services. No blank recovery or task replay. */
 import { configuredDiscordCaseKey } from './discord-case-identity.js';
 import { MAX_SESSION_NAME_LENGTH } from './config/terminal-limits.js';
@@ -39,7 +40,7 @@ export class DiscordSessionManagement {
   private async createNamed(body: { caseName: string; mode: SessionMode; tabGroupId?: string }): Promise<string> {
     const sessions = await this.deps.sessions();
     if (!this.deps.allowed()) throw new Error('Session creation is no longer allowed');
-    const prefix = body.mode === 'shell' ? 's' : 'w';
+    const prefix = getCli(body.mode)?.kind === 'shell' ? 's' : 'w';
     let next = 1;
     for (const session of sessions) {
       const match = /^([ws])(\d+)-([A-Za-z0-9_-]+)/.exec(session.name ?? '');

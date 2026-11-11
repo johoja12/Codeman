@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { listClis } from '../src/config/cli-registry/registry.js';
 import {
   buildRemoteSshAccessCheckCommand,
   buildRemoteListDirectoriesCommand,
@@ -21,7 +22,7 @@ import {
 } from '../src/remote-hosts.js';
 import { StateStore } from '../src/state-store.js';
 import { migrateLegacyRemoteCaseCodexCommands } from '../src/codex-command-profiles.js';
-import { RemoteHostSchema } from '../src/web/schemas.js';
+import { DockerHostSchema, RemoteHostSchema } from '../src/web/schemas.js';
 
 describe('remote-hosts domain', () => {
   let dir: string | null = null;
@@ -221,16 +222,18 @@ describe('remote-hosts domain', () => {
   it('returns safe mode defaults and remote display values', () => {
     // Login shell is resolved from the passwd entry (getent/dscl), not the tmux
     // server's $SHELL, so a macOS/zsh user gets zsh and ~/.zshrc is sourced (COD-277).
-    expect(defaultRemoteCommandForMode('shell')).toBe(`${REMOTE_LOGIN_SHELL_RESOLVE}exec "$login_shell" -i -l`);
+    expect(defaultRemoteCommandForMode('shell')).toBe(
+      `{ ${REMOTE_LOGIN_SHELL_RESOLVE}set -- -i -l; case \${login_shell##*/} in csh|tcsh) set --;; esac; exec "$login_shell" "$@"; }`
+    );
     // Routed through an interactive login shell so per-user PATH entries (e.g.
     // ~/.local/bin, ~/.opencode/bin) resolve — a bare `exec codex` sees only
     // sshd's minimal default PATH and fails with "command not found".
     expect(defaultRemoteCommandForMode('codex')).toBe(
-      `${REMOTE_LOGIN_SHELL_RESOLVE}exec "$login_shell" -i -l -c 'codex'`
+      `{ ${REMOTE_LOGIN_SHELL_RESOLVE}set -- -i -l; case \${login_shell##*/} in csh|tcsh) set --;; esac; exec "$login_shell" "$@" -c 'codex'; }`
     );
     // Mirrors the local claude default so the remote agent runs non-interactively.
     expect(defaultRemoteCommandForMode('claude')).toBe(
-      `${REMOTE_LOGIN_SHELL_RESOLVE}exec "$login_shell" -i -l -c 'claude --dangerously-skip-permissions'`
+      `{ ${REMOTE_LOGIN_SHELL_RESOLVE}set -- -i -l; case \${login_shell##*/} in csh|tcsh) set --;; esac; exec "$login_shell" "$@" -c 'claude --dangerously-skip-permissions'; }`
     );
     // The resolver must consult the passwd entry (getent Linux / dscl macOS), not $SHELL.
     expect(REMOTE_LOGIN_SHELL_RESOLVE).toContain('getent passwd');
@@ -292,6 +295,24 @@ describe('remote-hosts domain', () => {
       );
       expect(RemoteHostSchema.safeParse({ ...host, wakeMac: '04:d9:f5:80:c6' }).success).toBe(false);
       expect(RemoteHostSchema.safeParse({ ...host, wakeMac: '04:d9:f5:80:c6:58; rm -rf /' }).success).toBe(false);
+    });
+  });
+
+  describe('per-mode command overrides', () => {
+    const modes = ['shell', ...listClis().map((cli) => cli.id)];
+    const host = { id: 'h', label: 'H', host: '10.0.0.1', username: 'u' };
+
+    // `.strict()` refuses an unknown key, so a mode missing here cannot take an override, and
+    // `commands.*` is the documented way out for a login shell the stock launch cannot run.
+    it.each(modes)('accepts a %s override on a remote host and a docker host', (mode) => {
+      const commands = { [mode]: 'exec my-agent' };
+      const docker = { id: 'h', label: 'H', image: 'codeman/agent:base', commands };
+      expect(RemoteHostSchema.safeParse({ ...host, commands }).success).toBe(true);
+      expect(DockerHostSchema.safeParse(docker).success).toBe(true);
+    });
+
+    it('still refuses a key that is no mode', () => {
+      expect(RemoteHostSchema.safeParse({ ...host, commands: { nope: 'exec my-agent' } }).success).toBe(false);
     });
   });
 

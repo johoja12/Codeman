@@ -379,3 +379,25 @@ export function isBlockedAttachmentPath(absPath: string, blockedTrees: readonly 
   if (isSensitivePath(absPath)) return true;
   return blockedTrees.some((tree) => isUnderTree(absPath, tree));
 }
+
+/**
+ * Like `isBlockedAttachmentPath`, for a directory. The sensitive patterns describe file locations
+ * such as ~/.ssh/<key>, so a child probe is what refuses a folder like ~/.ssh itself.
+ */
+export function isBlockedAttachmentDirectory(dir: string, blockedTrees: readonly string[]): boolean {
+  return (
+    isBlockedAttachmentPath(dir, blockedTrees) ||
+    isBlockedAttachmentPath(join(dir, '__codeman_blocked_dir_probe__'), blockedTrees)
+  );
+}
+
+/**
+ * True when the attachment guard refuses `root` as the root of a worktree outside the session
+ * folder: workspace confinement is on, the folder is blocked or sensitive, or it surrounds a
+ * blocked tree. `root` must be absolute and symlink-resolved.
+ */
+export function isOutsideWorktreeRootRefused(root: string, guard: AttachmentGuardConfig): boolean {
+  if (guard.confineToWorkspace) return true;
+  if (isBlockedAttachmentDirectory(root, guard.blockedTrees)) return true;
+  return guard.blockedTrees.some((tree) => isUnderTree(tree, root));
+}

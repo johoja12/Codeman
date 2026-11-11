@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import * as gitAvailability from '../src/utils/git-availability.js';
+import { describe, it, expect, vi } from 'vitest';
 import { mkdtemp, writeFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -33,4 +34,14 @@ describe('Discord workspace result export', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+});
+
+it('refuses a local workspace diff before starting Apple git when the availability gate denies it', async () => {
+  const gate = vi.spyOn(gitAvailability, 'gitSpawnAllowed').mockReturnValue(false);
+  try {
+    await expect(discordWorkspaceHasChanges({ workingDir: tmpdir() })).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(gate).toHaveBeenCalledOnce();
+  } finally {
+    gate.mockRestore();
+  }
 });

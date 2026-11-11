@@ -1,3 +1,4 @@
+import { gitMissingError, gitSpawnAllowed } from './utils/git-availability.js';
 /** Read-only, explicitly unattributed workspace diff. Every exported path uses the file guard. */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -17,6 +18,7 @@ async function workspaceGit(scope: DiscordFileScope, args: string[]): Promise<st
       )
     ).toString('utf8');
   }
+  if (!gitSpawnAllowed()) throw gitMissingError();
   return (await exec('git', argv, { cwd: scope.workingDir, timeout: 8000, maxBuffer: 256 * 1024, encoding: 'utf8' }))
     .stdout;
 }

@@ -9,6 +9,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
+import { JSDOM } from 'jsdom';
 
 type Proto = Record<string, (...args: never[]) => unknown>;
 
@@ -129,41 +130,42 @@ describe('COD-233 guarded Files-panel download', () => {
     expect(showToast).not.toHaveBeenCalled();
   });
 
-  it('routes the render-time download control through the guarded downloader, not navigation', () => {
-    const proto = loadPanelsUiPrototype();
-    const path = 'deliverables/story.docx';
-    const downloadEl = { dataset: { path }, addEventListener: vi.fn() };
-    const itemEl = { dataset: { path, type: 'file' }, addEventListener: vi.fn() };
-    const tree = {
-      innerHTML: '',
-      querySelectorAll: vi.fn((sel: string) => (sel === '.file-tree-download' ? [downloadEl] : [itemEl])),
-    };
-    const downloadWorkspaceFile = vi.fn();
-    const host = {
-      $: vi.fn((id: string) => (id === 'fileBrowserTree' ? tree : null)),
-      fileBrowserSessionId: 'tree-owner-session',
-      fileBrowserData: browserData(path),
-      fileBrowserFilter: '',
-      fileBrowserExpandedDirs: new Set<string>(),
-      getFileIcon: vi.fn(() => 'FILE'),
-      formatFileSize: vi.fn(() => '1 KB'),
-      hasMatchingChild: vi.fn(() => false),
-      downloadWorkspaceFile,
-      renderFileBrowserTree: proto.renderFileBrowserTree as () => void,
-    };
-
-    host.renderFileBrowserTree();
-
-    const handler = downloadEl.addEventListener.mock.calls.find(([event]) => event === 'click')?.[1] as
-      | ((e: { preventDefault: () => void; stopPropagation: () => void }) => void)
-      | undefined;
-    expect(handler).toBeTypeOf('function');
-
-    const evt = { preventDefault: vi.fn(), stopPropagation: vi.fn() };
-    handler?.(evt);
-
-    expect(evt.preventDefault).toHaveBeenCalledOnce();
-    expect(evt.stopPropagation).toHaveBeenCalledOnce();
-    expect(downloadWorkspaceFile).toHaveBeenCalledWith('tree-owner-session', path);
+  it.each(['normal', 'search'])('guards the %s download click and keeps the rendered owner', (view) => {
+    const dom = new JSDOM('<div id="fileBrowserTree"></div><div id="fileBrowserStatus"></div>');
+    try {
+      const proto = loadPanelsUiPrototype({
+        document: dom.window.document,
+        window: dom.window,
+        CodemanBase: { url: (path: string) => path },
+      });
+      const path = 'deliverables/story.docx';
+      const downloadWorkspaceFile = vi.fn();
+      const openFilePreview = vi.fn();
+      const host = Object.assign(Object.create(proto), {
+        $: (id: string) => dom.window.document.getElementById(id),
+        activeSessionId: 'tree-owner-session',
+        fileBrowserSessionId: 'tree-owner-session',
+        fileBrowserData: browserData(path),
+        fileBrowserFilter: '',
+        fileBrowserExpandedDirs: new Set<string>(),
+        getFileIcon: vi.fn(() => 'FILE'),
+        formatFileSize: vi.fn(() => '1 KB'),
+        _fileBrowserCanDelete: () => false,
+        downloadWorkspaceFile,
+        openFilePreview,
+      });
+      if (view === 'normal') host.renderFileBrowserTree();
+      else host._renderFileBrowserSearchResults(browserData(path).tree, 'tree-owner-session', {});
+      host.activeSessionId = 'another-session';
+      const control = dom.window.document.querySelector('.file-tree-download');
+      expect(control).not.toBeNull();
+      const event = new dom.window.MouseEvent('click', { bubbles: true, cancelable: true });
+      control!.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(true);
+      expect(downloadWorkspaceFile).toHaveBeenCalledExactlyOnceWith('tree-owner-session', path);
+      expect(openFilePreview).not.toHaveBeenCalled();
+    } finally {
+      dom.window.close();
+    }
   });
 });

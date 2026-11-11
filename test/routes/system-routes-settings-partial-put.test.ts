@@ -17,6 +17,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'node:fs/promises';
 import { createRouteTestHarness, type RouteTestHarness } from './_route-test-utils.js';
 import { registerSystemRoutes } from '../../src/web/routes/system-routes.js';
 
@@ -56,6 +57,7 @@ const { EXISTING_SETTINGS, subagentWatcher, imageWatcher, workflowRunWatcher } =
       promptCacheKeepWarm: false,
       promptCacheKeepWarmMaxHours: 2,
       agentInboxPersistEnabled: true,
+      checkpointDefaultEnabled: false,
     },
     subagentWatcher: makeWatcher(false),
     imageWatcher: makeWatcher(true),
@@ -148,6 +150,22 @@ describe('PUT /api/settings — partial body must not reset service toggles', ()
 
     expect(res.statusCode).toBe(200);
     expect(harness.ctx.agentActivity.setTrackingEnabled).toHaveBeenCalledWith(false);
+  });
+
+  it('preserves a saved checkpoint default when an unrelated setting is updated', async () => {
+    const res = await harness.app.inject({
+      method: 'PUT',
+      url: '/api/settings',
+      payload: { showPlanUsageLimits: true },
+    });
+    expect(res.statusCode).toBe(200);
+    const writes = vi
+      .mocked(fs.writeFile)
+      .mock.calls.filter(([path]) => String(path).includes('settings.json'))
+      .map(([, body]) => JSON.parse(String(body)));
+    expect(writes).toContainEqual(
+      expect.objectContaining({ checkpointDefaultEnabled: false, showPlanUsageLimits: true })
+    );
   });
 
   it('still stops a watcher when the body explicitly disables it', async () => {

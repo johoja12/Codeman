@@ -55,6 +55,7 @@ export const BROWSER_TEST_GLOBS = [
   'test/doctor-settings.browser.test.ts',
   'test/git-status.browser.test.ts',
   'test/edit-history.browser.test.ts',
+  'test/sync-case-state.browser.test.ts',
   'test/split-pane-orchestration.browser.test.ts',
   'test/split-pane-auto-collapse.browser.test.ts',
   'test/spreadsheet-preview.browser.test.ts',
@@ -63,6 +64,10 @@ export const BROWSER_TEST_GLOBS = [
   'test/fullscreen-tab-switch-capture.browser.test.ts',
   'test/terminal-touch-swipe-axis.browser.test.ts',
   'test/phone-press-feedback.browser.test.ts',
+  'test/desktop-connect-page.browser.test.ts', // no server: the page is served by request interception
+  'test/local-model-ui.browser.test.ts',
+  'test/home-breakpoint-swap.browser.test.ts',
+  'test/log-viewer-reconnect.browser.test.ts',
 ];
 
 /**

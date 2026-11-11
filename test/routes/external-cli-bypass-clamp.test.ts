@@ -128,6 +128,7 @@ describe('clampExternalCliBypassForOwner — multi-user mode', () => {
     expect(out.codexConfig).toEqual({
       dangerouslyBypassApprovals: false,
       dangerouslyBypassHookTrust: false,
+      networkAccess: false,
       model: 'gpt-5',
     });
     expect(out.antigravityConfig).toEqual({ dangerouslySkipPermissions: false, model: 'gemini-3-pro' });
@@ -164,11 +165,30 @@ describe('clampExternalCliBypassForOwner — multi-user mode', () => {
       undefined,
       undefined
     );
-    // Downstream COD-416 also clamps codex's hookTrust switch (only-if-sent shape forces it off).
+    expect(out.codexConfig).toEqual({
+      dangerouslyBypassApprovals: false,
+      networkAccess: false,
+      dangerouslyBypassHookTrust: false,
+      reasoningEffort: 'xhigh',
+    });
+  });
+
+  it("forces a non-granted owner's codex network access off, as when the launch default filled it", async () => {
+    // applyLaunchDefaults runs BEFORE this clamp, so App Settings → Allow network access
+    // arrives here as an ordinary `networkAccess: true` in a sent config. It widens the
+    // sandbox to every host, so a non-granted owner must not get it.
+    const out = await _clampExternalCliBypassForOwner(
+      'peon',
+      { networkAccess: true },
+      undefined,
+      undefined,
+      undefined,
+      undefined
+    );
     expect(out.codexConfig).toEqual({
       dangerouslyBypassApprovals: false,
       dangerouslyBypassHookTrust: false,
-      reasoningEffort: 'xhigh',
+      networkAccess: false,
     });
   });
 
