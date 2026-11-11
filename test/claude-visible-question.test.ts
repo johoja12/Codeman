@@ -3,6 +3,7 @@ import {
   claudeVisibleQuestion,
   claudeQuestionGone,
   parseClaudeHookConfirmation,
+  parseClaudeCompactionPrompt,
 } from '../src/web/claude-visible-question.js';
 import { createDiscordNativeUiServices } from '../src/web/discord-native-ui-services.js';
 import { approvalInbox } from '../src/web/approval-inbox.js';
@@ -340,4 +341,82 @@ describe('visible Claude hook confirmation', () => {
       expect(approvalInbox.listPending()).toEqual([]);
     }
   );
+});
+
+const compactionPrompt = `* Worked for 45m 47s · done 9:49 AM · 1 shell still running
+──────────────────────────────────
+We recommend compacting earlier
+
+  Each message re-sends the whole conversation, so long conversations use up your plan's usage limits faster. With your current settings, Claude Code autocompacts
+  (replaces older messages with a summary) at 1m tokens (default via auto setting). Compacting earlier can reduce usage, but it happens more often, and some details can be
+  lost each time.
+
+  Want to autocompact at 400k tokens instead? Your model doesn't change. Switch back any time with /autocompact.
+
+  › Keep auto (1m tokens)
+    Autocompact at ‹ 400k › tokens
+      This conversation is at 441k, so it will be summarized on your next message.
+
+  ↑/↓ choose · ←/→ change size · enter confirm · esc not now
+`;
+describe('Claude compaction recommendation dialog', () => {
+  it.each(['›', '❯', '>'])(
+    'recognizes a complete current menu with %s selection and keeps all settings text',
+    (marker) => {
+      const q = parseClaudeCompactionPrompt(compactionPrompt.replace('› Keep auto', marker + ' Keep auto'))!;
+      expect(q.toolName).toBe('Autocompact');
+      expect(q.text).toContain('at 1m tokens');
+      expect(q.text).toContain('Autocompact at ‹ 400k › tokens');
+      expect(q.text).toContain('This conversation is at 441k');
+      expect(q.text).not.toContain('Worked for');
+      expect(q.text).toContain('in the terminal');
+    }
+  );
+  it('recognizes the second selected option and styled Ink row positioning', () => {
+    const selected = compactionPrompt
+      .replace('› Keep auto', 'Keep auto')
+      .replace('    Autocompact at', '  ❯ Autocompact at');
+    expect(parseClaudeCompactionPrompt(selected)).toBeDefined();
+    const ink = compactionPrompt
+      .trimEnd()
+      .split('\n')
+      .map((line, i) => `\x1b[${i + 1};1H\x1b[34m${line}\x1b[0m`)
+      .join('');
+    expect(parseClaudeCompactionPrompt(ink)?.toolName).toBe('Autocompact');
+  });
+  it.each([
+    '',
+    compactionPrompt.replace('We recommend compacting earlier', 'Ordinary response'),
+    compactionPrompt.replace('Want to autocompact at', 'Example at'),
+    compactionPrompt.replace('› Keep auto', 'Keep auto'),
+    compactionPrompt.replace('    Autocompact at', '  ❯ Autocompact at'),
+    compactionPrompt.replace('Keep auto (1m tokens)', 'Something else'),
+    compactionPrompt.replace('↑/↓ choose', 'partial footer'),
+    compactionPrompt + '────\n❯ new composer\n────',
+    '```\n' + compactionPrompt + '```',
+  ])('rejects stale, incomplete and inconsistent menu frames', (raw) => {
+    expect(parseClaudeCompactionPrompt(raw)).toBeUndefined();
+  });
+  it('forwards once while background work exists, retries delivery and never enables numeric answers', async () => {
+    const f = fixture();
+    Object.assign(f.s, { isWorking: true, watching: '1 shell still running' });
+    f.capture(() => compactionPrompt);
+    f.notify.mockReturnValueOnce(false).mockReturnValueOnce(true);
+    expect((await f.services.sessions())[0].pending).toBe(true);
+    const q = f.services.question('s')!;
+    expect(q).toMatchObject({ kind: 'question', terminalOnly: true, options: [] });
+    expect(q.text).toContain('400k');
+    expect(f.notify.mock.calls[0][0]).toMatchObject({ toolName: 'Autocompact', answerInTerminal: true });
+    await f.services.sessions();
+    await f.services.sessions();
+    expect(f.notify).toHaveBeenCalledTimes(2);
+    expect(f.services.question('s')!.id).toBe(q.id);
+    await expect(f.services.answer('s', q.id, q.revision, '1')).rejects.toThrow();
+    f.capture(() => 'partial capture');
+    await f.services.sessions();
+    expect(f.services.question('s')!.id).toBe(q.id);
+    f.capture(() => '────\n❯ \n────');
+    await f.services.sessions();
+    expect(f.services.question('s')).toBeUndefined();
+  });
 });

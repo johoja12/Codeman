@@ -105,3 +105,22 @@ export function parseClaudeHookConfirmation(raw: string): { text: string; toolNa
     text: body.trim() + '\n\nPermission required. Review and choose Yes or No in the terminal.',
   };
 }
+
+/** Claude's unnumbered compaction settings menu. Alert-only: its slider has no numeric answer contract. */
+export function parseClaudeCompactionPrompt(raw: string): { text: string; toolName: string } | undefined {
+  if (!raw.includes('We recommend compacting earlier')) return undefined;
+  const frame = normalizeCapturedFrame(raw, { maxLines: 160, maxChars: 24000 });
+  if (!frame) return undefined;
+  const heading = [...frame.matchAll(/^\s*We recommend compacting earlier\s*$/gm)].at(-1);
+  if (!heading) return undefined;
+  const body = frame.slice(heading.index!).trim();
+  const footer = /^\s*↑\/↓ choose\s*·\s*←\/→ change size\s*·\s*enter confirm\s*·\s*esc not now\s*$/im.exec(body);
+  if (!footer || body.slice(footer.index + footer[0].length).trim()) return undefined;
+  if (!/Want to autocompact at\s+\d+(?:\.\d+)?[km]?\s+tokens instead\?/i.test(body)) return undefined;
+  const menu =
+    /^\s*([❯›>]?)\s*Keep auto \(\d+(?:\.\d+)?[km]? tokens\)\s*\n\s*([❯›>]?)\s*Autocompact at\s+[‹<]?\s*\d+(?:\.\d+)?[km]?\s*[›>]?\s+tokens\s*$/im.exec(
+      body
+    );
+  if (!menu || Number(!!menu[1]) + Number(!!menu[2]) !== 1) return undefined;
+  return { toolName: 'Autocompact', text: body + '\n\nChoose the compaction setting in the terminal.' };
+}
