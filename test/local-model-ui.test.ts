@@ -18,6 +18,10 @@
  *    screen, and a 409 `size-changed` shows the new total and sends that one next;
  *  - the poll: once a second while the window is open, never after it closes, and a tick that
  *    moved only the download leaves the buttons in place;
+ *  - the models on this Mac: the list with its sizes, the state of each row, "Use" (a switch
+ *    with no confirm screen), "Delete" (asked once, in the row), "Add a model" (the chooser,
+ *    where a row that is on this Mac already is switched to), the way back from a stopped job,
+ *    and what an earlier Remove left on disk;
  *  - every payload string lands as text: an `<img onerror>` in a model, agent or chip name, an
  *    error's detail, a session name, a folder or a command creates no element;
  *  - a button exists only for an action the server lists.
@@ -47,7 +51,9 @@ import type {
   HardwareFacts,
   LocalModelConflict,
   LocalModelErrorCode,
+  LocalModelHarnessRow,
   LocalModelInstallView,
+  LocalModelLibraryRow,
   LocalModelMessage,
   LocalModelStatus,
   NoneReason,
@@ -72,7 +78,7 @@ interface App {
   openLocalModelWindow(): void;
   closeLocalModelWindow(): void;
   isLocalModelWindowOpen(): boolean;
-  startLocalModelSession(): Promise<void>;
+  startLocalModelSession(cli?: string): Promise<void>;
   loadAppSettingsFromServer?: () => Promise<void>;
   loadCliListForSettings?: () => Promise<void>;
   selectCustomModelEntry?: (cli: string, endpointId: string) => Promise<void>;
@@ -383,10 +389,26 @@ function install(over: Partial<LocalModelInstallView> = {}): LocalModelInstallVi
     developerTools: 'present',
     runtime: RUNTIME_MISSING,
     folder: FOLDER,
+    library: [],
+    harnesses: [],
     actions: ['install'],
     ...over,
   };
 }
+
+/** The installed model as the row of the library it is: in use, checked, with nothing to do on it. */
+const QWEN_ROW: LocalModelLibraryRow = {
+  id: 'qwen3.6:35b-a3b',
+  label: 'Qwen3.6 35B-A3B',
+  context: 131072,
+  sizeBytes: 23105798956,
+  sizeGb: '23.1',
+  active: true,
+  verified: true,
+  status: 'ready',
+  actions: [],
+};
+const STORE_ONE = { bytes: 23105798956, gb: '23.1' };
 
 /** The members a job carries from `installing` on. */
 const JOB: Partial<LocalModelInstallView> = {
@@ -453,7 +475,9 @@ const INSTALLED = status(
     running: true,
     endpointId: 'local-ollama',
     loaded: { context: 131072, memoryBytes: 26300000000, memoryGb: '26.3', onGpu: true },
-    actions: ['start-session', 'stop', 'remove'],
+    library: [QWEN_ROW],
+    store: STORE_ONE,
+    actions: ['start-session', 'stop', 'install', 'remove'],
   }
 );
 const STOPPED = status(
@@ -464,7 +488,9 @@ const STOPPED = status(
     running: false,
     endpointId: 'local-ollama',
     loaded: { context: 131072, memoryBytes: 26300000000, memoryGb: '26.3', onGpu: true },
-    actions: ['start', 'remove'],
+    library: [QWEN_ROW],
+    store: STORE_ONE,
+    actions: ['start', 'install', 'remove'],
   }
 );
 
@@ -1705,6 +1731,8 @@ describe('an installed model', () => {
     // row's own estimate, so the two figures are never read as a contradiction.
     expect(texts(body, '.lm-aside')).toEqual([
       'Runs with OpenCode. Context 131,072 tokens. Takes 26.3 GB of memory now, and up to about 36 GB at its peak, with all of the context in use. All of it is on the GPU.',
+      // Under the list of models: what the downloads take on disk.
+      'Downloaded models use 23.1 GB on this Mac.',
     ]);
     expect(buttons(body)).toEqual(['Remove', 'Stop', 'Start a session']);
     // One main action.
@@ -2367,5 +2395,954 @@ describe('an installed model whose runtime did not start', () => {
     press(page.body, 'Start');
     await settle();
     expect(verbs(app)).toEqual([['POST', '/api/local-model/runtime', { action: 'start' }]]);
+  });
+});
+
+// ---------- The models on this Mac ----------
+
+const GPT_ROW: LocalModelLibraryRow = {
+  id: 'gpt-oss:20b',
+  label: 'GPT-OSS 20B',
+  context: 65536,
+  sizeBytes: 13793441427,
+  sizeGb: '13.8',
+  active: false,
+  verified: true,
+  status: 'ready',
+  actions: ['use', 'delete'],
+};
+const STORE_TWO = { bytes: 36899240383, gb: '36.9' };
+
+/** Two models on this Mac, the Qwen one in use and running. */
+const TWO = status(
+  { budgetBytes: 40157944217, budgetGb: '40.2', budgetSource: 'measured' },
+  {
+    ...INSTALLED.install,
+    library: [QWEN_ROW, GPT_ROW],
+    store: STORE_TWO,
+    actions: ['start-session', 'stop', 'install', 'use', 'delete-model', 'remove'],
+  }
+);
+
+/** The buttons of the rows of the list (not the buttons of the screen), by their label. */
+const rowButtons = (page: Mounted) => texts(page.body, '.lm-lib-row .lm-lib-actions:not(.lm-lib-actions-away) button');
+
+function pressIn(page: Mounted, selector: string, label: string) {
+  const found = [...page.frame.querySelectorAll<HTMLButtonElement>(`${selector} button`)].find(
+    (el) => el.textContent === label
+  );
+  expect(found, `no button "${label}" in ${selector}`).toBeTruthy();
+  found!.click();
+}
+
+describe('the models on this Mac', () => {
+  it('lists the one installed model with its context, its state and its size on disk, and offers another', async () => {
+    const page = mount();
+    await opened(page, INSTALLED);
+    const { body } = page;
+    expect(texts(body, '.lm-lib-caption-label')).toEqual(['Models on this Mac']);
+    expect(texts(body, '.lm-lib-caption-size')).toEqual(['On disk']);
+    expect(texts(body, '.lm-lib-label')).toEqual(['Qwen3.6 35B-A3B']);
+    expect(texts(body, '.lm-lib-meta')).toEqual(['131,072 tokens']);
+    expect(texts(body, '.lm-lib-tag .lm-tag')).toEqual(['In use']);
+    expect(texts(body, '.lm-lib-size')).toEqual(['23.1 GB']);
+    // The model in use wears the selected look, and nothing can be done ON it here.
+    expect(body.querySelector('.lm-lib-row')!.classList.contains('lm-lib-row-on')).toBe(true);
+    expect(rowButtons(page)).toEqual([]);
+    expect(texts(body, '.lm-lib-foot button')).toEqual(['Add a model']);
+    // A real list for assistive technology, named by its caption.
+    const list = body.querySelector('.lm-lib-list')!;
+    expect(list.getAttribute('role')).toBe('list');
+    expect(list.getAttribute('aria-labelledby')).toBe('localModelLibraryLabel');
+    expect(body.querySelectorAll('[role="listitem"]')).toHaveLength(1);
+    // The screen scrolls from its top: it is no short screen any more.
+    expect(body.dataset.long).toBe('true');
+    // The buttons of the screen are what they were.
+    expect(buttons(body)).toEqual(['Remove', 'Stop', 'Start a session']);
+  });
+
+  it('two models: the one in use first, the other with Use and Delete, and what both take on disk', async () => {
+    const page = mount();
+    await opened(page, TWO);
+    const { body } = page;
+    expect(texts(body, '.lm-lib-label')).toEqual(['Qwen3.6 35B-A3B', 'GPT-OSS 20B']);
+    expect(texts(body, '.lm-lib-meta')).toEqual(['131,072 tokens', '65,536 tokens']);
+    expect(texts(body, '.lm-lib-tag .lm-tag')).toEqual(['In use', 'Ready']);
+    expect(texts(body, '.lm-lib-size')).toEqual(['23.1 GB', '13.8 GB']);
+    expect(rowButtons(page)).toEqual(['Use', 'Delete']);
+    // A short label on screen, the model's name for a screen reader.
+    const [use, remove] = [...body.querySelectorAll('.lm-lib-row .lm-lib-actions button')];
+    expect(use.getAttribute('aria-label')).toBe('Use GPT-OSS 20B');
+    expect(remove.getAttribute('aria-label')).toBe('Delete GPT-OSS 20B');
+    // Quiet buttons: the screen keeps its one main action, and nothing here is red yet.
+    expect(body.querySelectorAll('.lm-library .wt-btn-primary, .lm-library .wt-btn-danger')).toHaveLength(0);
+    expect(texts(body, '.lm-lib-notes .lm-aside')).toEqual(['Downloaded models use 36.9 GB on this Mac.']);
+  });
+
+  it('a row has a button only for an action the server lists for THAT row', async () => {
+    const page = mount();
+    const rows: LocalModelLibraryRow[] = [
+      QWEN_ROW,
+      { ...GPT_ROW, actions: ['use'] },
+      { ...GPT_ROW, id: 'a:1b', label: 'A', status: 'changed', actions: ['delete'] },
+      { ...GPT_ROW, id: 'b:1b', label: 'B', status: 'missing', actions: ['delete'] },
+      { ...GPT_ROW, id: 'c:1b', label: 'C', context: undefined, verified: false, status: 'unverified', actions: [] },
+      { id: 'd:1b', label: 'D', active: false, verified: false, status: 'unverified', actions: ['delete'] },
+    ];
+    await opened(page, status({}, { ...TWO.install, library: rows }));
+    const perRow = [...page.body.querySelectorAll('.lm-lib-row')].map((row) => [
+      row.querySelector('.lm-lib-label')!.textContent,
+      row.querySelector('.lm-tag')!.textContent,
+      texts(row, '.lm-lib-actions button').join('+'),
+    ]);
+    expect(perRow).toEqual([
+      ['Qwen3.6 35B-A3B', 'In use', ''],
+      ['GPT-OSS 20B', 'Ready', 'Use'],
+      ['A', 'Changed', 'Delete'],
+      ['B', 'Missing', 'Delete'],
+      ['C', 'Not checked', ''],
+      ['D', 'Not checked', 'Delete'],
+    ]);
+    // A row without a context or a size prints neither: no "undefined", no empty unit.
+    const last = [...page.body.querySelectorAll('.lm-lib-row')].at(-1)!;
+    expect(last.querySelector('.lm-lib-meta')).toBeNull();
+    expect(last.querySelector('.lm-lib-size')!.textContent).toBe('');
+    expect(page.body.textContent).not.toContain('undefined');
+    // Each state has a colour of its own.
+    expect([...page.body.querySelectorAll('.lm-lib-tag .lm-tag')].map((tag) => tag.className)).toEqual([
+      'lm-tag lm-tag-inuse',
+      'lm-tag lm-tag-ready',
+      'lm-tag lm-tag-changed',
+      'lm-tag lm-tag-missing',
+      'lm-tag lm-tag-unverified',
+      'lm-tag lm-tag-unverified',
+    ]);
+  });
+
+  it('Use switches at once: no confirm screen, and the screen says a switch is running', async () => {
+    const page = mount();
+    const switching: LocalModelInstallView = {
+      ...TWO.install,
+      state: 'installing',
+      step: 'verify',
+      steps: ['verify', 'connect'],
+      model: { id: 'gpt-oss:20b', label: 'GPT-OSS 20B' },
+      context: 65536,
+      library: [
+        { ...QWEN_ROW, active: false },
+        { ...GPT_ROW, actions: [] },
+      ],
+      actions: ['cancel'],
+    };
+    const { app } = await opened(page, TWO, () => ok(switching));
+    pressIn(page, '.lm-lib-row', 'Use');
+    await settle();
+    expect(verbs(app)).toEqual([['POST', '/api/local-model/use', { modelId: 'gpt-oss:20b' }]]);
+    expect(page.body.dataset.screen).toBe('progress');
+    expect(texts(page.body, '.lm-title')).toEqual(['Switching to GPT-OSS 20B']);
+    // Nothing is downloaded: no download bar, and the two steps of a switch.
+    expect(page.body.querySelector('.lm-meter')).toBeNull();
+    expect(texts(page.body, '.lm-step-label')).toEqual(['Loading and checking', 'Connecting']);
+    expect(texts(page.body, '.lm-aside')).toEqual([
+      'You can close this window. The switch continues while Codeman is running.',
+    ]);
+    expect(buttons(page.body)).toEqual(['Cancel']);
+  });
+
+  it('a switch that is refused keeps the screen and prints the server sentence with the session names', async () => {
+    const page = mount();
+    const { app } = await opened(page, TWO, () =>
+      conflict({
+        reason: 'sessions-open',
+        message: { text: LOCAL_MODEL_INSTALL_LABELS.conflictSessionsOpen, vars: { sessions: 'w1-app, w2-api' } },
+        sessions: ['w1-app', 'w2-api'],
+      })
+    );
+    pressIn(page, '.lm-lib-row', 'Use');
+    await settle();
+    expect(page.body.dataset.screen).toBe('installed');
+    expect(texts(page.body, '.lm-notice-text')).toEqual([
+      'Sessions are still using this model: w1-app, w2-api. Close them first.',
+    ]);
+    expect(verbs(app)).toHaveLength(1);
+    expect(rowButtons(page)).toEqual(['Use', 'Delete']);
+  });
+
+  it('Delete asks once, in the row, and sends nothing until the red button is pressed', async () => {
+    const page = mount();
+    const after: LocalModelInstallView = {
+      ...TWO.install,
+      library: [QWEN_ROW],
+      store: STORE_ONE,
+      actions: ['start-session', 'stop', 'install', 'remove'],
+    };
+    const { app } = await opened(page, TWO, () => ok(after));
+    pressIn(page, '.lm-lib-row', 'Delete');
+    await settle();
+    expect(verbs(app)).toEqual([]);
+    const ask = page.body.querySelector('.lm-lib-ask')!;
+    expect(texts(ask, '.lm-lead')).toEqual(['Delete GPT-OSS 20B from this Mac?']);
+    expect(texts(ask, '.lm-aside')).toEqual(['This frees 13.8 GB.']);
+    expect(texts(ask, 'button')).toEqual(['Cancel', 'Delete']);
+    // Red only here, in its own question.
+    expect(page.frame.querySelectorAll('.wt-btn-danger')).toHaveLength(1);
+    expect(ask.querySelector('.wt-btn-danger')!.textContent).toBe('Delete');
+    // The question sits right under the row it is about. That row's own buttons keep their
+    // room (the sizes must not jump) and are out of reach: unseen, disabled, hidden from a reader.
+    const asked = ask.previousElementSibling!;
+    expect(asked.querySelector('.lm-lib-label')!.textContent).toBe('GPT-OSS 20B');
+    expect(rowButtons(page)).toEqual([]);
+    const away = asked.querySelector('.lm-lib-actions')!;
+    expect(away.classList.contains('lm-lib-actions-away')).toBe(true);
+    expect(away.getAttribute('aria-hidden')).toBe('true');
+    expect([...away.querySelectorAll('button')].every((button) => button.disabled)).toBe(true);
+    // The focus is on the safe answer.
+    expect((page.document.activeElement as HTMLElement).textContent).toBe('Cancel');
+
+    pressIn(page, '.lm-lib-ask', 'Cancel');
+    await settle();
+    expect(page.body.querySelector('.lm-lib-ask')).toBeNull();
+    expect(rowButtons(page)).toEqual(['Use', 'Delete']);
+    expect(verbs(app)).toEqual([]);
+    // Back on the button that asked.
+    expect((page.document.activeElement as HTMLElement).dataset.lmKey).toBe('delete:gpt-oss:20b');
+
+    pressIn(page, '.lm-lib-row', 'Delete');
+    await settle();
+    pressIn(page, '.lm-lib-ask', 'Delete');
+    await settle();
+    expect(verbs(app)).toEqual([['DELETE', '/api/local-model/models', { modelId: 'gpt-oss:20b' }]]);
+    expect(texts(page.body, '.lm-lib-label')).toEqual(['Qwen3.6 35B-A3B']);
+    expect(page.body.querySelector('.lm-lib-ask')).toBeNull();
+    expect(texts(page.body, '.lm-lib-notes .lm-aside')).toEqual(['Downloaded models use 23.1 GB on this Mac.']);
+  });
+
+  it('a delete the server refuses leaves the row and prints why', async () => {
+    const page = mount();
+    await opened(page, TWO, () =>
+      conflict({
+        reason: 'model-active',
+        message: { text: LOCAL_MODEL_INSTALL_LABELS.conflictModelActive, vars: { model: 'GPT-OSS 20B' } },
+      })
+    );
+    pressIn(page, '.lm-lib-row', 'Delete');
+    await settle();
+    pressIn(page, '.lm-lib-ask', 'Delete');
+    await settle();
+    expect(texts(page.body, '.lm-notice-text')).toEqual([
+      'GPT-OSS 20B is the model in use. Switch to another model first, or remove the local model.',
+    ]);
+    expect(texts(page.body, '.lm-lib-label')).toEqual(['Qwen3.6 35B-A3B', 'GPT-OSS 20B']);
+  });
+
+  it('the Delete question of a row and the Remove question are never open together', async () => {
+    const page = mount();
+    await opened(page, TWO);
+    pressIn(page, '.lm-lib-row', 'Delete');
+    await settle();
+    expect(page.body.querySelector('.lm-lib-ask')).not.toBeNull();
+    press(page.body, 'Remove');
+    await settle();
+    expect(page.frame.querySelector('.lm-remove')).not.toBeNull();
+    expect(page.frame.querySelector('.lm-lib-ask')).toBeNull();
+  });
+
+  it('with the runtime stopped a row offers no delete, and one line says how to get it', async () => {
+    const page = mount();
+    const stopped = status(
+      {},
+      {
+        ...STOPPED.install,
+        library: [QWEN_ROW, { ...GPT_ROW, actions: ['use'] }],
+        store: STORE_TWO,
+        actions: ['start', 'install', 'use', 'remove'],
+      }
+    );
+    await opened(page, stopped);
+    expect(rowButtons(page)).toEqual(['Use']);
+    expect(texts(page.body, '.lm-lib-notes .lm-aside')).toEqual([
+      'Downloaded models use 36.9 GB on this Mac.',
+      'Press Start to delete a single model.',
+    ]);
+    // With one model there is no single model to delete, so the line is not there.
+    const one = mount();
+    await opened(one, STOPPED);
+    expect(one.body.textContent).not.toContain('Press Start to delete');
+  });
+
+  it('the screen that ends an install says one thing: no list, one button', async () => {
+    const page = mount();
+    const { app, serve } = await opened(page, INSTALLING);
+    serve(TWO);
+    await app.loadLocalModel({ force: true });
+    expect(page.body.dataset.screen).toBe('installed');
+    expect(page.body.querySelector('.lm-library')).toBeNull();
+    expect(page.body.dataset.long).toBe('false');
+    expect(buttons(page.body)).toEqual(['Start a session']);
+  });
+
+  // Seen on a Mac: Use, then the list was gone, and deleting the other model meant closing the
+  // window and opening it again.
+  it('a switch that ends in the open window comes back to the list, the other model in use', async () => {
+    const page = mount();
+    const switching = status(
+      {},
+      {
+        ...TWO.install,
+        state: 'installing',
+        step: 'verify',
+        steps: ['verify', 'connect'],
+        model: { id: 'gpt-oss:20b', label: 'GPT-OSS 20B' },
+        library: [
+          { ...QWEN_ROW, active: false },
+          { ...GPT_ROW, actions: [] },
+        ],
+        actions: ['cancel'],
+      }
+    );
+    const switched = status(
+      {},
+      {
+        ...TWO.install,
+        model: { id: 'gpt-oss:20b', label: 'GPT-OSS 20B' },
+        library: [
+          { ...GPT_ROW, active: true, actions: [] },
+          { ...QWEN_ROW, active: false, actions: ['use', 'delete'] },
+        ],
+      }
+    );
+    const { app, serve } = await opened(page, switching);
+    expect(page.body.dataset.screen).toBe('progress');
+    serve(switched);
+    await app.loadLocalModel({ force: true });
+    expect(page.body.dataset.screen).toBe('installed');
+    expect(texts(page.body, '.lm-lib-label')).toEqual(['GPT-OSS 20B', 'Qwen3.6 35B-A3B']);
+    expect(texts(page.body, '.lm-lib-tag .lm-tag')).toEqual(['In use', 'Ready']);
+    expect(rowButtons(page)).toEqual(['Use', 'Delete']);
+    // The whole installed screen, not the one-button screen that ends an install.
+    expect(buttons(page.body)).toEqual(['Remove', 'Stop', 'Start a session']);
+    expect(texts(page.body, '.lm-lib-foot button')).toEqual(['Add a model']);
+  });
+
+  it('"Add a model" opens the chooser on an installed model, and Back returns to it', async () => {
+    const page = mount();
+    const { app } = await opened(page, TWO);
+    pressIn(page, '.lm-lib-foot', 'Add a model');
+    await settle();
+    expect(page.body.dataset.screen).toBe('choose');
+    expect(page.body.querySelectorAll('[role="radio"]').length).toBeGreaterThan(1);
+    expect(buttons(page.body)).toEqual(['Back', 'Install on this Mac']);
+    press(page.body, 'Back');
+    await settle();
+    expect(page.body.dataset.screen).toBe('installed');
+    expect(verbs(app)).toEqual([]);
+    // No button without the server offering an install (no row fits, or it is not listed).
+    const none = mount();
+    await opened(none, status({}, { ...TWO.install, actions: ['start-session', 'stop', 'remove'] }));
+    expect(texts(none.body, '.lm-lib-foot button')).toEqual([]);
+  });
+
+  it('in the chooser a model that is on this Mac says so, and is switched to without a download', async () => {
+    const page = mount();
+    const answer = status(
+      {
+        pick: { ...PICK, library: 'active' },
+        alternatives: [{ ...ALT_SLOW, library: 'ready' }, ALT_SMALL],
+      },
+      TWO.install
+    );
+    const { app } = await opened(page, answer, () => ok({ ...TWO.install, state: 'installing', step: 'verify' }));
+    pressIn(page, '.lm-lib-foot', 'Add a model');
+    await settle();
+    const rows = [...page.body.querySelectorAll('.lm-model')];
+    const tagsOf = (row: Element) => texts(row, '.lm-tag');
+    // The model in use: its own tag beside the server's, and nothing to do with it here.
+    expect(tagsOf(rows[0])).toContain('In use');
+    const primary = () => page.frame.querySelector<HTMLButtonElement>('.lm-buttons .wt-btn-primary')!;
+    expect(primary().textContent).toBe('In use');
+    expect(primary().disabled).toBe(true);
+
+    // A model that is on this Mac and checked: one click switches to it.
+    const ready = rows.find((row) => tagsOf(row).includes('On this Mac'))!;
+    expect(ready).toBeTruthy();
+    (ready as HTMLElement).click();
+    await settle();
+    expect(primary().textContent).toBe('Use this model');
+    expect(primary().disabled).toBe(false);
+    primary().click();
+    await settle();
+    expect(verbs(app)).toEqual([['POST', '/api/local-model/use', { modelId: ALT_SLOW.modelId }]]);
+    // No confirm screen was shown on the way.
+    expect(page.body.dataset.screen).toBe('progress');
+  });
+
+  it('in the chooser a model that is not on this Mac is installed the usual way, with its sizes confirmed', async () => {
+    const page = mount();
+    const answer = status({ pick: { ...PICK, library: 'active' }, alternatives: [ALT_SMALL] }, TWO.install);
+    const { app } = await opened(page, answer, () => ok({ ...TWO.install, state: 'installing', step: 'model' }));
+    pressIn(page, '.lm-lib-foot', 'Add a model');
+    await settle();
+    const other = [...page.body.querySelectorAll<HTMLElement>('.lm-model')].find(
+      (row) => row.dataset.modelId === ALT_SMALL.modelId
+    )!;
+    other.click();
+    await settle();
+    press(page.body, 'Install on this Mac');
+    await settle();
+    expect(page.body.dataset.screen).toBe('confirm');
+    press(page.body, 'Download and install');
+    await settle();
+    expect(verbs(app)).toEqual([
+      [
+        'POST',
+        '/api/local-model/install',
+        {
+          modelId: ALT_SMALL.modelId,
+          cli: ALT_SMALL.harnesses[0].cli,
+          context: ALT_SMALL.context,
+          acknowledgedBytes: ALT_SMALL.installBytes,
+        },
+      ],
+    ]);
+  });
+
+  it('a job that stopped beside a checked model shows the way back to that model', async () => {
+    const back: LocalModelLibraryRow = { ...QWEN_ROW, active: false, actions: ['use', 'delete'] };
+    for (const first of [
+      status(
+        {},
+        { ...PAUSED.install, library: [back], actions: ['resume', 'install', 'use', 'delete-model', 'remove'] }
+      ),
+      status(
+        {},
+        {
+          ...failed('no-tool-call', { model: 'GPT-OSS 20B' }).install,
+          library: [back],
+          actions: ['resume', 'install', 'use', 'delete-model', 'remove'],
+        }
+      ),
+    ]) {
+      const page = mount();
+      const { app } = await opened(page, first, () => ok({ ...TWO.install, state: 'installing', step: 'verify' }));
+      expect(texts(page.body, '.lm-lib-label')).toEqual(['Qwen3.6 35B-A3B']);
+      expect(texts(page.body, '.lm-lib-tag .lm-tag')).toEqual(['Ready']);
+      expect(rowButtons(page)).toEqual(['Use', 'Delete']);
+      // No "Add a model" here: the job's own buttons offer another model.
+      expect(texts(page.body, '.lm-lib-foot button')).toEqual([]);
+      pressIn(page, '.lm-lib-row', 'Use');
+      await settle();
+      expect(verbs(app)).toEqual([['POST', '/api/local-model/use', { modelId: 'qwen3.6:35b-a3b' }]]);
+    }
+  });
+
+  it('a first job that stopped has nothing to go back to, and shows no list', async () => {
+    const page = mount();
+    // Its own model is on disk and checked, with nothing offered on it: Resume goes on with it.
+    await opened(page, status({}, { ...PAUSED.install, library: [{ ...QWEN_ROW, active: false }] }));
+    expect(page.body.querySelector('.lm-library')).toBeNull();
+    expect(page.body.dataset.long).toBe('false');
+    const stopped = mount();
+    await opened(stopped, failed('load-failed', { model: 'Qwen3.6 35B-A3B' }));
+    expect(stopped.body.querySelector('.lm-library')).toBeNull();
+  });
+
+  it('a paused switch says so, and waits', async () => {
+    const page = mount();
+    await opened(
+      page,
+      status({}, { ...PAUSED.install, step: 'verify', steps: ['verify', 'connect'], progress: undefined })
+    );
+    expect(texts(page.body, '.lm-title')).toEqual(['The switch to Qwen3.6 35B-A3B is paused']);
+    expect(texts(page.body, '.lm-aside')).toEqual(['The switch waits until you continue.']);
+    expect(page.body.querySelector('.lm-meter')).toBeNull();
+  });
+
+  it('the App Settings row names a switch as a switch', async () => {
+    const page = mount();
+    const job = { ...JOB, steps: ['verify', 'connect'] as LocalModelInstallView['steps'], step: 'verify' as const };
+    for (const [state, text] of [
+      ['installing', 'Switching to Qwen3.6 35B-A3B'],
+      ['paused', 'The switch to Qwen3.6 35B-A3B is paused'],
+      ['failed', 'The switch to Qwen3.6 35B-A3B stopped'],
+    ] as const) {
+      const app = page.newApp(ok(status({}, { ...job, state, actions: [] })));
+      await app.loadLocalModel({ force: true });
+      expect(texts(page.row, '.set-row-label')).toEqual([text]);
+    }
+  });
+});
+
+// ---------- The coding agents of an installed model ----------
+
+/** The agents the server lists for the installed model: two that can be started, one to install, one that needs a setup. */
+const AGENTS: LocalModelHarnessRow[] = [
+  { cli: 'opencode', cliLabel: 'OpenCode', default: true, status: 'ready', readyMark: '┃', actions: ['start-session'] },
+  {
+    cli: 'claude',
+    cliLabel: 'Claude Code',
+    default: false,
+    status: 'ready',
+    slowFirstTurn: true,
+    actions: ['start-session'],
+  },
+  {
+    cli: 'pi',
+    cliLabel: 'Pi',
+    default: false,
+    status: 'installable',
+    installCommand: 'npm install -g --ignore-scripts @earendil-works/pi-coding-agent',
+    actions: ['install'],
+  },
+  { cli: 'deepseek', cliLabel: 'DeepSeek', default: false, status: 'setup-needed', readyMark: '❯', actions: [] },
+];
+
+const withAgents = (rows: LocalModelHarnessRow[], over: Partial<LocalModelInstallView> = {}) =>
+  status(
+    {},
+    { ...INSTALLED.install, harnesses: rows, actions: [...INSTALLED.install.actions, 'install-agent'], ...over }
+  );
+
+const WITH_AGENTS = withAgents(AGENTS);
+
+describe('the coding agents of an installed model', () => {
+  const chips = (page: Mounted) => texts(page.body, '.lm-agent').map((text) => text.trim());
+  const chosen = (page: Mounted) =>
+    page.body.querySelector('.lm-agent[aria-checked="true"] .lm-agent-name')?.textContent ?? null;
+  const pick = (page: Mounted, label: string) => {
+    const chip = [...page.body.querySelectorAll<HTMLButtonElement>('.lm-agent')].find(
+      (el) => el.querySelector('.lm-agent-name')!.textContent === label
+    );
+    expect(chip, `no agent "${label}"`).toBeTruthy();
+    chip!.click();
+  };
+  const launcher = (app: App) => {
+    app.loadAppSettingsFromServer = vi.fn(async () => undefined);
+    app.loadCliListForSettings = vi.fn(async () => undefined);
+    app.selectCustomModelEntry = vi.fn(async () => undefined);
+    return app.selectCustomModelEntry;
+  };
+
+  it('is one radio group: a chip per agent in the server order, the default selected, a tag on what is not there', async () => {
+    const page = mount();
+    await opened(page, WITH_AGENTS);
+    const group = page.body.querySelector('.lm-agent-list')!;
+    expect(group.getAttribute('role')).toBe('radiogroup');
+    expect(page.document.getElementById(group.getAttribute('aria-labelledby')!)!.textContent).toBe(
+      'Start a session with'
+    );
+    expect(texts(page.body, '.lm-agent-name')).toEqual(['OpenCode', 'Claude Code', 'Pi', 'DeepSeek']);
+    expect(chips(page)).toEqual(['OpenCode', 'Claude Code', 'PiNot installed', 'DeepSeekNeeds setup']);
+    expect(chosen(page)).toBe('OpenCode');
+    // One tab stop for the group.
+    expect([...page.body.querySelectorAll<HTMLElement>('.lm-agent')].map((el) => el.tabIndex)).toEqual([0, -1, -1, -1]);
+    // The chips say which agent, so the facts line no longer does.
+    expect(page.body.textContent).not.toContain('Runs with');
+    expect(buttons(page.body)).toEqual(['Remove', 'Stop', 'Start a session']);
+    expect(frameOf(page.body).querySelectorAll('.lm-buttons .wt-btn-primary')).toHaveLength(1);
+  });
+
+  it('starts the session with the selected agent, and this device remembers the agent it started', async () => {
+    const page = mount();
+    const { app } = await opened(page, WITH_AGENTS);
+    const launch = launcher(app);
+    pick(page, 'Claude Code');
+    expect(chosen(page)).toBe('Claude Code');
+    // What the catalogue says about its first answer.
+    expect(texts(page.body, '.lm-agent-about .lm-aside')).toEqual(['The first answer can take minutes.']);
+    expect(verbs(app)).toEqual([]);
+    // Looking at a chip is not a choice yet.
+    expect(page.dom.window.localStorage.getItem('codeman-local-model-agent')).toBeNull();
+    press(page.body, 'Start a session');
+    await settle();
+    expect(launch).toHaveBeenCalledWith('claude', 'local-ollama');
+
+    // The window opened again later: the agent last started stands, not the default.
+    expect(page.dom.window.localStorage.getItem('codeman-local-model-agent')).toBe('claude');
+    const again = page.newApp(ok(WITH_AGENTS));
+    await again.loadLocalModel();
+    again.openLocalModelWindow();
+    await settle();
+    expect(chosen(page)).toBe('Claude Code');
+  });
+
+  it('a chip that was only looked at never hides Start a session when the window is opened again', async () => {
+    const page = mount();
+    const { app } = await opened(page, WITH_AGENTS);
+    pick(page, 'DeepSeek');
+    expect(buttons(page.body)).toEqual(['Remove', 'Stop']);
+    app.closeLocalModelWindow();
+    app.openLocalModelWindow();
+    await settle();
+    // Back on the default agent, with the main action in reach.
+    expect(chosen(page)).toBe('OpenCode');
+    expect(buttons(page.body)).toEqual(['Remove', 'Stop', 'Start a session']);
+
+    // And an agent that was started once and has since been uninstalled does not win either.
+    page.dom.window.localStorage.setItem('codeman-local-model-agent', 'pi');
+    app.closeLocalModelWindow();
+    app.openLocalModelWindow();
+    await settle();
+    expect(chosen(page)).toBe('OpenCode');
+    expect(buttons(page.body)).toEqual(['Remove', 'Stop', 'Start a session']);
+  });
+
+  it('a remembered agent the server no longer lists falls back to the default', async () => {
+    const page = mount();
+    page.dom.window.localStorage.setItem('codeman-local-model-agent', 'gone');
+    const { app } = await opened(page, WITH_AGENTS);
+    expect(chosen(page)).toBe('OpenCode');
+    const launch = launcher(app);
+    press(page.body, 'Start a session');
+    await settle();
+    expect(launch).toHaveBeenCalledWith('opencode', 'local-ollama');
+  });
+
+  it('an agent that is not on this Mac: its literal command, and the main button installs it', async () => {
+    const page = mount();
+    const installing = AGENTS.map((row) =>
+      row.cli === 'pi' ? { ...row, status: 'installing' as const, actions: [] } : row
+    );
+    const { app, serve } = await opened(page, WITH_AGENTS, () =>
+      ok(withAgents(installing, { actions: INSTALLED.install.actions }).install)
+    );
+    pick(page, 'Pi');
+    expect(texts(page.body, '.lm-agent-about .lm-aside')).toEqual([
+      'Pi is not on this Mac yet. Codeman installs it with this command:',
+    ]);
+    // The command the click consents to, as text, exactly as the server sent it.
+    expect(texts(page.body, '.lm-agent-about .lm-command')).toEqual([
+      'npm install -g --ignore-scripts @earendil-works/pi-coding-agent',
+    ]);
+    expect(buttons(page.body)).toEqual(['Remove', 'Stop', 'Install Pi']);
+    expect(frameOf(page.body).querySelector('.lm-buttons .wt-btn-primary')!.textContent).toBe('Install Pi');
+
+    press(page.body, 'Install Pi');
+    await settle();
+    // The id goes out as data; the command is the server's own and is never sent.
+    expect(verbs(app)).toEqual([['POST', '/api/local-model/agent', { cli: 'pi' }]]);
+    expect(chips(page)).toContain('PiInstalling');
+    expect(texts(page.body, '.lm-agent-about .lm-aside')).toEqual([
+      'Installing Pi. You can start a session with another agent meanwhile.',
+    ]);
+    const main = frameOf(page.body).querySelector<HTMLButtonElement>('.lm-buttons .wt-btn-primary')!;
+    expect([main.textContent, main.disabled]).toEqual(['Installing Pi', true]);
+    // The model is as it was: still installed, still running.
+    expect(page.body.dataset.screen).toBe('installed');
+    expect(texts(page.body, '.lm-state-text')).toEqual(['Running']);
+
+    // The installer landed: the next poll says so, and the same chip now starts a session.
+    serve(
+      withAgents(
+        AGENTS.map((row) =>
+          row.cli === 'pi'
+            ? {
+                cli: 'pi',
+                cliLabel: 'Pi',
+                default: false,
+                status: 'ready' as const,
+                actions: ['start-session' as const],
+              }
+            : row
+        )
+      )
+    );
+    await page.tick();
+    expect(chips(page)).toContain('Pi');
+    expect(chosen(page)).toBe('Pi');
+    expect(buttons(page.body)).toEqual(['Remove', 'Stop', 'Start a session']);
+    const launch = launcher(app);
+    press(page.body, 'Start a session');
+    await settle();
+    expect(launch).toHaveBeenCalledWith('pi', 'local-ollama');
+  });
+
+  it('while an agent installs, a session with another agent can be started', async () => {
+    const page = mount();
+    const rows = AGENTS.map((row) => (row.cli === 'pi' ? { ...row, status: 'installing' as const, actions: [] } : row));
+    const { app } = await opened(page, withAgents(rows, { actions: INSTALLED.install.actions }));
+    expect(chosen(page)).toBe('OpenCode');
+    const launch = launcher(app);
+    press(page.body, 'Start a session');
+    await settle();
+    expect(launch).toHaveBeenCalledWith('opencode', 'local-ollama');
+  });
+
+  it('a failed install: the server sentence on the chip that failed, the installer words folded away, and try again', async () => {
+    const page = mount();
+    const rows = AGENTS.map((row) =>
+      row.cli === 'pi'
+        ? {
+            ...row,
+            error: {
+              message: { text: LOCAL_MODEL_INSTALL_LABELS.errHarnessFailed, vars: { cli: 'Pi' } },
+              detail: 'npm ERR! <b>network</b> request failed',
+            },
+          }
+        : row
+    );
+    await opened(page, withAgents(rows));
+    // Not shown under another agent.
+    expect(page.body.querySelector('.lm-agent-about .lm-notice')).toBeNull();
+    pick(page, 'Pi');
+    expect(texts(page.body, '.lm-agent-about .lm-notice-text')).toEqual(['Pi could not be installed.']);
+    const detail = page.body.querySelector('.lm-agent-about .lm-detail-text')!;
+    // Someone else's text: shown as text, never as markup.
+    expect(detail.textContent).toBe('npm ERR! <b>network</b> request failed');
+    expect(detail.querySelector('b')).toBeNull();
+    expect(buttons(page.body)).toEqual(['Remove', 'Stop', 'Install Pi']);
+    // The model itself has no error: the headline still says ready.
+    expect(texts(page.body, '.lm-title')).toEqual(['Qwen3.6 35B-A3B is ready on this Mac.']);
+  });
+
+  it('an agent that needs a setup of its own says where, and has nothing to press', async () => {
+    const page = mount();
+    const { app } = await opened(page, WITH_AGENTS);
+    pick(page, 'DeepSeek');
+    expect(texts(page.body, '.lm-agent-about .lm-aside')).toEqual([
+      'DeepSeek needs a setup of its own. Set it up from the Run menu, then start a session with it here.',
+    ]);
+    expect(buttons(page.body)).toEqual(['Remove', 'Stop']);
+    expect(verbs(app)).toEqual([]);
+  });
+
+  it('with no agent that can be started the main button installs the default one', async () => {
+    const page = mount();
+    const rows: LocalModelHarnessRow[] = [
+      {
+        cli: 'opencode',
+        cliLabel: 'OpenCode',
+        default: true,
+        status: 'installable',
+        installCommand: 'curl -fsSL https://opencode.ai/install | bash',
+        actions: ['install'],
+      },
+    ];
+    await opened(page, withAgents(rows, { actions: ['stop', 'install', 'install-agent', 'remove'] }));
+    expect(buttons(page.body)).toEqual(['Remove', 'Stop', 'Install OpenCode']);
+    expect(texts(page.body, '.lm-command')).toEqual(['curl -fsSL https://opencode.ai/install | bash']);
+  });
+
+  it('a stopped model: Start stays the one main button, and an agent can still be installed', async () => {
+    const page = mount();
+    const rows = AGENTS.map((row) => (row.status === 'ready' ? { ...row, actions: [] } : row));
+    const { app } = await opened(
+      page,
+      withAgents(rows, { running: false, actions: ['start', 'install', 'install-agent', 'remove'] }),
+      () => ok(withAgents(rows, { running: false, actions: ['start', 'install', 'remove'] }).install)
+    );
+    expect(buttons(page.body)).toEqual(['Remove', 'Start']);
+    pick(page, 'Pi');
+    expect(buttons(page.body)).toEqual(['Remove', 'Start', 'Install Pi']);
+    const primary = frameOf(page.body).querySelectorAll('.lm-buttons .wt-btn-primary');
+    expect([...primary].map((el) => el.textContent)).toEqual(['Start']);
+    press(page.body, 'Install Pi');
+    await settle();
+    expect(verbs(app)).toEqual([['POST', '/api/local-model/agent', { cli: 'pi' }]]);
+  });
+
+  it('moves the selection with the arrow keys, Home and End, and the focus follows', async () => {
+    const page = mount();
+    await opened(page, WITH_AGENTS);
+    page.body.querySelector<HTMLElement>('.lm-agent[aria-checked="true"]')!.focus();
+    const key = (name: string) => {
+      const event = new page.dom.window.KeyboardEvent('keydown', { key: name, bubbles: true, cancelable: true });
+      page.document.activeElement!.dispatchEvent(event);
+      return event;
+    };
+    const walk: Array<[string, string]> = [
+      ['ArrowRight', 'Claude Code'],
+      ['ArrowDown', 'Pi'],
+      ['ArrowLeft', 'Claude Code'],
+      ['ArrowUp', 'OpenCode'],
+      // The ends wrap.
+      ['ArrowLeft', 'DeepSeek'],
+      ['ArrowRight', 'OpenCode'],
+      ['End', 'DeepSeek'],
+      ['Home', 'OpenCode'],
+    ];
+    for (const [name, agent] of walk) {
+      const event = key(name);
+      expect(event.defaultPrevented, name).toBe(true);
+      expect(chosen(page), name).toBe(agent);
+      const active = page.document.activeElement!;
+      expect(active.classList.contains('lm-agent'), name).toBe(true);
+      expect(active.getAttribute('aria-checked'), name).toBe('true');
+    }
+    // Any other key is left alone.
+    expect(key('a').defaultPrevented).toBe(false);
+  });
+
+  it('is not on the screen that ends an install, and not while something blocks every session', async () => {
+    const page = mount();
+    const { app, serve } = await opened(page, INSTALLING);
+    serve(WITH_AGENTS);
+    await page.tick();
+    // The install just finished in this window: one thing to do.
+    expect(page.body.querySelector('.lm-agents')).toBeNull();
+    expect(buttons(page.body)).toEqual(['Start a session']);
+    const launch = launcher(app);
+    press(page.body, 'Start a session');
+    await settle();
+    // The agent that was chosen for the install: the server's default.
+    expect(launch).toHaveBeenCalledWith('opencode', 'local-ollama');
+
+    const blocked = mount();
+    await opened(
+      blocked,
+      withAgents(
+        AGENTS.map((row) => ({ ...row, actions: row.actions.filter((action) => action !== 'start-session') })),
+        {
+          actions: ['stop', 'install', 'remove'],
+          error: {
+            code: 'model-changed',
+            message: { text: LOCAL_MODEL_INSTALL_LABELS.errModelChanged },
+            next: 'remove',
+          },
+        }
+      )
+    );
+    expect(blocked.body.querySelector('.lm-agents')).toBeNull();
+    expect(buttons(blocked.body)).not.toContain('Start a session');
+  });
+
+  it('an agent name is text of someone else: shown as text', async () => {
+    const page = mount();
+    const rows = AGENTS.map((row) =>
+      row.cli === 'pi'
+        ? { ...row, cliLabel: '<img src=x onerror=alert(1)>', installCommand: '<script>x</script>' }
+        : row
+    );
+    await opened(page, withAgents(rows));
+    pick(page, '<img src=x onerror=alert(1)>');
+    expect(page.body.querySelector('.lm-agents img, .lm-agents script')).toBeNull();
+    expect(texts(page.body, '.lm-command')).toEqual(['<script>x</script>']);
+    expect(buttons(page.body)).toContain('Install <img src=x onerror=alert(1)>');
+  });
+
+  it('in Chinese: the label, the tags, the line and the button', async () => {
+    const page = mount({ i18n: true });
+    page.win.CodemanI18n.start();
+    page.win.CodemanI18n.configure({ language: 'zh-CN' });
+    await opened(page, WITH_AGENTS);
+    expect(texts(page.body, '.lm-agents-label')).toEqual(['开始会话时使用']);
+    expect(texts(page.body, '.lm-agent .lm-tag')).toEqual(['未安装', '需要设置']);
+    pick(page, 'Pi');
+    expect(texts(page.body, '.lm-agent-about .lm-aside')).toEqual([
+      '此 Mac 上尚未安装 Pi。Codeman 会用下面这条命令安装它：',
+    ]);
+    expect(buttons(page.body)).toContain('安装 Pi');
+  });
+
+  it('a server that lists no agents (an older one): the one agent of the install, as before', async () => {
+    const page = mount();
+    const { app } = await opened(page, INSTALLED);
+    expect(page.body.querySelector('.lm-agents')).toBeNull();
+    expect(page.body.textContent).toContain('Runs with OpenCode.');
+    const launch = launcher(app);
+    press(page.body, 'Start a session');
+    await settle();
+    expect(launch).toHaveBeenCalledWith('opencode', 'local-ollama');
+  });
+});
+
+describe('what an earlier Remove left on disk', () => {
+  const LEFT = status({}, { store: STORE_ONE, actions: ['install', 'remove'] });
+
+  it('the chooser says what the downloads still take, and deletes them after one question', async () => {
+    const page = mount();
+    const { app } = await opened(page, LEFT, () => ok(install({ store: { bytes: 0, gb: '0.0' } })));
+    expect(texts(page.body, '.lm-leftovers .lm-aside')).toEqual([
+      'Models from an earlier install still use 23.1 GB on this Mac.',
+    ]);
+    pressIn(page, '.lm-leftovers', 'Delete them');
+    await settle();
+    expect(verbs(app)).toEqual([]);
+    expect(texts(page.body, '.lm-leftovers .lm-lead')).toEqual(['Delete the downloaded models from this Mac?']);
+    expect(texts(page.body, '.lm-leftovers .lm-lib-ask .lm-aside')).toEqual(['This frees 23.1 GB.']);
+    expect(page.body.querySelector('.lm-leftovers .wt-btn-danger')!.textContent).toBe('Delete');
+    pressIn(page, '.lm-leftovers', 'Cancel');
+    await settle();
+    expect(texts(page.body, '.lm-leftovers button')).toEqual(['Delete them']);
+    pressIn(page, '.lm-leftovers', 'Delete them');
+    await settle();
+    pressIn(page, '.lm-leftovers', 'Delete');
+    await settle();
+    expect(verbs(app)).toEqual([['DELETE', '/api/local-model', { removeModel: true }]]);
+    expect(page.body.querySelector('.lm-leftovers')).toBeNull();
+    // Still the chooser: installing is what this screen is for.
+    expect(page.body.dataset.screen).toBe('choose');
+    expect(buttons(page.body)).toEqual(['Install on this Mac']);
+  });
+
+  it('is not there without something on disk, or without the server offering the removal', async () => {
+    for (const first of [
+      IDLE,
+      status({}, { store: { bytes: 0, gb: '0.0' }, actions: ['install', 'remove'] }),
+      status({}, { store: STORE_ONE, actions: ['install'] }),
+    ]) {
+      const page = mount();
+      await opened(page, first);
+      expect(page.body.querySelector('.lm-leftovers')).toBeNull();
+    }
+  });
+
+  it('shows on a Mac no model fits too: the space can still be freed', async () => {
+    const page = mount();
+    const answer = none('memory');
+    await opened(page, { ...answer, install: install({ store: STORE_ONE, actions: ['remove'] }) });
+    expect(page.body.dataset.screen).toBe('none');
+    expect(texts(page.body, '.lm-leftovers .lm-aside')).toEqual([
+      'Models from an earlier install still use 23.1 GB on this Mac.',
+    ]);
+  });
+});
+
+describe('the models on this Mac: text of someone else, another language, an unchanged answer', () => {
+  it('a model name is text, in the row, in its question and in the labels of its buttons', async () => {
+    const HOSTILE = '<img src=x onerror="window.__pwned=1">';
+    const page = mount();
+    const rows: LocalModelLibraryRow[] = [QWEN_ROW, { ...GPT_ROW, id: `evil:1b`, label: `Model ${HOSTILE}` }];
+    await opened(page, status({}, { ...TWO.install, library: rows, folder: `/tmp/${HOSTILE}` }));
+    pressIn(page, '.lm-lib-row', 'Delete');
+    await settle();
+    expect(page.document.querySelectorAll('img, script, iframe')).toHaveLength(0);
+    expect((page.win as unknown as { __pwned?: number }).__pwned).toBeUndefined();
+    expect(texts(page.body, '.lm-lib-ask .lm-lead')).toEqual([`Delete Model ${HOSTILE} from this Mac?`]);
+  });
+
+  it('is translated when the language changes, the names staying as sent', async () => {
+    const page = mount({ i18n: true });
+    page.win.CodemanI18n.start();
+    await opened(page, TWO);
+    page.win.CodemanI18n.configure({ language: 'zh-CN' });
+    await settle();
+    expect(texts(page.body, '.lm-lib-caption-label')).toEqual(['此 Mac 上的模型']);
+    expect(texts(page.body, '.lm-lib-tag .lm-tag')).toEqual(['使用中', '就绪']);
+    expect(rowButtons(page)).toEqual(['使用', '删除']);
+    expect(texts(page.body, '.lm-lib-label')).toEqual(['Qwen3.6 35B-A3B', 'GPT-OSS 20B']);
+    expect(texts(page.body, '.lm-lib-notes .lm-aside')).toEqual(['已下载的模型在此 Mac 上占用 36.9 GB。']);
+    expect(texts(page.body, '.lm-lib-foot button')).toEqual(['添加模型']);
+  });
+
+  it('a poll that changes nothing leaves the rows and their buttons in place', async () => {
+    const page = mount();
+    await opened(page, TWO);
+    const before = page.body.querySelector('.lm-lib-row .lm-lib-actions button');
+    await page.tick();
+    await page.tick();
+    expect(page.body.querySelector('.lm-lib-row .lm-lib-actions button')).toBe(before);
+  });
+
+  it('the focus stays on the row button it was on when the list is repainted', async () => {
+    const page = mount();
+    const { app, serve } = await opened(page, TWO);
+    const remove = [...page.body.querySelectorAll<HTMLButtonElement>('.lm-lib-row .lm-lib-actions button')][1];
+    remove.focus();
+    serve(status({}, { ...TWO.install, store: { bytes: 36899240384, gb: '36.9' }, port: 11436 }));
+    await app.loadLocalModel({ force: true });
+    const active = page.document.activeElement as HTMLElement;
+    expect(active.textContent).toBe('Delete');
+    expect(active.dataset.lmKey).toBe('delete:gpt-oss:20b');
+    expect(active).not.toBe(remove);
   });
 });

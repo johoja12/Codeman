@@ -1419,10 +1419,14 @@ function throwFileEditError(statusCode: number, code: ApiErrorCode, message: str
  * Gate a resolved workspace file for edit-mode read/write. Throws a structured
  * error when the file may not be edited; returns void when it may. Order
  * matters for the message a user sees: confinement (the caller's 404) →
- * sensitive/blocked (403) → .git (403) → extension allowlist (400).
+ * sensitive/blocked (403) → .git (403) → extension allowlist (400). Dotenv is
+ * the one sensitive family the editor may open (`allowDotenv`): the plain
+ * preview already serves it to the same user. Keep this and the `editable`
+ * advertisement in the read route in step.
  */
 function assertEditableTarget(resolvedPath: string, relativePath: string, blockedTrees: readonly string[]): void {
-  if (isSensitivePath(resolvedPath) || isBlockedAttachmentPath(resolvedPath, blockedTrees)) {
+  // isBlockedAttachmentPath includes the sensitive-path check.
+  if (isBlockedAttachmentPath(resolvedPath, blockedTrees, { allowDotenv: true })) {
     throwFileEditError(403, ApiErrorCode.FORBIDDEN, 'Editing this file is blocked');
   }
   if (isDeniedEditRelativePath(relativePath)) {
@@ -2703,8 +2707,8 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
         relativePath !== undefined &&
         isEditableFileName(pathBasename(resolvedPath)) &&
         !isDeniedEditRelativePath(relativePath) &&
-        !isSensitivePath(resolvedPath) &&
-        !isBlockedAttachmentPath(resolvedPath, guard.blockedTrees) &&
+        !isSensitivePath(resolvedPath, { allowDotenv: true }) &&
+        !isBlockedAttachmentPath(resolvedPath, guard.blockedTrees, { allowDotenv: true }) &&
         stat.size <= MAX_EDITABLE_BYTES &&
         Buffer.from(content, 'utf8').equals(buf);
 
@@ -2810,6 +2814,13 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       // masked by the process umask; fsync so the rename never publishes a
       // partially-durable file. Trade-off (same as vim's default): the inode
       // changes, so hardlinks keep the old content.
+      //
+      // The new file would also take this process's own user and group, so a
+      // `.env` shared by group (you:www-data, 0640) came back you:you and the
+      // web server lost it. fchown puts both back where the account may: the
+      // owner can give a file to a group they belong to, and only root can set
+      // the user. Best effort, since a save that cannot keep the group is still
+      // the save the user asked for.
       const fileMode = stat.mode & 0o777;
       const tmpPath = join(
         dirname(resolvedPath),
@@ -2818,6 +2829,12 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       let handle;
       try {
         handle = await fs.open(tmpPath, 'wx', fileMode);
+        const tmpHandle = handle;
+        await tmpHandle
+          .chown(stat.uid, stat.gid)
+          .catch(() => tmpHandle.chown(-1, stat.gid))
+          .catch(() => {});
+        // After the chown: changing the owner can clear mode bits.
         await handle.chmod(fileMode);
         await handle.writeFile(outBuf);
         await handle.sync();

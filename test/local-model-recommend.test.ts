@@ -150,7 +150,12 @@ function without(facts: HardwareFacts, ...fields: (keyof HardwareFacts)[]): Hard
 }
 
 /** Display labels of the stock harnesses, as the CLI registry would supply them. Data, not a branch. */
-const HARNESS_LABELS: Record<string, string> = { opencode: 'OpenCode', claude: 'Claude Code', pi: 'Pi' };
+const HARNESS_LABELS: Record<string, string> = {
+  opencode: 'OpenCode',
+  claude: 'Claude Code',
+  pi: 'Pi',
+  deepseek: 'DeepSeek',
+};
 
 /** What the server knows about one harness: installed and accepting every model id, unless overridden. */
 function fact(cli: string, overrides: Partial<HarnessFact> = {}): HarnessFact {
@@ -170,7 +175,10 @@ const STOCK = getLocalModelCatalog();
 /** The frozen catalogue of 2026-11-06: for the rule tests (see the file header). */
 const RULES = LocalModelCatalogSchema.parse(RULES_LOCAL_MODEL_CATALOG);
 
-/** Every harness installed, the gated one included. Both catalogues list the same three. */
+/**
+ * Every harness installed. The stock catalogue lists four and gates none; the rules catalogue
+ * lists the first three of them and gates one, which is what the gate tests need.
+ */
 const ALL_INSTALLED: HarnessFact[] = STOCK.harnesses.map((row) => fact(row.cli));
 
 /** A stock model row by id. */
@@ -487,8 +495,15 @@ describe('needBytes', () => {
   it('states the need of every stock row at its largest context', () => {
     expect(Object.fromEntries(STOCK.models.map((m) => [m.id, needBytes(m, m.contexts[0])]))).toEqual({
       'qwen3.5:9b-q4_k_m': 11_380_487_246,
+      // 0.92 GB under the other two 9B builds: it has no vision projector.
+      'ornith:9b-q4_k_m': 10_458_772_264,
       'mimo-v2.6:9b-q4_k_m': 11_380_472_729,
       'north-mini-code-1.0:q4_k_m': 25_999_848_864,
+      // At its own window of 131072 tokens: 18.2 GB + 0.9 GB of K/V cache + 2.6 GB.
+      'muse-glimmer:30b-q4_k_m': 21_646_509_900,
+      // The MLX build at the same window: 19.1 GB + 5.9 GB of cache (45,000 bytes per token,
+      // measured) + the 8 GiB of prefix snapshots and 0.5 GB + 5 GB of peak.
+      'muse-glimmer:30b-mlx': 39_041_796_584,
       'qwen3.6:35b-a3b-mtp-q4_k_m': 28_808_554_317,
       'qwen3.6:35b-a3b': 35_955_462_956,
       'qwen3.8:27b-q8_0': 44_292_142_594,
@@ -544,6 +559,9 @@ describe('the fit grade', () => {
 // ---------- 2. The two real Macs ----------
 
 describe('the MacBook Pro (Mac17,13: Apple M5 Pro, 48 GB)', () => {
+  /** The same Mac without the probe: 48 GiB and the chip are all the fit and the speed depend on. */
+  const hw48 = mac(48, 'Apple M5 Pro');
+
   /**
    * Expected: Qwen3.6 35B-A3B at 131,072 tokens with OpenCode, a TIGHT fit, 67.7 tokens per
    * second, "Recommended for this Mac".
@@ -595,9 +613,12 @@ describe('the MacBook Pro (Mac17,13: Apple M5 Pro, 48 GB)', () => {
       tested: true,
       needSource: 'measured',
       tag: { kind: 'tested', label: 'Tested on a Mac like this' },
+      // Every harness of the catalogue can run it, the pick's own first, then by rank.
       harnesses: [
         { cli: 'opencode', cliLabel: 'OpenCode', installed: true },
         { cli: 'claude', cliLabel: 'Claude Code', installed: true, slowFirstTurn: true },
+        { cli: 'pi', cliLabel: 'Pi', installed: true },
+        { cli: 'deepseek', cliLabel: 'DeepSeek', installed: true },
       ],
       // No runtime download was named, so an install downloads the model alone.
       installBytes: 23_105_798_956,
@@ -642,25 +663,39 @@ describe('the MacBook Pro (Mac17,13: Apple M5 Pro, 48 GB)', () => {
     expect(result.notes).toEqual([]);
   });
 
-  it('lists four other models that fit, each at the largest context it fits at, the fast ones first', async () => {
+  it('lists every other model that fits, each at the largest context it fits at, the fast ones first', async () => {
     const result = recommend(await macbook(), STOCK, ALL_INSTALLED);
     expect(
       result.alternatives.map((c) => [c.modelId, c.context, c.fit, c.speed, c.tokensPerSecond ?? null, c.tag?.kind])
     ).toEqual([
       // The same model as a GGUF build: its fixed footprint holds the full window, 28.8 GB.
       ['qwen3.6:35b-a3b-mtp-q4_k_m', 262144, 'good', 'ok', 41.8, undefined],
+      // Muse Glimmer as the MLX build: 36.1 GB at 65536 tokens (0.960 of the estimate), and
+      // 5.4 x 3.07 = 16.6 tokens per second. At 131072 it needs 39.0 GB, 1.04: out.
+      ['muse-glimmer:30b-mlx', 65536, 'tight', 'ok', 16.6, 'tight'],
       ['north-mini-code-1.0:q4_k_m', 262144, 'good', 'ok', 41.8, undefined],
       ['mimo-v2.6:9b-q4_k_m', 131072, 'good', 'ok', 28.6, 'small'],
+      ['ornith:9b-q4_k_m', 131072, 'good', 'ok', 28.6, 'small'],
       ['qwen3.5:9b-q4_k_m', 131072, 'good', 'ok', 28.6, 'small'],
+      // The dense models compute to 2.95 x 3.07 = 9.1 tokens per second on this chip (5.2 in
+      // 8 bits): slow, so they come after every fast model, in the order of their rank.
+      ['qwen3.8:27b-mtp-q4_k_m', 262144, 'tight', 'slow', 9.1, 'tight'],
+      ['qwen3.8:27b-q8_0', 65536, 'tight', 'slow', 5.2, 'tight'],
+      ['muse-glimmer:30b-q4_k_m', 131072, 'good', 'slow', 9.1, 'slow'],
     ]);
-    // Only the tested row rests on a measurement of that model.
-    expect(result.alternatives.map((c) => c.needSource)).toEqual(['estimated', 'estimated', 'estimated', 'estimated']);
-    // The dense 27B fits too (32.1 GB at 262144) but computes to 2.95 x 3.07 = 9.1 tokens per
-    // second here: slow, so it ranks after four fast models and is not listed.
-    expect(modelFitsBudget(await macbook(), STOCK, 'qwen3.8:27b-mtp-q4_k_m', 262144)).toBe(true);
-    expect(order(result).some((entry) => entry.startsWith('qwen3.8:27b'))).toBe(false);
+    // Beside the tested pick, one more row rests on a measurement of its own model's memory.
+    expect(result.alternatives.filter((c) => c.needSource === 'measured').map((c) => c.modelId)).toEqual([
+      'muse-glimmer:30b-mlx',
+    ]);
+    // Every model of the catalogue that fits is on the list: nothing is cut off after four.
+    const fitting = STOCK.models.filter((m) => m.contexts.some((ctx) => modelFitsBudget(hw48, STOCK, m.id, ctx)));
+    expect(
+      rows(result)
+        .map((c) => c.modelId)
+        .sort()
+    ).toEqual(fitting.map((m) => m.id).sort());
     // The 122B fits at no context.
-    expect(order(result).some((entry) => entry.startsWith('ornith'))).toBe(false);
+    expect(order(result).some((entry) => entry.startsWith('ornith-1.5'))).toBe(false);
   });
 
   it('would get the same model as "Best fit", with the estimated speed, had nobody tested it', async () => {
@@ -692,41 +727,69 @@ describe('the MacBook Pro (Mac17,13: Apple M5 Pro, 48 GB)', () => {
       ['qwen3.8:27b-mtp-q4_k_m', 'unknown'],
       ['qwen3.8:27b-q8_0', 'unknown'],
       ['qwen3.6:35b-a3b-mtp-q4_k_m', 'unknown'],
+      ['muse-glimmer:30b-mlx', 'unknown'],
+      ['muse-glimmer:30b-q4_k_m', 'unknown'],
       ['north-mini-code-1.0:q4_k_m', 'unknown'],
+      ['mimo-v2.6:9b-q4_k_m', 'unknown'],
+      ['ornith:9b-q4_k_m', 'unknown'],
+      ['qwen3.5:9b-q4_k_m', 'unknown'],
     ]);
   });
 });
 
 describe('the Mac mini (Mac16,10: Apple M4, 16 GB)', () => {
   /**
-   * Expected: verdict `none` (reason `memory`) on the estimated budget, and `limited` with
-   * MiMo V2.6 9B (a GGUF build) at 65,536 tokens, a TIGHT fit, once the runtime measured its
-   * budget.
+   * Expected: `limited` with Ornith 1.0 9B at 65,536 tokens, a TIGHT fit, on the estimated
+   * budget, and MiMo V2.6 9B at 65,536 tokens, also tight, once the runtime measured its budget.
    *
-   * Why. The estimated budget is 9.67 GiB (10.4 GB: 2/3 of 16 GiB minus 1). The 9B on
-   * llama.cpp needs 6.55 GB of weights + 1.14 GB for a q8_0 K/V cache of 65,536 tokens +
-   * 2.55 GB beside them (its recurrent state live and in 8 context checkpoints, the runner, and
-   * the 1 GiB prompt cache the runtime allows) = 10.2 GB: 0.987 of the estimate, just past the
-   * 0.98 a tight fit may reach. The runtime measured 11.8 GiB on this Mac; the 6 GiB reserve
-   * leaves 10 GiB (10.7 GB) of it, and the same 10.2 GB is 0.954 of that.
+   * Why. The estimated budget is 9.67 GiB (10.4 GB: 2/3 of 16 GiB minus 1). A 9B on llama.cpp
+   * needs its weights + 1.14 GB for a q8_0 K/V cache of 65,536 tokens + 2.55 GB beside them (its
+   * recurrent state live and in 8 context checkpoints, the runner, and the 1 GiB prompt cache
+   * the runtime allows). MiMo and its base are 6.55 GB (a vision projector of 0.92 GB
+   * included): 10.2 GB, 0.987 of the estimate, just past the 0.98 a tight fit may reach. The
+   * Ornith build has no projector, 5.63 GB: 9.3 GB, 0.898 of the estimate. The runtime measured
+   * 11.8 GiB on this Mac; the 6 GiB reserve leaves 10 GiB (10.7 GB) of it, which admits all
+   * three, and the rank puts MiMo first.
    *
-   * Every figure of this row is computed from the model's architecture, none was measured
-   * (`needSource: 'estimated'`), so this Mac is on the edge either way. Only a run of the 9B on
-   * it settles which side.
+   * Every figure of these rows is computed from the model's architecture, none was measured
+   * (`needSource: 'estimated'`), and no 9B was ever run on such a Mac by us.
    */
-  it('gets no model on the estimated budget: the 9B needs 0.987 of it', async () => {
+  it('gets Ornith 1.0 9B at 65536 tokens on the estimated budget, tight: the other 9B builds need 0.987 of it', async () => {
     const hw = await macMini();
     expect(hw.chip).toBe('Apple M4');
     expect(hw.memClassGb).toBe(16);
 
     const result = recommend(hw, STOCK, ALL_INSTALLED);
 
-    expect(result).toMatchObject({ verdict: 'none', reason: 'memory', budgetSource: 'estimated' });
-    expect(result.headline).toEqual({ text: LOCAL_MODEL_LABELS.noneMemory, vars: { memory: '16' } });
-    expect(result.pick).toBeUndefined();
+    expect(result).toMatchObject({ verdict: 'limited', budgetSource: 'estimated' });
+    expect(result.headline).toEqual({ text: LOCAL_MODEL_LABELS.headlineLimited });
+    expect(result.notes).toEqual([{ text: LOCAL_MODEL_LABELS.noteUntested }]);
     // floor(17,179,869,184 x 2/3) - 1 GiB.
     expect(result.budgetBytes).toBe(10_379_504_298);
     expect(result.budgetGb).toBe('10.4');
+    expect(result.pick).toMatchObject({
+      modelId: 'ornith:9b-q4_k_m',
+      modelLabel: 'Ornith 1.0 9B',
+      license: 'MIT',
+      context: 65536,
+      cli: 'opencode',
+      // 5,629,110,568 + 17,408 x 65,536 + 2,547,960,320.
+      needBytes: 9_317_921_576,
+      needGb: '9.3',
+      memory: { modelBytes: 8_177_070_888, contextBytes: 1_140_850_688, peakBytes: 0 },
+      downloadGb: '5.6',
+      budgetShare: 0.898,
+      fit: 'tight',
+      // 9.3 x 120 / 100.
+      speed: 'ok',
+      tokensPerSecond: 11.2,
+      tested: false,
+      needSource: 'estimated',
+      tag: { kind: 'best-tight', label: 'Best fit, tight' },
+    });
+    // It is the only model that fits, and only at this context: at 131072 it needs 10.5 GB.
+    expect(order(result)).toEqual(['ornith:9b-q4_k_m@65536']);
+    expect(modelFitsBudget(hw, STOCK, 'ornith:9b-q4_k_m', 131072)).toBe(false);
     const nineB = stockModel('mimo-v2.6:9b-q4_k_m');
     // 6,550,811,033 + 17,408 x 65,536 + 2,547,960,320.
     expect(needBytes(nineB, 65536)).toBe(10_239_622_041);
@@ -734,7 +797,7 @@ describe('the Mac mini (Mac16,10: Apple M4, 16 GB)', () => {
     expect(needBytes(nineB, 65536) / result.budgetBytes).toBeLessThan(0.99);
   });
 
-  it('would need 11.4 GB at 131072 tokens, more than the whole budget', async () => {
+  it('would need 11.4 GB for MiMo at 131072 tokens, more than the whole budget', async () => {
     const hw = await macMini();
     const nineB = stockModel('mimo-v2.6:9b-q4_k_m');
     const budget = deviceBudget(hw).budgetBytes;
@@ -744,7 +807,7 @@ describe('the Mac mini (Mac16,10: Apple M4, 16 GB)', () => {
     expect(modelFitsBudget(hw, STOCK, 'mimo-v2.6:9b-q4_k_m', 65536)).toBe(false);
   });
 
-  it('gets a small model with the budget its runtime measured: the 9B at 65536 tokens, tight', async () => {
+  it('gets MiMo with the budget its runtime measured: at 65536 tokens, tight', async () => {
     // The runtime reported 11.8 GiB here; the 6 GiB reserve leaves 10 GiB (10.7 GB) of it.
     const result = recommend(await macMini(), STOCK, ALL_INSTALLED, { measuredTotalBytes: MACMINI_MEASURED_TOTAL });
     expect(result).toMatchObject({
@@ -773,13 +836,16 @@ describe('the Mac mini (Mac16,10: Apple M4, 16 GB)', () => {
       needSource: 'estimated',
       tag: { kind: 'best-tight', label: 'Best fit, tight' },
     });
-    // Its base model, the same figures, is the one alternative.
-    expect(order(result)).toEqual(['mimo-v2.6:9b-q4_k_m@65536', 'qwen3.5:9b-q4_k_m@65536']);
+    // The other two 9B builds follow by rank. The Ornith build is small enough for 131072
+    // tokens here (10.5 GB, 0.974), and a model is listed at the largest context it fits at.
+    expect(order(result)).toEqual(['mimo-v2.6:9b-q4_k_m@65536', 'ornith:9b-q4_k_m@131072', 'qwen3.5:9b-q4_k_m@65536']);
   });
 
   it('gets the same with Claude Code as its only coding agent, which also needs 65536 tokens', async () => {
     const hw = await macMini();
-    expect(recommend(hw, STOCK, [fact('claude')])).toMatchObject({ verdict: 'none', reason: 'memory' });
+    const estimated = recommend(hw, STOCK, [fact('claude')]);
+    expect(estimated.verdict).toBe('limited');
+    expect(estimated.pick).toMatchObject({ modelId: 'ornith:9b-q4_k_m', context: 65536, cli: 'claude' });
     const measured = recommend(hw, STOCK, [fact('claude')], { measuredTotalBytes: MACMINI_MEASURED_TOTAL });
     expect(measured.verdict).toBe('limited');
     expect(measured.pick).toMatchObject({ modelId: 'mimo-v2.6:9b-q4_k_m', context: 65536, cli: 'claude' });
@@ -791,22 +857,26 @@ describe('every memory size, with the stock catalogue', () => {
   // size. A change of a catalogue row or of a threshold that moves one of these answers has to
   // change this table on purpose. docs/local-models.md has the same table for people.
   const EXPECTED: [soldGb: number, chip: string, answer: string][] = [
-    // The smallest need at 65536 tokens is 10.2 GB; the budget is 2.1 GB.
+    // The smallest need at 65536 tokens is 9.3 GB; the budget is 2.1 GB.
     [8, 'Apple M2', 'none memory'],
-    // The 9B needs 10.2 GB at 65536 tokens, 0.987 of the 10.4 GB estimate: just out. A runtime
-    // that measured the budget a real 16 GB Mac measured admits it (see the Mac mini above).
-    [16, 'Apple M4', 'none memory'],
-    [16, 'Apple M1', 'none memory'],
+    // The 9B build without a vision projector needs 9.3 GB at 65536 tokens, 0.898 of the 10.4 GB
+    // estimate. The other two need 10.2 GB, 0.987: just out, until a runtime measures what a
+    // real 16 GB Mac measured (see the Mac mini above). On an M1 (68 GB/s) a 9B is slow: 6.3.
+    [16, 'Apple M4', 'limited ornith:9b-q4_k_m@65536 tight ok'],
+    [16, 'Apple M1', 'limited ornith:9b-q4_k_m@65536 tight slow'],
     // 11.4 GB at 131072 tokens, 0.964 of 11.8 GB, and nothing of 12 billion fits: `limited`.
     [18, 'Apple M3 Pro', 'limited mimo-v2.6:9b-q4_k_m@131072 tight ok'],
     // On a base chip with 100 GB/s the 9B computes to 9.3 tokens per second: slow.
     [24, 'Apple M3', 'limited mimo-v2.6:9b-q4_k_m@131072 good slow'],
     [24, 'Apple M4', 'limited mimo-v2.6:9b-q4_k_m@131072 good ok'],
     [24, 'Apple M4 Pro', 'limited mimo-v2.6:9b-q4_k_m@131072 good ok'],
-    // North Mini Code needs 23.2 GB at 65536 tokens: 1.06 of the 21.8 GB estimate. A runtime
-    // that measures about 3/4 of the memory admits it (see below).
-    [32, 'Apple M4', 'limited mimo-v2.6:9b-q4_k_m@131072 good ok'],
-    [32, 'Apple M1 Max', 'limited mimo-v2.6:9b-q4_k_m@131072 good ok'],
+    // Muse Glimmer 30B fits at 65536 tokens: 21.2 GB, 0.970 of the 21.8 GB estimate. So a 32 GB
+    // Mac is no small-model Mac (`ok`). The model is dense: on a base chip it computes to 3.5
+    // tokens per second and the fast 9B stays the pick, on a Max chip (11.8) it is the pick.
+    // North Mini Code needs 23.2 GB at 65536 tokens, 1.06 of the estimate: a runtime that
+    // measures about 3/4 of the memory admits it (see below).
+    [32, 'Apple M4', 'ok mimo-v2.6:9b-q4_k_m@131072 good ok'],
+    [32, 'Apple M1 Max', 'ok muse-glimmer:30b-q4_k_m@65536 tight ok'],
     // A Max chip runs the dense 27B fast enough (12.1); an M3 Max (300 GB/s) does not (8.9),
     // and takes the 35B-A3B as a GGUF build, whose memory does not grow after it loaded. Both
     // at 131072 tokens, 0.966 and 0.971 of the budget.
@@ -846,18 +916,44 @@ describe('every memory size, with the stock catalogue', () => {
     expect(result.headline).toEqual({ text: LOCAL_MODEL_LABELS.noneMemory, vars: { memory: '8' } });
     // The smallest model a harness can work with needs more than four times the budget.
     const smallest = Math.min(...STOCK.models.map((m) => needBytes(m, 65536)));
-    expect(formatGb(smallest)).toBe('10.2');
+    expect(formatGb(smallest)).toBe('9.3');
     expect(smallest / result.budgetBytes).toBeGreaterThan(4);
   });
 
-  it('gives no model to 8 and 16 GB, a small model to every Mac from 18 to 32 GB, and every larger one a model of 27 billion or more', () => {
+  it('offers Muse Glimmer as the MLX build from 48 GB only, and never as the pick of a Mac whose disk has room', () => {
+    // Measured on a 48 GB Mac: 45,000 bytes held per token and up to 8 GiB of prefix snapshots,
+    // 36.1 GB at 65536 tokens. Runtime issue 18269 reports this build stuck, and a restart, on
+    // a 32 GB Mac: the figures keep it away from there.
     for (const hw of SWEEP) {
       const result = recommend(hw, STOCK, ALL_INSTALLED);
       const label = `${hw.memClassGb} GB ${hw.chip}`;
-      if (hw.memClassGb <= 16) expect(result.reason, label).toBe('memory');
-      else if (hw.memClassGb <= 32) {
+      const offered = rows(result).some((c) => c.modelId === 'muse-glimmer:30b-mlx');
+      expect(offered, label).toBe(hw.memClassGb >= 48);
+      expect(result.pick?.modelId, label).not.toBe('muse-glimmer:30b-mlx');
+    }
+    // The 32 GB Mac with a Max chip keeps the GGUF build as its pick.
+    const m1max = recommend(mac(32, 'Apple M1 Max'), STOCK, ALL_INSTALLED);
+    expect(m1max.pick?.modelId).toBe('muse-glimmer:30b-q4_k_m');
+  });
+
+  it('gives no model to 8 GB, a small model to every Mac from 16 to 24 GB, and every Mac from 36 GB a model of 27 billion or more', () => {
+    for (const hw of SWEEP) {
+      const result = recommend(hw, STOCK, ALL_INSTALLED);
+      const label = `${hw.memClassGb} GB ${hw.chip}`;
+      if (hw.memClassGb <= 8) expect(result.reason, label).toBe('memory');
+      else if (hw.memClassGb <= 24) {
         expect(result.verdict, label).toBe('limited');
         expect(result.pick?.paramsB, label).toBe(9);
+      } else if (hw.memClassGb === 32) {
+        // A model of 30 billion fits, so the Mac is not `limited`. It is dense: the pick only
+        // where it is not slow (a chip this file knows is fast, or one it knows nothing about).
+        expect(result.verdict, label).toBe('ok');
+        expect(
+          rows(result).map((c) => c.modelId),
+          label
+        ).toContain('muse-glimmer:30b-q4_k_m');
+        expect(result.pick?.paramsB, label).toBe(hw.chip === 'Apple M4' ? 9 : 29.6);
+        if (hw.chip === 'Apple M4') expect(result.notes[0], label).toEqual({ text: LOCAL_MODEL_LABELS.noteSmallPick });
       } else {
         expect(result.verdict, label).toBe('ok');
         expect(result.pick?.paramsB, label).toBeGreaterThanOrEqual(27);
@@ -1274,10 +1370,18 @@ describe('verdict none', () => {
       const oneShort = recommend(withFree(cut - 1), STOCK, ALL_INSTALLED);
       expect(oneShort.pick?.modelId).toBe('qwen3.6:35b-a3b-mtp-q4_k_m');
       expect(oneShort.headline.text).toBe(LOCAL_MODEL_LABELS.headlineOk);
-      // At 33 GB neither 35B-A3B build has room: North Mini Code, and the tested pair is named.
+      // At 33 GB neither 35B-A3B build has room: the next rank whose speed is `ok` and whose
+      // download fits is Muse Glimmer as the MLX build (19.1 GB), and the tested pair is named.
       const short = recommend(withFree(33 * GB), STOCK, ALL_INSTALLED);
       expect(short.verdict).toBe('ok');
-      expect(short.pick?.modelId).toBe('north-mini-code-1.0:q4_k_m');
+      expect(short.pick).toMatchObject({
+        modelId: 'muse-glimmer:30b-mlx',
+        context: 65536,
+        fit: 'tight',
+        tested: false,
+      });
+      // Below 29.8 GB that build has no room either, and North Mini Code (18.6 GB) is the pick.
+      expect(recommend(withFree(29.5 * GB), STOCK, ALL_INSTALLED).pick?.modelId).toBe('north-mini-code-1.0:q4_k_m');
       expect(short.notes).toEqual([
         { text: LOCAL_MODEL_LABELS.noteDiskDropped, vars: { model: 'Qwen3.6 35B-A3B', missing: '0.8' } },
         { text: LOCAL_MODEL_LABELS.noteUntested },
@@ -1620,11 +1724,13 @@ describe('the ranking', () => {
     expect(result.pick).toMatchObject({ context: 1024, fit: 'tight', budgetShare: 0.92 });
   });
 
-  it('lists each model once, never the pick again, and at most four alternatives', () => {
-    expect(MAX_ALTERNATIVES).toBe(4);
-    // Seven models fit a 128 GB Mac; the pick plus four are shown.
+  it('lists each model once, never the pick again, and every model that fits', () => {
+    // The bound is above what either catalogue holds, so nothing that fits is cut off.
+    expect(MAX_ALTERNATIVES).toBe(11);
+    for (const [, catalog] of BOTH) expect(catalog.models.length - 1).toBeLessThanOrEqual(MAX_ALTERNATIVES);
+    // Seven models fit a 128 GB Mac: the pick and all six others are shown.
     const result = recommend(mac(128, 'Apple M5 Ultra'), RULES, ALL_INSTALLED);
-    expect(result.alternatives).toHaveLength(4);
+    expect(result.alternatives).toHaveLength(6);
     const ids = rows(result).map((c) => c.modelId);
     expect(new Set(ids).size).toBe(ids.length);
     for (const [, catalog] of BOTH) {
@@ -1633,8 +1739,25 @@ describe('the ranking', () => {
         const sweptIds = rows(swept).map((c) => c.modelId);
         expect(new Set(sweptIds).size).toBe(sweptIds.length);
         expect(swept.alternatives.length).toBeLessThanOrEqual(MAX_ALTERNATIVES);
+        // Every model that fits at a context a harness works at is on the list (the sweep's
+        // Macs have 500 GB of free disk, so none is left out for room).
+        const fitting = catalog.models.filter((m) =>
+          m.contexts.some((ctx) => ctx >= 65536 && modelFitsBudget(hw, catalog, m.id, ctx))
+        );
+        expect([...sweptIds].sort(), `${hw.memClassGb} GB ${hw.chip}`).toEqual(fitting.map((m) => m.id).sort());
       }
     }
+  });
+
+  it('still cuts a list longer than the bound, and the install can only take what is listed', () => {
+    // Fourteen models that all fit: the pick and MAX_ALTERNATIVES others, best rank first.
+    const many = catalogOf(
+      Array.from({ length: 14 }, (_, index) => modelNeeding(`m${index + 1}:x`, GIB, { rank: index + 1 }))
+    );
+    const result = recommend(HUNDRED_GIB_MAC, many, [fact('alpha')]);
+    expect(rows(result)).toHaveLength(1 + MAX_ALTERNATIVES);
+    expect(rows(result)[0].modelId).toBe('m14:x');
+    expect(rows(result).at(-1)?.modelId).toBe('m3:x');
   });
 });
 
@@ -1642,9 +1765,12 @@ describe('harnesses', () => {
   const hw = mac(48, 'Apple M4 Max');
 
   it('never chooses a gated harness, even when it is the only one that could run a model', () => {
+    // The rule is tested on the rules catalogue, which gates one harness. The stock catalogue
+    // gates none since 2026-11-10; the sweep still runs on it, so a row gated again is covered.
+    expect(RULES.harnesses.filter((row) => row.gated).map((row) => row.cli)).toEqual(['pi']);
+    expect(STOCK.harnesses.filter((row) => row.gated)).toEqual([]);
     for (const [, catalog] of BOTH) {
       const gated = catalog.harnesses.filter((row) => row.gated).map((row) => row.cli);
-      expect(gated).toEqual(['pi']);
       for (const swept of SWEEP) {
         const result = recommend(swept, catalog, ALL_INSTALLED);
         for (const candidate of rows(result)) {
@@ -2064,6 +2190,8 @@ describe('what each row of the chooser carries', () => {
       'qwen3.5:9b-q8_0': 'estimated',
       'qwen3.5:9b': 'estimated',
       'gpt-oss:20b': 'estimated',
+      // Slow on this chip, so it was the sixth row: listed since the list holds every model.
+      'qwen3.8:27b-q8_0': 'estimated',
     });
   });
 });
@@ -2075,10 +2203,21 @@ describe('the measured budget, end to end', () => {
     const measured = recommend(hw, STOCK, ALL_INSTALLED, { measuredTotalBytes: MACBOOK_MEASURED_TOTAL });
     expect([estimated.budgetSource, estimated.budgetGb]).toEqual(['estimated', '37.6']);
     expect([measured.budgetSource, measured.budgetGb]).toEqual(['measured', '40.2']);
-    // The same rows in the same order; only the share of each changes.
-    expect(order(measured)).toEqual(order(estimated));
-    expect(rows(estimated).map((c) => c.budgetShare)).toEqual([0.957, 0.767, 0.692, 0.303, 0.303]);
-    expect(rows(measured).map((c) => c.budgetShare)).toEqual([0.895, 0.717, 0.647, 0.283, 0.283]);
+    // The same models in the same order. The share of each changes, and two models step up a
+    // context: the 27B in 8 bits fits 65536 tokens under the estimate (0.975) and 131072 under
+    // what the runtime reported (0.976), and Muse Glimmer as the MLX build goes from 65536
+    // (0.960) to its whole window of 131072 (0.972).
+    expect(rows(measured).map((c) => c.modelId)).toEqual(rows(estimated).map((c) => c.modelId));
+    const stepped = order(estimated).filter((entry, index) => order(measured)[index] !== entry);
+    expect(stepped).toEqual(['muse-glimmer:30b-mlx@65536', 'qwen3.8:27b-q8_0@65536']);
+    expect(order(measured)).toContain('qwen3.8:27b-q8_0@131072');
+    expect(order(measured)).toContain('muse-glimmer:30b-mlx@131072');
+    expect(rows(estimated).map((c) => c.budgetShare)).toEqual([
+      0.957, 0.767, 0.96, 0.692, 0.303, 0.278, 0.303, 0.853, 0.975, 0.576,
+    ]);
+    expect(rows(measured).map((c) => c.budgetShare)).toEqual([
+      0.895, 0.717, 0.972, 0.647, 0.283, 0.26, 0.283, 0.798, 0.976, 0.539,
+    ]);
     for (const candidate of rows(measured)) {
       expect(candidate.budgetShare).toBeCloseTo(candidate.needBytes / MACBOOK_MEASURED_TOTAL, 3);
     }

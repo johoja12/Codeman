@@ -64,6 +64,7 @@ import {
   type PiConfig,
   type GrokConfig,
   type CopilotConfig,
+  type JcodeConfig,
   type DeepSeekConfig,
   type OmpConfig,
   type SessionRemote,
@@ -165,6 +166,7 @@ import {
 } from './session-cli-builder.js';
 import {
   SessionAutoOps,
+  type ContextReport,
   type CheckpointObservation,
   type CheckpointProgress,
   type CheckpointState,
@@ -986,6 +988,7 @@ export class Session extends EventEmitter {
   private _watching: string | null = null;
   /** Last `prompt_cache` report from the statusline exporter; null until Claude sends one. */
   private _promptCache: PromptCacheStatus | null = null;
+  private _contextReport: ContextReport | null = null;
   /** Prompt-cache keep-warm opt-in; undefined = follow the app-wide default. Persisted. */
   private _keepWarmEnabled: boolean | undefined;
   /** Last status the keep-warm service published for this session; ephemeral. */
@@ -1179,6 +1182,8 @@ export class Session extends EventEmitter {
   private _grokConfig: GrokConfig | undefined;
   // GitHub Copilot configuration (only for mode === 'copilot')
   private _copilotConfig: CopilotConfig | undefined;
+  // jcode configuration (only for mode === 'jcode')
+  private _jcodeConfig: JcodeConfig | undefined;
 
   // DeepSeek Harness configuration (only for mode === 'deepseek')
   private _deepSeekConfig: DeepSeekConfig | undefined;
@@ -1336,6 +1341,8 @@ export class Session extends EventEmitter {
       /** Grok configuration (only for mode === 'grok') */
       grokConfig?: GrokConfig;
       copilotConfig?: CopilotConfig;
+      /** jcode configuration (only for mode === 'jcode') */
+      jcodeConfig?: JcodeConfig;
       /** DeepSeek Harness configuration (only for mode === 'deepseek') */
       deepSeekConfig?: DeepSeekConfig;
       /** OMP configuration (only for mode === 'omp') */
@@ -1574,6 +1581,11 @@ export class Session extends EventEmitter {
       this._copilotConfig = config.copilotConfig;
     }
 
+    // Apply jcode configuration
+    if (config.jcodeConfig) {
+      this._jcodeConfig = config.jcodeConfig;
+    }
+
     // Apply env overrides (exported at spawn, not persisted to disk).
     // Legacy migration: pre-0.7.2 carried effort as the CLAUDE_CODE_EFFORT_LEVEL env var,
     // which hard-locks /effort switching. Extract it into _effort (--settings soft default)
@@ -1699,6 +1711,7 @@ export class Session extends EventEmitter {
       isIdleAutomationBlocked: () => this.blocksIdleAutomation,
       isStopped: () => this._isStopped,
       getTotalTokens: () => this._totalInputTokens + this._totalOutputTokens,
+      getContextReport: () => this._contextReport,
       getSessionId: () => this.id,
     });
     this._autoOps.on('autoCompact', (data) => this.emit('autoCompact', data));
@@ -1919,6 +1932,7 @@ export class Session extends EventEmitter {
     // rather than show the previous conversation's "warm until" against the new one; the
     // next statusline render repopulates. A same-id reattach returned above, untouched.
     this._promptCache = null;
+    this._contextReport = null;
   }
 
   /**
@@ -2319,6 +2333,17 @@ export class Session extends EventEmitter {
     const changed = JSON.stringify(next) !== JSON.stringify(prev);
     this._promptCache = next;
     return changed;
+  }
+
+  /**
+   * Take the context size from a statusline report and run the threshold checks on it. The
+   * token paths above cannot do this: they only run when the counter moves, and the counter
+   * does not see the cached context.
+   */
+  noteContextReport(report: ContextReport): void {
+    this._contextReport = report;
+    this._autoOps.checkAutoCompact();
+    this._autoOps.checkAutoClear();
   }
 
   /** Prompt-cache keep-warm opt-in; undefined means the app-wide default applies. */
@@ -3345,6 +3370,7 @@ export class Session extends EventEmitter {
       autoResumeEnabled: this._autoOps.autoResumeEnabled,
       autoResumeAt: this._autoOps.autoResumeAt ?? undefined,
       promptCache: this._promptCache ?? undefined,
+      contextWindowSize: this._contextReport?.windowSize,
       statusLineExporter: this.statusLineExporter,
       keepWarmEnabled: this._keepWarmEnabled,
       keepWarm: this._keepWarm ?? undefined,
@@ -3380,6 +3406,7 @@ export class Session extends EventEmitter {
       piConfig: this._piConfig,
       grokConfig: this._grokConfig,
       copilotConfig: this._copilotConfig,
+      jcodeConfig: this._jcodeConfig,
       deepSeekConfig: this._deepSeekConfig,
       ompConfig: this._ompConfig,
       resumeSessionId: this._resumeSessionId,
@@ -3845,6 +3872,7 @@ export class Session extends EventEmitter {
       piConfig: this._piConfig,
       grokConfig: this._grokConfig,
       copilotConfig: this._copilotConfig,
+      jcodeConfig: this._jcodeConfig,
       deepSeekConfig: this._deepSeekConfig,
       // OMP resolution/pinning does NOT happen here. This object is built
       // EAGERLY — including on every boot-recovery reattach, before anyone
@@ -4436,6 +4464,7 @@ export class Session extends EventEmitter {
             piConfig: this._piConfig,
             grokConfig: this._grokConfig,
             copilotConfig: this._copilotConfig,
+            jcodeConfig: this._jcodeConfig,
             deepSeekConfig: this._deepSeekConfig,
             ompConfig: this._ompConfig,
             resumeSessionId: this._resumeSessionId,
@@ -5087,6 +5116,7 @@ export class Session extends EventEmitter {
       piConfig: this._piConfig,
       grokConfig: this._grokConfig,
       copilotConfig: this._copilotConfig,
+      jcodeConfig: this._jcodeConfig,
       deepSeekConfig: this._deepSeekConfig,
       ompConfig: this._ompConfig,
     };
@@ -6321,9 +6351,9 @@ export class Session extends EventEmitter {
   // Matches patterns like "123.4k tokens", "5234 tokens", "1.2M tokens"
   //
   // SAFETY LIMITS:
-  // - Max tokens per session: 500k (Claude's context is ~200k)
+  // - Max tokens per session: MAX_SESSION_TOKENS (the largest context Claude reports is 1M)
   // - Max delta per update: 100k (prevents sudden jumps from parsing errors)
-  // - Rejects "M" suffix values > 0.5 (500k) to prevent false matches
+  // - Rejects "M" suffix values above that maximum to prevent false matches
   private parseTokensFromStatusLine(cleanData: string): void {
     // Quick pre-check: skip expensive regex if "token" not present (performance optimization)
     if (!cleanData.includes('token')) return;
@@ -6341,9 +6371,8 @@ export class Session extends EventEmitter {
       if (suffix === 'k') {
         tokenCount *= 1000;
       } else if (suffix === 'm') {
-        // Safety: Reject M values that would result in > 500k tokens
-        // Claude's context window is ~200k, so anything claiming millions is likely a false match
-        if (tokenCount > 0.5) {
+        // Safety: anything claiming more than the largest context is likely a false match
+        if (tokenCount * 1000000 > MAX_SESSION_TOKENS) {
           console.warn(
             `[Session ${this.id}] Rejected suspicious M token value: ${tokenMatch[0]} (would be ${tokenCount * 1000000} tokens)`
           );
@@ -6379,6 +6408,7 @@ export class Session extends EventEmitter {
         this._totalOutputTokens += Math.round(delta * 0.4);
 
         // Check if we should auto-compact or auto-clear
+        this._autoOps.noteAbsoluteCounter();
         this._autoOps.checkAutoCompact();
         this._autoOps.checkAutoClear();
       }

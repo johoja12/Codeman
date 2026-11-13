@@ -166,6 +166,7 @@ import {
   applyWorkspaceHooks,
   refreshStaleCodemanHooks,
   verifyClaudeSessionStartHookCapability,
+  applyApprovalHookFile,
 } from '../../hooks-config.js';
 import { generateClaudeMd } from '../../templates/claude-md.js';
 import { imageWatcher } from '../../image-watcher.js';
@@ -240,6 +241,7 @@ import {
 import { resolveCaseRepository, resolveManagedWorktree } from '../../git-worktrees.js';
 import { LRUMap } from '../../utils/lru-map.js';
 import { describeUnknownPath, probePathKind, type PathProbeOptions } from '../../utils/index.js';
+import { claudeProjectsDir } from '../../utils/claude-transcript.js';
 import { findLatestOmpSessionId } from '../../utils/omp-session-resolver.js';
 import { scanOmpSessionsHistory } from '../../omp-transcript.js';
 import { scanCodexSessionsHistory, codexThreadBySessionId } from '../../codex-transcript.js';
@@ -1275,6 +1277,19 @@ export function registerSessionRoutes(
     onCreateReady?: (create: (request: FastifyRequest) => Promise<unknown>) => void;
   } = {}
 ): RemoteWakeRegistry {
+  /**
+   * Install the approval hook MODULE a CLI declares (`capabilities.approvalHookFile`,
+   * omp) into a LOCAL workspace, so its approval dialogs raise an alert. Shared by
+   * POST /api/sessions and POST /api/quick-start so the two cannot drift; callers own
+   * the remote/Docker/named-workspace conditions and call it only after the launch
+   * pre-flight. Gated on `workspaceHooksEnabled` like Claude's block. Best-effort: a
+   * failure here must not fail the create.
+   */
+  const installApprovalHook = async (mode: SessionMode, workspace: string): Promise<void> => {
+    const fileName = getCli(mode)?.capabilities.approvalHookFile;
+    if (!fileName || !(await ctx.getWorkspaceHooksEnabled())) return;
+    await applyApprovalHookFile(workspace, fileName).catch(() => {});
+  };
   // Wake-on-LAN for sleeping remote hosts (see remote-wake.ts). One registry per
   // route registration (= one web server) — the same shape as the process-wide
   // `sessionWaits` singleton, but without the global.
@@ -1594,6 +1609,13 @@ export function registerSessionRoutes(
       }
     }
 
+    // Approval hook module (omp): after the pre-flight, like the agent skill below, so a
+    // CLI that cannot start leaves nothing in the workspace. Same remote and
+    // named-workingDir conditions as the hooks above.
+    if (!remote && body.workingDir) {
+      await installApprovalHook(body.mode ?? 'claude', workingDir);
+    }
+
     // Agent skill (docs/agent-control-plan.md §2): ADD-ONLY on create, same shared-
     // workspace rationale as the statusLine above: a create must never remove the
     // skill from under other live sessions in the repo. Marker-guarded, so a user's
@@ -1711,6 +1733,8 @@ export function registerSessionRoutes(
       piConfig: mode === 'pi' ? gatedPiConfig : undefined,
       grokConfig: mode === 'grok' ? gatedGrokConfig : undefined,
       copilotConfig: mode === 'copilot' ? gatedCopilotConfig : undefined,
+      // No bypass switch to clamp (jcode has no approval prompts), so the body's own config.
+      jcodeConfig: mode === 'jcode' ? launchBody.jcodeConfig : undefined,
       deepSeekConfig: mode === 'deepseek' ? gatedDeepSeekConfig : undefined,
       ompConfig: resolveOmpConfigForCreate(mode, workingDir, launchBody.ompConfig),
       resumeSessionId: validatedResumeId,
@@ -3202,7 +3226,8 @@ export function registerSessionRoutes(
   const claudeHistoryPinCache = new LRUMap<string, { submitAt: number; claudeSessionId: string }>({ maxSize: 1024 });
   async function resolveActiveClaudeSessionIdFromHistory(
     session: Session,
-    projectsDir: string
+    projectsDir: string,
+    historyPath: string
   ): Promise<string | null> {
     // A pane whose conversation id came from its OWN hook needs no correlation:
     // $CODEMAN_SESSION_ID (the pane's env) -> data.session_id (the CLI's own
@@ -3229,7 +3254,6 @@ export function registerSessionRoutes(
       if (s.lastSubmitAt) otherSubmits.push(s.lastSubmitAt);
     }
 
-    const historyPath = join(homedir(), '.claude', 'history.jsonl');
     const stat = await fs.stat(historyPath).catch(() => null);
     if (!stat || stat.size === 0) return null;
     const tail = await readFileTail(historyPath, Buffer.alloc(CLAUDE_HISTORY_TAIL_BYTES), stat.size);
@@ -3461,6 +3485,32 @@ export function registerSessionRoutes(
   }
 
   /**
+   * Where THIS session's claude keeps its conversations: `<config dir>/projects` and
+   * `<config dir>/history.jsonl`. The session's own `CLAUDE_CONFIG_DIR` override (#255) comes
+   * first, then the server's (a pane inherits it through tmux), then `~/.claude`: the order
+   * `claudeProjectsDir()` gives the relaunch pin and the Edit history panel. Looking under
+   * `~/.claude` alone showed "No response yet" for every session on a relocated folder (#701).
+   *
+   * ⚠️ A relocated folder is a path somebody chose, and it can sit on a mount that stopped
+   * answering, so it is probed bounded first (#516, without `pastCap`: agents poll this).
+   * Anything but a directory answers null, which callers read as "no transcript", never as a
+   * reason to look under `~/.claude` instead: a file of the same name there is another
+   * conversation. The default folder is not probed, so that path is unchanged.
+   *
+   * ⚠️ Local sessions only read their own override: in a Docker case or on a remote host the
+   * value names a folder over there, and the same path on this host is somebody else's.
+   */
+  async function claudeConversationDirs(
+    session: Session
+  ): Promise<{ projectsDir: string; historyPath: string } | null> {
+    const local = !session.remote && !session.docker;
+    const projectsDir = claudeProjectsDir(local ? session.claudeConfigDir() : undefined);
+    const relocated = projectsDir !== join(homedir(), '.claude', 'projects');
+    if (relocated && (await probePathKind(projectsDir)) !== 'directory') return null;
+    return { projectsDir, historyPath: join(dirname(projectsDir), 'history.jsonl') };
+  }
+
+  /**
    * Mirror a rename into the conversation's `/resume` title (claude-session-title.ts).
    * Local Claude-format transcripts only: a remote pane's transcript lives on the remote host and a
    * docker pane's inside the container (HOME=/home/agent), never under the host's projects dir. Best
@@ -3475,11 +3525,13 @@ export function registerSessionRoutes(
     )
       return;
     try {
-      const projectsDir = join(process.env.HOME || '/tmp', '.claude', 'projects');
       const hookPath = ctx.getTranscriptPath(session.id);
+      const dirs = hookPath ? null : await claudeConversationDirs(session);
       const transcript = hookPath
         ? { sessionId: basename(hookPath, '.jsonl'), path: hookPath }
-        : await findClaudeTranscript(projectsDir, session.claudeSessionId || session.id, session.id);
+        : dirs
+          ? await findClaudeTranscript(dirs.projectsDir, session.claudeSessionId || session.id, session.id)
+          : null;
       if (transcript) await appendClaudeCustomTitle(transcript.path, transcript.sessionId, session.name);
     } catch (err) {
       console.warn(`[Session] Could not carry rename into the Claude transcript for ${session.id}:`, err);
@@ -3625,13 +3677,36 @@ export function registerSessionRoutes(
       };
     }
 
-    // Scan ~/.claude/projects/*/ for the transcript file
-    const projectsDir = join(process.env.HOME || '/tmp', '.claude', 'projects');
+    // An external CLI with no transcript reader that the pane segmenter cannot read either
+    // (jcode: a repainting alternate-screen TUI, whose segmented stream served its welcome
+    // banner as "the answer", measured) has nothing honest to return. Empty, "nothing said
+    // yet", like the DeepSeek reader above: the Claude scan below would otherwise go looking
+    // in ~/.claude/projects and could adopt a Claude conversation from the same folder.
+    // `codeman agent read --source terminal` / MCP `read_output` still read the screen.
+    {
+      const caps = getCli(session.mode)?.capabilities;
+      if (caps?.external && caps.transcript === 'none') {
+        return context === 'full' || context === 'turn'
+          ? { text: '', timestamp: '', messages: [] }
+          : { text: '', timestamp: '' };
+      }
+    }
+
+    // `turn` is the brief view's context: the last ANSWERED turn's assistant
+    // messages, so a multi-row answer is not reduced to its final row. `text`
+    // stays the last assistant row in every mode (agent pollers hash it).
+    const wantsMessages = context === 'full' || context === 'turn';
+
+    // Scan <config dir>/projects/*/ for the transcript file: the session's own Claude config
+    // folder when it was relocated, else the server's, else ~/.claude.
+    const dirs = await claudeConversationDirs(session);
+    if (!dirs) return wantsMessages ? { text: '', timestamp: '', messages: [] } : { text: '', timestamp: '' };
+    const { projectsDir, historyPath } = dirs;
 
     // Adopt the current conversation id if the user ran `/clear` — Claude CLI's
     // interactive PTY emits no JSON on stdout, so without this lookup the
     // stored id stays pinned to the pre-/clear transcript.
-    const activeId = await resolveActiveClaudeSessionIdFromHistory(session, projectsDir);
+    const activeId = await resolveActiveClaudeSessionIdFromHistory(session, projectsDir, historyPath);
     if (activeId && activeId !== session.claudeSessionId) {
       session.adoptClaudeSessionId(activeId);
       ctx.agentActivity.identityChanged(session);
@@ -3648,10 +3723,6 @@ export function registerSessionRoutes(
       }
     }
 
-    // `turn` is the brief view's context: the last ANSWERED turn's assistant
-    // messages, so a multi-row answer is not reduced to its final row. `text`
-    // stays the last assistant row in every mode (agent pollers hash it).
-    const wantsMessages = context === 'full' || context === 'turn';
     const claudeSessionId = session.claudeSessionId || session.id;
     const transcript = await findClaudeTranscript(projectsDir, claudeSessionId, session.id);
     if (!transcript) {
@@ -4690,6 +4761,7 @@ export function registerSessionRoutes(
       piConfig,
       grokConfig,
       copilotConfig,
+      jcodeConfig,
       deepSeekConfig,
       ompConfig,
       envOverrides,
@@ -4770,6 +4842,7 @@ export function registerSessionRoutes(
         piConfig ||
         grokConfig ||
         copilotConfig ||
+        jcodeConfig ||
         deepSeekConfig ||
         ompConfig ||
         openCodeConfig ||
@@ -4838,6 +4911,7 @@ export function registerSessionRoutes(
         piConfig ||
         grokConfig ||
         copilotConfig ||
+        jcodeConfig ||
         deepSeekConfig ||
         ompConfig ||
         openCodeConfig ||
@@ -4956,6 +5030,7 @@ export function registerSessionRoutes(
             piConfig,
             grokConfig,
             copilotConfig,
+            jcodeConfig,
             deepSeekConfig,
           } as unknown as Record<string, unknown>)
         );
@@ -5039,7 +5114,7 @@ export function registerSessionRoutes(
         writeFileSync(join(resolvedCasePath, 'CLAUDE.md'), claudeMd);
 
         // Write .claude/settings.local.json with hooks for desktop notifications
-        // (Claude-specific — OpenCode, Codex, Gemini, Antigravity, Pi, Grok, DeepSeek and OMP use their own systems)
+        // (Claude-specific — OpenCode, Codex, Gemini, Antigravity, Pi, Grok, DeepSeek, OMP and jcode use their own systems)
         if (
           mode !== 'opencode' &&
           mode !== 'codex' &&
@@ -5047,7 +5122,8 @@ export function registerSessionRoutes(
           mode !== 'antigravity' &&
           mode !== 'pi' &&
           mode !== 'grok' &&
-          mode !== 'omp'
+          mode !== 'omp' &&
+          mode !== 'jcode'
         ) {
           await writeHooksConfig(resolvedCasePath);
         }
@@ -5088,6 +5164,13 @@ export function registerSessionRoutes(
       } else {
         await refreshStaleCodemanHooks(workspacePath).catch(() => {});
       }
+    }
+
+    // Approval hook module (omp), for a new AND an existing case. The launch pre-flight
+    // above has passed. Local only: a remote case path lives on another host, and a Docker
+    // pane cannot reach the loopback API (`approvalHookAvailableForMode()` answers no there).
+    if (!remote && !docker) {
+      await installApprovalHook(mode, workspacePath);
     }
 
     // Agent skill injection (docs/agent-control-plan.md §2): ADD-ONLY on create,
@@ -5155,6 +5238,7 @@ export function registerSessionRoutes(
       piConfig,
       grokConfig,
       copilotConfig,
+      jcodeConfig,
       deepSeekConfig,
       ompConfig,
     };
@@ -5389,6 +5473,7 @@ export function registerSessionRoutes(
       piConfig: mode === 'pi' ? qsGatedPiConfig : undefined,
       grokConfig: mode === 'grok' ? qsGatedGrokConfig : undefined,
       copilotConfig: mode === 'copilot' ? qsGatedCopilotConfig : undefined,
+      jcodeConfig: mode === 'jcode' ? qsLaunchConfigs.jcodeConfig : undefined,
       deepSeekConfig: mode === 'deepseek' ? qsGatedDeepSeekConfig : undefined,
       ompConfig: qsResolvedOmpConfig,
       envOverrides: qsGatedEnvOverrides,

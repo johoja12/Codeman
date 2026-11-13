@@ -5,7 +5,7 @@
 <h2 align="center">Mission control for AI coding agents</h2>
 
 <p align="center">
-  <em>Claude Code &bull; OpenCode &bull; Codex &bull; Antigravity &bull; Gemini &bull; Pi &bull; Grok &bull; DeepSeek &bull; OMP &bull; Copilot &bull; Terminal - One Dashboard &bull; Any Device</em>
+  <em>Claude Code &bull; OpenCode &bull; Codex &bull; Antigravity &bull; Gemini &bull; Pi &bull; Grok &bull; DeepSeek &bull; OMP &bull; Copilot &bull; jcode &bull; Terminal - One Dashboard &bull; Any Device</em>
 </p>
 
 <p align="center">
@@ -33,7 +33,7 @@
   <img src="docs/images/tiles-crt-stats-1600-20261010.gif" alt="Codeman tile grid: six live agents (DeepSeek Harness, Claude Code, Pi, Codex, OpenCode and a shell) powering on and off with the CRT animation, with the live header strip showing CPU, memory and Claude plan usage" width="800">
 </p>
 
-**Codeman** is a self-hosted mission control for AI coding agents. It spawns Claude Code, OpenCode, Codex, Antigravity, Gemini, Pi, Grok, DeepSeek Harness, OMP, or GitHub Copilot CLI inside persistent tmux sessions, streams the real terminal to any browser, and keeps agents productive after you walk away: it re-prompts on idle, resumes when a usage limit resets, runs scheduled jobs, and shows every background agent working in real time.
+**Codeman** is a self-hosted mission control for AI coding agents. It spawns Claude Code, OpenCode, Codex, Antigravity, Gemini, Pi, Grok, DeepSeek Harness, OMP, GitHub Copilot CLI, or jcode inside persistent tmux sessions, streams the real terminal to any browser, and keeps agents productive after you walk away: it re-prompts on idle, resumes when a usage limit resets, runs scheduled jobs, and shows every background agent working in real time.
 
 Get started in one line (macOS & Linux, Windows via WSL):
 
@@ -50,7 +50,7 @@ The installer asks before every system change, and re-running the same line upda
 
 On a Mac you can skip the terminal: [download Codeman.dmg](https://github.com/Ark0N/Codeman/releases/latest/download/Codeman.dmg), and the app installs Codeman for you, opens the one already running, or connects to one on another machine. More in [On a Mac: the Codeman app](#on-a-mac-the-codeman-app).
 
-- **One dashboard, ten CLIs** - run [Claude Code, OpenCode, Codex, Antigravity, Gemini, Pi, Grok, DeepSeek, OMP, or GitHub Copilot](#more-features) per session (plus plain shell), locally, [in Docker](#isolated-docker-sessions), or [over SSH](#remote-ssh-sessions), with your own dashboards open as [web tabs](#more-features) beside them
+- **One dashboard, eleven CLIs** - run [Claude Code, OpenCode, Codex, Antigravity, Gemini, Pi, Grok, DeepSeek, OMP, GitHub Copilot, or jcode](#more-features) per session (plus plain shell), locally, [in Docker](#isolated-docker-sessions), or [over SSH](#remote-ssh-sessions), with your own dashboards open as [web tabs](#more-features) beside them
 - **Truly phone-friendly** - a [touch-optimized terminal](#mobile-optimized-web-ui) with instant local echo, QR login, swipe navigation, and push notifications
 - **Runs while you sleep** - [idle detection + respawn cycling](#respawn-controller) and auto-resume when a subscription limit resets, for 24+ hour unattended runs
 - **See your agents think** - [live floating windows](#live-agent-visualization) for every subagent and teammate, with real-time transcripts
@@ -79,7 +79,7 @@ This installs Node.js, tmux and a build toolchain if missing (node-pty ships no 
 - **No administrator rights needed.** On an account without `sudo`, one whose `sudo` rights the installer cannot confirm (outside the `sudo`, `wheel` and `admin` groups, with a password still required) or a Mac account that is not an administrator and has no Homebrew it can write to, the installer downloads Node.js from nodejs.org and the tmux project's own build into `~/.codeman/runtime`, each checked against its SHA-256, and takes the source as an archive when there is no working git. `--no-admin` forces that route and `CODEMAN_NO_ADMIN=0` turns it off. Two limits: Linux needs make, a C++ compiler and python3 to be there already, and the tmux download needs macOS 15 or newer. Details in the [wiki](https://github.com/Ark0N/Codeman/wiki/Installation#without-administrator-rights).
 - **Flags for the impatient.** `curl -fsSL https://getcodeman.com/install | bash -s -- --tailscale --service` answers the questions from the command line (`--lan`, `--local`, `--run`, `--no-start`, `--name <n>`, `--port <n>`, `--yes` too). **CI / headless:** without a terminal attached, steps that would change your system abort with instructions instead of running silently; set `CODEMAN_NONINTERACTIVE=1` to approve them for automation.
 
-You'll need at least one AI coding CLI installed — [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenCode](https://opencode.ai), [Codex](https://developers.openai.com/codex/cli), [Antigravity](https://antigravity.google), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Pi](https://pi.dev), [Grok Build](https://github.com/xai-org/grok-build), [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), [OMP](https://github.com/can1357/oh-my-pi), or [GitHub Copilot CLI](https://github.com/github/copilot-cli) (any combination works; Gemini CLI is enterprise-only since Google's consumer cutover, and Antigravity is its successor). The installer detects whichever of the ten is present; if none is found, it offers to install any of them from a menu (DeepSeek excepted, since its npm package installs only a launcher with no runnable profile), or you can skip and install one yourself later. After install:
+You'll need at least one AI coding CLI installed — [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenCode](https://opencode.ai), [Codex](https://developers.openai.com/codex/cli), [Antigravity](https://antigravity.google), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [Pi](https://pi.dev), [Grok Build](https://github.com/xai-org/grok-build), [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), [OMP](https://github.com/can1357/oh-my-pi), [GitHub Copilot CLI](https://github.com/github/copilot-cli), or [jcode](https://jcode.sh) (any combination works; Gemini CLI is enterprise-only since Google's consumer cutover, and Antigravity is its successor). The installer detects whichever of the eleven is present; if none is found, it offers to install any of them from a menu (DeepSeek excepted, since its npm package installs only a launcher with no runnable profile), or you can skip and install one yourself later. After install:
 
 ```bash
 codeman web
@@ -108,7 +108,7 @@ The first run asks three questions (data folder, port, password; Enter takes the
 
 **[Download Codeman.dmg](https://github.com/Ark0N/Codeman/releases/latest/download/Codeman.dmg)** · one universal app for Apple Silicon and Intel · macOS 11.3 or later
 
-A small native app that opens Codeman in its own window. On a Mac without Codeman it installs it for you, with no Terminal and no administrator password, shows the install as a checklist, and offers to install a coding agent if the Mac has none yet. On a Mac that already runs Codeman it finds the server and opens it, or starts it when it is stopped. Under **Another machine** it connects to Codeman on your Mac mini, a home server or your tailnet, with the password kept in the Keychain, and can start an install over there through SSH. On a MacBook Pro with a PROLED XDR display, whose lid logo lights up, **View > Blink Apple Logo** makes the logo show what your agents are doing: it breathes while they work, blinks when one waits for you and flashes when one needs permission, and each state can take a style of your own. It stays off until you turn it on. The app is Rust around macOS's own WebKit, not a bundled browser, so the download is under 5 MB.
+A small native app that opens Codeman in its own window. On a Mac without Codeman it installs it for you, with no Terminal and no administrator password, shows the install as a checklist, and offers to install a coding agent if the Mac has none yet. On a Mac that already runs Codeman it finds the server and opens it, or starts it when it is stopped. Under **Another machine** it connects to Codeman on your Mac mini, a home server or your tailnet, with the password kept in the Keychain, and can start an install over there through SSH. On a MacBook Pro with a PROLED XDR display, whose lid logo lights up, **View > Blink Apple Logo** makes the logo show what your agents are doing: it breathes while they work, blinks when one waits for you and flashes when one needs permission, and each state can take a style of your own. It stays off until you turn it on. To turn the logo off, dim it or give it effects the rest of the time, there's [LogoLight](https://github.com/Ark0N/LogoLight) (`brew install --cask ark0n/tap/logolight`), which steps aside while Codeman blinks the logo. The app is Rust around macOS's own WebKit, not a bundled browser, so the download is under 5 MB.
 
 Open `Codeman.dmg`, drag Codeman into Applications and open it from there. macOS asks once whether to open an app downloaded from the internet: click **Open**.
 
@@ -290,7 +290,7 @@ Click **+ New Session** (or **Quick Start**). A session is one AI CLI running in
 | Field                        | What it does                                                                                                        |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------------- |
 | **Working directory / case** | The folder the agent operates in. A "case" is just a named working dir Codeman remembers. **Add Case** creates one from scratch, links an existing folder, or clones a GitHub repo straight into one (**Clone Repo**). |
-| **CLI / run mode**           | `Claude` (default), `OpenCode`, `Codex`, `Antigravity`, `Gemini`, `Pi`, `Grok`, `DeepSeek`, `OMP`, `Copilot`, or `Terminal` (plain shell). |
+| **CLI / run mode**           | `Claude` (default), `OpenCode`, `Codex`, `Antigravity`, `Gemini`, `Pi`, `Grok`, `DeepSeek`, `OMP`, `Copilot`, `jcode`, or `Terminal` (plain shell). |
 | **Model**                    | Per-session model (App Settings → Models → New Claude sessions). A soft default — `/model` still works in-session.                  |
 | **Effort / Ultracode**       | Reasoning effort (`low`–`max`) or `ultracode` for dynamic multi-agent workflows. Switchable anytime with `/effort`. |
 
@@ -483,6 +483,8 @@ The title is templated into the served HTML on first byte, so it's correct from 
 | **110k tokens** | Auto `/compact` | Context summarized, work continues |
 | **140k tokens** | Auto `/clear`   | Fresh start with `/init`           |
 
+Both are opt-in per session, and the thresholds go up to the model's window. Claude sessions are measured by the context size on the statusline, cache reads included; everything else by Codeman's token counter.
+
 ### Tab Alerts
 
 <p align="center">
@@ -518,7 +520,7 @@ PTY Output → 16ms Server Batch → DEC 2026 Wrap → SSE → Client rAF → xt
 - **Clone a GitHub repo as a case** — paste a repository URL into **Add Case → Clone Repo** and Codeman clones it into `~/codeman-cases/<name>` and registers it as a normal case, ready to run an agent in. It preflights the URL while you type (tells you whether it can be cloned anonymously and offers the repo's real branches and tags for the optional branch/tag field), fills the case name in from the URL, and lets you pick which CLI the Run button should use. Public repositories over `https://`; Codeman never collects or stores credentials
 - **Create a case in a custom folder** — tick **Create in a custom folder** in **Add Case → Create New**, pick a parent folder (Browse included) and a name, and Codeman scaffolds the new case there instead of `~/codeman-cases`. The target must be a new or empty folder; system directories, your home folder itself, credential trees such as `~/.ssh`, and Codeman's own data folder are refused. Admin only in multi-user mode.
 - **Open a tmux session you started by hand**: a tmux session started outside Codeman shows up on the home screen, on this machine automatically and in your Docker cases' containers or on your saved SSH hosts when you scan for them. One click opens it as a tab. Closing the tab only detaches, and Codeman will not respawn or relaunch an agent it did not start. See [Opened outside Codeman](docs/wiki/The-Dashboard.md#opened-outside-codeman).
-- **Multi-CLI** — run **Claude Code**, **OpenCode**, **Codex**, **Antigravity**, **Gemini**, **Pi**, **Grok**, **DeepSeek Harness**, **OMP**, or **GitHub Copilot CLI** per session; env-var prefixes auto-gate (`CLAUDE_CODE_*` vs `OPENCODE_*` vs `CODEX_*` vs `ANTIGRAVITY_*` vs `GEMINI_*`/`GOOGLE_*` vs `PI_*` vs `GROK_*`/`XAI_*` vs `DSH_*`/`DEEPSEEK_*` vs `OMP_*` vs `COPILOT_*`). See [`docs/opencode-integration.md`](docs/opencode-integration.md), [`docs/pi-integration.md`](docs/pi-integration.md), [`docs/grok-integration.md`](docs/grok-integration.md), [`docs/deepseek-integration.md`](docs/deepseek-integration.md) [`docs/omp-integration.md`](docs/omp-integration.md) and [`docs/copilot-integration.md`](docs/copilot-integration.md)
+- **Multi-CLI** — run **Claude Code**, **OpenCode**, **Codex**, **Antigravity**, **Gemini**, **Pi**, **Grok**, **DeepSeek Harness**, **OMP**, **GitHub Copilot CLI**, or **jcode** per session; env-var prefixes auto-gate (`CLAUDE_CODE_*` vs `OPENCODE_*` vs `CODEX_*` vs `ANTIGRAVITY_*` vs `GEMINI_*`/`GOOGLE_*` vs `PI_*` vs `GROK_*`/`XAI_*` vs `DSH_*`/`DEEPSEEK_*` vs `OMP_*` vs `COPILOT_*`). See [`docs/opencode-integration.md`](docs/opencode-integration.md), [`docs/pi-integration.md`](docs/pi-integration.md), [`docs/grok-integration.md`](docs/grok-integration.md), [`docs/deepseek-integration.md`](docs/deepseek-integration.md), [`docs/omp-integration.md`](docs/omp-integration.md), [`docs/copilot-integration.md`](docs/copilot-integration.md) and [`docs/jcode-integration.md`](docs/jcode-integration.md) (jcode takes no env prefix: its tools run in one shared daemon)
 - **Custom model endpoints** _(new in 1.29.0, HTTP API for now)_ — point a session's CLI at any OpenAI-compatible endpoint instead of its native backend: a local llama.cpp, llama-swap, Ollama or vLLM box, or a cloud gateway such as Azure AI Foundry or OpenRouter. Save an endpoint once (`POST /api/model-endpoints`; its models are discovered from `/v1/models`), apply it to a session (`POST /api/sessions/:id/custom-model`), and the CLI restarts in place on that endpoint. Verified live for Claude, OpenCode, Pi, Grok and OMP; Codex, Gemini and DeepSeek have documented gaps, Antigravity has no mechanism. A toolbar picker is the follow-up. See [`docs/custom-model-endpoints.md`](docs/custom-model-endpoints.md)
 - **A model on this Mac** _(experimental, new in 1.50.0)_: on a Mac with Apple silicon, **Run a local model** on the welcome screen shows which coding model fits, installs it with its runtime and a coding agent, and starts a session on it: no account, no API key, and the prompts and files of that session go to a model on this Mac, not to a cloud provider. Then mix cloud and local: through the [codeman skill](#the-agent-skill-start-here) a Claude Code session hands work to that model (`spawn_worker <name> local`, `sendmark`) and reads the answer back, so Claude plans and reviews in the cloud while the Mac does the bulk: summaries, first drafts, files that should stay here. See [`docs/local-models.md`](docs/local-models.md)
 - **Web tabs** — open Grafana, Uptime Kuma, a Vite dev server or any dashboard URL as a tab beside your sessions (Run dropdown → **Web / URL** → **Add URL**). Dashboards are proxied through Codeman's own origin, so an `http://` target works from a phone over HTTPS and through the tunnel, single-page apps route on their own paths, and a frame that reloads recovers itself. A `localhost` link an agent prints opens as a web tab automatically. See [`docs/web-tabs.md`](docs/web-tabs.md)
@@ -1000,7 +1002,7 @@ for _ in $(seq 1 10); do
 done
 printf '%s\n' "$TXT"
 
-# 5b. Other modes (shell/opencode/gemini/antigravity/pi/grok/omp/copilot) have no transcript:
+# 5b. Other modes (shell/opencode/gemini/antigravity/pi/grok/omp/copilot/jcode) have no transcript:
 #     read the terminal. ⚠️ Use terminal?tail=, NOT /output: the latter's textOutput
 #     is empty for every tmux-backed (i.e. every interactive) session. tail counts
 #     BYTES, and what comes back is terminal data, ANSI included.
@@ -1241,7 +1243,7 @@ flowchart TB
         end
 
         subgraph External["External"]
-            CLI["AI CLI<br/><small>Claude Code / OpenCode / Codex / Antigravity / Gemini / Pi / Grok / DeepSeek / OMP / GitHub Copilot</small>"]
+            CLI["AI CLI<br/><small>Claude Code / OpenCode / Codex / Antigravity / Gemini / Pi / Grok / DeepSeek / OMP / GitHub Copilot / jcode</small>"]
             BG["Background Agents<br/><small>(Task tool)</small>"]
         end
     end

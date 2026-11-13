@@ -39,6 +39,7 @@ describe('SessionAutoOps auto-resume', () => {
       isIdleAutomationBlocked: () => activityBlocked,
       isStopped: () => stopped,
       getTotalTokens: () => 0,
+      getContextReport: () => null,
       getSessionId: () => 'test-session',
     });
   });

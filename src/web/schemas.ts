@@ -496,6 +496,30 @@ const CopilotConfigSchema = z
   .optional();
 
 /**
+ * Schema for jcode (1jehuang/jcode)-specific configuration.
+ *
+ * jcode has no approval prompts and no bypass flag, so there is nothing for the
+ * multi-user clamp to touch.
+ */
+const JcodeConfigSchema = z
+  .object({
+    model: z
+      .string()
+      .max(100)
+      .regex(/^[a-zA-Z0-9._\-/]+$/)
+      .optional(),
+    // A session id (`session_fox_<ms>_<hex>`) or short name (`fox`). Leading
+    // alphanumeric: --resume's value is optional, so a value starting with `-`
+    // would be parsed as a flag of its own.
+    resumeSessionId: z
+      .string()
+      .max(100)
+      .regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/)
+      .optional(),
+  })
+  .optional();
+
+/**
  * Schema for OMP CLI-specific configuration.
  */
 const OmpConfigSchema = z
@@ -659,6 +683,7 @@ export const CreateSessionSchema = z.object({
   piConfig: PiConfigSchema,
   grokConfig: GrokConfigSchema,
   copilotConfig: CopilotConfigSchema,
+  jcodeConfig: JcodeConfigSchema,
   deepSeekConfig: DeepSeekConfigSchema,
   ompConfig: OmpConfigSchema,
   /** Resume a previous Claude conversation by its session ID (used for reboot recovery) */
@@ -759,6 +784,7 @@ export const StatusTelemetrySchema = z.object({
           used_percentage: z.number().nullish(),
           total_input_tokens: z.number().nullish(),
           total_output_tokens: z.number().nullish(),
+          context_window_size: z.number().nullish(),
         })
         .nullish(),
       cost: z.object({ total_cost_usd: z.number().nullish() }).nullish(),
@@ -906,6 +932,7 @@ const RemoteCommandOverridesSchema = z
     deepseek: z.string().min(1).max(300).optional(),
     omp: z.string().min(1).max(300).optional(),
     copilot: z.string().min(1).max(300).optional(),
+    jcode: z.string().min(1).max(300).optional(),
   })
   .strict()
   .optional();
@@ -1379,6 +1406,7 @@ export const QuickStartSchema = z.object({
   piConfig: PiConfigSchema,
   grokConfig: GrokConfigSchema,
   copilotConfig: CopilotConfigSchema,
+  jcodeConfig: JcodeConfigSchema,
   deepSeekConfig: DeepSeekConfigSchema,
   ompConfig: OmpConfigSchema,
   envOverrides: safeEnvOverridesSchema,
@@ -2697,14 +2725,20 @@ const localModelId = z
   .max(200)
   .regex(/^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/, 'Invalid model id');
 
+/**
+ * A coding agent as a CLI registry id. A request-shape check only: the real gate is the
+ * service's own lookup of the id among the catalogue harnesses it offers right now.
+ */
+const localModelCli = z
+  .string()
+  .max(64)
+  .regex(/^[a-z0-9][a-z0-9_-]*$/, 'Invalid coding agent id');
+
 /** POST /api/local-model/install: the row the person chose and the size they confirmed. */
 export const LocalModelInstallSchema = z
   .object({
     modelId: localModelId,
-    cli: z
-      .string()
-      .max(64)
-      .regex(/^[a-z0-9][a-z0-9_-]*$/, 'Invalid coding agent id'),
+    cli: localModelCli,
     context: z.number().int().positive().max(MAX_DISCOVERED_CONTEXT_TOKENS),
     acknowledgedBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   })
@@ -2720,6 +2754,15 @@ export const LocalModelRuntimeSchema = z
 
 /** DELETE /api/local-model. The body may be empty. */
 export const LocalModelRemoveSchema = z.object({ removeModel: z.boolean().optional() }).strict();
+
+/** POST /api/local-model/use: a checked model of the library to switch to. */
+export const LocalModelUseSchema = z.object({ modelId: localModelId }).strict();
+
+/** DELETE /api/local-model/models: one model of the store, by its name. Never a path. */
+export const LocalModelDeleteSchema = z.object({ modelId: localModelId }).strict();
+
+/** POST /api/local-model/agent: one more coding agent to install beside an installed model. */
+export const LocalModelAgentSchema = z.object({ cli: localModelCli }).strict();
 
 /**
  * A shell-safe bare word, mirroring `config/cli-registry/schema.ts`'s own `shellToken` —

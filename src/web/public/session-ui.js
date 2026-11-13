@@ -97,6 +97,15 @@ const RUN_MODE_LAUNCH = {
     // The multi-user clamp forces it back off for non-granted owners server-side.
     buildConfig: () => ({ copilotConfig: { allowAll: true } }),
   },
+  jcode: {
+    label: 'jcode',
+    installHint: 'jcode not found. Install with: curl -fsSL https://jcode.sh/install | bash',
+    // No custom endpoint recipe yet: jcode's provider lives in its shared daemon, not the pane.
+    supportsCustomModel: false,
+    // Deliberately no jcodeConfig: jcode has no approval prompts, so there is no bypass
+    // switch to opt into (same as pi).
+    buildConfig: () => null,
+  },
   grok: {
     runMethod: 'runGrok',
     label: 'Grok',
@@ -2806,6 +2815,10 @@ Object.assign(CodemanApp.prototype, {
     return this._runCliMode('copilot');
   },
 
+  async runJcode() {
+    return this._runCliMode('jcode');
+  },
+
 
   // ═══════════════════════════════════════════════════════════════
   // Session Options Modal
@@ -2920,7 +2933,11 @@ Object.assign(CodemanApp.prototype, {
     // Populate respawn config from saved state
     this.loadSavedRespawnConfig(sessionId);
 
-    // Populate auto-compact/clear from session state
+    // Populate auto-compact/clear from session state. A threshold above the model's window
+    // can never fire, so the inputs stop there once the statusline has reported it.
+    const maxThreshold = session.contextWindowSize ?? 1000000;
+    document.getElementById('modalAutoCompactThreshold').max = maxThreshold;
+    document.getElementById('modalAutoClearThreshold').max = maxThreshold;
     document.getElementById('modalAutoCompactEnabled').checked = session.autoCompactEnabled ?? false;
     document.getElementById('modalAutoCompactThreshold').value = session.autoCompactThreshold ?? 110000;
     document.getElementById('modalAutoCompactPrompt').value = session.autoCompactPrompt ?? '';

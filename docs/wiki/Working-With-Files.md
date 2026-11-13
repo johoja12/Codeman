@@ -8,7 +8,8 @@ until you get home.
 
 A panel that browses the active session's working directory, or the git worktree its agent
 moved into ([Git Worktrees](Git-Worktrees#when-an-agent-moves-into-a-worktree)). Its header
-button is on by default; if it is missing, re-enable it in **App Settings → Header & Panels**.
+button is on by default on a desktop and off on a phone. The setting is per device: switch it
+in **App Settings → Header & Panels** on the device you want it on.
 
 The panel and its search list up to 5,000 files and folders per load, shallow levels first and
 taking turns between folders, so one huge folder cannot use up that limit before the ones after it,
@@ -76,6 +77,11 @@ convenient:
 - **`.git/` is denied outright.** Hooks are executable code, and a corrupted index looks
   unrecoverable to someone who wanted to fix a typo.
 - **Non-UTF-8 content is refused**, verified by a round-trip comparison.
+- **Dotenv files are editable, other credential files are not.** `.env`, `.env.local` and
+  `prod.env` open in the editor like any config file, and a save keeps the file's mode (a
+  `0600` file stays `0600`) and, where your account may set it, its group, so a `.env` a web
+  server reads through its group stays readable. `.npmrc`, `credentials.json`, anything under
+  `.ssh/` and Codeman's own `~/.codeman/.env` stay read-only here.
 
 ## Attachments
 

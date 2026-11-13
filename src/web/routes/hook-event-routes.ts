@@ -13,12 +13,25 @@ import { HookEventSchema, isValidWorkingDir } from '../schemas.js';
 import { sanitizeHookData, parseBody } from '../route-helpers.js';
 import { persistDockerCaseClaudeSessionId } from '../../docker-hosts.js';
 import { getDataDir } from '../../config/instance.js';
-import { sessionWaits, hooksAvailableForMode, sessionHookOptions } from '../session-wait-registry.js';
+import {
+  sessionWaits,
+  hooksAvailableForMode,
+  approvalHookAvailableForMode,
+  sessionHookOptions,
+} from '../session-wait-registry.js';
 import { getCli } from '../../config/cli-registry/registry.js';
 import { approvalInbox, type ApprovalKind } from '../approval-inbox.js';
 import { buildPaneCapture } from '../pane-capture.js';
 import type { SessionPort, EventPort, RespawnPort, ConfigPort, InfraPort, AgentActivityPort } from '../ports/index.js';
 import type { HookKind } from '../../session-agent-activity-coordinator.js';
+
+/**
+ * The only events an approval-only hook module (`capabilities.approvalHookFile`, omp)
+ * sends: a dialog opened, and a dialog closed. Anything else claimed for such a session
+ * (`stop`, `idle_prompt`) is a signal it can never legitimately emit, so it is dropped
+ * like any other mode-gated forgery.
+ */
+const APPROVAL_HOOK_EVENTS = new Set(['permission_prompt', 'elicitation_complete']);
 
 /** Hook events that open an Approvals Inbox item. */
 const APPROVAL_KIND_BY_EVENT: Record<string, ApprovalKind> = {
@@ -158,6 +171,13 @@ export function registerHookEventRoutes(
     // could never legitimately emit one is now dropped instead of steering another
     // agent's control flow.
     const waitSession = ctx.sessions.get(sessionId);
+    // An approval-only session (omp) reports dialogs and nothing else, so it reaches the
+    // `blocked` half of the gate and never the `stop` half.
+    const approvalOnly =
+      !!waitSession &&
+      !hooksAvailableForMode(waitSession.mode, sessionHookOptions(waitSession)) &&
+      approvalHookAvailableForMode(waitSession.mode, sessionHookOptions(waitSession)) &&
+      APPROVAL_HOOK_EVENTS.has(event);
     if (waitSession && hooksAvailableForMode(waitSession.mode, sessionHookOptions(waitSession))) {
       if (event === 'stop') {
         sessionWaits.notifySignal(sessionId, 'stop');
@@ -165,6 +185,8 @@ export function registerHookEventRoutes(
       } else if (event === 'permission_prompt' || event === 'elicitation_dialog') {
         sessionWaits.notifySignal(sessionId, 'blocked');
       }
+    } else if (approvalOnly && event === 'permission_prompt') {
+      sessionWaits.notifySignal(sessionId, 'blocked');
     }
     // Even a mode-mismatched stop remains raw evidence in the run summary.
     if (event === 'stop' && waitSession && !hooksAvailableForMode(waitSession.mode, sessionHookOptions(waitSession)))
@@ -296,7 +318,7 @@ export function registerHookEventRoutes(
     // replacement would forget the item was unseen, or that a person had seen it). With no idle
     // item pending, the keep-alive's idle prompt opens a pre-acknowledged one.
     const keepsPendingIdle = keepAliveReason !== undefined && approvalInbox.getForSession(sessionId)?.kind === 'idle';
-    if (session && hooksAvailableForMode(session.mode, sessionHookOptions(session))) {
+    if (session && (hooksAvailableForMode(session.mode, sessionHookOptions(session)) || approvalOnly)) {
       if (approvalKind === 'idle' && keepsPendingIdle) {
         // Left in place: no new item, and the broadcast below carries the keep-alive reason.
       } else if (approvalKind) {
@@ -307,6 +329,9 @@ export function registerHookEventRoutes(
         const toolSummary = toolInput
           ? [toolInput.command, toolInput.file_path, toolInput.description].find((v) => typeof v === 'string')
           : undefined;
+        // Visible tmux frame first (it IS the dialog); raw byte-buffer tail as
+        // the fallback for direct-PTY sessions and the no-op test mux.
+        const readFrame = buildPaneCapture(session, ctx.mux);
         const item = approvalInbox.notePrompt({
           sessionId,
           sessionName,
@@ -316,18 +341,25 @@ export function registerHookEventRoutes(
           toolSummary: typeof toolSummary === 'string' ? toolSummary : undefined,
           message: typeof safeData.message === 'string' ? safeData.message : undefined,
           cwd: typeof safeData.cwd === 'string' ? safeData.cwd : undefined,
-          // Supervised-hook CLIs (DeepSeek Harness): dialog keystrokes are unverifiable,
-          // so the item is an alert — answer in the terminal. Capability-gated, not by
-          // mode id, so a future supervised CLI inherits the same shape.
-          answerInTerminal: getCli(session.mode)?.capabilities.hooks === 'supervised',
+          // Supervised-hook CLIs (DeepSeek Harness) and approval-only hook modules (omp):
+          // dialog keystrokes are unverifiable (the inbox's re-capture parses Claude's
+          // numbered dialog only, and omp's composer keeps taking typing while its prompt
+          // is docked, so a `1` would land there), so the item is an alert — answer in
+          // the terminal. Capability-gated, not by mode id.
+          answerInTerminal: getCli(session.mode)?.capabilities.hooks === 'supervised' || approvalOnly,
           // What the pane says is still running in the background. An idle prompt from a
           // session that is watching its own work opens acknowledged, so it never arms an
           // alert nobody can answer; notePrompt() carries the whole reasoning.
           watching: session.watching,
           preAcknowledged: keepAliveReason,
-          // Visible tmux frame first (it IS the dialog); raw byte-buffer tail as
-          // the fallback for direct-PTY sessions and the no-op test mux.
-          capture: buildPaneCapture(session, ctx.mux),
+          // An approval-only module (omp) clears its own item with `elicitation_complete`,
+          // so its frame is taken ONCE, as the card's context, and never read again, like
+          // an item raised from the screen (web/screen-blocked.ts). The inbox's re-read is
+          // shaped for Claude's numbered dialog: omp's has no numbered rows, but an agent's
+          // plan above it does, so the list was parsed as the item's options, and once it
+          // scrolled out of the frame the item was resolved as answered in the terminal
+          // while omp still waited.
+          ...(approvalOnly ? { context: readFrame() ?? undefined } : { capture: readFrame }),
         });
         approvalId = item.id;
         acknowledgedReason = item.acknowledgedReason;
@@ -366,9 +398,12 @@ export function registerHookEventRoutes(
         sessionId,
         sessionName,
         ...safeData,
-        // Supervised-hook CLIs answer in the terminal: omit approvalId so push
-        // cannot offer Approve/Deny that the answer route would refuse.
-        ...(approvalId && session && getCli(session.mode)?.capabilities.hooks !== 'supervised' && { approvalId }),
+        // Supervised-hook CLIs and approval-only modules answer in the terminal: omit
+        // approvalId so push cannot offer Approve/Deny that the answer route would refuse.
+        ...(approvalId &&
+          session &&
+          getCli(session.mode)?.capabilities.hooks !== 'supervised' &&
+          !approvalOnly && { approvalId }),
       });
     }
 

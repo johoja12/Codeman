@@ -3680,12 +3680,7 @@ class CodemanApp {
         const quote = copyBtn.closest('.rv-quote-wrap')?.querySelector('blockquote');
         const text = code ? code.textContent || '' : quote ? this._quoteBlockText(quote) : null;
         const ok = text !== null ? await this._copyText(text) : false;
-        copyBtn.classList.remove('rv-copied', 'rv-copy-failed');
-        copyBtn.classList.add(ok ? 'rv-copied' : 'rv-copy-failed');
-        clearTimeout(copyBtn._resetTimer);
-        copyBtn._resetTimer = setTimeout(() => {
-          copyBtn.classList.remove('rv-copied', 'rv-copy-failed');
-        }, 1500);
+        this._setCopyControlState(copyBtn, ok);
         return;
       }
 
@@ -3909,7 +3904,27 @@ class CodemanApp {
     );
   }
 
-  /** Copy the raw Markdown source of the latest response without rendering it first. */
+  /**
+   * The raw Markdown of the newest answer in a message list: every row of its
+   * turn, or the last row when the reader emits no numeric turns (Codex, the
+   * pane parser). Tool and status blocks share the assistant role but are not
+   * the answer.
+   */
+  _responseViewerMarkdownFrom(messages) {
+    const answers = messages.filter(
+      (msg) => msg && (msg.role === 'assistant' || (!msg.role && msg.kind === 'response'))
+        && (!msg.kind || msg.kind === 'response') && msg.text?.trim()
+    );
+    const last = answers[answers.length - 1];
+    if (!last) return '';
+    if (typeof last.turn !== 'number') return last.text;
+    return answers
+      .filter((msg) => msg.turn === last.turn)
+      .map((msg) => msg.text)
+      .join('\n\n');
+  }
+
+  /** Copy the raw Markdown source of the answer the response viewer is showing. */
   async copyResponseViewerMarkdown() {
     const button = document.getElementById('responseViewerCopyMarkdown');
     const markdown = this._responseViewerMarkdown || '';
@@ -4272,9 +4287,11 @@ class CodemanApp {
                   ? 'OMP'
                   : mode === 'copilot'
                     ? 'GitHub Copilot'
-                    : mode === 'opencode'
-                      ? 'OpenCode'
-                      : 'Claude';
+                    : mode === 'jcode'
+                      ? 'jcode'
+                      : mode === 'opencode'
+                        ? 'OpenCode'
+                        : 'Claude';
   }
 
   async toggleResponseViewer() {
@@ -4327,7 +4344,7 @@ class CodemanApp {
         }
       }
 
-      this._responseViewerMarkdown = lastResponse;
+      this._responseViewerMarkdown = this._responseViewerMarkdownFrom(turnMessages) || lastResponse;
 
       const body = document.getElementById('responseViewerBody');
       if (turnMessages.length > 0) {
@@ -4414,11 +4431,9 @@ class CodemanApp {
         return;
       }
 
-      const lastResponse = [...messages].reverse().find((msg) => {
-        const kind = msg.kind || (msg.role === 'user' ? 'prompt' : 'response');
-        return kind === 'response';
-      });
-      if (lastResponse) this._responseViewerMarkdown = lastResponse.text || '';
+      // Keep the brief view's answer when this history holds none of its own.
+      this._responseViewerMarkdown = this._responseViewerMarkdownFrom(messages) || this._responseViewerMarkdown;
+
 
       // Turn segmentation (one message per model message) lives INSIDE the block
       // renderer, which is the only full-view renderer here: it renders transcript
@@ -12830,7 +12845,9 @@ class CodemanApp {
                       ? 'Kill Tmux & OMP'
                       : session.mode === 'copilot'
                         ? 'Kill Tmux & GitHub Copilot'
-                        : 'Kill Tmux & Claude Code';
+                        : session.mode === 'jcode'
+                          ? 'Kill Tmux & jcode'
+                          : 'Kill Tmux & Claude Code';
     }
 
     document.getElementById('closeConfirmModal').classList.add('active');

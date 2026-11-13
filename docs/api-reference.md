@@ -211,11 +211,15 @@ a genuine tunnel failure looks like, and `204` cannot carry `waitedMs` / `status
 `limitPaused`. Reserve error handling for the four codes in the table below.
 
 **2. `stop` fires only for `claude` (and `deepseek`) sessions, `blocked` also for
-`codex`.** Both come from Claude Code hooks, and no other mode installs them: `shell`
-runs no agent, and the external CLIs render their own TUIs and post no hooks
-(`deepseek`'s status bridge reports the same two, see its own docs). The one exception
-is `blocked` on `codex`: Codeman reads codex's approval, question and trust dialogs off
-its screen and raises `blocked` for them (see [Signals](#signals)). For every other mode
+`codex` and a local `omp` session.** Both come from Claude Code hooks, and no other mode
+installs them: `shell` runs no agent, and the external CLIs render their own TUIs and post
+no hooks (`deepseek`'s status bridge reports the same two, see its own docs). There are two
+exceptions, both for `blocked` alone. On `codex`, Codeman reads codex's approval, question
+and trust dialogs off its screen and raises `blocked` for them. On `omp`, Codeman installs
+a hook module into the session's workspace that forwards omp's own tool approval events
+(a local session only: nothing is installed for a remote, Docker or adopted one, where
+`blocked` stays a 400, and omp asks nothing while its `tools.approvalMode` is the default
+`yolo`). See [Signals](#signals). For every other mode
 only `idle`, `working` and `exit` are accepted. `exit` is dependable everywhere; `idle` and
 `working` are screen-checked for `opencode`, `gemini`, `pi`, `omp` and `antigravity` (as for `claude` and
 `codex`) and not guaranteed elsewhere: see the caveats under [Signals](#signals) before
@@ -249,7 +253,7 @@ contract is a **marker unique to each call** (`MARK="DONE_$RANDOM"`, send
 | `idle` | the session's own `idle` event | `claude`: yes, on ❯-prompt detection after activity. `codex`, `opencode`, `gemini`, `pi`, `omp`, `antigravity`: yes, the same screen check through the prompt marker and working line each declares (`capabilities.workDetect`); an `antigravity` session waiting on a shell-command approval stays `working` until it is answered. `shell`: **once only**, ~500 ms after start, and never again. Other external CLIs (`grok`, `deepseek`): not guaranteed (they render their own TUIs and readiness is output stabilization) |
 | `working` | the session's own `working` event | `claude`, plus `codex`, `opencode`, `gemini`, `pi`, `omp` and `antigravity` through the working line each declares. Elsewhere not guaranteed: it rests on generic output heuristics such as a braille spinner glyph |
 | `stop` | the Claude Code `stop` hook, the definitive end-of-turn signal | `claude` (and `deepseek`) only |
-| `blocked` | a `permission_prompt` or `elicitation_dialog` hook; on `codex`, a dialog read off its screen | `claude`, `deepseek` and `codex`; on `claude` rarer than it looks: see below |
+| `blocked` | a `permission_prompt` or `elicitation_dialog` hook; on `codex`, a dialog read off its screen; on `omp`, its own tool approval event, forwarded by the hook module Codeman installs | `claude`, `deepseek`, `codex` and a local `omp` session; on `claude` rarer than it looks: see below |
 | `exit` | no process is behind the session | every mode |
 
 `stop` is the signal to orchestrate on where it exists; `idle` is a heuristic
@@ -1169,6 +1173,14 @@ that sends the report, decided when the pane starts: `injected` (it does), `coll
 `.claude/settings.local.json` sets its own `statusLine`, which Codeman never replaces) or
 `remote` (remote and Docker sessions). Absent when unknown.
 
+`contextWindowSize` is the model's context window in tokens from the same report (200000,
+or 1000000 with extended context), absent until a report carries it and dropped, like
+`promptCache`, on a post-`/clear` conversation switch. It is the upper bound for
+`autoCompactThreshold` and `autoClearThreshold` (1000000 while it is absent): a higher value
+is stored as the window, and Session Options stops its two inputs there. The thresholds
+themselves are compared with the report's `context_window.total_input_tokens`, cache reads
+included, and with the session's token counter for a launch without the exporter.
+
 ## Placing a new session in a tab group (`tabGroupId`)
 
 `POST /api/v1/sessions` and `POST /api/v1/quick-start` accept an optional
@@ -1280,8 +1292,9 @@ the tab to be tried again: Codeman never starts a local process in its place.
 
 Cross-session queue of prompts waiting on a human (permission dialogs,
 AskUserQuestion questions, idle prompts). Answerable items come from Claude-mode
-sessions only; DeepSeek Harness (its status bridge) and Codex (dialogs read off its
-screen) open **alert-only** items with `answerInTerminal: true`. Items are
+sessions only; DeepSeek Harness (its status bridge), Codex (dialogs read off its
+screen) and omp (its tool approval events, through the hook module Codeman installs)
+open **alert-only** items with `answerInTerminal: true`. Items are
 in-memory (a server restart drops them; the next prompt re-fires the hook, and a
 codex dialog still on screen is read again after the pane re-attaches).
 Design: [`approvals-inbox-plan.md`](approvals-inbox-plan.md).
@@ -1687,6 +1700,23 @@ Read and write the CLI registry (`docs/cli-registry.md`). Every **write** route 
 | `PUT`    | `/api/clis/custom/:id`        | `{ label, shortBadge, binaries, argv, enabled? }`       | Replace an existing custom entry. An absent `enabled` keeps the entry's current state. `400` for a stock id, `404` for an unknown one. |
 | `DELETE` | `/api/clis/:id`               | none                                                    | Delete a custom entry. `400` for a stock id, `404` for an unknown one.                                  |
 
+### Per-CLI availability probes
+
+Each agent CLI has a read-only probe, `GET /api/<mode>/status`, which answers
+`{ available, path }` for the binary the server would launch (no session needed, not gated).
+`pi`, `grok`, `omp`, `copilot` and `jcode` add `version`, since their binary names are short or shared
+with unrelated programs and the resolver rejects a candidate whose `--version` has the wrong
+shape; `deepseek` answers a wider shape (`runnable`, `profiles`, ...). `GET /api/jcode/status`
+is answered by the generic registry resolver, the same one a jcode spawn uses, so it applies
+the entry's `jcode v<semver>` version anchor.
+
+A jcode session takes `jcodeConfig: { model?, resumeSessionId? }` on `POST /api/sessions`
+and `POST /api/quick-start` (`--model`, `--resume`; the resume value is a jcode session id or
+short name and must start with a letter or digit). jcode takes no `envOverrides` prefix, and
+`GET /api/sessions/:id/last-response` answers an empty `text` (and `messages: []` with
+`?context=full`) for it: read its screen with `GET /api/sessions/:id/terminal?tail=` instead.
+See `docs/jcode-integration.md`.
+
 ## MCP server sync
 
 Copies MCP servers between the agent CLIs' own user-level config files (`docs/cli-registry.md`, "MCP server sync"). **Opt-in:** both routes answer `403 FORBIDDEN` while the synced `mcpSyncEnabled` setting is off (the default), and for a non-admin in multi-user mode, because the routes write files in the server user's home. A second `POST` while one is running answers `409 CONFLICT`.
@@ -1766,7 +1796,7 @@ Only replies from `allowedUserIds`, in `guildId`, inside a thread the bridge cre
 
 ## Local model
 
-`GET /api/local-model` looks at the machine the server runs on and says which local coding model fits it, with which agent CLI, and where an install of one stands. Five verbs install a model, pause and continue the install, stop and start the model runtime, and remove everything again. It covers Apple silicon macOS only; anywhere else the GET is still a `200`, with verdict `none`, and nothing can be installed. How it works: [local-models.md](local-models.md).
+`GET /api/local-model` looks at the machine the server runs on and says which local coding model fits it, with which agent CLI, where an install of one stands and which models are on the machine. Eight verbs install a model (a first one, or another one beside it), switch to a model that is already there, pause and continue a job, stop and start the model runtime, delete one model, install one more agent CLI beside an installed model, and remove everything again. It covers Apple silicon macOS only; anywhere else the GET is still a `200`, with verdict `none`, and nothing can be installed. How it works: [local-models.md](local-models.md).
 
 **Experimental.** These routes and their payloads are labeled experimental: the fields below, the states, the error codes and the sentences may change or go in a MINOR or PATCH release (see [versioning-policy.md](versioning-policy.md), "What SemVer does NOT cover", item 3). Do not build on their shape yet.
 
@@ -1775,11 +1805,14 @@ Every route is admin only in multi-user mode (`403 FORBIDDEN`, answered before a
 | Method   | Path                       | Body                                             | Notes                                                                                                                                                                                                                                                  |
 | -------- | -------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `GET`    | `/api/local-model`         | none                                             | `200` with `{ hardware, recommendation, catalogUpdated, install }`. `500 INTERNAL_ERROR` only when the recommendation itself fails, never for a failed probe.                                                                                             |
-| `POST`   | `/api/local-model/install` | `{ modelId, cli, context, acknowledgedBytes }`   | Starts the one install job and answers at once; the job runs on in the server. `400 INVALID_INPUT` when the three choices are not a row the server offers right now. `409`: `job-running`, `already-installed`, `size-changed`.                         |
+| `POST`   | `/api/local-model/install` | `{ modelId, cli, context, acknowledgedBytes }`   | Starts the one install job and answers at once; the job runs on in the server. With a model installed it adds another one: the earlier model stays on disk, and the new one is the model in use when the job ends. `400 INVALID_INPUT` when the three choices are not a row the server offers right now. `409`: `job-running`, `already-installed` (this model at this context is the one in use), `size-changed`, `sessions-open`. |
+| `POST`   | `/api/local-model/use`     | `{ modelId }`                                    | Switches to a model of `install.library` whose `actions` list `use`. A job of the two steps `verify` and `connect`; nothing is downloaded. `400 INVALID_INPUT` when the model is not a checked model of the library, or no coding agent for it is installed. `409`: `job-running`, `wrong-state` (nothing is installed), `already-installed`, `sessions-open`. |
 | `POST`   | `/api/local-model/cancel`  | none                                             | Interrupts the step in flight; the job is `paused` at that step. `409 wrong-state` when no job is running.                                                                                                                                                |
 | `POST`   | `/api/local-model/resume`  | `{ newPort? }` (may be absent)                   | Continues a `paused` or `failed` job at the same step. `newPort: true` chooses another port first. `409`: `job-running`, `wrong-state`, `sessions-open` (`newPort` while live sessions use the model).                                                  |
 | `POST`   | `/api/local-model/runtime` | `{ action: "start" \| "stop", newPort? }`        | `stop` stops the runtime and keeps it from starting at the next boot; `start` undoes that. `newPort: true` with `start` chooses another port and moves the saved endpoint to it. `409`: `job-running`, `wrong-state` (nothing is installed), `sessions-open` (`stop` or `newPort` while live sessions use the model: their agents keep calling the address they were started with). |
-| `DELETE` | `/api/local-model`         | `{ removeModel? }` (may be absent)               | Stops the runtime, removes the saved endpoint, restores the settings flag when this feature switched it on and no other endpoint is saved, deletes the runtime; the model only with `removeModel: true`. `409`: `job-running`, `sessions-open`.        |
+| `DELETE` | `/api/local-model`         | `{ removeModel? }` (may be absent)               | Stops the runtime, removes the saved endpoint, restores the settings flag when this feature switched it on and no other endpoint is saved, deletes the runtime; the downloaded models (all of them) only with `removeModel: true`. With nothing installed it is what deletes the models an earlier Remove kept. `409`: `job-running`, `sessions-open`. |
+| `DELETE` | `/api/local-model/models`  | `{ modelId }`                                    | Deletes ONE model from the store, through the runtime. `modelId` is a model name (`name:tag`) of `install.library` whose `actions` list `delete`, never a path. `400 INVALID_INPUT` for a name that is not on this machine. `409`: `job-running`, `wrong-state` (nothing is installed), `model-active` (the model of the installation or of the current job), `runtime-not-running`. `500 OPERATION_FAILED` when the runtime did not delete it. |
+| `POST`   | `/api/local-model/agent`   | `{ cli }`                                        | Installs one more agent CLI beside an installed model and answers at once; the installer runs on in the server and `install.harnesses` says how it stands. `cli` is a row of `install.harnesses` whose `actions` list `install`; the server runs that row's `installCommand`, the release's own stock command, never text from the request. It is not a job: `install.state` stays `installed` whatever the installer does, sessions are not refused, and no live session is looked at. An agent that can already be started answers `200` with the view as it is. `400 INVALID_INPUT` for a CLI that is not a row of `install.harnesses`, or one that one command does not make startable (`setup-needed`). `409`: `job-running` (a job, or another agent install, is running), `wrong-state` (nothing is installed). |
 
 Every verb answers `{ success: true, data: <install> }` with the `install` object (below) as it is after the verb. A refusal the feature names is a `409` whose envelope also carries the conflict:
 
@@ -1797,9 +1830,9 @@ Every verb answers `{ success: true, data: <install> }` with the `install` objec
 }
 ```
 
-`data.reason` is `job-running`, `already-installed` (remove the installed model first), `size-changed` (with `expectedBytes` and `expectedGb`), `sessions-open` (with `sessions`, the names of the live sessions that use the model) or `wrong-state`. A `409 CONFLICT` without `data` means a config file that must not be overwritten (`settings.json` or `custom-model-hosts.json` does not parse); `error` names the fix.
+`data.reason` is `job-running`, `already-installed` (the model is the one in use already), `size-changed` (with `expectedBytes` and `expectedGb`), `sessions-open` (with `sessions`, the names of the live sessions that use the model), `wrong-state`, `model-active` (a delete of the model in use: switch first, or remove everything) or `runtime-not-running` (a delete while the runtime is down: start it first). A `409 CONFLICT` without `data` means a config file that must not be overwritten (`settings.json` or `custom-model-hosts.json` does not parse); `error` names the fix.
 
-`POST /api/local-model/install` also answers `400` when a saved model endpoint already uses the id `local-ollama` and was not created by this feature: rename or delete that endpoint first. The check is made before anything is downloaded. Every `400` the install names, and the `507 OPERATION_FAILED` of a first install on a full disk, carries its sentence as `data.message` (`{ text, vars }`, like a `409`), so a client can print it in its own language.
+`POST /api/local-model/install` also answers `400` when a saved model endpoint already uses the id `local-ollama` and was not created by this feature: rename or delete that endpoint first. The check is made before anything is downloaded. Every `400` the feature names, the `507 OPERATION_FAILED` of a first install on a full disk and the `500 OPERATION_FAILED` of a delete the runtime refused carry their sentence as `data.message` (`{ text, vars }`, like a `409`), so a client can print it in its own language.
 
 **Consent is bound to the size shown.** `acknowledgedBytes` must be the `installBytes` of the chosen row: the model download plus the runtime download while the runtime is not unpacked yet. The server compares it with its own total before anything starts and answers `409 size-changed` when they differ, so a click confirms exactly the size the person saw.
 
@@ -1816,7 +1849,7 @@ A probe that fails is an answer, not an error: a server that is not on macOS, or
   - `verdict`: `ok`, `limited` or `none`. `limited` is a statement about the Mac: no model with 12 billion parameters or more fits its memory, so what it can run handles small edits and questions and does not replace a cloud model. It is judged on every model that fits, before the free disk space is looked at and whatever the pick is. With `ok` the pick can still be a small model (a larger one may be slow, have no speed figure or have no room on the disk); `notes` then says so.
   - `reason`, present only with `none`: `not-macos`, `intel`, `memory`, `disk`, `macos` (too old) or `no-harness` (no agent CLI that can be connected to a local model is installed or installable). `memory` has three sentences: nothing fits at all (slot `memory`, the size the Mac is sold as), a model fits but only below the context length an agent CLI needs (slots `budget` and `need`, so a Mac that misses by a little reads as that), and the memory size could not be read (no slot).
   - `headline` and `notes[]`: `{ text, vars? }`. `text` is an English sentence that may hold `{placeholder}` slots, and `vars` carries the slot values as text. Notes, in order: the pick is a small model although larger ones fit (verdict `ok` only); a model that fits the memory was left out because its download would not leave 10 GiB free on the disk (slots `model` and `missing`: the best-ranked such model and the GB to free up); nobody tested the pick on a Mac like this one.
-  - `pick` (absent with `none`) and `alternatives[]` (at most four, best first; empty with `none`), each one model at one context length with one agent CLI. The order: a pair tested on a Mac like this one first, then speed (`ok` before `unknown` before `slow`), then the model's rank, the agent CLI's rank and the larger context. The memory fit decides whether a row is listed and what it says (`fit`, `tag`), it does not sort, so a model is offered at the largest context it fits at. A model whose download would leave less than 10 GiB free on the disk is not listed (an unknown free disk space excludes nothing):
+  - `pick` (absent with `none`) and `alternatives[]` (every other model of the catalogue that fits, best first; empty with `none`), each one model at one context length with one agent CLI. An install is accepted only for a row of this list. The order: a pair tested on a Mac like this one first, then speed (`ok` before `unknown` before `slow`), then the model's rank, the agent CLI's rank and the larger context. The memory fit decides whether a row is listed and what it says (`fit`, `tag`), it does not sort, so a model is offered at the largest context it fits at. A model whose download would leave less than 10 GiB free on the disk is not listed (an unknown free disk space excludes nothing):
     - `modelId` (`name:tag`), `modelLabel`, `license`, `paramsB` (parameters in billions), `context` (tokens);
     - `cli`, `cliLabel`, `cliInstalled` (`false`: the CLI is not on this machine yet but can be installed without administrator rights), `slowFirstTurn?`;
     - `needBytes` and `needGb` (memory the model needs at that context, at its PEAK: the weights, what stays held per token of context, what the runner holds beside both, and what it takes for a moment while a long prompt is processed), `needSource` (`measured`: the figures were measured for this model on a Mac; `estimated`: they are another model's), `downloadBytes` and `downloadGb`, `budgetShare` (need divided by `budgetBytes`, rounded to three decimals);
@@ -1825,22 +1858,26 @@ A probe that fails is an answer, not an error: a server that is not on macOS, or
     - `tag?`: `{ kind, label }`, the one tag of the row. `kind` is `tested`, `best`, `tight`, `slow` or `small`;
     - `fit`: `good` (up to 0.85 of the budget) or `tight` (up to 0.98), with its label `fitLabel`;
     - `speed`: `ok`, `slow` (under 10 tokens per second) or `unknown`, with `speedLabel` (absent for `ok`) and `tokensPerSecond` (rounded to one decimal, absent for `unknown`; `speed` is decided on the unrounded figure, so `10` can be `slow`). `unknown` means the chip is in no row of the catalogue's chip table, or the catalogue has no speed figure for the model: a speed is never guessed;
-    - `tested`: we ran this model with this CLI on a Mac like this one (same chip, same memory size). Its `tokensPerSecond` is then the speed measured in that run.
+    - `tested`: we ran this model with this CLI on a Mac like this one (same chip, same memory size). Its `tokensPerSecond` is then the speed measured in that run;
+    - `library?`: the model at this context is a checked model on this machine already (see `install.library`). `active`: it is the model in use. `ready`: `POST /api/local-model/use` switches to it, and nothing is downloaded. Absent otherwise.
   - `budgetBytes` and `budgetGb`: the memory a model may use on this Mac (`0` for `not-macos` and `intel`, where none is computed). `budgetSource` is `estimated` (computed from the installed memory: all there is before the runtime ran), `wired-limit` (taken from `iogpu.wired_limit_mb`) or `measured` (the device total the runtime itself printed when it started; the GET uses it from the first install on).
 - `catalogUpdated`: ISO date on which the catalogue's rows were last checked.
 - `install`: where the install stands and what can be done about it.
   - `state`: `idle` (nothing installed, no job), `installing`, `paused` (Cancel or a server restart stopped the job; it never continues without a click), `failed` or `installed`.
-  - `step` and `steps[]` (present with `installing`, `paused` and `failed`): the step the job is in or stopped in, and the steps of this job in order, out of `runtime`, `model`, `verify`, `agent`, `connect`. `agent` is absent from a job whose agent CLI was already installed.
+  - `step` and `steps[]` (present with `installing`, `paused` and `failed`): the step the job is in or stopped in, and the steps of this job in order, out of `runtime`, `model`, `verify`, `agent`, `connect`. `agent` is absent from a job whose agent CLI was already installed. A switch (`POST .../use`) is the two steps `verify` and `connect`.
   - `progress` (while a download runs, and as it stood on a paused or failed job): `completedBytes`, `totalBytes`, `completedGb`, `totalGb`, and while it moves `bytesPerSecond`, `mbPerSecond` (whole decimal megabytes per second as text) and `secondsLeft`. During the `model` step both byte figures come from the download's own lines, not from the catalogue.
   - `error` (with `failed`; with `installed` only when something blocks a session): `{ code, message: { text, vars? }, next, nextModel?, detail? }`. `next` is the ONE action that helps: `retry` (`POST .../resume`), `other-port` (`POST .../resume` or `.../runtime` with `newPort: true`), `next-model` (choose again; `nextModel` is `{ modelId, modelLabel }` when the server knows one), `start` (`POST .../runtime`) or `remove` (`DELETE`). `detail` is raw text for the curious (an installer's last lines), not translated.
-  - `model` (`{ id, label }`), `cli`, `cliLabel`, `context`: the choice of the job or of the installation. `port`: the runtime's loopback port, once chosen.
+  - `model` (`{ id, label }`), `cli`, `cliLabel`, `context`: the choice of the job or of the installation. With `installed`, `cli` is the DEFAULT agent CLI, the one a client that names none starts: the agent of the installation while it can be started, else the first row of `harnesses` that can. `port`: the runtime's loopback port, once chosen.
   - `running`: the runtime Codeman started is alive right now. A runtime the person stopped is `running: false` with no `error`.
   - `loaded` (with `installed`): what the runtime reported when the job checked the loaded model: `context`, `memoryBytes`, `memoryGb`, `onGpu`.
-  - `endpointId` (with `installed`): the saved model endpoint a session is started on, with `cli`.
+  - `endpointId` (with `installed`): the saved model endpoint a session is started on, with `cli` or with any row of `harnesses` that offers `start-session`.
   - `developerTools`: `present`, `missing` (the Mac has no Xcode or Command Line Tools, so macOS will offer to install them the first time an agent runs `git` or `python3`) or `unknown`.
   - `runtime`: `{ version, installed, downloadBytes, downloadGb, unpackedGb }`. `downloadBytes` is `0` once the runtime is unpacked.
   - `folder`: the absolute folder everything of this feature is kept in.
-  - `actions[]`: exactly what the server accepts right now, out of `install`, `cancel`, `resume`, `start`, `stop`, `remove` and `start-session` (not a route here: start a session on `endpointId`; offered only while the runtime runs and nothing blocks a session).
+  - `library[]`: the models on this machine, the model in use first. Empty with `idle` (no runtime is there to ask). Each row: `id` (the name the runtime lists, `name:tag`), `label`, `context?` (the context it was checked with), `sizeBytes?` and `sizeGb?` (its size on disk as the runtime reports it, else as recorded when it was checked), `active` (it is the model in use), `verified` (Codeman checked it), `status` and `actions[]`. `status` is `ready`, `changed` (checked, and the runtime now reports another digest under the name), `missing` (checked, and the runtime no longer lists it) or `unverified` (the runtime lists it and Codeman never checked it: a model an earlier Remove kept, the model of a job that has not passed its check, or one another program pulled through the runtime's port). `actions` is what the server accepts for THAT row right now, out of `use` and `delete`; `delete` needs the running runtime, and a name that is not a plain `name:tag` is listed with no action.
+  - `store?`: `{ bytes, gb }`, what the model store takes on disk (the files of its blob folder, so shared layers count once and an interrupted download is included). Present in every state once it was measured; cached for about thirty seconds.
+  - `harnesses[]`: the agent CLIs a session on the model in use can be started with, the default one first, then by the catalogue's rank. The agent is chosen per session: a session is started with `mode` set to a row's `cli` and `customModel: { endpointId, modelId }`. Empty in every state but `installed`. Each row: `cli`, `cliLabel`, `default` (true on the row `install.cli` names), `status`, `installCommand?` (with `installable` and `installing`: the literal command `POST .../agent` runs), `slowFirstTurn?` (the first answer takes minutes), `readyMark?` (a literal without white space that the agent's composer draws once it takes input: what a script waits for on `GET /api/sessions/:id/wait-output` before it sends the first prompt; absent for an agent with no measured mark. A mark says the composer is there, not that nothing else is: DeepSeek Harness with dsh-TUI 0.19 opens a setup guide whose cursor is its `❯` too until a person has finished it once, so a script reads the pane after the mark), `error?` (`{ message, detail? }`: the last install of this agent through `POST .../agent` failed; kept in memory only) and `actions[]` (`start-session`, `install`). `status` is `ready` (it can be started, the answer the Run menu gets), `installable` (not on this machine, and `POST .../agent` installs it), `installing` (that install is running; the model stays as it is) or `setup-needed` (not startable, and one command does not make it so: DeepSeek Harness without a terminal profile, or a command that needs an administrator; set it up from the Run menu or a terminal).
+  - `actions[]`: exactly what the server accepts right now, out of `install` (with `installed`: add another model), `cancel`, `resume`, `start`, `stop`, `remove` (with `idle` only while `store` holds something), `use` and `delete-model` (only while a row of `library` offers them), `install-agent` (only while a row of `harnesses` offers `install`) and `start-session` (not a route here: start a session on `endpointId`; offered only while the runtime runs, nothing blocks a session and, when `harnesses` is known, at least one agent CLI can be started).
 
 Error codes (`install.error.code`), each with one next step:
 
@@ -1850,9 +1887,11 @@ Error codes (`install.error.code`), each with one next step:
 | `start`      | `runtime-stopped` (the runtime crashed three times in a row and is no longer restarted)                                                                                                                                                 |
 | `other-port` | `port-in-use`                                                                                                                                                                                                                           |
 | `next-model` | `model-not-found`, `does-not-fit`, `no-tool-call`                                                                                                                                                                                       |
-| `remove`     | `model-changed` (the model's digest is no longer the one stored at install time; a session on it is refused)                                                                                                                            |
+| `remove`     | `model-changed` (the model's digest is no longer the one stored when it was checked; a session on it is refused, and so is a switch to it)                                                                                              |
 
-Starting a session on the saved endpoint goes through the existing custom model launch (`POST /api/quick-start` with `customModel`, or `POST /api/sessions/:id/custom-model`). For the endpoint this feature manages both answer `OPERATION_FAILED` with one sentence while the runtime is not running, when the model's digest changed, or for a model other than the installed one.
+Two codes are only ever the reason of a refused session start, never on `install.error`: `runtime-not-running` (the person stopped the runtime) and `job-unfinished` (a job that changes the model in use is running or stopped: nothing is started until it ended `installed` again).
+
+Starting a session on the saved endpoint goes through the existing custom model launch (`POST /api/quick-start` with `customModel`, or `POST /api/sessions/:id/custom-model`). For the endpoint this feature manages both answer `OPERATION_FAILED` with one sentence while the runtime is not running, while a job that changes the model in use is running or stopped, when the model's digest changed, or for a model other than the one in use.
 
 Every computed size a person reads travels twice: as bytes, and as decimal GB text without the unit (`"needGb": "29.6"`). Show the text and add the unit; do not divide the bytes yourself, so one request never shows two different roundings. The installed memory is the exception named above: show `memClassGb`.
 

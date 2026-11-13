@@ -78,7 +78,7 @@ Never push, tag, publish, open releases or post announcements on `Ark0N/Codeman`
 
 GitHub CI runs `npm run check:lockfile`, so lockfile drift fails the build even if the `version-packages` script is bypassed.
 
-**Version**: 1.50.1 (must match `package.json`)
+**Version**: 1.51.0 (must match `package.json`)
 
 ## Fork Workflow: GitHub + gh (this checkout)
 
@@ -566,3 +566,12 @@ Other key scripts: `scripts/tmux-manager.sh` (safe tmux mgmt), `scripts/tunnel.s
 - Regular-file deletion uses `fileOnly=true` for upstream's no-symlink/inode checks. The fork file manager retains directory and remote SFTP deletion without that flag; both paths refuse adopted sessions and keep ownership/rate-limit guards.
 - A verified outside worktree is an explicit second file scope, rechecked against the attachment guard on every read/write. Absolute paths in it stay confined to it; relative paths retain the session workspace as their root.
 - Discord never automates an adopted session or infers its transcript from the neutral wrapper folder. Native Claude UI controls use the declared `claude-tui` profile, and shell naming uses registry `kind`.
+
+## Upstream 1.51 integration rules
+
+- Auto-compaction uses fresh statusLine context size and rechecks at send time. Preserve checkpoint exclusion and usage-limit pause guards.
+- OMP approval modules expose blocked alerts only, never full Claude hooks or answerable inbox actions; only the module closes its alert.
+- Local create and respawn pass jcode configuration through the registry launch boundary while retaining Headroom and ownership guards.
+- Response Markdown copies all answer segments in the displayed turn; preserve rich text copy, transcript filters, and explicit viewer close behavior.
+- File Viewer may edit workspace dotenv files while refusing other credentials and Codeman data files; preserve remote refusal and file ownership on save.
+- File Viewer remains off by default on phones and honors explicit opt-in alongside the fork Sources and Library entries.

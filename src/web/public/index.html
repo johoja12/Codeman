@@ -772,7 +772,7 @@
         <div class="response-viewer-actions">
           <button class="response-viewer-more" id="responseViewerMore" onclick="app.loadFullContext()">More</button>
           <button class="response-viewer-copy" id="responseViewerCopy" type="button" onclick="app.copyResponseViewerRichText()" title="Copy response as rich text" aria-label="Copy response as rich text"></button>
-          <button class="response-viewer-more response-viewer-copy-markdown" id="responseViewerCopyMarkdown" type="button" onclick="app.copyResponseViewerMarkdown()" title="Copy response as Markdown" aria-label="Copy response as Markdown">Copy Markdown</button>
+          <button class="response-viewer-more response-viewer-copy-markdown" id="responseViewerCopyMarkdown" type="button" onclick="app.copyResponseViewerMarkdown()" title="Copy response as Markdown">Copy Markdown</button>
           <button class="response-viewer-close" onclick="app.closeResponseViewer()">&times;</button>
         </div>
       </div>
@@ -1231,6 +1231,7 @@
                 <option value="deepseek">DeepSeek</option>
                 <option value="omp">OMP</option>
                 <option value="copilot">GitHub Copilot</option>
+                <option value="jcode">jcode</option>
               </select>
             </div>
             <div class="form-row"><label>Working Directory</label><input type="text" id="schWorkingDir" placeholder="/absolute/path"></div>
@@ -1691,7 +1692,7 @@
                       <span class="set-row-desc">Summarizes the context at the threshold while preserving key information.</span>
                     </div>
                     <div class="set-row-actions">
-                      <input type="number" id="modalAutoCompactThreshold" class="set-num set-num-wide" value="110000" min="10000" max="500000" step="10000" onchange="app.autoSaveAutoCompact()">
+                      <input type="number" id="modalAutoCompactThreshold" class="set-num set-num-wide" value="110000" min="10000" max="1000000" step="10000" onchange="app.autoSaveAutoCompact()">
                       <span class="set-unit">tokens</span>
                       <label class="switch switch-sm"><input type="checkbox" id="modalAutoCompactEnabled" onchange="app.autoSaveAutoCompact()"><span class="slider"></span></label>
                     </div>
@@ -1709,7 +1710,7 @@
                       <span class="set-row-desc">Full context reset at the threshold. Keep it higher than auto-compact.</span>
                     </div>
                     <div class="set-row-actions">
-                      <input type="number" id="modalAutoClearThreshold" class="set-num set-num-wide" value="140000" min="10000" max="500000" step="10000" onchange="app.autoSaveAutoClear()">
+                      <input type="number" id="modalAutoClearThreshold" class="set-num set-num-wide" value="140000" min="10000" max="1000000" step="10000" onchange="app.autoSaveAutoClear()">
                       <span class="set-unit">tokens</span>
                       <label class="switch switch-sm"><input type="checkbox" id="modalAutoClearEnabled" onchange="app.autoSaveAutoClear()"><span class="slider"></span></label>
                     </div>
@@ -4216,6 +4217,7 @@
                 <option value="deepseek" data-cli="deepseek">DeepSeek</option>
                 <option value="omp" data-cli="omp">OMP</option>
                 <option value="copilot" data-cli="copilot">GitHub Copilot</option>
+                <option value="jcode" data-cli="jcode">jcode</option>
                 <option value="shell">Shell (no agent)</option>
               </select>
               <span class="form-hint">Which CLI to point the Run button at once the clone finishes. Changeable any time from the Run dropdown.</span>
@@ -4426,7 +4428,7 @@
             <div class="form-row docker-create-only">
               <label>Image</label>
               <input type="text" id="dockerImage" placeholder="codeman/agent:base" autocomplete="off" autocapitalize="off" spellcheck="false">
-              <span class="form-hint">Build it once with <code>node scripts/build-agent-image.mjs</code>. Contains node + claude/opencode/codex/gemini/agy/pi/grok/dsh/omp/copilot + tmux.</span>
+              <span class="form-hint">Build it once with <code>node scripts/build-agent-image.mjs</code>. Contains node + claude/opencode/codex/gemini/agy/pi/grok/dsh/omp/copilot/jcode + tmux.</span>
             </div>
             <div class="form-row docker-create-only">
               <label>Network</label>

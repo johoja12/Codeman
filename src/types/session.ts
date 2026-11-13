@@ -8,7 +8,7 @@
  * - SessionConfig — creation-time config (id, workingDir, createdAt)
  * - SessionOutput — captured stdout/stderr/exitCode
  * - SessionStatus — 'idle' | 'busy' | 'stopped' | 'error' | 'parked'
- * - SessionMode — 'claude' | 'shell' | 'opencode' | 'codex' | 'gemini' | 'antigravity' | 'pi' | 'grok' | 'deepseek' | 'omp' | 'copilot' (which CLI backend)
+ * - SessionMode — 'claude' | 'shell' | 'opencode' | 'codex' | 'gemini' | 'antigravity' | 'pi' | 'grok' | 'deepseek' | 'omp' | 'copilot' | 'jcode' (which CLI backend)
  * - ClaudeMode — CLI permission mode ('dangerously-skip-permissions' | 'auto' | 'normal' | 'allowedTools')
  * - SessionColor — visual differentiation color
  * - OpenCodeConfig — OpenCode-specific settings (model, autoAllowTools, continueSession)
@@ -19,6 +19,7 @@
  * - GrokConfig — Grok Build CLI (xAI `grok`) settings (model, alwaysApprove, resume/continue)
  * - CopilotConfig — GitHub Copilot CLI settings (model, allowAll, resume/continue)
  * - DeepSeekConfig — DeepSeek Harness (`dsh`) settings (profile, permissionMode, resume, status bridge)
+ * - JcodeConfig: jcode settings (model, resume)
  *
  * Cross-domain relationships:
  * - SessionState.respawnConfig embeds RespawnConfig (respawn domain)
@@ -78,7 +79,8 @@ export type SessionMode =
   | 'grok'
   | 'deepseek'
   | 'omp'
-  | 'copilot';
+  | 'copilot'
+  | 'jcode';
 export type SessionCheckpointMode = 'compact' | 'clear' | 'new';
 
 export interface SessionCheckpointState {
@@ -127,7 +129,18 @@ export interface SessionWriteOptions {
 
 export type RemoteCommandMode = Extract<
   SessionMode,
-  'shell' | 'claude' | 'opencode' | 'codex' | 'gemini' | 'antigravity' | 'pi' | 'grok' | 'deepseek' | 'omp' | 'copilot'
+  | 'shell'
+  | 'claude'
+  | 'opencode'
+  | 'codex'
+  | 'gemini'
+  | 'antigravity'
+  | 'pi'
+  | 'grok'
+  | 'deepseek'
+  | 'omp'
+  | 'copilot'
+  | 'jcode'
 >;
 
 /**
@@ -273,7 +286,18 @@ export interface RemoteSessionInfo {
 /** Which CLI backends a Docker case can run (same set as remote). */
 export type DockerCommandMode = Extract<
   SessionMode,
-  'shell' | 'claude' | 'opencode' | 'codex' | 'gemini' | 'antigravity' | 'pi' | 'grok' | 'deepseek' | 'omp' | 'copilot'
+  | 'shell'
+  | 'claude'
+  | 'opencode'
+  | 'codex'
+  | 'gemini'
+  | 'antigravity'
+  | 'pi'
+  | 'grok'
+  | 'deepseek'
+  | 'omp'
+  | 'copilot'
+  | 'jcode'
 >;
 
 /** Container engine. Docker and Podman differ in the uid/userns + host-gateway alias. */
@@ -689,6 +713,24 @@ export interface CopilotConfig {
   /**
    * Resume a specific session (--resume <value>): an id, id prefix or session name, as ONE plain word
    * starting with a letter or digit (a leading `-` would make the value its own flag).
+   */
+  resumeSessionId?: string;
+}
+
+/**
+ * jcode (1jehuang/jcode) session configuration.
+ *
+ * jcode has no approval prompts and no bypass flag, so there is nothing
+ * privileged to configure; the provider and its login come from jcode's own
+ * `~/.jcode/config.toml`. Verified against jcode 0.98.1.
+ */
+export interface JcodeConfig {
+  /** Model ID passed via --model (e.g. "claude-opus-4-8", "gpt-5.5"). */
+  model?: string;
+  /**
+   * Resume a jcode session (--resume): its id (`session_fox_<ms>_<hex>`) or its
+   * short name (`fox`), as ONE plain word starting with a letter or digit, since
+   * --resume's value is optional and a leading `-` would make it its own flag.
    */
   resumeSessionId?: string;
 }
@@ -1124,6 +1166,8 @@ export interface SessionState {
    * `expiresAt` has passed reads as cold rather than as a stale warm.
    */
   promptCache?: PromptCacheStatus;
+  /** The model's context window in tokens from the last statusline report; absent until one arrives. */
+  contextWindowSize?: number;
   /** Why a cache report will or will not arrive (see `StatusLineExporter`); absent when unknown. */
   statusLineExporter?: StatusLineExporter;
   /** Prompt-cache keep-warm opt-in; absent = follow the app-wide `promptCacheKeepWarm` default. */
@@ -1213,6 +1257,8 @@ export interface SessionState {
   deepSeekConfig?: DeepSeekConfig;
   /** OMP-specific configuration (only for mode === 'omp') */
   ompConfig?: OmpConfig;
+  /** jcode configuration (only for mode === 'jcode') */
+  jcodeConfig?: JcodeConfig;
   /** Claude conversation session ID to resume after reboot (set by restore script) */
   resumeSessionId?: string;
   /**

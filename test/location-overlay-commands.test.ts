@@ -47,6 +47,7 @@ it('pins every remote pane command', () => {
     deepseek: remoteLoginShellCommand('dsh'),
     omp: remoteLoginShellCommand('omp'),
     copilot: remoteLoginShellCommand('copilot'),
+    jcode: remoteLoginShellCommand('jcode'),
   };
   for (const [mode, want] of Object.entries(expected)) {
     expect(defaultRemoteCommandForMode(mode as SessionMode), mode).toBe(want);
@@ -67,6 +68,7 @@ it('pins every in-container pane command', () => {
     deepseek: 'exec dsh',
     omp: 'exec omp',
     copilot: 'exec copilot',
+    jcode: 'exec jcode',
   };
   for (const [mode, want] of Object.entries(expected)) {
     expect(defaultDockerCommandForMode(mode as SessionMode), mode).toBe(want);

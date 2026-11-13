@@ -7,10 +7,13 @@
  * drives the install verbs:
  *
  *   POST   /api/local-model/install   { modelId, cli, context, acknowledgedBytes }
+ *   POST   /api/local-model/use       { modelId }
  *   POST   /api/local-model/cancel
  *   POST   /api/local-model/resume    { newPort? }
  *   POST   /api/local-model/runtime   { action: 'start' | 'stop', newPort? }
  *   DELETE /api/local-model           { removeModel }
+ *   DELETE /api/local-model/models    { modelId }
+ *   POST   /api/local-model/agent     { cli }
  *
  * ## Three surfaces, one window
  *
@@ -25,14 +28,19 @@
  *    | Screen      | When                                                              |
  *    |-------------|-------------------------------------------------------------------|
  *    | `choose`    | idle: the memory bar, the models that fit as a radio group, the   |
- *    |             | coding agent, "Install on this Mac"                               |
+ *    |             | coding agent, "Install on this Mac". Also from an installed       |
+ *    |             | model ("Add a model"): a row that is on this Mac already says so  |
+ *    |             | and is switched to without a download                             |
  *    | `confirm`   | after that button: the download as a table with its total, where  |
  *    |             | it goes                                                           |
  *    | `progress`  | installing: the download bar, the steps, Cancel                   |
  *    | `paused`    | paused (Cancel or a server restart): Continue or Remove           |
  *    | `failed`    | failed: the server's sentence and the ONE action that helps       |
- *    | `installed` | installed: running or stopped, Start a session, Stop/Start, Remove |
- *    |             | (right after an install: Start a session alone)                   |
+ *    | `installed` | installed: running or stopped, the coding agents a session can be |
+ *    |             | started with, the models on this Mac with their size on disk      |
+ *    |             | (Use, Delete), Add a model, Start a session (or "Install <agent>" |
+ *    |             | for one that is not on this Mac), Stop/Start, Remove (right after |
+ *    |             | an install: Start a session alone)                                |
  *    | `none`      | idle and nothing fits: the hardware line, the reason, Close       |
  *
  * The memory bar is the one strong element: the memory this Mac can give a model, filled to
@@ -48,6 +56,23 @@
  * The rows of the chooser are the server's: its pick first, then the other models by download
  * size, largest first, which is a column the reader can see. The server's own order of the
  * alternatives is its ranking (what it would offer next), not a reading order.
+ *
+ * The models on this Mac (`install.library`) are a list of their own, on the installed screen
+ * and on a paused or failed one that has a model to go back to: the model in use first, each
+ * with its size on disk and the two things a row can offer, "Use" (a switch, nothing is
+ * downloaded) and "Delete" (asked once, in the row). Under it the disk use of all downloaded
+ * models (`install.store`) and "Add a model". A row has a button only for an action the server
+ * lists for THAT row (`row.actions`).
+ *
+ * The coding agent is chosen per session (`install.harnesses`): on the installed screen every
+ * agent the model can be run with is a chip of one radio group, the server's default first.
+ * The main button follows the selected chip: "Start a session" for one that can be started,
+ * "Install <agent>" for one that is not on this Mac (its literal install command is on screen
+ * above the button, so the click is the consent), and nothing to press for one that needs a
+ * setup of its own. An install of an agent runs beside the model: the state stays `installed`,
+ * and another agent can be started meanwhile. The device remembers the agent a session was
+ * last STARTED with, and each opening of the window selects it while it can be started (a
+ * chip that was only looked at is not a choice, or the window would reopen on "Install").
  *
  * ## Polling
  *
@@ -99,6 +124,12 @@ const LOCAL_MODEL_MAX_AGE_MS = 60000;
 
 /** How often the open window asks where the install stands. */
 const LOCAL_MODEL_POLL_MS = 1000;
+
+/** What `confirmDelete` holds while the question is about everything an earlier Remove kept. No model id has a space. */
+const LOCAL_MODEL_STORE_KEY = 'the store';
+
+/** Where this device remembers the coding agent last chosen for a session (a CLI id, as data). */
+const LOCAL_MODEL_AGENT_STORAGE_KEY = 'codeman-local-model-agent';
 
 /** The tag kinds of the server's pick (`CandidateTagKind`): the ones drawn in the accent colour. */
 const LOCAL_MODEL_ACCENT_TAGS = ['tested', 'best', 'best-tight'];
@@ -200,6 +231,62 @@ function localModelCandidates(status) {
   return [recommendation.pick, ...bySize.map((entry) => entry.row)].filter(
     (row) => row && typeof row.modelId === 'string'
   );
+}
+
+/**
+ * Whether the job of `install` is a switch to a model that is on this Mac already: its steps
+ * hold no download. The steps are the server's; nothing is compared with a model or an agent.
+ */
+function localModelIsSwitch(install) {
+  const steps = Array.isArray(install.steps) ? install.steps : [];
+  return steps.length > 0 && !steps.includes('model');
+}
+
+/** The rows of `install.library`: the models on this Mac. A payload without the list has none. */
+function localModelLibrary(install) {
+  return (Array.isArray(install.library) ? install.library : []).filter((row) => row && typeof row.id === 'string');
+}
+
+/** What a library row's state is called, and the tag class that colours it. */
+function localModelLibraryTag(row) {
+  if (row.active === true) return { text: localModelT('In use'), kind: 'inuse' };
+  if (row.status === 'ready') return { text: localModelT('Ready'), kind: 'ready' };
+  if (row.status === 'changed') return { text: localModelT('Changed'), kind: 'changed' };
+  if (row.status === 'missing') return { text: localModelT('Missing'), kind: 'missing' };
+  return { text: localModelT('Not checked'), kind: 'unverified' };
+}
+
+/** The rows of `install.harnesses`: the coding agents the model in use can be run with. A payload without the list has none. */
+function localModelAgents(install) {
+  return (Array.isArray(install.harnesses) ? install.harnesses : []).filter(
+    (row) => row && typeof row.cli === 'string' && row.cli
+  );
+}
+
+/** What an agent chip says beside the name, and the tag class that colours it. Nothing for one that can be started. */
+function localModelAgentTag(row) {
+  if (row.status === 'installing') return { text: localModelT('Installing'), kind: 'tight' };
+  if (row.status === 'installable') return { text: localModelT('Not installed'), kind: 'unverified' };
+  if (row.status === 'setup-needed') return { text: localModelT('Needs setup'), kind: 'unverified' };
+  return null;
+}
+
+/** The coding agent this device chose last, or '' (storage can be empty or refused: the default agent stands then). */
+function localModelStoredAgent() {
+  try {
+    const value = window.localStorage.getItem(LOCAL_MODEL_AGENT_STORAGE_KEY);
+    return typeof value === 'string' ? value : '';
+  } catch {
+    return '';
+  }
+}
+
+function localModelStoreAgent(cli) {
+  try {
+    window.localStorage.setItem(LOCAL_MODEL_AGENT_STORAGE_KEY, String(cli));
+  } catch {
+    /* a convenience only */
+  }
 }
 
 /**
@@ -482,14 +569,20 @@ Object.assign(CodemanApp.prototype, {
   /**
    * Called with the `install` object that is about to replace the one on screen. An install
    * that was running and is installed now finished in front of the person: the window then
-   * shows the screen that ends it (see `justInstalled`). Any other state ends that moment.
+   * shows the screen that ends it (see `justInstalled`). A switch is the exception: it ends
+   * on the whole installed screen, list of models included. Any other state ends that moment.
    */
   _noteLocalModelInstall(next) {
     const ui = this._localModelWindowState();
-    const before = localModelInstall(this._localModelStatus).state;
+    const last = localModelInstall(this._localModelStatus);
+    const before = last.state;
     const after = next && typeof next.state === 'string' ? next.state : 'idle';
+    // A switch downloads nothing (its job has no `model` step). The person pressed Use in the
+    // list of models, so it ends on that list, with "In use" on the other row: the screen
+    // that ends an install would take the list away from someone who came to tidy it.
+    const switched = Array.isArray(last.steps) && !last.steps.includes('model');
     if (after !== 'installed') ui.justInstalled = false;
-    else if (before === 'installing' && ui.open) ui.justInstalled = true;
+    else if (before === 'installing' && ui.open) ui.justInstalled = !switched;
   },
 
   _localModelRefused() {
@@ -507,6 +600,11 @@ Object.assign(CodemanApp.prototype, {
         modelId: null,
         /** The selected coding agent (a CLI id, as data), or null for the row's first. */
         cli: null,
+        /**
+         * The coding agent chosen for a session on the installed model (a CLI id, as data), or
+         * null: what this device chose last, else the server's default.
+         */
+        agent: null,
         /** A verb is in flight: every button waits. */
         busy: false,
         /** What the last verb answered when it was refused. */
@@ -517,8 +615,14 @@ Object.assign(CodemanApp.prototype, {
         confirmRemove: false,
         removeModel: true,
         /**
-         * The install finished while this window was open: the screen that ends it shows
-         * "Start a session" alone. Stop and Remove belong to the window opened later.
+         * The Delete question of one row is open: that row's model id, or `LOCAL_MODEL_STORE_KEY`
+         * for the downloaded models an earlier Remove kept.
+         */
+        confirmDelete: null,
+        /**
+         * An install (a job that downloaded a model) finished while this window was open:
+         * the screen that ends it shows "Start a session" alone. Stop and Remove belong to
+         * the window opened later. Never set by a switch (`_noteLocalModelInstall`).
          */
         justInstalled: false,
       };
@@ -537,15 +641,36 @@ Object.assign(CodemanApp.prototype, {
     return { candidates, candidate, harnesses, harness };
   },
 
+  /**
+   * The coding agents of the installed model and the one a session would start with: the chip
+   * selected in this opening of the window, else the agent this device last STARTED a session
+   * with while it can still be started, else the server's default (its first row). A
+   * remembered agent that is not startable now never wins: the window would open on "Install"
+   * or on nothing to press, with "Start a session" out of sight. `row` is null when the server
+   * lists none.
+   */
+  _localModelAgent() {
+    const ui = this._localModelWindowState();
+    const rows = localModelAgents(localModelInstall(this._localModelStatus));
+    const stored = ui.agent ? '' : localModelStoredAgent();
+    const row =
+      rows.find((entry) => entry.cli === ui.agent) ||
+      rows.find((entry) => entry.cli === stored && entry.status === 'ready') ||
+      rows.find((entry) => entry.default === true) ||
+      rows[0];
+    return { rows, row: row || null };
+  },
+
   /** Which screen the window shows, see the table in @fileoverview. */
   _localModelScreen() {
     const ui = this._localModelWindowState();
     const install = localModelInstall(this._localModelStatus);
     const selection = this._localModelSelection();
     if (install.state === 'installing') return 'progress';
-    if (install.state === 'installed') return 'installed';
     const canInstall = install.actions.includes('install') && !!selection;
+    // The chooser is also where a second model is added to an installed one.
     if (canInstall && (ui.view === 'choose' || ui.view === 'confirm')) return ui.view;
+    if (install.state === 'installed') return 'installed';
     if (install.state === 'paused') return 'paused';
     if (install.state === 'failed') return 'failed';
     return selection ? 'choose' : 'none';
@@ -571,7 +696,11 @@ Object.assign(CodemanApp.prototype, {
       busy: false,
       notice: null,
       expected: null,
+      // A chip that was only looked at in an earlier opening is not a choice: each opening
+      // starts from the agent last STARTED on this device, else the server's default.
+      agent: null,
       confirmRemove: false,
+      confirmDelete: null,
       justInstalled: false,
     });
     this._forgetLocalModelPaint();
@@ -690,10 +819,10 @@ Object.assign(CodemanApp.prototype, {
     this.renderLocalModel();
   },
 
-  /** Back to the chooser (from the confirm screen, or to pick another model after a stop). */
+  /** Back to the chooser (from the confirm screen, to pick another model after a stop, or to add one). */
   chooseLocalModel(modelId) {
     const ui = this._localModelWindowState();
-    Object.assign(ui, { view: 'choose', notice: null, expected: null, confirmRemove: false });
+    Object.assign(ui, { view: 'choose', notice: null, expected: null, confirmRemove: false, confirmDelete: null });
     if (typeof modelId === 'string') {
       ui.modelId = modelId;
       ui.cli = null;
@@ -749,6 +878,79 @@ Object.assign(CodemanApp.prototype, {
     this.renderLocalModel();
   },
 
+  /**
+   * "Use": switch to a model that is on this Mac already. Nothing is downloaded, so there is
+   * no confirm screen: the server loads and checks the model again and connects it.
+   */
+  async useLocalModel(modelId) {
+    const ui = this._localModelWindowState();
+    ui.confirmDelete = null;
+    const result = await this._localModelVerb('POST', '/api/local-model/use', { modelId });
+    // Started, or refused with the server's sentence: either way the state's own screen says it.
+    if (result.ok || result.conflict) ui.view = 'auto';
+    this.renderLocalModel();
+  },
+
+  /** "Delete" of one row: first the question in the row, then (with `confirmed`) the delete. */
+  async deleteLocalModelEntry(modelId, { confirmed = false } = {}) {
+    const ui = this._localModelWindowState();
+    if (!confirmed) {
+      Object.assign(ui, { confirmDelete: modelId, confirmRemove: false, notice: null });
+      this.renderLocalModel();
+      // On the safe answer, whatever had the focus (a click does not move it in every browser).
+      this._focusLocalModelWindow('delete-no');
+      return;
+    }
+    await this._localModelVerb('DELETE', '/api/local-model/models', { modelId });
+    ui.confirmDelete = null;
+    this.renderLocalModel();
+  },
+
+  /** "Delete them": the downloaded models an earlier Remove kept, while nothing is installed. */
+  async deleteLocalModelStore({ confirmed = false } = {}) {
+    const ui = this._localModelWindowState();
+    if (!confirmed) {
+      Object.assign(ui, { confirmDelete: LOCAL_MODEL_STORE_KEY, notice: null });
+      this.renderLocalModel();
+      this._focusLocalModelWindow('delete-no');
+      return;
+    }
+    await this._localModelVerb('DELETE', '/api/local-model', { removeModel: true });
+    ui.confirmDelete = null;
+    this.renderLocalModel();
+  },
+
+  /** Leave a Delete question without deleting. The focus goes back to the button that asked. */
+  keepLocalModelEntry() {
+    const ui = this._localModelWindowState();
+    const asked = ui.confirmDelete;
+    Object.assign(ui, { confirmDelete: null, notice: null });
+    this.renderLocalModel();
+    if (asked) this._focusLocalModelWindow(asked === LOCAL_MODEL_STORE_KEY ? 'store-delete' : `delete:${asked}`);
+  },
+
+  /**
+   * Select a coding agent for the next session. Nothing is sent, and nothing is remembered
+   * yet: a chip can be selected just to see what installing it would run. The device
+   * remembers an agent once a session was started with it.
+   */
+  selectLocalModelAgent(cli) {
+    const ui = this._localModelWindowState();
+    if (ui.busy || typeof cli !== 'string' || !cli) return;
+    ui.agent = cli;
+    ui.notice = null;
+    this.renderLocalModel();
+  },
+
+  /**
+   * "Install <agent>": the consent click for the command shown above the button. The server
+   * runs its own stock command for that agent, never text from here, and answers at once: the
+   * install goes on beside the model and the next polls say how it stands.
+   */
+  installLocalModelAgent(cli) {
+    return this._localModelVerb('POST', '/api/local-model/agent', { cli });
+  },
+
   cancelLocalModelInstall() {
     return this._localModelVerb('POST', '/api/local-model/cancel');
   },
@@ -767,7 +969,7 @@ Object.assign(CodemanApp.prototype, {
   async removeLocalModel({ confirmed = false } = {}) {
     const ui = this._localModelWindowState();
     if (!confirmed) {
-      Object.assign(ui, { confirmRemove: true, notice: null });
+      Object.assign(ui, { confirmRemove: true, confirmDelete: null, notice: null });
       this.renderLocalModel();
       return;
     }
@@ -777,20 +979,24 @@ Object.assign(CodemanApp.prototype, {
   },
 
   /**
-   * "Start a session": a session on the saved connection with the coding agent of the install.
+   * "Start a session": a session on the saved connection with a coding agent: `cli` (the
+   * chip that is selected), or without one the server's default agent (`install.cli`).
    * The page's own copies are stale right after an install (the settings flag was switched on
    * by the server and the agent may have been installed a moment ago), so both are read again
    * before the existing launcher runs. Both values are the payload's; no id is compared.
    */
-  async startLocalModelSession() {
+  async startLocalModelSession(cli) {
     const install = localModelInstall(this._localModelStatus);
-    if (typeof install.cli !== 'string' || typeof install.endpointId !== 'string') return;
+    const agent = typeof cli === 'string' && cli ? cli : install.cli;
+    if (typeof agent !== 'string' || typeof install.endpointId !== 'string') return;
+    // The agent a session was started with is the one the next opening selects.
+    if (typeof cli === 'string' && cli) localModelStoreAgent(cli);
     const settingsOpen = document.getElementById('appSettingsModal')?.classList.contains('active');
     this.closeLocalModelWindow();
     if (settingsOpen) this.closeAppSettings?.();
     await this.loadAppSettingsFromServer?.();
     await this.loadCliListForSettings?.();
-    await this.selectCustomModelEntry?.(install.cli, install.endpointId);
+    await this.selectCustomModelEntry?.(agent, install.endpointId);
   },
 
   // ═══════════════════════════════════════════════════════════════
@@ -829,9 +1035,20 @@ Object.assign(CodemanApp.prototype, {
     const status = this._localModelStatus;
     const install = localModelInstall(status);
     const model = install.model ? String(install.model.label || install.model.id || '') : '';
-    if (install.state === 'installing') return localModelT('Installing {model}', { model });
-    if (install.state === 'paused') return localModelT('The install of {model} is paused', { model });
-    if (install.state === 'failed') return localModelT('The install of {model} stopped', { model });
+    const switching = localModelIsSwitch(install);
+    if (install.state === 'installing') {
+      return switching ? localModelT('Switching to {model}', { model }) : localModelT('Installing {model}', { model });
+    }
+    if (install.state === 'paused') {
+      return switching
+        ? localModelT('The switch to {model} is paused', { model })
+        : localModelT('The install of {model} is paused', { model });
+    }
+    if (install.state === 'failed') {
+      return switching
+        ? localModelT('The switch to {model} stopped', { model })
+        : localModelT('The install of {model} stopped', { model });
+    }
     if (install.state === 'installed') {
       if (install.running) return localModelT('{model} is running', { model });
       return localModelT('{model} is installed and stopped', { model });
@@ -917,6 +1134,8 @@ Object.assign(CodemanApp.prototype, {
       foot && tail && tail.classList && (tail.classList.contains('lm-foot') || tail.classList.contains('lm-remove'));
     body.dataset.screen = screen;
     body.replaceChildren(...(actions ? parts.slice(0, -1) : parts));
+    // A screen that carries the list of models starts at the top and scrolls (see styles.css).
+    body.dataset.long = body.querySelector('.lm-library') ? 'true' : 'false';
     if (foot) foot.replaceChildren(...(actions ? [tail] : []));
     body.scrollTop = scrolled;
     this._settleLocalModelBars(body);
@@ -1030,6 +1249,12 @@ Object.assign(CodemanApp.prototype, {
       if (LOCAL_MODEL_ACCENT_TAGS.includes(candidate.tag.kind)) tag.classList.add('lm-tag-accent');
       tag.classList.add(`lm-tag-${candidate.tag.kind}`);
       tagSlot.appendChild(tag);
+    }
+    // Already on this Mac: choosing it switches to it, and nothing is downloaded.
+    if (candidate.library === 'active') {
+      tagSlot.appendChild(localModelEl('span', 'lm-tag lm-tag-inuse', localModelT('In use')));
+    } else if (candidate.library === 'ready') {
+      tagSlot.appendChild(localModelEl('span', 'lm-tag lm-tag-ready', localModelT('On this Mac')));
     }
     row.appendChild(tagSlot);
     const speed = localModelEl('span', 'lm-model-speed', localModelSpeedText(candidate));
@@ -1153,6 +1378,10 @@ Object.assign(CodemanApp.prototype, {
     if (hints.length) runs.appendChild(localModelEl('span', 'lm-runs-hint', hints.join(' ')));
     parts.push(runs);
 
+    // Nothing is installed, and an earlier Remove kept its downloads: what they take, and the way to free it.
+    const leftovers = this._localModelStoreEl(install);
+    if (leftovers) parts.push(leftovers);
+
     const notice = this._localModelNoticeEl();
     if (notice) parts.push(notice);
 
@@ -1160,13 +1389,25 @@ Object.assign(CodemanApp.prototype, {
     const promise = localModelT('No account and no API key. The model runs only on this Mac.');
     foot.appendChild(localModelEl('p', 'lm-foot-note', promise));
     const buttons = localModelEl('div', 'lm-buttons');
-    // Reached from a paused or stopped install: the way back to it.
+    // Reached from a paused or stopped install, or from an installed model: the way back to it.
     if (install.state !== 'idle') {
       buttons.appendChild(
         localModelButton(localModelT('Back'), { key: 'back', onClick: () => this.leaveLocalModelChooser() })
       );
     }
-    if (install.actions.includes('install')) {
+    if (candidate.library === 'active') {
+      // The model that runs now: nothing to do with it here.
+      buttons.appendChild(localModelButton(localModelT('In use'), { key: 'primary', primary: true, disabled: true }));
+    } else if (candidate.library === 'ready' && install.actions.includes('use')) {
+      buttons.appendChild(
+        localModelButton(localModelT('Use this model'), {
+          key: 'primary',
+          primary: true,
+          disabled: ui.busy,
+          onClick: () => void this.useLocalModel(candidate.modelId),
+        })
+      );
+    } else if (install.actions.includes('install')) {
       buttons.appendChild(
         localModelButton(localModelT('Install on this Mac'), {
           key: 'primary',
@@ -1179,6 +1420,290 @@ Object.assign(CodemanApp.prototype, {
     if (buttons.childElementCount) foot.appendChild(buttons);
     parts.push(foot);
     return parts;
+  },
+
+  /**
+   * The models on this Mac: one row per model of `install.library` with its name, the context
+   * it was checked with, its state, its size on disk and what the server offers for it. A row
+   * whose Delete was pressed is followed by the question, once, in place. `null` when there is
+   * no row, or (with `onlyWithActions`, for a paused or failed job) no row offers anything.
+   */
+  _localModelLibraryEl(install, { onlyWithActions = false } = {}) {
+    const ui = this._localModelWindowState();
+    const rows = localModelLibrary(install);
+    const offers = (row, action) => Array.isArray(row.actions) && row.actions.includes(action);
+    if (!rows.length) return null;
+    if (onlyWithActions && !rows.some((row) => offers(row, 'use') || offers(row, 'delete'))) return null;
+
+    const section = localModelEl('div', 'lm-library');
+    const list = localModelEl('div', 'lm-lib-list');
+    list.setAttribute('role', 'list');
+    list.setAttribute('aria-labelledby', 'localModelLibraryLabel');
+    const caption = localModelEl('div', 'lm-lib-caption');
+    const label = localModelEl('span', 'lm-lib-caption-label', localModelT('Models on this Mac'));
+    label.id = 'localModelLibraryLabel';
+    caption.appendChild(label);
+    caption.appendChild(localModelEl('span', 'lm-lib-caption-size', localModelT('On disk')));
+    list.appendChild(caption);
+
+    for (const row of rows) {
+      const name = String(row.label || row.id);
+      const item = localModelEl('div', row.active === true ? 'lm-lib-row lm-lib-row-on' : 'lm-lib-row');
+      item.setAttribute('role', 'listitem');
+      const what = localModelEl('div', 'lm-lib-name');
+      what.appendChild(localModelEl('span', 'lm-lib-label', name));
+      if (Number.isFinite(row.context)) {
+        what.appendChild(
+          localModelEl(
+            'span',
+            'lm-lib-meta',
+            localModelT('{context} tokens', { context: localModelCount(row.context) })
+          )
+        );
+      }
+      item.appendChild(what);
+      const tag = localModelLibraryTag(row);
+      const tagSlot = localModelEl('span', 'lm-lib-tag');
+      tagSlot.appendChild(localModelEl('span', `lm-tag lm-tag-${tag.kind}`, tag.text));
+      item.appendChild(tagSlot);
+      item.appendChild(localModelEl('span', 'lm-lib-size', row.sizeGb ? localModelGb(row.sizeGb) : ''));
+
+      const asking = ui.confirmDelete === row.id && offers(row, 'delete');
+      const actions = localModelEl('span', 'lm-lib-actions');
+      // While the row's question is open its buttons keep their place and are out of reach,
+      // so the column of sizes does not move when the question opens.
+      if (asking) {
+        actions.classList.add('lm-lib-actions-away');
+        actions.setAttribute('aria-hidden', 'true');
+      }
+      if (offers(row, 'use')) {
+        const use = localModelButton(localModelT('Use'), {
+          key: `use:${row.id}`,
+          disabled: ui.busy || asking,
+          onClick: () => void this.useLocalModel(row.id),
+        });
+        use.classList.add('lm-btn-row');
+        use.setAttribute('aria-label', localModelT('Use {model}', { model: name }));
+        actions.appendChild(use);
+      }
+      if (offers(row, 'delete')) {
+        const remove = localModelButton(localModelT('Delete'), {
+          key: `delete:${row.id}`,
+          disabled: ui.busy || asking,
+          onClick: () => void this.deleteLocalModelEntry(row.id),
+        });
+        remove.classList.add('lm-btn-row');
+        remove.setAttribute('aria-label', localModelT('Delete {model}', { model: name }));
+        actions.appendChild(remove);
+      }
+      item.appendChild(actions);
+      list.appendChild(item);
+
+      if (asking) {
+        list.appendChild(
+          this._localModelAskEl({
+            question: localModelT('Delete {model} from this Mac?', { model: name }),
+            detail: row.sizeGb ? localModelT('This frees {size} GB.', { size: row.sizeGb }) : '',
+            onYes: () => void this.deleteLocalModelEntry(row.id, { confirmed: true }),
+          })
+        );
+      }
+    }
+    section.appendChild(list);
+
+    const foot = localModelEl('div', 'lm-lib-foot');
+    const notes = localModelEl('div', 'lm-lib-notes');
+    const store = install.store;
+    if (store && Number(store.bytes) > 0 && store.gb) {
+      notes.appendChild(
+        localModelEl('p', 'lm-aside', localModelT('Downloaded models use {size} GB on this Mac.', { size: store.gb }))
+      );
+    }
+    // Only the runtime deletes a model: with it stopped, the rows offer none, and this says why.
+    if (install.state === 'installed' && install.running !== true && rows.length > 1) {
+      notes.appendChild(localModelEl('p', 'lm-aside', localModelT('Press Start to delete a single model.')));
+    }
+    if (notes.childElementCount) foot.appendChild(notes);
+    if (install.state === 'installed' && install.actions.includes('install') && this._localModelSelection()) {
+      const add = localModelButton(localModelT('Add a model'), {
+        key: 'add',
+        disabled: ui.busy,
+        onClick: () => this.chooseLocalModel(),
+      });
+      add.classList.add('lm-btn-row');
+      foot.appendChild(add);
+    }
+    if (foot.childElementCount) section.appendChild(foot);
+    return section;
+  },
+
+  /** A Delete question in place: the question, what it frees, Cancel and the red Delete. */
+  _localModelAskEl({ question, detail, onYes }) {
+    const ui = this._localModelWindowState();
+    const ask = localModelEl('div', 'lm-lib-ask');
+    ask.setAttribute('role', 'group');
+    const text = localModelEl('div', 'lm-lib-ask-text');
+    text.appendChild(localModelEl('p', 'lm-lead', question));
+    if (detail) text.appendChild(localModelEl('p', 'lm-aside', detail));
+    ask.appendChild(text);
+    const buttons = localModelEl('div', 'lm-lib-actions');
+    const no = localModelButton(localModelT('Cancel'), {
+      key: 'delete-no',
+      disabled: ui.busy,
+      onClick: () => this.keepLocalModelEntry(),
+    });
+    no.classList.add('lm-btn-row');
+    const yes = localModelButton(localModelT('Delete'), {
+      key: 'delete-yes',
+      danger: true,
+      disabled: ui.busy,
+      onClick: onYes,
+    });
+    yes.classList.add('lm-btn-row');
+    buttons.appendChild(no);
+    buttons.appendChild(yes);
+    ask.appendChild(buttons);
+    return ask;
+  },
+
+  /**
+   * Nothing is installed and the model store still holds downloads (an earlier Remove kept
+   * them): what they take on disk and "Delete them", asked once in place. `null` unless the
+   * server offers that removal.
+   */
+  _localModelStoreEl(install) {
+    const ui = this._localModelWindowState();
+    const store = install.store;
+    if (install.state !== 'idle' || !install.actions.includes('remove')) return null;
+    if (!store || !(Number(store.bytes) > 0) || !store.gb) return null;
+    if (ui.confirmDelete === LOCAL_MODEL_STORE_KEY) {
+      const box = localModelEl('div', 'lm-leftovers');
+      box.appendChild(
+        this._localModelAskEl({
+          question: localModelT('Delete the downloaded models from this Mac?'),
+          detail: localModelT('This frees {size} GB.', { size: store.gb }),
+          onYes: () => void this.deleteLocalModelStore({ confirmed: true }),
+        })
+      );
+      return box;
+    }
+    const box = localModelEl('div', 'lm-leftovers lm-lib-foot');
+    box.appendChild(
+      localModelEl(
+        'p',
+        'lm-aside',
+        localModelT('Models from an earlier install still use {size} GB on this Mac.', { size: store.gb })
+      )
+    );
+    const remove = localModelButton(localModelT('Delete them'), {
+      key: 'store-delete',
+      disabled: ui.busy,
+      onClick: () => void this.deleteLocalModelStore(),
+    });
+    remove.classList.add('lm-btn-row');
+    box.appendChild(remove);
+    return box;
+  },
+
+  /**
+   * The coding agents a session on the installed model can be started with
+   * (`install.harnesses`): one chip per agent, a radio group, and under it one line about the
+   * selected one. For an agent that is not on this Mac that line is the literal install command
+   * (the main button then reads "Install <agent>"), and after a failed install the server's
+   * sentence with the installer's last words folded away. `null` when the server lists none.
+   */
+  _localModelAgentsEl() {
+    const ui = this._localModelWindowState();
+    const { rows, row: chosen } = this._localModelAgent();
+    if (!rows.length || !chosen) return null;
+
+    const section = localModelEl('div', 'lm-agents');
+    const label = localModelEl('p', 'lm-agents-label', localModelT('Start a session with'));
+    label.id = 'localModelAgentsLabel';
+    section.appendChild(label);
+
+    const group = localModelEl('div', 'lm-agent-list');
+    group.setAttribute('role', 'radiogroup');
+    group.setAttribute('aria-labelledby', 'localModelAgentsLabel');
+    for (const row of rows) {
+      const on = row === chosen;
+      const chip = localModelEl('button', on ? 'lm-agent lm-agent-on' : 'lm-agent');
+      chip.type = 'button';
+      chip.setAttribute('role', 'radio');
+      chip.setAttribute('aria-checked', on ? 'true' : 'false');
+      // One tab stop for the group: the selected chip.
+      chip.tabIndex = on ? 0 : -1;
+      chip.dataset.lmKey = `agent:${row.cli}`;
+      chip.disabled = ui.busy;
+      const radio = localModelEl('span', 'lm-radio');
+      radio.setAttribute('aria-hidden', 'true');
+      chip.appendChild(radio);
+      chip.appendChild(localModelEl('span', 'lm-agent-name', String(row.cliLabel || row.cli)));
+      const tag = localModelAgentTag(row);
+      if (tag) chip.appendChild(localModelEl('span', `lm-tag lm-tag-${tag.kind}`, tag.text));
+      chip.addEventListener('click', () => this.selectLocalModelAgent(row.cli));
+      group.appendChild(chip);
+    }
+    group.addEventListener('keydown', (event) => this._onLocalModelAgentKey(event));
+    section.appendChild(group);
+
+    const name = String(chosen.cliLabel || chosen.cli);
+    const about = localModelEl('div', 'lm-agent-about');
+    if (chosen.status === 'installable' || chosen.status === 'installing') {
+      const lead =
+        chosen.status === 'installing'
+          ? localModelT('Installing {cli}. You can start a session with another agent meanwhile.', { cli: name })
+          : localModelT('{cli} is not on this Mac yet. Codeman installs it with this command:', { cli: name });
+      about.appendChild(localModelEl('p', 'lm-aside', lead));
+      if (chosen.installCommand) about.appendChild(localModelEl('code', 'lm-command', String(chosen.installCommand)));
+    } else if (chosen.status === 'setup-needed') {
+      about.appendChild(
+        localModelEl(
+          'p',
+          'lm-aside',
+          localModelT(
+            '{cli} needs a setup of its own. Set it up from the Run menu, then start a session with it here.',
+            {
+              cli: name,
+            }
+          )
+        )
+      );
+    } else if (chosen.slowFirstTurn === true) {
+      about.appendChild(localModelEl('p', 'lm-aside', localModelT('The first answer can take minutes.')));
+    }
+    // The last install of this agent failed: the server's sentence, and what the installer said.
+    const error = chosen.status === 'installable' ? chosen.error : null;
+    if (error && error.message) {
+      const failed = localModelEl('div', 'lm-notice');
+      failed.setAttribute('role', 'alert');
+      failed.appendChild(localModelEl('p', 'lm-notice-text', localModelMessage(error.message)));
+      if (typeof error.detail === 'string' && error.detail) {
+        const details = localModelEl('details', 'lm-details');
+        details.appendChild(localModelEl('summary', '', localModelT('Details')));
+        details.appendChild(localModelEl('pre', 'lm-detail-text', error.detail));
+        failed.appendChild(details);
+      }
+      about.appendChild(failed);
+    }
+    if (about.childElementCount) section.appendChild(about);
+    return section;
+  },
+
+  /** Arrow keys, Home and End move the selection of the agent chips, and the focus with it. */
+  _onLocalModelAgentKey(event) {
+    const { rows, row } = this._localModelAgent();
+    if (!rows.length || !row) return;
+    const index = rows.indexOf(row);
+    let next = -1;
+    if (event.key === 'ArrowDown' || event.key === 'ArrowRight') next = (index + 1) % rows.length;
+    else if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') next = (index - 1 + rows.length) % rows.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = rows.length - 1;
+    if (next < 0 || next === index) return;
+    event.preventDefault();
+    this.selectLocalModelAgent(rows[next].cli);
+    this._focusLocalModelWindow(`agent:${rows[next].cli}`);
   },
 
   /** Arrow keys, Home and End move the selection of the radio group, and the focus with it. */
@@ -1397,9 +1922,18 @@ Object.assign(CodemanApp.prototype, {
     const paused = screen === 'paused';
     const model = install.model ? String(install.model.label || install.model.id || '') : '';
     const parts = [];
-    const title = paused
-      ? localModelT('The install of {model} is paused', { model })
-      : localModelT('Installing {model}', { model });
+    // A switch to a model that is on this Mac already downloads nothing, and says so in its name.
+    const switching = localModelIsSwitch(install);
+    let title;
+    if (switching) {
+      title = paused
+        ? localModelT('The switch to {model} is paused', { model })
+        : localModelT('Switching to {model}', { model });
+    } else {
+      title = paused
+        ? localModelT('The install of {model} is paused', { model })
+        : localModelT('Installing {model}', { model });
+    }
     parts.push(localModelEl('p', 'lm-title', title));
 
     // The download bar takes the place of the memory bar, for as long as something downloads.
@@ -1414,19 +1948,26 @@ Object.assign(CodemanApp.prototype, {
       return parts;
     }
 
-    // What waits or goes on is the download while there is one, the install after it.
+    // What waits or goes on is the download while there is one, the install (or the switch) after it.
     const downloading = !!meter;
     let note;
-    if (paused) {
+    if (paused && switching) {
+      note = localModelT('The switch waits until you continue.');
+    } else if (paused) {
       note = downloading
         ? localModelT('The download waits until you continue.')
         : localModelT('The install waits until you continue.');
+    } else if (switching) {
+      note = localModelT('You can close this window. The switch continues while Codeman is running.');
     } else {
       note = downloading
         ? localModelT('You can close this window. The download continues while Codeman is running.')
         : localModelT('You can close this window. The install continues while Codeman is running.');
     }
     parts.push(localModelEl('p', 'lm-aside', note));
+    // A paused job that has a checked model beside it: the way back to that model.
+    const library = paused ? this._localModelLibraryEl(install, { onlyWithActions: true }) : null;
+    if (library) parts.push(library);
     const notice = this._localModelNoticeEl();
     if (notice) parts.push(notice);
 
@@ -1548,6 +2089,9 @@ Object.assign(CodemanApp.prototype, {
       parts.push(this._localModelRemoveEl());
       return parts;
     }
+    // A checked model beside the one that stopped: the way back to it.
+    const library = this._localModelLibraryEl(install, { onlyWithActions: true });
+    if (library) parts.push(library);
     const notice = this._localModelNoticeEl();
     if (notice) parts.push(notice);
 
@@ -1629,7 +2173,9 @@ Object.assign(CodemanApp.prototype, {
     state.appendChild(localModelEl('span', 'lm-state-text', error ? `${model}, ${running}` : running));
     parts.push(state);
     const about = [];
-    if (install.cliLabel) about.push(localModelT('Runs with {cli}.', { cli: String(install.cliLabel) }));
+    // The agents have their own block below when the server lists them; without the list, the one of the install.
+    const agent = this._localModelAgent().row;
+    if (!agent && install.cliLabel) about.push(localModelT('Runs with {cli}.', { cli: String(install.cliLabel) }));
     const line = this._localModelFactsLine(install);
     if (line) about.push(line);
     if (about.length) parts.push(localModelEl('p', 'lm-aside', about.join(' ')));
@@ -1641,13 +2187,22 @@ Object.assign(CodemanApp.prototype, {
     const tools = this._localModelDeveloperToolsEl();
     if (tools) parts.push(tools);
     const notice = this._localModelNoticeEl();
-    if (notice) parts.push(notice);
 
     const can = (action) => install.actions.includes(action);
     const next = error ? this._localModelNextButton(install, error) : null;
     // The screen that ends an install has one button. Stop and Remove are for the window
     // opened later (or for this one once anything else was said in it).
     const ending = ui.justInstalled === true && can('start-session') && !error && !notice;
+    // Which coding agent the next session runs with. Not on the screen that ends an install
+    // (that one says one thing: the session starts with the agent that was just chosen), and
+    // not while something blocks every session.
+    const agents = ending || error ? null : this._localModelAgentsEl();
+    if (agents) parts.push(agents);
+    // Everything that is on this Mac, what it takes on disk, and the way to another model.
+    // Not on the screen that ends an install: that one says one thing.
+    const library = ending ? null : this._localModelLibraryEl(install);
+    if (library) parts.push(library);
+    if (notice) parts.push(notice);
     const foot = localModelEl('div', 'lm-foot');
     const buttons = localModelEl('div', 'lm-buttons');
     if (!ending && can('remove') && error?.next !== 'remove') {
@@ -1669,24 +2224,53 @@ Object.assign(CodemanApp.prototype, {
       );
     }
     // Start is the main action of a stopped model, unless the error's own button says so already.
+    const startIsMain =
+      can('start') &&
+      !(error && (error.next === 'start' || error.next === 'other-port')) &&
+      !can('start-session') &&
+      !next;
     if (can('start') && !(error && (error.next === 'start' || error.next === 'other-port'))) {
       buttons.appendChild(
         localModelButton(localModelT('Start'), {
-          key: can('start-session') || next ? 'start' : 'primary',
-          primary: !can('start-session') && !next,
+          key: startIsMain ? 'primary' : 'start',
+          primary: startIsMain,
           disabled: ui.busy,
           onClick: () => void this.setLocalModelRuntime('start'),
         })
       );
     }
     if (next) buttons.appendChild(next);
-    if (can('start-session')) {
+    // The main button follows the selected coding agent, by what the server offers for it.
+    const offers = (action) => !!agents && Array.isArray(agent?.actions) && agent.actions.includes(action);
+    if (agents && agent && agent.status !== 'ready') {
+      const name = String(agent.cliLabel || agent.cli);
+      if (offers('install')) {
+        buttons.appendChild(
+          localModelButton(localModelT('Install {cli}', { cli: name }), {
+            // A stopped model's main action is Start: installing an agent is the quiet one then.
+            key: startIsMain ? 'agent-install' : 'primary',
+            primary: !next && !startIsMain,
+            disabled: ui.busy,
+            onClick: () => void this.installLocalModelAgent(agent.cli),
+          })
+        );
+      } else if (agent.status === 'installing') {
+        buttons.appendChild(
+          localModelButton(localModelT('Installing {cli}', { cli: name }), {
+            key: startIsMain ? 'agent-install' : 'primary',
+            primary: !next && !startIsMain,
+            disabled: true,
+          })
+        );
+      }
+      // An agent that needs a setup of its own has nothing to press: the line above says where.
+    } else if (agents ? offers('start-session') : can('start-session')) {
       buttons.appendChild(
         localModelButton(localModelT('Start a session'), {
           key: 'primary',
           primary: !next,
           disabled: ui.busy,
-          onClick: () => void this.startLocalModelSession(),
+          onClick: () => void this.startLocalModelSession(agents && agent ? agent.cli : undefined),
         })
       );
     }
@@ -1703,6 +2287,8 @@ Object.assign(CodemanApp.prototype, {
     if (hw) parts.push(hw);
     const reason = localModelMessage(status.recommendation.headline);
     if (reason) parts.push(localModelEl('p', 'lm-reason', reason));
+    const leftovers = this._localModelStoreEl(localModelInstall(status));
+    if (leftovers) parts.push(leftovers);
     const notice = this._localModelNoticeEl();
     if (notice) parts.push(notice);
     const foot = localModelEl('div', 'lm-foot');

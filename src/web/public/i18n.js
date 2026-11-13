@@ -246,6 +246,11 @@
     'No full conversation history available for this session': '此会话没有可显示的完整对话历史',
     'Last Response': '最近一次回复',
     More: '更多',
+    'Copy Markdown': '复制 Markdown',
+    'Copy response as Markdown': '将回复复制为 Markdown',
+    'Copied response as Markdown': '已将回复复制为 Markdown',
+    'Failed to copy response as Markdown': '无法将回复复制为 Markdown',
+    'No response content to copy': '没有可复制的回复内容',
     'Codeman version': '{name}版本',
     Stop: '停止',
     Watching: '监视中',
@@ -277,6 +282,7 @@
     'Run DeepSeek': '运行 DeepSeek',
     'Run OMP': '运行 OMP',
     'Run GitHub Copilot': '运行 GitHub Copilot',
+    'Run jcode': '运行 jcode',
     'Run Shell': '运行 Shell',
     'More tools': '更多工具',
     'Select AI backend': '选择 AI 后端',
@@ -1448,6 +1454,36 @@
     'Installing {model}': '正在安装 {model}',
     'The install of {model} is paused': '{model} 的安装已暂停',
     'The install of {model} stopped': '{model} 的安装已中止',
+    // A switch to a model that is on this Mac already: nothing is downloaded.
+    'Switching to {model}': '正在切换到 {model}',
+    'The switch to {model} is paused': '切换到 {model} 的操作已暂停',
+    'The switch to {model} stopped': '切换到 {model} 的操作已中止',
+    'The switch waits until you continue.': '切换会等你点击继续后再进行。',
+    'You can close this window. The switch continues while Codeman is running.':
+      '可以关闭此窗口。只要 {name} 在运行，切换就会继续。',
+    // The models on this Mac: the list of the installed screen, its states and its two actions.
+    'Models on this Mac': '此 Mac 上的模型',
+    'On disk': '占用磁盘',
+    '{context} tokens': '{context} 个令牌',
+    'In use': '使用中',
+    Ready: '就绪',
+    Changed: '已变化',
+    Missing: '已缺失',
+    'Not checked': '未检查',
+    'On this Mac': '已在此 Mac 上',
+    Use: '使用',
+    'Use {model}': '使用 {model}',
+    'Use this model': '使用此模型',
+    'Delete {model}': '删除 {model}',
+    'Delete {model} from this Mac?': '要从此 Mac 删除 {model} 吗？',
+    'This frees {size} GB.': '这会释放 {size} GB。',
+    'Downloaded models use {size} GB on this Mac.': '已下载的模型在此 Mac 上占用 {size} GB。',
+    'Press Start to delete a single model.': '点击“启动”后才能删除单个模型。',
+    'Add a model': '添加模型',
+    'Delete the downloaded models from this Mac?': '要从此 Mac 删除已下载的模型吗？',
+    'Models from an earlier install still use {size} GB on this Mac.':
+      '之前安装留下的模型仍在此 Mac 上占用 {size} GB。',
+    'Delete them': '删除它们',
     '{model} is running': '{model} 正在运行',
     '{model} is installed and stopped': '{model} 已安装，当前已停止',
     'Checking this Mac': '正在检查此 Mac',
@@ -1524,6 +1560,18 @@
     'Takes {memory} GB of memory now.': '目前占用 {memory} GB 内存。',
     'All of it is on the GPU.': '全部位于 GPU 上。',
     'Start a session': '开始会话',
+    // The coding agents of an installed model: one chip each, and the line under the selected one.
+    'Start a session with': '开始会话时使用',
+    Installing: '正在安装',
+    'Not installed': '未安装',
+    'Needs setup': '需要设置',
+    'Install {cli}': '安装 {cli}',
+    'Installing {cli}. You can start a session with another agent meanwhile.':
+      '正在安装 {cli}。在此期间，你可以用其他智能体开始会话。',
+    '{cli} is not on this Mac yet. Codeman installs it with this command:':
+      '此 Mac 上尚未安装 {cli}。{name} 会用下面这条命令安装它：',
+    '{cli} needs a setup of its own. Set it up from the Run menu, then start a session with it here.':
+      '{cli} 需要单独设置。请先在"运行"菜单中完成设置，然后就可以在这里用它开始会话。',
     'Remove the local model from this Mac?': '要从此 Mac 移除本地模型吗？',
     'Also delete the downloaded model': '同时删除已下载的模型',
     'The coding agent stays installed.': '编程智能体会保留，不会被卸载。',
@@ -1592,9 +1640,13 @@
     'Codeman could not save the connection to the model.': '{name} 无法保存与模型的连接。',
     'The model on this Mac changed since it was installed. Remove it and install it again.':
       '此 Mac 上的模型在安装后发生了变化。请移除后重新安装。',
+    'The model on this Mac is being changed and is not ready. Finish or undo that in the local model window first.':
+      '此 Mac 上的模型正在更换，尚未就绪。请先在本地模型窗口中完成或撤销这一操作。',
     'The install stopped on an unexpected error.': '安装因意外错误而中止。',
     'An install is already running.': '已有一个安装正在进行。',
-    'A model is already installed on this Mac. Remove it first.': '此 Mac 上已安装了一个模型。请先移除它。',
+    'This model is already in use on this Mac.': '此 Mac 已在使用这个模型。',
+    '{model} is the model in use. Switch to another model first, or remove the local model.':
+      '{model} 是正在使用的模型。请先切换到其他模型，或移除本地模型。',
     'The download is {size} GB now. Check the sizes and confirm again.':
       '现在的下载大小为 {size} GB。请核对大小后再次确认。',
     'Sessions are still using this model: {sessions}. Close them first.':
@@ -1604,8 +1656,13 @@
       '目前不为此 Mac 提供这一上下文大小下的该模型。',
     'This coding agent is not offered for this model.': '该模型不提供这个编程智能体。',
     '{cli} is not installed and cannot be installed from here.': '{cli} 尚未安装，也无法从这里安装。',
-    'Only {model} is installed on this Mac. Remove it and install another model first.':
-      '此 Mac 上只安装了 {model}。请先移除它，再安装其他模型。',
+    'Only {model} is in use on this Mac. Switch models in the local model window first.':
+      '此 Mac 目前只使用 {model}。请先在本地模型窗口中切换模型。',
+    'This model is not one of the checked models on this Mac.': '该模型不在此 Mac 上已检查的模型之列。',
+    'This model is not on this Mac.': '此 Mac 上没有这个模型。',
+    '{cli} is not installed on this Mac. Install a coding agent in the local model window first.':
+      '此 Mac 上没有安装 {cli}。请先在本地模型窗口中安装一个编程智能体。',
+    '{model} could not be deleted from this Mac.': '无法从此 Mac 删除 {model}。',
     // What the endpoint routes answer for the record of the model on this Mac (shown as a toast).
     'This endpoint belongs to the model Codeman runs on this Mac. Change or remove it in the local model window.':
       '此端点属于 {name} 在此 Mac 上运行的模型。请在本地模型窗口中更改或移除它。',

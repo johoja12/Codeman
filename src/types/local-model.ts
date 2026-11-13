@@ -207,6 +207,15 @@ export interface LocalHarnessEntry {
   gated?: boolean;
   /** True: the first answer takes minutes, because the harness sends a very large fixed prompt. */
   slowFirstTurn?: boolean;
+  /**
+   * A literal with no white space that this harness's composer draws once it takes input, and
+   * nothing before it does: what a script waits for before it sends the first prompt
+   * (`GET /api/sessions/:id/wait-output`). Only a mark that was MEASURED on a session started
+   * on a custom model goes here. Absent: the CLI registry's own
+   * `capabilities.composerReadyMark` is used when it declares one, and a harness with neither
+   * has no mark.
+   */
+  readyMark?: string;
 }
 
 /**
@@ -248,9 +257,18 @@ export interface HarnessFact {
   cli: string;
   /** The registry's display label ('OpenCode'). */
   label: string;
-  /** The CLI's binary was found on this machine. */
+  /**
+   * The CLI can be started on this machine: the same answer the Run menu gets. For a launcher
+   * that starts nothing by itself (`discovery.launcherProfile` in the CLI registry) that is its
+   * binary AND something for it to launch.
+   */
   installed: boolean;
-  /** Not installed, but the registry has an install command for this platform that needs no administrator rights. */
+  /**
+   * Not installed, but ONE command makes it startable: the registry has an install command for
+   * this platform that needs no administrator rights, and the CLI is not a launcher. A launcher
+   * needs a second install the command does not make (a profile, which is third-party code
+   * with a consent of its own), so it is never installable from here.
+   */
   installable: boolean;
   /**
    * The literal install command the install job would run for this CLI: the STOCK
@@ -259,6 +277,8 @@ export interface HarnessFact {
    * (`CandidateHarness.installCommand`).
    */
   installCommand?: string;
+  /** The registry's `capabilities.composerReadyMark`, when the CLI declares one and it holds no white space. */
+  readyMark?: string;
   /** Whether this CLI can be launched with that model id (its command-line pattern accepts it). */
   acceptsModelId: (modelId: string) => boolean;
 }
@@ -554,6 +574,12 @@ export interface Candidate {
   installBytes: number;
   /** `installBytes` as decimal GB text, no unit. */
   installGb: string;
+  /**
+   * Set by the route, never by `recommend()`: this model at this context is a checked model of
+   * the library on this Mac (`LocalModelInstallView.library`). `active`: it is the model in
+   * use. `ready`: `POST /api/local-model/use` switches to it, and nothing is downloaded.
+   */
+  library?: 'active' | 'ready';
 }
 
 /**
@@ -577,10 +603,10 @@ export interface Recommendation {
   /** Present exactly when `verdict` is `ok` or `limited`. */
   pick?: Candidate;
   /**
-   * The next models that fit and have room on the disk (at most four), best first: tested
-   * before not tested, then ok before unknown before slow speed, then the higher model rank.
-   * Each is at the largest context it fits at, with the best harness that can run it there.
-   * Empty when `verdict` is `none`.
+   * Every other model that fits and has room on the disk (`MAX_ALTERNATIVES` is above what the
+   * catalogue holds), best first: tested before not tested, then ok before unknown before
+   * slow speed, then the higher model rank. Each is at the largest context it fits at, with
+   * the best harness that can run it there. Empty when `verdict` is `none`.
    */
   alternatives: Candidate[];
   /** `DeviceBudget.budgetBytes`. 0 when no budget is computed: not macOS, or a Mac without Apple silicon. */

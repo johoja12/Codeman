@@ -4,7 +4,9 @@ Codeman can set up a coding model that runs on the Mac the server runs on: no ac
 no API key, and the session's prompts and files go to a model on this Mac rather than a
 cloud provider (the coding agent itself may still check for updates). One button on the welcome screen opens a window that
 shows what fits this Mac, installs the choice and ends on a coding agent session that
-runs on it.
+runs on it. The same window then lists the models that are on this Mac with what each takes
+on disk, adds another one, switches between them and deletes one
+([The models on this Mac](#the-models-on-this-mac)).
 
 **Experimental.** The routes and their payloads may change in any release
 ([versioning-policy.md](versioning-policy.md), "Experimental local model routes"). Apple
@@ -17,28 +19,29 @@ in [architecture-invariants.md](architecture-invariants.md#local-model-install).
 ## Which model fits which Mac
 
 The window offers the best model of the catalogue (`src/config/local-model-catalog.ts`) that
-fits this Mac's memory at a context a coding agent can work with, and up to four more. What
-the catalogue answers today, before the runtime measured anything (the budget is then an
-estimate: 2/3 of the memory below 36 GB, 3/4 from 36 GB, less 1 GiB, and never more than the
-memory less 6, 8 or 12 GiB for macOS, Codeman, a browser and the agent):
+fits this Mac's memory at a context a coding agent can work with, and under it every other
+model of the catalogue that fits (eleven models today: a 16 GB Mac sees one of them, a 512 GB
+Mac all eleven). What the catalogue answers today, before the runtime measured anything (the
+budget is then an estimate: 2/3 of the memory below 36 GB, 3/4 from 36 GB, less 1 GiB, and
+never more than the memory less 6, 8 or 12 GiB for macOS, Codeman, a browser and the agent):
 
-| Memory           | Budget  | What it gets                                                                                                                                                                                                                                                                                                                                       |
-| ---------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 8 GB             | 2.1 GB  | Nothing. The smallest model a coding agent can work with needs 10.2 GB at 65,536 tokens                                                                                                                                                                                                                                                            |
-| 16 GB            | 10.4 GB | Nothing. MiMo V2.6 9B at 65,536 tokens needs 10.2 GB, 98.7% of the budget, just past the 98% a tight fit may reach (it is 95% of the 10.7 GB a 16 GB Mac mini measured). On the edge either way: only a run on such a Mac settles it                                                                                                               |
-| 18 GB            | 11.8 GB | A small model (`limited`): MiMo V2.6 9B at 131,072 tokens, 11.4 GB, tight. Its base, Qwen3.5 9B, is the one alternative                                                                                                                                                                                                                            |
-| 24 GB            | 16.1 GB | The same, with room. On a base M2 or M3 (100 GB/s) it computes to 9.3 tokens per second: slow                                                                                                                                                                                                                                                      |
-| 32 GB            | 21.8 GB | The same. North Mini Code 1.0 needs 23.2 GB at 65,536 tokens; once the runtime measures about 3/4 of the memory, as it did on a 16 and a 48 GB Mac, the Mac gets it at 131,072 tokens, or Qwen3.8 27B at 65,536 tokens on a Max chip                                                                                                               |
-| 36 GB            | 27.9 GB | Qwen3.8 27B at 131,072 tokens on an M4 or M5 Max (27.0 GB, 97%); on a slower chip, where the dense 27B computes to under 10 tokens per second, Qwen3.6 35B-A3B as a GGUF build (27.1 GB, 97%). Both tight                                                                                                                                          |
-| 48 GB            | 37.6 GB | Qwen3.6 35B-A3B (MLX) at 131,072 tokens: the pair we tested, "Recommended" on an Apple M5 Pro with 48 GB. On a Max chip Qwen3.8 27B at 262,144 tokens (32.1 GB, tight). The test was a short task: in a long session MLX may keep up to 8 GiB more, which brings this pair to the edge of the budget, and past it while a long prompt is processed |
-| 64 GB            | 50.5 GB | Qwen3.8 27B at 262,144 tokens on a Max chip; Qwen3.6 35B-A3B (MLX) on a Pro chip                                                                                                                                                                                                                                                                   |
-| 96 GB            | 76.2 GB | Qwen3.8 27B at 262,144 tokens; on an M3 Max, Qwen3.6 35B-A3B (MLX)                                                                                                                                                                                                                                                                                 |
-| 128 GB           | 102 GB  | Ornith 1.5 122B-A10B (MLX) at 131,072 tokens, 97.4 GB, tight                                                                                                                                                                                                                                                                                       |
-| 192, 256, 512 GB | 154 GB+ | Ornith 1.5 122B-A10B at 262,144 tokens                                                                                                                                                                                                                                                                                                             |
+| Memory           | Budget  | What it gets                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ---------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 8 GB             | 2.1 GB  | Nothing. The smallest model a coding agent can work with needs 9.3 GB at 65,536 tokens                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| 16 GB            | 10.4 GB | A small model (`limited`): Ornith 1.0 9B at 65,536 tokens, 9.3 GB, tight (90%). Its build has no vision projector, which makes it 0.9 GB smaller than the other two 9B builds: MiMo V2.6 9B needs 10.2 GB there, 98.7% of the budget, just past the 98% a tight fit may reach. Once the runtime measures what a 16 GB Mac mini measured (10.7 GB), all three fit and MiMo is the pick. No 9B was run on such a Mac by us: only a run settles it                                                                                                                                        |
+| 18 GB            | 11.8 GB | A small model (`limited`): MiMo V2.6 9B at 131,072 tokens, 11.4 GB, tight. Ornith 1.0 9B (10.5 GB) and Qwen3.5 9B are the alternatives                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| 24 GB            | 16.1 GB | The same, with room. On a base M2 or M3 (100 GB/s) it computes to 9.3 tokens per second: slow                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| 32 GB            | 21.8 GB | No longer a small-model Mac: Muse Glimmer 30B fits at 65,536 tokens (21.2 GB, 97%, tight). It is a dense model. On an M1 Max or M2 Max it computes to 11.8 tokens per second and is the pick; on a base or Pro chip it computes to under 6 and is listed as slow, and the pick stays MiMo V2.6 9B at 131,072 tokens with the note that it is a small model. North Mini Code 1.0 needs 23.2 GB at 65,536 tokens; once the runtime measures about 3/4 of the memory, as it did on a 16 and a 48 GB Mac, the Mac gets it at 131,072 tokens, or Qwen3.8 27B at 65,536 tokens on a Max chip. Run once on a Mac (an M5 Pro with 48 GB, 2026-11-12): this GGUF build wrote 15 tokens per second, and an OpenCode worker given a one-line task showed no answer after 7 minutes. Its MLX build, which finished an OpenCode turn on a one-line prompt in 45 seconds, needs 36.1 GB and is offered from 48 GB |
+| 36 GB            | 27.9 GB | Qwen3.8 27B at 131,072 tokens on an M4 or M5 Max (27.0 GB, 97%); on a slower chip, where the dense 27B computes to under 10 tokens per second, Qwen3.6 35B-A3B as a GGUF build (27.1 GB, 97%). Both tight. Muse Glimmer 30B at 131,072 tokens (21.6 GB, 78%) is the alternative with room to spare                                                                                                                                                                                                                                                                                     |
+| 48 GB            | 37.6 GB | Qwen3.6 35B-A3B (MLX) at 131,072 tokens: the pair we tested, "Recommended" on an Apple M5 Pro with 48 GB. On a Max chip Qwen3.8 27B at 262,144 tokens (32.1 GB, tight). A session of many prompts on that Mac (a 95,000-token prompt, then twelve separate ones of 15,000 tokens, measured on 2026-11-12) ended at 33.4 GB of the 40.2 GB its runtime measures, still growing by 0.5 GiB a prompt: MLX may keep up to 8 GiB of earlier prompts, which brings this pair to the edge of the budget. Muse Glimmer 30B as its MLX build is offered here too, at 65,536 tokens (36.1 GB, tight) |
+| 64 GB            | 50.5 GB | Qwen3.8 27B at 262,144 tokens on a Max chip; Qwen3.6 35B-A3B (MLX) on a Pro chip                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| 96 GB            | 76.2 GB | Qwen3.8 27B at 262,144 tokens; on an M3 Max, Qwen3.6 35B-A3B (MLX)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| 128 GB           | 102 GB  | Ornith 1.5 122B-A10B (MLX) at 131,072 tokens, 97.4 GB, tight                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| 192, 256, 512 GB | 154 GB+ | Ornith 1.5 122B-A10B at 262,144 tokens                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 
 "Tight" means the need is between 85% and 98% of the budget; above 98% a model is not
 offered. A model that computes to under 10 tokens per second on the chip is "slow" and ranks
-after the fast ones, which is why the chip changes the pick at 36 to 96 GB. Every model is
+after the fast ones, which is why the chip changes the pick at 32 to 96 GB. Every model is
 offered at the largest context it fits at, and never below 65,536 tokens: OpenCode's own
 prompt is 8,000 to 10,000 tokens, and at 32,768 it would compact after less than one default
 file read. `test/local-model-recommend.test.ts` ("every memory size") pins this table.
@@ -70,15 +73,21 @@ names its runner (`runner`) and its figures follow that runner's rule:
 - **MLX** grows its cache with the tokens actually used, keeps snapshots of the recurrent
   state, and may keep up to 8 GiB of snapshots of earlier prompts, which no setting bounds. A
   Mac always takes the MLX build of a tag that has one. Below 48 GB that 8 GiB does not fit
-  beside a useful model, so the catalogue lists GGUF builds there.
+  beside a useful model, so the catalogue lists GGUF builds there. For Muse Glimmer the MLX
+  runner was measured holding 38,000 to 45,000 bytes per token, against the 7,072 its GGUF
+  build computes to: close to every layer's cache at full length, so it evidently does not
+  trim the sliding-window layers the way llama.cpp does.
 
 Where every figure comes from:
 
 | Model                        | Runner    | Memory figures                                                                      | Speed (tokens per second per 100 GB/s)                    |
 | ---------------------------- | --------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------- |
 | `qwen3.5:9b-q4_k_m`          | llama.cpp | computed from the Qwen3.5-9B config                                                 | 9.3: a published run on an M1 Max                         |
+| `ornith:9b-q4_k_m`           | llama.cpp | the same (a fine-tune of Qwen3.5-9B; its config and its GGUF header say so)         | 9.3: the same architecture and weights size               |
 | `mimo-v2.6:9b-q4_k_m`        | llama.cpp | the same (a fine-tune of Qwen3.5-9B)                                                | 9.3: the same architecture and size                       |
 | `north-mini-code-1.0:q4_k_m` | llama.cpp | computed from its config                                                            | 13.6: the 35B-A3B's, the same 3 billion active parameters |
+| `muse-glimmer:30b-q4_k_m`    | llama.cpp | computed from its config: 13 full-attention and 39 sliding-window layers            | 2.95: the dense 27B's, whose weights are the same size    |
+| `muse-glimmer:30b-mlx`       | MLX       | **measured** on an Apple M5 Pro with 48 GB, the 8 GiB of prefix snapshots counted   | 5.4: measured beside the 35B-A3B on MLX, 0.32 of its 16.9 |
 | `qwen3.6:35b-a3b-mtp-q4_k_m` | llama.cpp | computed from the Qwen3.6-35B-A3B config, prediction layer included                 | 13.6: a published run on an M1 Max                        |
 | `qwen3.6:35b-a3b`            | MLX       | **measured** on an Apple M5 Pro with 48 GB                                          | 16.9: a published run; 67.7 measured on the tested Mac    |
 | `qwen3.8:27b-q8_0`           | llama.cpp | computed from the Qwen3.8-27B config, prediction layer included                     | 1.7: the row below scaled by file size                    |
@@ -86,13 +95,22 @@ Where every figure comes from:
 | `ornith-1.5:122b`            | MLX       | computed from the Qwen3.5-122B-A10B config, scaled by the measured MLX row, + 8 GiB | 5.0: the 35B-A3B's, x 3/10 active parameters              |
 
 Sizes are what the registry serves a Mac for each tag (every layer plus the config), read on
-2026-11-08. Only one row was ever run on a Mac, so every other answer in the table above is a
-calculation. For a llama.cpp build the check after the download catches a load that was
+2026-11-08 (the Ornith 1.0 and Muse Glimmer rows on 2026-11-10, Muse Glimmer's MLX build on
+2026-11-12). Two rows carry memory figures measured on a Mac, both on an Apple M5 Pro with
+48 GB; every other answer in the table above is a calculation. Three more rows were installed
+and loaded on that Mac on 2026-11-12 (Qwen3.5 9B, Ornith 1.0 9B and Muse Glimmer as a GGUF
+build): that checked their download size and that they load on the GPU, not their memory
+figures. For a llama.cpp build the check after the download catches a load that was
 judged too kindly, but not what grows after it in host memory (the checkpoints and the prompt
 cache, which are counted, not checked); for an MLX build it catches neither (see "The check"
-below). The measured row's figures come from single long prompts, not a session of many
-requests, in which MLX may keep up to 8 GiB more. The catalogue header lists the models left out on
-purpose (no evidence of working tool calls, a restrictive licence, a known bug) and why.
+below). The 35B-A3B's figures come from single long prompts, not a session of many
+requests, in which MLX may keep up to 8 GiB more: such a session was measured on it later
+(the 48 GB row above) and its figures were left as they are. Muse Glimmer's MLX row counts
+the 8 GiB. The catalogue header lists the models left
+out on purpose (no evidence of working tool calls, a restrictive licence, a known bug, a
+build that needs a newer runtime than the pinned one) and why. The strongest of those today
+is Ripple 65B Preview, published on 2026-11-09: every build of it requires Ollama 0.40.16,
+one above the pin.
 
 A new row needs its model's architecture (attention layers, K/V heads, head size, and its
 linear-attention or sliding-window layers, from its `config.json`) in the table of
@@ -103,7 +121,9 @@ for a row it does not know. Its answer for each memory size is then pinned in
 ## What an install does, in order
 
 The person picks a model, presses "Install on this Mac" and confirms the sizes once. The
-server then runs one job of five steps. The window polls `GET /api/local-model` once a
+server then runs one job of five steps. The same job adds a second model to an installed one
+("Add a model"): the runtime is there already, so it downloads the model alone, and the
+earlier model stays on disk. The window polls `GET /api/local-model` once a
 second; the job runs in the server, so the window can be closed.
 
 | Step      | What it does                                                                                                                                              |
@@ -206,6 +226,66 @@ This step does not need the `cliManagementEnabled` setting. That setting gates t
 CLI management surface; this path can only ever run one vetted command for one catalogue
 row.
 
+### Which coding agents, and what each was measured with
+
+The coding agent is chosen **per session**. An installed model lists every agent it can be
+run with (`install.harnesses` of the GET), and the window shows them as chips under "Start a
+session with": the agent the model was installed with is the default, and the choice is
+remembered on the device. The launch check asks about the endpoint and the model, never about
+the agent, so a session with one agent and a session with another run on the same model.
+
+| Agent            | First request (its fixed prompt)                                    | Installed from the window | What was seen, and where                                                                                                                    |
+| ---------------- | ------------------------------------------------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| OpenCode         | about 8,100 tokens, 11 tools (v1.19.5; more with user-level skills) | yes                       | A tool round trip on a Mac with a real model (the catalogue's tested entry), and on a scripted endpoint for v1.19.5                         |
+| Claude Code      | about 36,000 tokens, so the first answer takes minutes              | yes                       | Shipped in 1.50.0; not measured again for this table                                                                                        |
+| Pi               | 2,096 tokens, 4 tools (v1.5.2)                                      | yes                       | A complete tool round trip against a real model: tool call, tool result, final answer, the file on disk                                     |
+| DeepSeek Harness | about 7,650 tokens, 25 tools (0.1.1-rc.2); 6,983, 27 tools (0.2.2-rc.1) | **no**                | A tool round trip on a scripted endpoint only, on both versions. Against a real model the launch and the model name reached the runtime, and no turn finished |
+
+How to read the last column: the runs of 2026-11-10 were made on **Linux**, through Codeman's
+own custom model launch, against Ollama 0.13.0 with a 1.7B model on a CPU ("a real model") or
+against a scripted endpoint that replays that runtime's stream of a tool call. A scripted run
+proves the agent's side of the protocol, not what a model does with its prompt. None of them
+ran on a Mac or on the pinned runtime. Every agent sent the `name:tag` model name unchanged.
+
+Three things follow from how the agents differ:
+
+- **Pi is told the model's window.** Without it Pi takes an unknown model for a
+  128,000-token one and never compacts before the real window is full. Codeman now writes the
+  endpoint's context length into the model list it gives Pi (the custom model feature as a
+  whole, not only this window). Two things remain: a custom model session gives Pi a home
+  directory of its own, so Pi fetches its two search tools again at every start (it needs the
+  network for that; `PI_OFFLINE=1` skips it), and Pi asks "Trust project
+  folder?" in every such session when a folder above the working directory holds agent
+  skills, because the answer is stored in the home it does not keep.
+- **DeepSeek Harness is a launcher.** `dsh` starts nothing by itself: a session needs a
+  terminal profile, which is third-party code with its own consent in the Run menu. Its
+  install command installs the launcher only, so this window never installs it. It is listed
+  as "Needs setup" until the Run menu can start it, and as a normal agent from then on. It is
+  the one agent of the four besides Claude Code that reports the end of a turn. Its custom
+  endpoint recipe itself was verified with a real model on a llama.cpp server
+  ([custom-model-endpoints.md](custom-model-endpoints.md)); what is missing is a finished turn
+  on this feature's runtime. On today's version (0.2.2-rc.1 with dsh-TUI 0.19.0) two more
+  things were seen: a setup guide opens in every session until a person has finished it once
+  (a person in a tab presses through it; a script must not, see the codeman skill), and its
+  transcript file was renamed, so Codeman's response viewer and `last-response` are empty for
+  a dsh session on that version until the reader learns the new name.
+- **OpenCode and DeepSeek Harness send a second, small request** beside the first prompt (a
+  title, a side question). The runtime answers one request at a time, so it queues.
+
+### Installing one more agent beside an installed model
+
+An agent that is not on the Mac has "Not installed" on its chip. Selecting it shows the
+literal install command, and the main button becomes "Install <agent>". That click is the
+consent; `POST /api/local-model/agent` then runs the same stock command under the same rules
+as the `agent` step above (catalogue row only, compiled command only, admin only, audited,
+one installer at a time).
+
+It is **not a job**. The state stays `installed` whatever the installer does: the model stays
+loaded, sessions are not refused, and a session with another agent can be started while it
+runs. A failed install shows the sentence and the installer's last lines under the chip, and
+leaves everything else as it was. The outcome is kept in memory only, so a restart of the
+server forgets a failure (the chip then simply says "Not installed" again).
+
 ### The connection
 
 Two writes outside the local model folder, both undone by Remove:
@@ -240,14 +320,17 @@ Switching the setting on also starts that five-minute sweep for every other save
 
 ## Starting a session
 
-"Start a session" starts the coding agent on the endpoint `local-ollama` through the
+"Start a session" starts the selected coding agent on the endpoint `local-ollama` through the
 existing custom model launch. Before a coding agent is STARTED on that endpoint the server
 checks, in this order:
 
+- no job that changes the model in use is running or stopped: until an install or a switch
+  ended, nothing is started ("The model on this Mac is being changed and is not ready");
 - the runtime child Codeman started is alive (whatever else answers on the port is not
   ours);
-- the digest the runtime reports for the installed model is the one stored at install time;
-- the model asked for is the one that was installed and checked.
+- the digest the runtime reports for the model in use is the one stored when it was checked;
+- the model asked for is the model in use. Another model that is on this Mac is not started
+  on the endpoint: switch to it in the window first.
 
 That check runs wherever a new agent process comes to be on the endpoint: a session created
 with the model, a model applied to a running session (which restarts its agent), the attach
@@ -266,29 +349,86 @@ The codeman skill ([`skills/codeman`](../skills/codeman/SKILL.md#claude-in-the-c
 lets an agent in a Codeman session hand work to this model, so Claude in the cloud plans and
 reviews while the model on this Mac does the bulk: summaries, classification, first drafts, and
 files that should not leave the machine. `local_model` reads `GET /api/local-model` and says what
-is installed or why nothing can run; `spawn_worker <name> local` starts the runtime when it was
-stopped (as Start does), then starts the installed coding agent on `local-ollama` through the same
+is installed or why nothing can run, with the coding agents the model can be run with and the
+models on the Mac; `spawn_worker <name> local` starts the runtime when it was
+stopped (as Start does), then starts the default coding agent (`install.cli`), or with
+`local:<agent>` (`local:pi`, `local:deepseek`) another one that is ready, on `local-ollama` through the same
 quick-start launch and the same checks as above; `sendmark` gives the worker a task and reads its
-answer back from a file it writes in its own folder. The skill never installs a model and never
+answer back from a file it writes in its own folder. The skill never installs a model or a coding agent and never
 answers a confirmation, the runtime still answers one request at a time, and while a worker it
 opened is live, Stop and Remove are refused until it is closed.
+
+## The models on this Mac
+
+The model store can hold several models. **One of them is the model in use**: the one the
+endpoint record `local-ollama` lists, the runtime is started for and a session can be
+started on. The runtime holds one model in memory at a time (`OLLAMA_MAX_LOADED_MODELS=1`),
+so this is what the Mac can really do, and it keeps every rule above: one record, one
+model, one stored digest per model.
+
+The installed screen lists what is on this Mac, the model in use first:
+
+| A row says    | It means                                                                                                                                                              |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| In use        | The model sessions start on                                                                                                                                           |
+| Ready         | Codeman downloaded and checked it. **Use** switches to it                                                                                                             |
+| Not checked   | The runtime lists it and Codeman never checked it: a model an earlier Remove kept, or one another program pulled through the runtime's port. It can only be deleted   |
+| Changed       | It was checked, and the runtime now reports another digest under its name. It is never started; delete it and install it again                                        |
+| Missing       | It was checked, and the runtime no longer lists it. **Delete** drops the entry                                                                                        |
+
+Each row shows the context the model was checked with and its size on disk, as the runtime
+reports it. Under the list is what all downloads take together: the size of the files in
+`local-model/models/blobs`, so layers two models share are counted once and an interrupted
+download is included. The window asks the runtime for the list at most every five seconds
+and measures the store at most every thirty, never on every poll.
+
+- **Add a model** opens the chooser. A model that is not on this Mac is installed like the
+  first one, with its sizes confirmed; when the job ends it is the model in use, and the
+  earlier model stays in the list. A row that is on this Mac already says so and is switched
+  to, without a download and without a confirm screen.
+- **Use** switches to a checked model. It is a job of two steps, `verify` and `connect`:
+  the runtime is restarted with the context the model was checked with, the model is loaded
+  and checked again (the tiny chat, the GPU, the tool probe), its digest must still be the
+  stored one (else the switch fails with `model-changed` before the model is loaded), and
+  the endpoint record is rewritten. The default coding agent becomes the one the model was
+  checked with when it is still installed, else the one of the installation, else any other
+  agent that is on the Mac and can run the model.
+- **Delete** removes one model through the runtime's own delete, after one question in the
+  row. The request carries the model's name, never a path, and the server deletes only a
+  name of its own listing. The model in use cannot be deleted: switch first, or Remove. It
+  needs the running runtime, so a stopped model shows no Delete until Start.
+
+Adding a model and switching are refused while a session uses the model ("Sessions are
+still using this model"), like Stop: their coding agents were started with the other model's
+name, and the runtime would swap models on every request.
+
+While a job that started from an installed model runs, or after it stopped (paused or
+failed), no session is started: the checks above want a finished installation, and the
+refusal says so (`job-unfinished`). The window
+then lists the checked models with **Use**, which is the way back to the earlier one. Going
+back deletes what the stopped job left of a model that never passed its check, the way a new
+install does; a checked model is never deleted that way.
 
 ## Stop, Start, Remove
 
 - **Stop** stops the runtime and keeps it from starting at the next boot. **Start** undoes
-  that.
+  that, and so does a switch to another model or the install of one: the job starts the
+  runtime, and the model it ends on is in use.
 - **Remove** stops the runtime, removes the endpoint record, switches the setting off again
   only when this feature switched it on and no other endpoint is saved, and deletes the
-  runtime and its private home. The downloaded model is deleted only when asked. The coding
-  agent stays. While a live session uses the model, Remove answers with the session names
-  instead.
+  runtime and its private home. The downloaded models (all of them) are deleted only when
+  asked. The coding agent stays. While a live session uses the model, Remove answers with
+  the session names instead.
+- **Models a Remove kept** are not lost space: with nothing installed the window says how
+  much they still take and offers "Delete them", and after a new install they show in the
+  list as "Not checked", each with its own Delete.
 
 ## Where everything is
 
 All under the data directory (`~/.codeman`, or the instance's own):
 
 ```
-local-model.json                           the state file (mode 0600)
+local-model.json                           the state file (mode 0600), with the list of checked models
 local-model/
   runtime/ollama-0.40.15.tgz.partial       the runtime archive while it downloads
   runtime/ollama-0.40.15/                  the unpacked runtime (about 579 MB)
@@ -313,9 +453,12 @@ in App Settings.
 | ------------ | ------------------------------------------------------------- | ---------------- | -------------------------------------- |
 | `idle`       | stays idle                                                    | refused          | install                                |
 | `installing` | becomes `paused` at the same step                             | becomes `paused` | cancel                                 |
-| `paused`     | stays paused                                                  | refused          | resume, install, remove                |
-| `failed`     | stays failed, same error                                      | refused          | resume, install, remove                |
-| `installed`  | stays installed; the runtime is started unless it was stopped | refused          | start a session, stop or start, remove |
+| `paused`     | stays paused                                                  | refused          | resume, install, use, delete a model, remove |
+| `failed`     | stays failed, same error                                      | refused          | resume, install, use, delete a model, remove |
+| `installed`  | stays installed; the runtime is started unless it was stopped | refused          | start a session, stop or start, install (add a model), use, delete a model, remove |
+
+`use` and "delete a model" are listed only while a row of the list offers them, and in
+`idle` "remove" is offered only while the model store still holds something.
 
 One job at a time. A job a server restart interrupted comes back paused and never continues
 without a click. Cancel interrupts the step in flight (the download, the pull, the request,
@@ -351,12 +494,25 @@ or `python3`.
   a session uses the model: close those sessions first.
 - **The runtime does not enforce the context length.** A prompt longer than the context was
   accepted in testing. Do not rely on the runtime to stop one.
-- **Most memory figures are calculated, not measured.** One model was run on one Mac; the
-  others are computed from their architecture, and the runtime settings they assume (an 8-bit
+- **Most memory figures are calculated, not measured.** Two models were measured on one Mac;
+  the others are computed from their architecture, and the runtime settings they assume (an 8-bit
   K/V cache, flash attention, a 1 GiB prompt cache) were read in its source, not yet observed
   on a Mac. "Recommended" appears only for the pair we ran, on the Mac we ran it on.
+- **A tool call that quotes a tool call can be cut off.** The pinned runtime reads the tool
+  calls of every Qwen-family model in the catalogue (the Ornith, MiMo and Qwen rows, the pair
+  we ran included) with one parser, and that parser ends a call at the first closing tag it
+  sees. An argument that itself contains a whole tool call, such as a prompt handed to a
+  sub-agent that shows one, arrives cut off and the rest as text (runtime issue 16992, filed
+  on `ornith:35b`; the fix, runtime pull request 17021, is open). The check after a download
+  asks for one plain tool call and does not see this.
 - **The model stays in memory for ten minutes** after the last request, then the runtime
   unloads it.
+- **One model runs at a time.** Several can be on disk; the runtime holds one, and a switch
+  restarts it and loads the other model (seconds to a minute). Close the sessions on the
+  model first: the window refuses the switch while one is open.
+- **The disk figures are the runtime's.** A row's size is what the runtime reports for the
+  model, and the total is the size of its blob files. Neither was compared with Finder on a
+  Mac yet.
 
 ## Keeping the catalogue current
 
