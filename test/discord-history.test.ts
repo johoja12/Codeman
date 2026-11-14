@@ -209,6 +209,53 @@ it('reads a status-confirmed local resumed conversation from its custom home des
   }
 });
 
+describe('pinned local Codex conversations', () => {
+  it.each(['nativeResumeId', 'resumeSessionId', 'missing'])(
+    'never substitutes a newer background rollout for a %s pin',
+    async (pin) => {
+      const dir = await mkdtemp(join(tmpdir(), 'pinned-discord-history-'));
+      const sessionId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+      const rollout = (conversationId: string, owner: string, text: string) =>
+        [
+          { type: 'session_meta', payload: { id: conversationId, originator: owner, cwd: '/shared/work' } },
+          { type: 'response_item', payload: { role: 'assistant', content: [{ type: 'output_text', text }] } },
+        ]
+          .map((row) => JSON.stringify(row))
+          .join('\n') + '\n';
+      try {
+        await mkdir(join(dir, 'sessions'));
+        if (pin !== 'missing') {
+          await writeFile(
+            join(dir, 'sessions', 'rollout-' + id + '.jsonl'),
+            rollout(id, 'codeman_older-owner', 'Interactive conversation')
+          );
+        }
+        await writeFile(
+          join(dir, 'sessions', 'rollout-' + other + '.jsonl'),
+          rollout(other, 'codeman_' + sessionId, 'Unrelated background run')
+        );
+        const session = {
+          id: sessionId,
+          mode: 'codex',
+          workingDir: '/shared/work',
+          nativeResumeId: pin === 'resumeSessionId' ? null : id,
+          codexConfig: pin === 'resumeSessionId' ? { resumeSessionId: id } : undefined,
+          envOverrideValue: (key: string) => (key === 'CODEX_HOME' ? dir : undefined),
+        } as unknown as import('../src/session.js').Session;
+        if (pin === 'missing') {
+          await expect(readDiscordSessionHistory(session)).rejects.toThrow();
+        } else {
+          const history = await readDiscordSessionHistory(session);
+          expect(history.conversationId).toBe(id);
+          expect(history.turns.map((turn) => turn.text)).toEqual(['Interactive conversation']);
+        }
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    }
+  );
+});
+
 describe('passive Claude settings metadata', () => {
   const row = (extra: Record<string, unknown> = {}) => ({
     type: 'assistant',
