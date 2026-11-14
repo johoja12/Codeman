@@ -681,7 +681,9 @@ async function withDiscordSessionHistorySource<T>(
       throw new DiscordHistoryReadError('profile_changed');
     id = recoveredId;
   }
-  if (format === 'codex-rollout' && !session.remote && !recoveredId) {
+  // Resumed conversations can have an older owner; background runs may share our marker.
+  // Discover by ownership only while no native conversation is pinned.
+  if (format === 'codex-rollout' && !session.remote && !recoveredId && !id) {
     const { findOwnedCodexConversation, resolveEffectiveCodexHome } =
       await import('./checkpoint-conversation-identity.js');
     id =
