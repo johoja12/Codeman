@@ -3,9 +3,11 @@ import type { DiscordTable } from './discord-tables.js';
 
 export function interactiveDiscordTable(table: DiscordTable): boolean {
   return (
+    table.header.length > 0 &&
+    table.header.length <= 24 &&
     table.rows.length > 0 &&
-    table.header.join(' · ').length <= 500 &&
-    table.rows.every((r) => r.join(' · ').length <= 950)
+    table.rows.length <= 200 &&
+    [table.header, ...table.rows].reduce((n, row) => n + row.join('').length, 0) <= 64 * 1024
   );
 }
 export function discordTablePage(table: DiscordTable, page: number): Array<Record<string, unknown>> {
@@ -117,4 +119,84 @@ export async function discordTablePng(table: DiscordTable, page: number): Promis
     svg = discordTableSvg(table, page);
   }
   return new Resvg(svg, { font: { loadSystemFonts: true } }).render().asPng();
+}
+
+/** Bounded table pages with repeated headers; oversized rows continue without losing cell text. */
+export function discordTableImagePages(table: DiscordTable): string[] {
+  if (!interactiveDiscordTable(table)) throw new Error('Table exceeds preview limits');
+  const width = Math.max(900, Math.min(3200, table.header.length * 360));
+  const colWidth = (width - 48) / table.header.length;
+  const wrap = (text: string): string[] => {
+    const chars = Array.from(plain(text));
+    const lines: string[] = [];
+    const budget = Math.max(3, Math.floor((colWidth - 28) / 12));
+    while (chars.length) {
+      let units = 0,
+        count = 0;
+      while (count < chars.length && units + (chars[count].codePointAt(0)! > 0x2ff ? 2 : 1) <= budget) {
+        units += chars[count].codePointAt(0)! > 0x2ff ? 2 : 1;
+        count++;
+      }
+      count = Math.max(1, count);
+      const space = chars.slice(0, count).lastIndexOf(' ');
+      if (count < chars.length && space > count / 2) count = space + 1;
+      lines.push(chars.splice(0, count).join('').trim());
+    }
+    return lines.length ? lines : [''];
+  };
+  const header = table.header
+    .map(wrap)
+    .map((lines) => (lines.length > 8 ? [...lines.slice(0, 7), '… (full header in CSV)'] : lines));
+  const rowHeight = (cells: string[][]) => Math.max(...cells.map((c) => c.length)) * 28 + 24;
+  const headerHeight = rowHeight(header);
+  const maxLines = Math.max(1, Math.floor((2200 - 160 - headerHeight) / 28) - 1);
+  const pages: Array<{ rows: Array<{ cells: string[][]; index: number }>; first: number; last: number }> = [];
+  let page = { rows: [] as Array<{ cells: string[][]; index: number }>, first: 0, last: 0 };
+  let height = 100 + headerHeight;
+  table.rows.forEach((row, index) => {
+    const cells = row.map(wrap);
+    const lines = Math.max(...cells.map((c) => c.length));
+    for (let offset = 0; offset < lines; offset += maxLines) {
+      const fragment = cells.map((c) => c.slice(offset, offset + maxLines));
+      const size = rowHeight(fragment) + 2;
+      if (page.rows.length && height + size > 2140) {
+        pages.push(page);
+        page = { rows: [], first: index, last: index };
+        height = 100 + headerHeight;
+      }
+      if (!page.rows.length) page.first = index;
+      page.last = index;
+      page.rows.push({ cells: fragment, index });
+      height += size;
+    }
+  });
+  if (page.rows.length) pages.push(page);
+  return pages.map((page, pageIndex) => {
+    let y = 76;
+    const body: string[] = [];
+    const draw = (cells: string[][], index: number) => {
+      const h = rowHeight(cells);
+      body.push(
+        `<rect x="24" y="${y}" width="${width - 48}" height="${h}" fill="${index < 0 ? '#303e52' : index % 2 ? '#242a34' : '#1c222c'}"/>`
+      );
+      cells.forEach((lines, col) => {
+        if (col) body.push(`<path d="M${24 + col * colWidth} ${y}v${h}" stroke="#435064" stroke-width="1"/>`);
+        lines.forEach((line, n) =>
+          body.push(
+            `<text x="${38 + col * colWidth}" y="${y + 31 + n * 28}" font-size="20" fill="${index < 0 ? '#b7d7ff' : '#edf2fa'}"${index < 0 ? ' font-weight="bold"' : ''}>${xml(line)}</text>`
+          )
+        );
+      });
+      y += h + 2;
+    };
+    draw(header, -1);
+    page.rows.forEach((row) => draw(row.cells, row.index));
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${y + 54}" font-family="DejaVu Sans, sans-serif"><rect width="100%" height="100%" fill="#141a23"/><text x="24" y="43" font-size="25" font-weight="bold" fill="#edf2fa">Table · rows ${page.first + 1}–${page.last + 1} of ${table.rows.length}</text>${body.join('')}<text x="24" y="${y + 33}" font-size="17" fill="#a8b5c7">${pageIndex + 1} / ${pages.length} · Codeman · Original data available as CSV</text></svg>`;
+  });
+}
+export async function discordTableImage(table: DiscordTable, page: number): Promise<{ data: Buffer; pages: number }> {
+  const images = discordTableImagePages(table);
+  if (!Number.isInteger(page) || page < 0 || page >= images.length) throw new Error('Invalid table image page');
+  const { Resvg } = await import('@resvg/resvg-js');
+  return { data: new Resvg(images[page], { font: { loadSystemFonts: true } }).render().asPng(), pages: images.length };
 }

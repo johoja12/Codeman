@@ -64,6 +64,7 @@ export interface DiscordNativeUiServices {
   workspace(id: string): Promise<{ summary: string; diff: string }>;
 }
 export interface DiscordUiPayload {
+  files?: DiscordFile[];
   content: string;
   flags?: number;
   components?: DiscordPost['components'];
