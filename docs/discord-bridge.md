@@ -283,34 +283,17 @@ full-response attachment behavior. Notifications mode retains its existing plain
 message format. This affects future posts; it does not edit previous Discord
 messages.
 
-#### Compact table cards
+#### Table images
 
-New native assistant answers in Full mode render eligible Markdown tables as
-Components V2 cards with the first column as a record heading, the remaining
-column headings shown once, and cell values kept in their original column order.
-Three records appear per page, separated by dividers. **Next** opens a private
-view; subsequent **Previous/Next** clicks update that view without changing the
-shared answer. Prose before, between and after tables stays in sequence.
+New native assistant answers in Full mode render recognized Markdown tables automatically as PNG galleries with aligned columns, repeated headers, grid lines and alternating rows. Tap an image to zoom. Larger tables have bounded image pages; **Next** opens a private image view and **Previous/Next** update that view without changing the shared answer. Long cells continue on subsequent image pages, and prose stays in sequence.
 
-**View table** posts a dark PNG table preview into the same session thread.
-The preview includes all rows when it fits the bounded image size; taller tables
-show the selected three-row page. **Download CSV** posts all rows, with quoted
-cells, UTF-8 text and spreadsheet formula protection. Both actions read the exact
-original assistant response and recheck the session/conversation and permissions;
-they never submit a model prompt. Initial shared-card buttons can recover after a
-restart from stored response references and a verified bot-owned message. Private
-browsing panels expire normally.
+**View table** posts the selected PNG into the session thread. **Download CSV** posts all original rows with quoted cells, UTF-8 text and spreadsheet formula protection. These actions reread the exact response and recheck the session, conversation and permissions without submitting a model prompt. Shared-card controls can recover after restart; private panels expire normally.
 
-Tables with more than 200 rows/24 columns, oversized cells, excessive response
-parts or unrecognized syntax retain the existing text fallback. Literal code
-examples stay literal. Existing Discord messages are not rewritten. Table parsing
-and export evaluate no HTML, links, external images or cell code; PNG rendering
-uses the bundled resvg library and system fonts.
+The parser bounds recognized tables to 200 rows, 24 columns and 64 KiB of source. Larger or unrecognized syntax retains the existing text/full-response fallback. Literal code examples stay literal. Table rendering evaluates no HTML, links, external images or cell code; PNGs use the bundled resvg library and system fonts. Existing messages are not automatically rewritten.
 
-![Compact table card layout preview](images/discord-table-card-mobile.png)
+![Automatic table PNG example with synthetic data](images/discord-table-card-mobile.png)
 
-This table preview is rendered from a generated Components V2 payload; Discord
-controls the exact client typography and spacing.
+This is actual renderer output using synthetic example data. Discord controls the image's display size; the full PNG opens when tapped.
 
 ![Mobile response-card layout preview](images/discord-response-card-mobile.png)
 

@@ -24,7 +24,7 @@ import {
 } from './discord-response-format.js';
 import { readDiscordTaskUpdates, renderDiscordTaskUpdates, type DiscordTaskUpdates } from './discord-task-updates.js';
 import { discordTableParts, type DiscordTable } from './discord-tables.js';
-import { discordTablePage, discordTableCsv, discordTablePng, interactiveDiscordTable } from './discord-table-view.js';
+import { discordTableCsv, discordTableImage, interactiveDiscordTable } from './discord-table-view.js';
 import { discordDisplayText } from './discord-display-text.js';
 import type { DiscordInteraction, GatewayMessage, DiscordPost } from './discord-bridge.js';
 import type { DiscordNativeUiHost, DiscordUiPayload, DiscordUiSession } from './discord-native-ui-types.js';
@@ -53,7 +53,7 @@ export function uiV2Payload(payload: DiscordUiPayload): DiscordUiPayload {
 }
 export function uiWirePayload(payload: DiscordUiPayload, edit = false): Record<string, unknown> {
   if (!((payload.flags ?? 0) & DISCORD_COMPONENTS_V2)) return { ...payload };
-  const { content: _content, ...rest } = payload;
+  const { content: _content, files: _files, ...rest } = payload;
   return { ...rest, ...(edit ? { content: null, embeds: [] } : {}) };
 }
 const ownsUiMarker = (message: { content?: string; components?: unknown }, marker: string) =>
@@ -568,13 +568,7 @@ export class DiscordNativeUi {
   ): Promise<DiscordPost[] | undefined> {
     const parts = discordTableParts(text);
     const tables = parts.filter((p) => 'table' in p);
-    if (
-      !tables.length ||
-      tables.length > 4 ||
-      text.length > 12000 ||
-      tables.some((p) => !interactiveDiscordTable(p.table))
-    )
-      return undefined;
+    if (!tables.length || tables.some((p) => !interactiveDiscordTable(p.table))) return undefined;
     const s = await this.target(id);
     if (this.host.channelForSession(id) !== channel || !s.conversation) throw new Error('Response destination changed');
     const ctx: UiContext = { channel, session: id, conversation: s.conversation };
@@ -585,7 +579,8 @@ export class DiscordNativeUi {
       if ('text' in part) {
         if (part.text.trim()) posts.push(...discordResponsePosts(part.text, { ...options, controls: [] }));
       } else {
-        const view = this.tableView(ctx, scope, userCursor, responseCursor, part.table, index++, 0);
+        const tableIndex = index++;
+        const view = await this.tableView(ctx, scope, userCursor, responseCursor, part.table, tableIndex, 0);
         const container = view.components![0];
         container.accent_color = options.color ?? 0x58a6ff;
         (container.components as unknown[]).unshift({
@@ -599,7 +594,7 @@ export class DiscordNativeUi {
         });
       }
     }
-    // Keep adjacent prose and compact rows in one card when Discord's limits permit.
+    // Keep adjacent prose and table images in one card when Discord's limits permit.
     const merged: DiscordPost[] = [];
     for (const post of posts) {
       const previous = merged.at(-1);
@@ -611,15 +606,15 @@ export class DiscordNativeUi {
         const count = (nodes: Array<Record<string, unknown>>): number =>
           nodes.reduce((n, c) => n + 1 + (Array.isArray(c.components) ? count(c.components) : 0), 0);
         const size = joined.reduce((n, c) => n + (typeof c.content === 'string' ? c.content.length : 0), 0);
-        if (size <= 3500 && count(joined) <= 30) {
+        if (size <= 3500 && count(joined) <= 30 && (previous?.files?.length ?? 0) + (post.files?.length ?? 0) <= 10) {
           previous!.components![0].components = joined;
+          previous!.files = [...(previous!.files ?? []), ...(post.files ?? [])];
           continue;
         }
       }
       if (merged.length) post.flags = (post.flags ?? 0) | DISCORD_SUPPRESS_NOTIFICATIONS;
       merged.push(post);
     }
-    if (merged.length > 8) return undefined;
     if (options.controls?.length) {
       const last = merged.at(-1)!;
       const container = last.components![0];
@@ -658,7 +653,7 @@ export class DiscordNativeUi {
     if (!table || !interactiveDiscordTable(table)) throw new Error('Original table changed or is unavailable');
     return table;
   }
-  private tableView(
+  private async tableView(
     ctx: UiContext,
     scope: string | undefined,
     userCursor: string,
@@ -666,7 +661,7 @@ export class DiscordNativeUi {
     table: DiscordTable,
     index: number,
     page: number
-  ): DiscordUiPayload {
+  ): Promise<DiscordUiPayload> {
     const current = () =>
       scope === this.host.scope() &&
       this.host.channelForSession(ctx.session!) === ctx.channel &&
@@ -687,7 +682,7 @@ export class DiscordNativeUi {
               ? { name: `table-${index + 1}.csv`, data: discordTableCsv(original) }
               : {
                   name: `table-${index + 1}-page-${targetPage + 1}.png`,
-                  data: await discordTablePng(original, targetPage),
+                  data: (await discordTableImage(original, targetPage)).data,
                 };
           await this.target(ctx.session!, ctx.conversation);
           if (!authorized()) throw new Error('Response destination changed');
@@ -707,22 +702,35 @@ export class DiscordNativeUi {
       if (disabled) b.disabled = true;
       return b;
     };
-    const components = discordTablePage(table, page);
-    if (table.rows.length > 3)
+    const image = await discordTableImage(table, page);
+    const name = `table-${index + 1}-page-${page + 1}.png`;
+    const components: Array<Record<string, unknown>> = [
+      {
+        type: 12,
+        items: [
+          {
+            media: { url: 'attachment://' + name },
+            description:
+              `Table ${index + 1}, page ${page + 1} of ${image.pages}. Columns: ${table.header.join(', ')}`.slice(
+                0,
+                1024
+              ),
+          },
+        ],
+      },
+      { type: 10, content: `-# Table ${index + 1} · ${table.rows.length} rows · Page ${page + 1} of ${image.pages}` },
+    ];
+    if (image.pages > 1)
       components.push(
         row(
           button('Previous', Math.max(0, page - 1), 'page', page === 0),
-          button(
-            'Next',
-            Math.min(Math.ceil(table.rows.length / 3) - 1, page + 1),
-            'page',
-            (page + 1) * 3 >= table.rows.length
-          )
+          button('Next', Math.min(image.pages - 1, page + 1), 'page', page + 1 >= image.pages)
         )
       );
     components.push(row(button('View table', page, 'png'), button('Download CSV', page, 'csv')));
     return {
       content: '',
+      files: [{ name, data: image.data }],
       flags: DISCORD_COMPONENTS_V2 | DISCORD_SUPPRESS_NOTIFICATIONS,
       allowed_mentions: noMentions,
       components: [{ type: 17, accent_color: 0x58a6ff, components }],
@@ -848,12 +856,12 @@ export class DiscordNativeUi {
         continue;
       const ctx: UiContext = { channel, session: id, conversation };
       const anchor = ref.responseCursor ?? ref.userCursor;
-      const route = /^cmui:[a-f0-9]{40}:t:(\d{1,2}):(\d{1,2}):(page|png|csv):([a-f0-9]{32})$/.exec(custom);
+      const route = /^cmui:[a-f0-9]{40}:t:(\d{1,2}):(\d{1,3}):(page|png|csv):([a-f0-9]{32})$/.exec(custom);
       if (route && ref.responseCursor) {
         const index = Number(route[1]),
           page = Number(route[2]),
           op = route[3];
-        if (index >= 4 || page >= 67) continue;
+        if (index >= 100 || page >= 1000) continue;
         const key =
           'cmui:' +
           hash(JSON.stringify([scope, ctx, `${ref.responseCursor}:table:${index}:${page}:${op}:${route[4]}`])).slice(
@@ -864,10 +872,10 @@ export class DiscordNativeUi {
         const table = await this.responseTable(ctx, scope, ref.userCursor, ref.responseCursor, index);
         if (hash(table.source).slice(0, 32) !== route[4]) return undefined;
         // Register this exact target page action, including neighboring navigation targets.
-        this.tableView(ctx, scope, ref.userCursor, ref.responseCursor, table, index, page);
+        await this.tableView(ctx, scope, ref.userCursor, ref.responseCursor, table, index, page);
         // A page route encodes its destination; its button is generated on a neighboring page.
         if (op === 'page' && !this.actions.has(custom)) {
-          this.tableView(ctx, scope, ref.userCursor, ref.responseCursor, table, index, page > 0 ? page - 1 : 1);
+          await this.tableView(ctx, scope, ref.userCursor, ref.responseCursor, table, index, page > 0 ? page - 1 : 1);
         }
         if (!current()) return undefined;
         const restored = this.actions.get(custom);

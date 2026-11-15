@@ -316,6 +316,8 @@ interface DiscordBoundAction {
   messageId?: string;
 }
 export interface DiscordPost {
+  /** Internal upload envelope, removed before JSON encoding. */
+  files?: DiscordFile[];
   content: string;
   flags?: number;
   allowed_mentions: { parse: string[]; users: string[] };
@@ -334,9 +336,10 @@ export interface DiscordPost {
 }
 
 /** Discord V2 disallows legacy content/embeds even when our internal envelope keeps content empty. */
-function discordWirePost<T extends Partial<DiscordPost>>(post: T): T | Omit<T, 'content' | 'embeds'> {
-  if (!((post.flags ?? 0) & DISCORD_COMPONENTS_V2)) return post;
-  const { content: _content, embeds: _embeds, ...wire } = post;
+function discordWirePost(post: Partial<DiscordPost>): Record<string, unknown> {
+  const { files: _files, ...clean } = post;
+  if (!((post.flags ?? 0) & DISCORD_COMPONENTS_V2)) return clean;
+  const { content: _content, embeds: _embeds, ...wire } = clean;
   return wire;
 }
 
@@ -1167,12 +1170,29 @@ export class DiscordBridge {
         },
         finish: async (m, body) => {
           if ((m.message?.flags ?? 0) & DISCORD_COMPONENTS_V2) body = uiV2Payload(body);
+          const payload =
+            body.flags && body.flags & DISCORD_COMPONENTS_V2
+              ? { ...discordWirePost(body), flags: body.flags | 64, content: null, embeds: [] }
+              : discordWirePost(body);
+          let wire: unknown = payload;
+          if (body.files?.length) {
+            const form = new FormData();
+            form.append(
+              'payload_json',
+              JSON.stringify({
+                ...payload,
+                attachments: body.files.map((f, i) => ({ id: i, filename: safeAttachmentName(f.name) })),
+              })
+            );
+            body.files.forEach((f, i) =>
+              form.append(`files[${i}]`, new Blob([Buffer.from(f.data)]), safeAttachmentName(f.name))
+            );
+            wire = form;
+          }
           await this.api.request(
             'PATCH',
             `/webhooks/${encodeURIComponent(m.application_id)}/${encodeURIComponent(m.token)}/messages/@original`,
-            body.flags && body.flags & DISCORD_COMPONENTS_V2
-              ? { ...discordWirePost(body), flags: body.flags | 64, content: null, embeds: [] }
-              : body
+            wire
           );
         },
         control: async (id, command) => this.deps.control?.(id, command) ?? { text: 'Session controls unavailable' },
@@ -3186,6 +3206,13 @@ export class DiscordBridge {
     editMessageId?: string,
     retained: Array<{ id: string; filename: string }> = []
   ): Promise<unknown> {
+    if (post.files?.length) {
+      file = [...post.files, ...(Array.isArray(file) ? file : file ? [file] : [])];
+      if (new Set(file.map((upload) => upload.name)).size !== file.length)
+        throw new BridgeProblem('Attachment names conflict');
+    }
+    const { files: _files, ...wirePost } = post;
+    post = wirePost;
     if (this.cfg.mode === 'full' && sessionId) {
       if (!this.destinationMatches(sessionId, channelId)) throw new BridgeProblem('Discord destination changed');
       if (sessionId.startsWith('__case__:'))

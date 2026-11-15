@@ -1581,7 +1581,7 @@ it('renders saved URL-bearing previews as one valid thread link while keeping ti
 
 const tableResponse =
   'Placement results\n\n| Pod | Namespace | State |\n|---|---|---|\n' +
-  Array.from({ length: 7 }, (_, i) => `| pod-${i} | hdai | ${i ? 'Completed' : 'Pending'} |`).join('\n') +
+  Array.from({ length: 100 }, (_, i) => `| pod-${i} | hdai | ${i ? 'Completed' : 'Pending'} |`).join('\n') +
   '\n\nAll original rows retained.';
 async function tableFixture() {
   const f = await fixture();
@@ -1598,29 +1598,32 @@ async function tableFixture() {
     title: '✓ Turn finished',
     controls,
   }))!;
-  const card = posts.find((p) => JSON.stringify(p).includes('Showing 1–3'))!;
+  const card = posts.find((p) => p.files?.length)!;
   return { ...f, posts, card };
 }
-it('paginates compact table rows privately, preserves prose and downloads the exact original CSV', async () => {
+it('paginates real table images privately, preserves prose and downloads the exact original CSV', async () => {
   const f = await tableFixture();
   expect(f.posts).toHaveLength(1);
+  expect(f.card.files?.[0].data.subarray(0, 8).toString('hex')).toBe('89504e470d0a1a0a');
+  expect(discordUiNodes(f.card.components).some((n) => n.type === 12)).toBe(true);
+  expect(JSON.stringify(f.card.components)).not.toContain('hdai ·');
   expect(JSON.stringify(f.posts)).toContain('Placement results');
   expect(JSON.stringify(f.posts)).toContain('All original rows retained.');
   expect(JSON.stringify(f.card)).not.toContain('pod-3');
   expect(f.component(f.card, 'Previous').disabled).toBe(true);
   const page2 = await f.click(f.card, 'Next');
-  expect(JSON.stringify(page2)).toContain('Showing 4–6 of 7');
+  expect(JSON.stringify(page2.components)).toContain('Page 2 of');
+  expect(page2.files?.[0].data.subarray(0, 8).toString('hex')).toBe('89504e470d0a1a0a');
   expect(f.responses.at(-1)).toEqual({ type: 5, data: { flags: 64 } });
   const page3 = await f.click(page2, 'Next');
   expect(f.responses.at(-1)).toEqual({ type: 6 });
-  expect(JSON.stringify(page3)).toContain('Showing 7–7 of 7');
-  expect(f.component(page3, 'Next').disabled).toBe(true);
+  expect(JSON.stringify(page3.components)).toContain('Page 3 of');
   const pageBack = await f.click(page3, 'Previous');
-  expect(JSON.stringify(pageBack)).toContain('Showing 4–6 of 7');
+  expect(JSON.stringify(pageBack.components)).toContain('Page 2 of');
   await f.click(pageBack, 'Download CSV');
   const file = vi.mocked(f.host.postFile).mock.calls.at(-1)![1];
   expect(file.name).toBe('table-1.csv');
-  expect(file.data.toString().match(/pod-/g)).toHaveLength(7);
+  expect(file.data.toString().match(/pod-/g)).toHaveLength(100);
   expect(f.host.control).not.toHaveBeenCalled();
   expect(f.host.submit).not.toHaveBeenCalled();
 });
@@ -1642,7 +1645,7 @@ it.each(['Next', 'View table', 'Download CSV'])(
     await ui.interaction(f.event(f.component(f.card, label), { message: { id } }));
     expect(JSON.stringify(f.finishes.at(-1))).not.toContain('no longer available');
     expect(JSON.stringify(f.finishes.at(-1))).not.toContain('not confirmed');
-    if (label === 'Next') expect(JSON.stringify(f.finishes.at(-1))).toContain('Showing 4–6 of 7');
+    if (label === 'Next') expect(JSON.stringify(f.finishes.at(-1)?.components)).toContain('Page 2 of');
     else expect(f.host.postFile).toHaveBeenCalledTimes(1);
   }
 );
@@ -1687,7 +1690,7 @@ it.each([1, 2, 3])('renders a %i-row table with unique controls and usable expor
     const ids = discordUiNodes(post.components).flatMap((n) => (typeof n.custom_id === 'string' ? [n.custom_id] : []));
     expect(new Set(ids).size).toBe(ids.length);
   }
-  const card = posts.find((p) => JSON.stringify(p).includes('Showing 1–'))!;
+  const card = posts.find((p) => p.files?.length)!;
   const labels = discordUiNodes(card.components).map((n) => n.label);
   expect(labels).not.toContain('Previous');
   expect(labels).not.toContain('Next');

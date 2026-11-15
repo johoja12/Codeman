@@ -898,3 +898,54 @@ it('retries corrected rejected response cards with the same nonce and never repl
     send(THREAD, { content: 'changed accepted rendering' }, undefined, 's1', 'same-native-event')
   ).rejects.toThrow('formatting changed');
 });
+
+it('uploads automatic table gallery images and fingerprints their bytes without leaking the internal file envelope', async () => {
+  const forms: FormData[] = [];
+  const { b } = await ready(undefined, async (_url, init) => {
+    if (init.body instanceof FormData) forms.push(init.body);
+    return Response.json({ id: MESSAGE });
+  });
+  const post = {
+    content: '',
+    flags: 32768 | 4096,
+    allowed_mentions: { parse: [], users: [] },
+    components: [{ type: 17, components: [{ type: 12, items: [{ media: { url: 'attachment://table.png' } }] }] }],
+    files: [{ name: 'table.png', data: Buffer.from('image bytes') }],
+  };
+  const send = (
+    b as unknown as {
+      deliverPost: (
+        channel: string,
+        payload: typeof post,
+        file: undefined | Array<{ name: string; data: Buffer }>,
+        session: string,
+        key: string
+      ) => Promise<unknown>;
+    }
+  ).deliverPost.bind(b);
+  await send(THREAD, post, undefined, 's1', 'image-table');
+  const wire = JSON.parse(String(forms[0].get('payload_json')));
+  expect(wire.files).toBeUndefined();
+  expect(wire.content).toBeUndefined();
+  expect(wire.flags & 4096).toBeTruthy();
+  expect(JSON.stringify(wire.components)).toContain('attachment://table.png');
+  expect(JSON.stringify(wire.components)).not.toContain('"type":13');
+  expect(await (forms[0].get('files[0]') as File).text()).toBe('image bytes');
+  await send(THREAD, post, undefined, 's1', 'image-table');
+  expect(forms).toHaveLength(1);
+  await send(THREAD, post, [{ name: 'report.txt', data: Buffer.from('artifact') }], 's1', 'image-with-artifacts');
+  expect(await (forms[1].get('files[0]') as File).text()).toBe('image bytes');
+  expect(await (forms[1].get('files[1]') as File).text()).toBe('artifact');
+  await expect(
+    send(THREAD, post, [{ name: 'table.png', data: Buffer.from('conflict') }], 's1', 'collision')
+  ).rejects.toThrow('Attachment names conflict');
+  await expect(
+    send(
+      THREAD,
+      { ...post, files: [{ name: 'table.png', data: Buffer.from('changed bytes') }] },
+      undefined,
+      's1',
+      'image-table'
+    )
+  ).rejects.toThrow('formatting changed');
+});

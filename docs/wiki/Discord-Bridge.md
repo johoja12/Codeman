@@ -125,3 +125,8 @@ Results show observed native execution and provide guarded local/SSH file downlo
 Generated files outside the session folder offer **Review <filename>**, followed by a private **Allow this file** confirmation showing the host and full path. The one-use approval attaches that file to the original response without granting folder access. Other attachments are retained; credential blocks and the four-file / 8 MB response limits remain. Controls expire after six minutes or a restart. Use `!codeman file /absolute/path` to reopen a review for an older output.
 
 A message's **Apps** menu offers **Codeman: Send to session**, **Codeman: Queue follow-up** and **Codeman: Start session**. Review the explicit destination, source text and attachments before confirming. Creating a session and submitting the selected source are separate choices. All controls use the configured allowlist and private destinations; Notifications mode retains its existing behavior.
+
+
+### Tables in responses
+
+Recognized Markdown tables appear automatically as PNG tables with aligned columns, repeated headers and alternating rows. Tap the image to zoom. Larger tables have Previous/Next image pages; browsing opens a private panel, so it does not replace the shared response. Download CSV preserves all original rows and cell text. Prose stays beside the table, and literal table examples inside code blocks stay as code.

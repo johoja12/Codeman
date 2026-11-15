@@ -6,6 +6,8 @@ import {
   discordTableSvg,
   discordTablePng,
   interactiveDiscordTable,
+  discordTableImagePages,
+  discordTableImage,
 } from '../src/discord-table-view.js';
 const table = {
   header: ['Pod', 'Namespace', 'Purpose', 'Observed state'],
@@ -69,8 +71,8 @@ describe('Components V2 table views', () => {
         .join('\n')
     ).toContain('```\n| A | B |');
   });
-  it('refuses oversized interactive cells and leaves oversized source literal', () => {
-    expect(interactiveDiscordTable({ ...table, rows: [['x'.repeat(1000)]] })).toBe(false);
+  it('accepts long image cells and leaves excessive source literal', () => {
+    expect(interactiveDiscordTable({ ...table, rows: [['x'.repeat(1000)]] })).toBe(true);
     const source = '| A | B |\n|---|---|\n| x | ' + 'a'.repeat(66000) + ' |';
     expect(discordTableParts(source)).toEqual([{ text: source }]);
   });
@@ -96,4 +98,33 @@ it('keeps identifiers intact in plain image text and includes all rows in a smal
   });
   expect(svg).toContain('pod_with_underscores');
   expect(svg).toContain('rows 1–8 of 8');
+});
+
+it('renders automatic image pages with repeated headers, grid columns and all long cell content', async () => {
+  const large = {
+    ...table,
+    rows: Array.from({ length: 70 }, (_, i) => [`unique-${i}`, 'namespace', 'long purpose '.repeat(30), 'Ready']),
+  };
+  const pages = discordTableImagePages(large);
+  expect(pages.length).toBeGreaterThan(1);
+  for (const page of pages) {
+    expect(page).toContain('Observed state');
+    expect(page).toContain('<path');
+    expect(Number(/height="(\d+)"/.exec(page)![1])).toBeLessThanOrEqual(2300);
+  }
+  for (let i = 0; i < 70; i++) expect(pages.join('')).toContain(`unique-${i}`);
+  const image = await discordTableImage(large, 1);
+  expect(image.pages).toBe(pages.length);
+  expect(image.data.subarray(0, 8).toString('hex')).toBe('89504e470d0a1a0a');
+  await expect(discordTableImage(large, pages.length)).rejects.toThrow('Invalid');
+});
+it('continues a single oversized cell across image pages without dropping text or loading markup', () => {
+  const pages = discordTableImagePages({
+    header: ['A', 'B'],
+    rows: [['<image href="https://bad.test"/>', 'x'.repeat(12000) + 'TAIL_MARKER']],
+    source: '',
+  });
+  expect(pages.length).toBeGreaterThan(1);
+  expect(pages.join('')).not.toContain('<image');
+  expect(pages.join('')).toContain('TAIL_MARKER');
 });
