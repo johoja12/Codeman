@@ -3206,7 +3206,11 @@ export class DiscordBridge {
     editMessageId?: string,
     retained: Array<{ id: string; filename: string }> = []
   ): Promise<unknown> {
-    file ??= post.files?.length ? post.files : undefined;
+    if (post.files?.length) {
+      file = [...post.files, ...(Array.isArray(file) ? file : file ? [file] : [])];
+      if (new Set(file.map((upload) => upload.name)).size !== file.length)
+        throw new BridgeProblem('Attachment names conflict');
+    }
     const { files: _files, ...wirePost } = post;
     post = wirePost;
     if (this.cfg.mode === 'full' && sessionId) {

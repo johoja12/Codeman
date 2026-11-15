@@ -917,7 +917,7 @@ it('uploads automatic table gallery images and fingerprints their bytes without 
       deliverPost: (
         channel: string,
         payload: typeof post,
-        file: undefined,
+        file: undefined | Array<{ name: string; data: Buffer }>,
         session: string,
         key: string
       ) => Promise<unknown>;
@@ -933,6 +933,12 @@ it('uploads automatic table gallery images and fingerprints their bytes without 
   expect(await (forms[0].get('files[0]') as File).text()).toBe('image bytes');
   await send(THREAD, post, undefined, 's1', 'image-table');
   expect(forms).toHaveLength(1);
+  await send(THREAD, post, [{ name: 'report.txt', data: Buffer.from('artifact') }], 's1', 'image-with-artifacts');
+  expect(await (forms[1].get('files[0]') as File).text()).toBe('image bytes');
+  expect(await (forms[1].get('files[1]') as File).text()).toBe('artifact');
+  await expect(
+    send(THREAD, post, [{ name: 'table.png', data: Buffer.from('conflict') }], 's1', 'collision')
+  ).rejects.toThrow('Attachment names conflict');
   await expect(
     send(
       THREAD,
