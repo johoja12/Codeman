@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
-import { createIsolatedBuild } from './isolated-build-fixture.js';
+import { createIsolatedBuild, ISOLATED_BUILD_TIMEOUT_MS } from './isolated-build-fixture.js';
 
 const read = (path: string) => readFileSync(resolve(import.meta.dirname, '..', path), 'utf8');
 const indexSource = read('src/web/public/index.html');
@@ -232,18 +232,26 @@ describe('mobile IME preview delivery graph', () => {
     expect(buildSource).toContain("'mobile-ime-preview.js'");
   });
 
-  it('emits the exact hashed controller referenced by built HTML', () => {
-    const fixture = createIsolatedBuild();
-    try {
-      execFileSync(process.execPath, ['scripts/build.mjs'], { cwd: fixture.root, stdio: 'pipe', timeout: 120_000 });
-      const builtHtml = readFileSync(resolve(fixture.root, 'dist/web/public/index.html'), 'utf8');
-      const match = builtHtml.match(/mobile-ime-preview\.([a-f0-9]{8})\.js/);
-      expect(match).not.toBeNull();
-      expect(existsSync(resolve(fixture.root, 'dist/web/public', match![0]))).toBe(true);
-    } finally {
-      fixture.dispose();
-    }
-  }, 120_000);
+  it(
+    'emits the exact hashed controller referenced by built HTML',
+    () => {
+      const fixture = createIsolatedBuild();
+      try {
+        execFileSync(process.execPath, ['scripts/build.mjs'], {
+          cwd: fixture.root,
+          stdio: 'pipe',
+          timeout: ISOLATED_BUILD_TIMEOUT_MS,
+        });
+        const builtHtml = readFileSync(resolve(fixture.root, 'dist/web/public/index.html'), 'utf8');
+        const match = builtHtml.match(/mobile-ime-preview\.([a-f0-9]{8})\.js/);
+        expect(match).not.toBeNull();
+        expect(existsSync(resolve(fixture.root, 'dist/web/public', match![0]))).toBe(true);
+      } finally {
+        fixture.dispose();
+      }
+    },
+    ISOLATED_BUILD_TIMEOUT_MS + 30_000
+  );
 
   it('scopes preview presentation and native composition suppression to touch ownership', () => {
     expect(cssSource).toContain('.xterm-helpers .codeman-ime-preview');

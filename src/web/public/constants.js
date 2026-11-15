@@ -17,7 +17,7 @@
  * @dependency None (first in load order)
  * @loadorder 1 of 15 — constants.js → mobile-handlers.js → voice-input.js → notification-manager.js
  *   → keyboard-accessory.js → input-cjk.js → app.js → terminal-ui.js → respawn-ui.js
- *   → ralph-panel.js → settings-ui.js → panels-ui.js → session-ui.js → ralph-wizard.js
+ *   → ralph-panel.js → settings-ui.js → panels-ui.js → session-ui.js
  *   → api-client.js → subagent-windows.js
  */
 
@@ -114,7 +114,6 @@ const AUTO_CLOSE_NOTIFICATION_MS = 8000;    // Auto-close browser notifications
 const DEFAULT_TOAST_DURATION_MS = 3000;     // How long a corner toast stays by default
 const MIN_NOTIFICATION_DURATION_MS = 1000;  // Shortest configurable toast / browser-notification time
 const MAX_NOTIFICATION_DURATION_MS = 300000; // Longest configurable toast / browser-notification time
-const THROTTLE_DELAY_MS = 100;              // General UI throttle delay
 const TERMINAL_CHUNK_SIZE = 32 * 1024;      // 32KB chunks for terminal buffer loading
 const TERMINAL_TAIL_SIZE = 1024 * 1024;     // 1MB tail for initial load (more scrollback on tab switch)
 // A shell's automatic loads (tab select, drop recovery, a tile's load) read
@@ -133,23 +132,17 @@ const SHELL_LOAD_HISTORY_LINES = 10000;
 const SHELL_LOAD_BASE_QUERY = `full=1&tail=${TERMINAL_TAIL_SIZE}&alt=recording`;
 const SHELL_LOAD_QUERY = `${SHELL_LOAD_BASE_QUERY}&lines=${SHELL_LOAD_HISTORY_LINES}`;
 const SYNC_WAIT_TIMEOUT_MS = 50;            // Wait timeout for terminal sync
-const STATS_POLLING_INTERVAL_MS = 2000;     // System stats polling
 const TUI_REDRAW_SETTLE_MS = 400;           // Grace for a TUI to redraw after a real resize, before fetching its buffer
 const FOREIGN_RESIZE_SETTLE_MS = 1200;      // Debounce for reconciling after ANOTHER client resized the shared PTY (COD-179)
 const REMOTE_RECONCILE_TICK_MS = 25000;     // Periodic mid-turn reconcile cadence for busy REMOTE TUI sessions (COD-180)
 
 // Z-index base values for layered floating windows
 const ZINDEX_SUBAGENT_BASE = 1000;
-const ZINDEX_PLAN_SUBAGENT_BASE = 1100;
 const ZINDEX_LOG_VIEWER_BASE = 2000;
 const ZINDEX_IMAGE_POPUP_BASE = 3000;
 
 // Subagent/floating window layout
 const WINDOW_INITIAL_TOP_PX = 120;
-const WINDOW_CASCADE_OFFSET_PX = 30;
-const WINDOW_MIN_WIDTH_PX = 200;
-const WINDOW_MIN_HEIGHT_PX = 200;
-const WINDOW_DEFAULT_WIDTH_PX = 300;
 
 // WebGL renderer auto-fallback thresholds.
 // _installWebGLLongTaskGuard() observes longtask entries and disables WebGL
@@ -2111,7 +2104,7 @@ function getEventCoords(e) {
   return { clientX: e.clientX, clientY: e.clientY };
 }
 
-// HTML escape utility (shared by NotificationManager, CodemanApp, and ralph-wizard.js)
+// HTML escape utility (shared by NotificationManager and the CodemanApp mixins)
 const _htmlEscapeMap = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const _htmlEscapePattern = /[&<>"']/g;
 function escapeHtml(text) {

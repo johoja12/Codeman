@@ -196,11 +196,6 @@ export abstract class AiCheckerBase<
   protected abstract getNegativeVerdict(): V;
 
   /**
-   * Get the error verdict value.
-   */
-  protected abstract getErrorVerdict(): V;
-
-  /**
    * Create an error result.
    */
   protected abstract createErrorResult(reasoning: string, durationMs: number): R;

@@ -480,8 +480,8 @@
 
   // Per-skin xterm.js palettes. The 'daylight-blue' object equals the legacy hardcoded
   // theme, so default behavior is unchanged. Shared at module scope and exported on the
-  // global so both terminal-ui.js (main terminal) and panels-ui.js (teammate terminals,
-  // a separate IIFE) can read the current skin's palette.
+  // global so the main terminal and every other module that builds a terminal (tiles,
+  // the split pane) can read the current skin's palette.
   //
   // ⚠️ The selection key is `selectionBackground`, xterm's name for it since v5 (#360).
   // An ITheme is a plain object handed straight to xterm, so an unknown key is not an
@@ -1534,7 +1534,6 @@ Object.assign(CodemanApp.prototype, {
       let touchLastX = 0;
       let touchLastY = 0;
       let velocity = 0;
-      let lastTime = 0;
       let scrollFrame = null;
       let isTouching = false;
       // One id per touch contact (touchstart), carried by its touchmoves AND its
@@ -1542,10 +1541,7 @@ Object.assign(CodemanApp.prototype, {
       // gesture however slowly the finger moves (pageKeysForGesture).
       let touchContactId = 0;
 
-      const scrollLoop = (timestamp) => {
-        const dt = lastTime ? (timestamp - lastTime) / 16.67 : 1;
-        lastTime = timestamp;
-
+      const scrollLoop = () => {
         if (!isTouching && Math.abs(velocity) > 0.3) {
           // Momentum phase — convert pixel velocity to lines
           const lines = Math.round(velocity / cellHeight());
@@ -1631,7 +1627,6 @@ Object.assign(CodemanApp.prototype, {
           const touch = this._beginTerminalTouchGesture(touchGesture, ev.touches);
           velocity = 0;
           pixelAccum = 0;
-          lastTime = 0;
           if (!touch) {
             isTouching = false;
             didScroll = true;
@@ -8579,16 +8574,6 @@ Object.assign(CodemanApp.prototype, {
     this._refitAfterCellSizeChange();
     this._localEchoOverlay?.refreshFont();
     this._predictiveEcho?.refreshFont();
-    for (const [, entry] of this.teammateTerminals || []) {
-      if (!entry?.terminal) continue;
-      entry.terminal.options.fontWeight = fontWeight;
-      entry.terminal.options.fontWeightBold = fontWeightBold;
-      try {
-        entry.fitAddon?.fit();
-      } catch {
-        /* pane not laid out yet — its own resize observer refits it */
-      }
-    }
     this._forEachTile?.((tile) => {
       tile.terminal.options.fontWeight = fontWeight;
       tile.terminal.options.fontWeightBold = fontWeightBold;
@@ -9179,7 +9164,7 @@ Object.assign(CodemanApp.prototype, {
     }, 100);
   },
 
-  // Re-theme all live xterm terminals (main + teammate) to the given skin's palette.
+  // Re-theme all live xterm terminals (main pane and tiles) to the given skin's palette.
   // Uses the xterm v5+ live setter (full object assignment triggers a repaint for both
   // DOM and WebGL renderers) plus a belt-and-suspenders refresh().
   applyTerminalSkin(skin) {
@@ -9196,17 +9181,6 @@ Object.assign(CodemanApp.prototype, {
       try {
         this.terminal.refresh(0, this.terminal.rows - 1);
       } catch {}
-    }
-    if (this.teammateTerminals) {
-      for (const [, entry] of this.teammateTerminals) {
-        if (entry && entry.terminal) {
-          entry.terminal.options.minimumContrastRatio = minimumContrastRatio;
-          entry.terminal.options.theme = { ...theme };
-          try {
-            entry.terminal.refresh(0, entry.terminal.rows - 1);
-          } catch {}
-        }
-      }
     }
     this._forEachTile?.((tile) => {
       tile.terminal.options.minimumContrastRatio = minimumContrastRatio;

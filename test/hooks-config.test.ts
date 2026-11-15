@@ -37,7 +37,6 @@ import {
   resolveStatusLineCliCommand,
   settingsWriteBlocker,
   stripCaseEnvKeys,
-  updateCaseEnvVars,
   updateCaseModel,
   verifyClaudeSessionStartHookCapability,
   writeHooksConfig,
@@ -320,7 +319,6 @@ describe('writeHooksConfig', () => {
     await ensureCodemanHooks(caseDir);
     await refreshStaleCodemanHooks(caseDir);
     await updateCaseModel(caseDir, 'opus');
-    await updateCaseEnvVars(caseDir, { CLAUDE_CODE_NEW: 'value' });
     await stripCaseEnvKeys(caseDir, ['CLAUDE_CODE_KEEP']);
     await applyStatusLineConfig(caseDir, true);
     await applyStatusLineConfig(caseDir, false);

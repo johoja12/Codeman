@@ -18,7 +18,7 @@ import { nativeModelComposerReady } from './native-composer-ready.js';
  *
  * Key methods: `runPrompt()`, `startInteractive()`, `startShell()`,
  * `writeViaMux()`, `toState()`, `stop()`, `resize()`, `isIdle()`,
- * `setAutoCompact()`, `findTaskDescriptionNear()`, `getTerminalBuffer()`
+ * `setAutoCompact()`, `getTerminalBuffer()`
  *
  * @dependencies session-cli-builder (args/env), session-auto-ops (auto-compact/clear),
  *   ralph-tracker (todo/completion parsing), bash-tool-parser (tool invocation tracking),
@@ -125,7 +125,6 @@ import {
   SPINNER_PATTERN,
   CLAUDE_WORKING_LINE_PATTERN,
   MAX_SESSION_TOKENS,
-  execPattern,
   getClaudeCliVersion,
   getClaudeBinaryPath,
   spawnPtyWithHelperRepair,
@@ -180,7 +179,6 @@ import {
   canonicalizeCodexHome,
 } from './checkpoint-conversation-identity.js';
 import { detectUsageLimitPause } from './usage-limit-patterns.js';
-import { SessionTaskCache } from './session-task-cache.js';
 import { InteractivePtyExitBreaker } from './session-pty-exit-breaker.js';
 import { isGeneratedSessionName, SubmittedPromptTracker } from './session-auto-name.js';
 import { parseTerminalAttachmentRequests } from './attachment-magic.js';
@@ -333,12 +331,6 @@ const MAX_CLAUDE_SESSION_CHAIN = 32;
 // ^[[I (focus in), ^[[O (focus out), and the enable/disable sequences
 // eslint-disable-next-line no-control-regex
 const FOCUS_ESCAPE_FILTER = /\x1b\[\?1004[hl]|\x1b\[[IO]/g;
-
-// Pattern to match Task tool invocations in terminal output
-// Matches: "Explore(Description)", "Task(Description)", "Bash(Description)", etc.
-// The prefix characters vary (●, ·, ✶, etc.) so we don't require them
-// We look for the tool name followed by (description)
-const TASK_TOOL_PATTERN = /\b(Explore|Task|Bash|Plan|general-purpose)\(([^)]+)\)/g;
 
 // Pre-compiled patterns for hot paths (avoid regex compilation per call)
 /** Pattern to strip leading ANSI escapes and whitespace from terminal buffer */
@@ -835,9 +827,6 @@ export class Session extends EventEmitter {
   readonly createdAt: number;
   readonly mode: SessionMode;
 
-  // Task description cache (extracted to SessionTaskCache)
-  private _taskCache = new SessionTaskCache();
-
   private _name: string;
   private _nameSource: SessionNameSource;
   /** `pinCliSessionName` as of the last spawn (see {@link _refreshCliNamePin}). */
@@ -1151,10 +1140,6 @@ export class Session extends EventEmitter {
   // Ralph tracking (Ralph Wiggum loops and todo lists inside Claude Code)
   private _ralphTracker: RalphTracker;
 
-  // Agent tree tracking
-  private _parentAgentId: string | null = null;
-  private _childAgentIds: string[] = [];
-
   // Nice prioritying configuration
   private _niceConfig: NiceConfig = { ...DEFAULT_NICE_CONFIG };
 
@@ -1295,9 +1280,7 @@ export class Session extends EventEmitter {
     toolsUpdate: (tools: ActiveBashTool[]) => void;
   } | null = null;
 
-  // Task descriptions parsed from terminal output — delegated to SessionTaskCache
-
-  // Throttle expensive PTY processing (Ralph, bash parser, task descriptions)
+  // Throttle expensive PTY processing (Ralph, bash parser)
   // Accumulates clean data between processing windows to avoid running regex on every chunk
   private _lastExpensiveProcessTime: number = 0;
   private _pendingCleanData: string = '';
@@ -2488,14 +2471,6 @@ export class Session extends EventEmitter {
     return this._taskTracker;
   }
 
-  get runningTaskCount(): number {
-    return this._taskTracker.getRunningCount();
-  }
-
-  get taskTree(): BackgroundTask[] {
-    return this._taskTracker.getTaskTree();
-  }
-
   get taskStats(): { total: number; running: number; completed: number; failed: number } {
     return this._taskTracker.getStats();
   }
@@ -2517,36 +2492,8 @@ export class Session extends EventEmitter {
     return this._ralphTracker.getTodoStats();
   }
 
-  // Bash tool tracking getters
-  get bashToolParser(): BashToolParser {
-    return this._bashToolParser;
-  }
-
   get activeTools(): ActiveBashTool[] {
     return this._bashToolParser.activeTools;
-  }
-
-  get parentAgentId(): string | null {
-    return this._parentAgentId;
-  }
-
-  set parentAgentId(value: string | null) {
-    this._parentAgentId = value;
-  }
-
-  get childAgentIds(): string[] {
-    return [...this._childAgentIds];
-  }
-
-  addChildAgentId(agentId: string): void {
-    if (!this._childAgentIds.includes(agentId)) {
-      this._childAgentIds.push(agentId);
-    }
-  }
-
-  removeChildAgentId(agentId: string): void {
-    const idx = this._childAgentIds.indexOf(agentId);
-    if (idx >= 0) this._childAgentIds.splice(idx, 1);
   }
 
   // Nice priority config getters and setters
@@ -3386,8 +3333,6 @@ export class Session extends EventEmitter {
       ralphEnabled: this._ralphTracker.enabled,
       ralphAutoEnableDisabled: this._ralphTracker.autoEnableDisabled || undefined,
       ralphCompletionPhrase: this._ralphTracker.loopState.completionPhrase || undefined,
-      parentAgentId: this._parentAgentId || undefined,
-      childAgentIds: this._childAgentIds.length > 0 ? this._childAgentIds : undefined,
       niceEnabled: this._niceConfig.enabled,
       niceValue: this._niceConfig.niceValue,
       color: this._color,
@@ -5506,7 +5451,7 @@ export class Session extends EventEmitter {
   }
 
   /**
-   * Process expensive parsers (ANSI strip, Ralph, bash tool, token, CLI info, task descriptions).
+   * Process expensive parsers (ANSI strip, Ralph, bash tool, token, CLI info).
    * Called on a throttled schedule (every EXPENSIVE_PROCESS_INTERVAL_MS) instead of on every
    * PTY data chunk. Receives accumulated raw data to process in one batch.
    */
@@ -5557,11 +5502,6 @@ export class Session extends EventEmitter {
     // Parse Claude Code CLI info (version, model, account type) from startup
     if (!this._cliInfoParsed) {
       this.parseClaudeCodeInfo(getCleanData());
-    }
-
-    // Parse task descriptions from terminal output (e.g., "Explore(Check files)")
-    if (rawData.includes('(') && rawData.includes(')')) {
-      this.parseTaskDescriptionsFromTerminalData(getCleanData());
     }
 
     // Legacy gerunds, Claude-only. The status-line pattern above already ran for every
@@ -6286,65 +6226,8 @@ export class Session extends EventEmitter {
       } else if (trimmed) {
         this._textOutput.append(line + '\n');
       }
-
-      // Parse task descriptions from terminal output (e.g., "Explore(Description)")
-      // This captures the short description from Claude Code's Task tool output
-      // Use direct method since cleanLine is already ANSI-stripped (line 1460)
-      this.parseTaskDescriptionsDirect(cleanLine);
     }
     // Note: BufferAccumulator auto-trims when max size exceeded
-  }
-
-  /**
-   * Parse task descriptions from terminal data (may contain multiple lines).
-   * Called from interactive mode's onData handler with ANSI-stripped data.
-   * @param cleanData - Terminal data with ANSI codes already stripped
-   */
-  private parseTaskDescriptionsFromTerminalData(cleanData: string): void {
-    // Quick pre-check: skip if no parentheses present
-    if (!cleanData.includes('(') || !cleanData.includes(')')) return;
-
-    // Split by newlines and process each line (data already ANSI-stripped)
-    const lines = cleanData.split(NEWLINE_SPLIT_PATTERN);
-    for (const line of lines) {
-      this.parseTaskDescriptionsDirect(line);
-    }
-  }
-
-  /**
-   * Parse task descriptions from a pre-cleaned line (no ANSI codes).
-   * Used by both processOutput() and parseTaskDescriptionsFromTerminalData().
-   */
-  private parseTaskDescriptionsDirect(cleanLine: string): void {
-    // Quick pre-check: skip expensive regex if no common tool patterns present
-    if (!cleanLine.includes('(') || !cleanLine.includes(')')) return;
-
-    execPattern(TASK_TOOL_PATTERN, cleanLine, (match) => {
-      const description = match[2].trim();
-      if (description && description.length > 0) {
-        this._taskCache.add(Date.now(), description);
-      }
-    });
-  }
-
-  /**
-   * Get recent task descriptions parsed from terminal output.
-   * Returns descriptions sorted by timestamp (most recent first).
-   */
-  getRecentTaskDescriptions(): Array<{ timestamp: number; description: string }> {
-    return this._taskCache.getAll();
-  }
-
-  /**
-   * Find a task description that was parsed close to a given timestamp.
-   * Used to correlate with SubagentWatcher discoveries.
-   *
-   * @param subagentStartTime - The timestamp when the subagent was discovered
-   * @param maxAgeMs - Maximum age difference to consider (default 10 seconds)
-   * @returns The matching description or undefined
-   */
-  findTaskDescriptionNear(subagentStartTime: number, maxAgeMs: number = 10000): string | undefined {
-    return this._taskCache.findNear(subagentStartTime, maxAgeMs);
   }
 
   // Parse token count from Claude's status line in interactive mode
@@ -7614,10 +7497,6 @@ export class Session extends EventEmitter {
     this._status = killMux ? 'stopped' : 'idle';
     this._currentTaskId = null;
 
-    // Clear task description cache and agent tree to prevent memory leak
-    this._taskCache.clear();
-    this._childAgentIds = [];
-
     // Kill the associated mux session if requested
     if (killMux && this._mux) {
       // Try to kill mux session even if _muxSession is not set (e.g., restored sessions)
@@ -7702,8 +7581,6 @@ export class Session extends EventEmitter {
 
     this._pid = null;
     this._currentTaskId = null;
-    this._taskCache.clear();
-    this._childAgentIds = [];
 
     // Detach the mux/tmux session. killSession() already implements the
     // COD-105-safe owned/non-owned differentiation (kill vs. local-only
@@ -7759,6 +7636,5 @@ export class Session extends EventEmitter {
     this._messages = [];
     this._taskTracker.clear();
     this._ralphTracker.clear();
-    this._taskCache.clear();
   }
 }

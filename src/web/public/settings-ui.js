@@ -6023,14 +6023,6 @@ Object.assign(CodemanApp.prototype, {
   },
 
   /**
-   * Get the parent session ID for an agent from the persistent map.
-   * This is the ONLY source of truth for connection lines.
-   */
-  getAgentParentSessionId(agentKey) {
-    return this.subagentParentMap.get(agentKey) || null;
-  },
-
-  /**
    * Set and persist the parent session ID for an agent.
    * Once set, this association is PERMANENT and never recalculated.
    */

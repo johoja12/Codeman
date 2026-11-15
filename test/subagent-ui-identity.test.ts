@@ -832,3 +832,32 @@ describe('secondary opaque identity consumers', () => {
     expect(host.textContent).not.toContain('opaque-neutral-secret');
   });
 });
+
+describe('upstream wizard cleanup with fork subagent connectors', () => {
+  it('draws opaque keys through sidebar anchors without wizard state', () => {
+    const app = makeApp();
+    document.body.innerHTML = '<svg id="connectionLines"></svg><div id="parent"></div><div id="child"></div>';
+    const tab = document.getElementById('parent')!;
+    const child = document.getElementById('child')!;
+    const key = 'opaque/key?one';
+    app.subagentWindows.set(key, { element: child, minimized: false, hidden: false });
+    app.subagentParentMap.set(key, 'tab-a');
+    app._paintedSessionTab = vi.fn(() => tab);
+    app._tabAnchor = vi.fn(() => ({ x: 240, y: 80 }));
+    app._tabConnectorPath = vi.fn(() => 'M 240 80 C 300 80, 300 200, 400 200');
+    app._appendUltracodeConnectionLines = undefined;
+    app._appendUltracodeAgentConnectionLines = undefined;
+    app._appendLineageConnectionLines = undefined;
+    app._applyLineEntrances = vi.fn();
+
+    app._updateConnectionLinesImmediate();
+
+    const line = document.querySelector('#connectionLines path')!;
+    expect(line.getAttribute('data-agent-key')).toBe(key);
+    expect(line.hasAttribute('data-agent-id')).toBe(false);
+    expect(line.getAttribute('data-parent-tab')).toBe('tab-a');
+    expect(line.getAttribute('d')).toBe('M 240 80 C 300 80, 300 200, 400 200');
+    expect(app._tabAnchor).toHaveBeenCalledWith(tab.getBoundingClientRect());
+    expect(app._applyLineEntrances).toHaveBeenCalledOnce();
+  });
+});

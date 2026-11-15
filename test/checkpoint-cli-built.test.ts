@@ -8,7 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { execFile, spawn } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
 import { promisify } from 'node:util';
-import { createIsolatedBuild } from './isolated-build-fixture.js';
+import { createIsolatedBuild, ISOLATED_BUILD_TIMEOUT_MS } from './isolated-build-fixture.js';
 
 const execFileAsync = promisify(execFile);
 const CHILD_TIMEOUT_MS = 10_000;
@@ -27,7 +27,10 @@ describe('built checkpoint CLI', () => {
 
   beforeAll(async () => {
     fixture = createIsolatedBuild();
-    await execFileAsync(process.execPath, ['scripts/build.mjs'], { cwd: fixture.root, timeout: 120_000 });
+    await execFileAsync(process.execPath, ['scripts/build.mjs'], {
+      cwd: fixture.root,
+      timeout: ISOLATED_BUILD_TIMEOUT_MS,
+    });
     response = { status: 200, body: 'null' };
     const candidate = createServer((req, res) => {
       req.resume();
@@ -56,7 +59,7 @@ describe('built checkpoint CLI', () => {
     const address = candidate.address();
     if (!address || typeof address === 'string') throw new Error('test server did not bind');
     apiUrl = `http://127.0.0.1:${address.port}`;
-  }, 120_000);
+  }, ISOLATED_BUILD_TIMEOUT_MS + 30_000);
 
   afterAll(async () => {
     const runningChildren = [...children];

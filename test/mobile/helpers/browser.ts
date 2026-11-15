@@ -59,7 +59,3 @@ export async function closeAllBrowsers(): Promise<void> {
     delete browsers[key];
   }
 }
-
-export function isChromium(engine: 'chromium' | 'webkit'): boolean {
-  return engine === 'chromium';
-}

@@ -3,6 +3,9 @@ import { cpSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 
+/** A fresh compile plus all assets took 159s under load; keep build tests bounded without a 120s false failure. */
+export const ISOLATED_BUILD_TIMEOUT_MS = 5 * 60_000;
+
 export function createIsolatedBuild() {
   const source = resolve(import.meta.dirname, '..');
   const root = mkdtempSync(join(tmpdir(), 'codeman-build-test-'));
