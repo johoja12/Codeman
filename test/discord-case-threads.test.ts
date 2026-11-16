@@ -259,3 +259,31 @@ describe('owned case channels and session threads', () => {
     expect(api.createThread).toHaveBeenCalledTimes(1);
   });
 });
+
+it('provisions an empty case once and reuses its parent when the first session starts', async () => {
+  const m = manager();
+  const [a, b] = await Promise.all([m.forCase(scope, identity), m.forCase(scope, identity)]);
+  expect(a).toBe(b);
+  expect(api.create).toHaveBeenCalledTimes(1);
+  expect(api.postStarter).not.toHaveBeenCalled();
+  expect(api.createThread).not.toHaveBeenCalled();
+  expect(m.caseForChannel(scope, a)).toBe(identity.key);
+  expect(await manager().forCase(scope, identity)).toBe(a);
+  const thread = await manager().forSession(scope, 'first', 'w1-saif');
+  expect(channels.get(thread)?.parent_id).toBe(a);
+  expect(api.create).toHaveBeenCalledTimes(1);
+});
+it('does not create an empty case after its configuration is revoked during discovery', async () => {
+  let current = true;
+  const get = api.get;
+  api.get = vi.fn(async (id) => {
+    const result = await get(id);
+    current = false;
+    return result;
+  });
+  await expect(manager().forCase(scope, identity, () => current)).rejects.toThrow('configuration changed');
+  expect(api.create).not.toHaveBeenCalled();
+  api.get = get;
+  expect(await manager().forCase(scope, identity)).toBeTruthy();
+  expect(api.create).toHaveBeenCalledTimes(1);
+});

@@ -56,6 +56,8 @@ export interface DiscordNativeUiServices {
     inputRevision?: string
   ): Promise<'accepted' | 'blocked' | 'uncertain'>;
   cases(): Promise<DiscordUiCase[]>;
+  /** Saved-case channel discovery is independent of launch eligibility and host reachability. */
+  caseChannels?(): Promise<import('./discord-case-identity.js').DiscordCaseIdentity[]>;
   defaults(): Promise<{ model: string; effort: string; approval: string }>;
   saveDefaults(values: { model: string; effort: string; approval: string }, current: () => boolean): Promise<void>;
   question(id: string): DiscordUiQuestion | undefined;

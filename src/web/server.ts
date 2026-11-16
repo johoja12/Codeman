@@ -4084,6 +4084,10 @@ export class WebServer extends EventEmitter {
 
   /** Keep the Discord thread in step with the tab: created, renamed, deleted. Never throws. */
   private bridgeSessionEvent(event: string, data: unknown): void {
+    if (event === SseEvent.CaseCreated || event === SseEvent.CaseLinked || event === SseEvent.CaseRenamed) {
+      void this.discordBridge.syncCases().catch(() => undefined);
+      return;
+    }
     // Deletion is NOT handled here: `session:deleted` also fires for a detach (killMux=false), where the
     // session keeps running and can be re-attached. The real delete calls the bridge from the cleanup path.
     if (event !== SseEvent.SessionCreated && event !== SseEvent.SessionUpdated) return;

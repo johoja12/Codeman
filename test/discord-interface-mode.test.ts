@@ -2,6 +2,8 @@
 import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { createDiscordNativeUiServices } from '../src/web/discord-native-ui-services.js';
+import { configuredDiscordCaseChannel } from '../src/discord-case-identity.js';
 import { hashDiscordPrompt } from '../src/discord-native-execution.js';
 import { readDiscordSessionFile } from '../src/discord-file-transfers.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -3192,5 +3194,104 @@ it('rechecks file identity after its asynchronous contents read before uploading
   });
   await f.click(allow, '999999999999999991');
   expect(posts.filter((p) => p.path.endsWith('/messages/' + f.message.id) && p.fileFields?.length)).toHaveLength(0);
+  expect(sendInput).not.toHaveBeenCalled();
+});
+
+it('syncs saved empty cases on startup and manual sync without starting or messaging sessions', async () => {
+  sessions = [];
+  let cases = [{ name: 'meetily', path: '/work/meetily' }];
+  const nativeUi = createDiscordNativeUiServices({
+    sessions: () => new Map(),
+    cases: async () => cases,
+    allowed: () => true,
+    url: () => undefined,
+  });
+  const b = makeBridge(undefined, { nativeUi, caseForSession: async () => configuredDiscordCaseChannel(cases[0]) });
+  await b.reload();
+  await b.syncSessions();
+  expect(creations()).toHaveLength(1);
+  const parent = creations()[0].body;
+  expect(parent.name).toBe('meetily');
+  expect(posts.filter((p) => p.method === 'POST' && /\/threads$|\/messages$/.test(p.path))).toHaveLength(0);
+  expect(sendInput).not.toHaveBeenCalled();
+  await b.syncCases();
+  b.stop();
+  const again = makeBridge(undefined, { nativeUi, caseForSession: async () => configuredDiscordCaseChannel(cases[0]) });
+  await again.reload();
+  await again.syncSessions();
+  expect(creations()).toHaveLength(1);
+  cases = [...cases, { name: 'new-case', path: '/work/new-case' }];
+  await again.syncCases();
+  expect(creations()).toHaveLength(2);
+  sessions = [{ id: 'new-session', name: 'w1-meetily' }];
+  await again.sessionCreated('new-session', 'w1-meetily');
+  expect(creations()).toHaveLength(2);
+  const thread = [...remoteChannels.values()].find((c) => c.type === 11);
+  const channel = [...remoteChannels.values()].find((c) => c.type === 0 && c.name === 'meetily');
+  expect(thread.parent_id).toBe(channel.id);
+  expect(sendInput).not.toHaveBeenCalled();
+});
+it('does not create saved-case channels in Notifications mode', async () => {
+  sessions = [];
+  await writeDiscordConfig(dir, { ...cfg, mode: 'notifications' });
+  const caseChannels = vi.fn(async () => [{ key: 'a'.repeat(64), name: 'meetily' }]);
+  const nativeUi = createDiscordNativeUiServices({
+    sessions: () => new Map(),
+    cases: async () => [],
+    allowed: () => true,
+    url: () => undefined,
+  });
+  nativeUi.caseChannels = caseChannels;
+  const b = makeBridge(undefined, { nativeUi });
+  await b.reload();
+  await b.syncCases();
+  await b.syncSessions();
+  expect(caseChannels).not.toHaveBeenCalled();
+  expect(creations()).toHaveLength(0);
+});
+it('ignores an in-flight saved-case snapshot after Discord is disabled', async () => {
+  sessions = [];
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const nativeUi = createDiscordNativeUiServices({
+    sessions: () => new Map(),
+    cases: async () => [],
+    allowed: () => true,
+    url: () => undefined,
+  });
+  nativeUi.caseChannels = async () => {
+    await gate;
+    return [{ key: 'a'.repeat(64), name: 'meetily' }];
+  };
+  const b = makeBridge(undefined, { nativeUi });
+  await b.reload();
+  const pending = b.syncSessions();
+  await writeDiscordConfig(dir, { ...cfg, enabled: false });
+  await b.reload();
+  release();
+  await pending;
+  expect(creations()).toHaveLength(0);
+});
+
+it('continues provisioning other cases and live sessions after a case sync error', async () => {
+  const nativeUi = createDiscordNativeUiServices({
+    sessions: () => new Map(),
+    cases: async () => [],
+    allowed: () => true,
+    url: () => undefined,
+  });
+  nativeUi.caseChannels = async () => [
+    { key: 'invalid', name: 'bad' },
+    { key: 'b'.repeat(64), name: 'empty' },
+  ];
+  const b = makeBridge(undefined, { nativeUi });
+  await b.reload();
+  await b.syncSessions();
+  expect(creations().some((c) => c.body.name === 'empty')).toBe(true);
+  expect([...remoteChannels.values()].filter((c) => c.type === 11)).toHaveLength(2);
+  expect(b.sessionSync.state).toBe('error');
+  expect(b.sessionSync.failed).toBe(1);
   expect(sendInput).not.toHaveBeenCalled();
 });

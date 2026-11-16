@@ -16,7 +16,7 @@ import { readJsonConfig, SETTINGS_PATH } from './route-helpers.js';
 import { SettingsUpdateSchema } from './schemas.js';
 import { mutateSettingsFile } from './settings-writer.js';
 import { discordWorkspaceResults, discordWorkspaceHasChanges } from '../discord-workspace-results.js';
-import { configuredDiscordCaseKey } from '../discord-case-identity.js';
+import { configuredDiscordCaseKey, configuredDiscordCaseChannel } from '../discord-case-identity.js';
 import type { DiscordNativeUiServices } from '../discord-native-ui-types.js';
 import type { Session } from '../session.js';
 import type { CaseInfo } from '../types.js';
@@ -223,6 +223,15 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
           };
         })
       );
+    },
+    caseChannels: async () => {
+      if (!deps.allowed()) return [];
+      const cases = await deps.cases();
+      if (!deps.allowed()) return [];
+      return cases.flatMap((c) => {
+        const identity = configuredDiscordCaseChannel(c);
+        return identity ? [identity] : [];
+      });
     },
     cases: async () =>
       deps.allowed()
