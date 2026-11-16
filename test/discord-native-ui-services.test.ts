@@ -200,3 +200,70 @@ it('keeps canonical activity identity separate from action/input conversation id
   });
   expect(s.nativeResumeId).toBe('configured');
 });
+
+it('discovers saved local, remote-offline and container case channels without making them launchable', async () => {
+  let allowed = true;
+  const cases = [
+    { name: 'local', path: '/work/local' },
+    {
+      name: 'meetily',
+      path: 'user@host:/work/meetily',
+      unreachable: true,
+      remote: { hostId: 'mac', host: 'host', username: 'user', path: '/work/meetily' },
+    },
+    {
+      name: 'container',
+      path: '/host/work',
+      docker: { hostId: 'docker', container: 'test', path: '/host/work', containerWorkdir: '/workspace' },
+    },
+  ];
+  const s = createDiscordNativeUiServices({
+    sessions: () => new Map(),
+    cases: async () => cases,
+    allowed: () => allowed,
+    url: () => undefined,
+  });
+  const found = await s.caseChannels!();
+  expect(found.map((c) => c.name)).toEqual(['local', 'meetily', 'container']);
+  expect((await s.cases()).map((c) => c.name)).toEqual(['local']);
+  const { resolveDiscordCase } = await import('../src/discord-case-identity.js');
+  expect(found[1].key).toBe(
+    resolveDiscordCase(
+      {
+        id: 'future',
+        workingDir: '/work/meetily',
+        remote: { ...cases[1].remote!, label: 'mac', remotePath: '/work/meetily' },
+      },
+      cases
+    ).key
+  );
+  expect(found[2].key).toBe(
+    resolveDiscordCase(
+      {
+        id: 'future',
+        workingDir: '/host/work',
+        docker: {
+          hostId: 'docker',
+          containerName: 'test',
+          containerWorkdir: '/workspace',
+        } as import('../src/types.js').SessionDocker,
+      },
+      cases
+    ).key
+  );
+  allowed = false;
+  expect(await s.caseChannels!()).toEqual([]);
+});
+it('rechecks case discovery permission after the saved-case reader completes', async () => {
+  let allowed = true;
+  const s = createDiscordNativeUiServices({
+    sessions: () => new Map(),
+    cases: async () => {
+      allowed = false;
+      return [{ name: 'private', path: '/private' }];
+    },
+    allowed: () => allowed,
+    url: () => undefined,
+  });
+  expect(await s.caseChannels!()).toEqual([]);
+});

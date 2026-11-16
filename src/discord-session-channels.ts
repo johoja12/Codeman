@@ -174,18 +174,33 @@ export class DiscordSessionChannels {
       !!c && c.type === 0 && c.guild_id === e.guildId && c.parent_id === e.categoryId && c.topic === this.marker(e)
     );
   }
-  forSession(scope: DiscordChannelScope, id: string, name?: string): Promise<string> {
+  forSession(
+    scope: DiscordChannelScope,
+    id: string,
+    name?: string,
+    current: () => boolean = () => true
+  ): Promise<string> {
     const key = keyOf(scope, id);
-    const current = this.pending.get(key);
-    if (current) return current;
-    const run = this.ensure(scope, id, name).finally(() => {
+    const pending = this.pending.get(key);
+    if (pending) return pending;
+    const run = this.ensure(scope, id, name, current).finally(() => {
       if (this.pending.get(key) === run) this.pending.delete(key);
     });
     this.pending.set(key, run);
     return run;
   }
-  private async ensure(scope: DiscordChannelScope, id: string, name?: string): Promise<string> {
+  private async ensure(
+    scope: DiscordChannelScope,
+    id: string,
+    name: string | undefined,
+    current: () => boolean
+  ): Promise<string> {
+    const check = () => {
+      if (!current()) throw new DiscordChannelProblem('Discord configuration changed');
+    };
+    check();
     await this.load();
+    check();
     if (this.state.deleted[id]) throw new DiscordChannelProblem('The session was deleted');
     if (!snowflake(scope.guildId) || !snowflake(scope.categoryId))
       throw new DiscordChannelProblem('Choose a Discord session category for Full interface mode');
@@ -194,6 +209,7 @@ export class DiscordSessionChannels {
     if (e?.channelId && e.state === 'active') {
       try {
         const channel = await this.api.get(e.channelId);
+        check();
         if (!this.owned(e, channel))
           throw new DiscordChannelProblem('Session channel ownership changed; refusing to reuse it');
         const desired = (this.options.name ?? discordSessionChannelName)(name, id);
@@ -209,6 +225,7 @@ export class DiscordSessionChannels {
     // Only an outstanding, durable create intent may adopt an unknown channel id.
     if (e?.state === 'creating') {
       const list = await this.api.list(scope.guildId);
+      check();
       if (!Array.isArray(list)) throw new DiscordChannelProblem('Discord did not return the server channel list');
       const candidates = list.filter((c) => this.owned(e, c));
       if (candidates.length !== 1)
@@ -224,6 +241,7 @@ export class DiscordSessionChannels {
       return e.channelId;
     }
     const category = await this.api.get(scope.categoryId);
+    check();
     if (!category || category.type !== 4 || category.guild_id !== scope.guildId)
       throw new DiscordChannelProblem('Session category must belong to the configured Discord server');
     if (Object.keys(this.state.entries).length >= 4096)
@@ -236,6 +254,11 @@ export class DiscordSessionChannels {
       e.state = 'failed';
       throw err;
     } // No HTTP before durable intent.
+    if (!current()) {
+      e.state = 'failed';
+      await this.save();
+      check();
+    }
     let channel: DiscordManagedChannel | null;
     try {
       channel = await this.api.create(scope.guildId, {

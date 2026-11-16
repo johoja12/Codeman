@@ -63,3 +63,14 @@ export function configuredDiscordCaseKey(c: CaseInfo): string | undefined {
   }
   return isAbsolute(c.path) ? key(['@single', 'local', resolve(c.path)]) : undefined;
 }
+
+/** Saved-case channel identity, including containers that cannot be launched from Discord. */
+export function configuredDiscordCaseChannel(c: CaseInfo): DiscordCaseIdentity | undefined {
+  if (c.docker) {
+    const workdir = c.docker.containerWorkdir ?? c.docker.path;
+    if (!posix.isAbsolute(workdir)) return undefined;
+    return { key: key(['@single', 'docker', c.docker.hostId, c.docker.container, workdir]), name: c.name };
+  }
+  const id = configuredDiscordCaseKey(c);
+  return id ? { key: id, name: c.name } : undefined;
+}

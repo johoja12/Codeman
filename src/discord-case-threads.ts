@@ -282,6 +282,15 @@ export class DiscordCaseThreads {
       ? { name: t.name ?? '' }
       : false;
   }
+  /** Creates only the owned parent channel; no session, starter message or thread. */
+  async forCase(
+    scope: DiscordChannelScope,
+    identity: DiscordCaseIdentity,
+    current: () => boolean = () => true
+  ): Promise<string> {
+    if (!/^[a-f0-9]{64}$/.test(identity.key)) throw new DiscordChannelProblem('Case metadata is unavailable');
+    return this.parents.forSession(scope, identity.key, safeName(identity.name), current);
+  }
   forSession(scope: DiscordChannelScope, id: string, name?: string): Promise<string> {
     const key = scopeKey(scope, id),
       pending = this.pending.get(key);

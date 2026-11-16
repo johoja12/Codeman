@@ -135,6 +135,8 @@ Codeman (private category)
     w1-home   → its existing SSH session
 ```
 
+Saved cases receive a case channel even when they have no sessions. Full-mode startup, settings sync and **Sync sessions** reconcile these empty channels; creating, linking or renaming a case also triggers channel sync. No agent, starter message or session thread is created for an empty case. Unreachable saved remote cases remain visible. Existing case channels are reused when a session starts.
+
 Grouping uses configured case roots, initial workspaces, transport/host and owner metadata. Tab names such as `w1-saif` do not determine membership. Same-name cases on different hosts or roots stay separate. An unlinked shell groups only with sessions in its exact workspace on the same host and owner. This does not restart agents, change cwd, reset shell variables or copy environments. Each thread still targets one exact native session.
 
 Send prompts, replies, files and task/history commands **inside the session thread**. A plain message in the case channel returns session-thread links and submits nothing, including when only one session exists. Management commands work there and in the configured Parent / control channel; `!codeman open <session-id>` finds an exact session. There is no implicit default session.

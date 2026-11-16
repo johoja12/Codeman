@@ -1051,6 +1051,8 @@ export class DiscordBridge {
   private firstLoad?: Promise<void>;
   private last: DiscordResult | null = null;
   private syncRun?: Promise<DiscordSessionSync>;
+  private caseSyncRun?: Promise<void>;
+  private caseSyncQueued = false;
   private syncQueued = false;
   private syncState: DiscordSessionSync = { state: 'idle', total: 0, ready: 0, failed: 0 };
   private stopped = false;
@@ -1425,6 +1427,49 @@ export class DiscordBridge {
       : this.threads[id] === channel;
   }
 
+  /** Synchronize saved case parents without creating agents, starters or session threads. */
+  syncCases(): Promise<void> {
+    if (this.caseSyncRun) {
+      this.caseSyncQueued = true;
+      return this.caseSyncRun;
+    }
+    const run = (async () => {
+      await this.ensureLoaded();
+      if (this.stopped || this.held || !this.acceptsControls || !this.deps.nativeUi?.enabled()) return;
+      const binding = this.controlScope;
+      const scope = { guildId: this.cfg.guildId, categoryId: this.cfg.categoryId };
+      const current = () =>
+        !this.stopped &&
+        !this.held &&
+        this.acceptsControls &&
+        this.deps.nativeUi?.enabled() === true &&
+        binding === this.controlScope;
+      const cases = (await this.deps.nativeUi?.caseChannels?.()) ?? [];
+      const unique = new Map(cases.map((c) => [c.key, c]));
+      let failure: unknown;
+      for (const identity of unique.values()) {
+        if (!current()) return;
+        try {
+          await this.channels.forCase(scope, identity, current);
+        } catch (error) {
+          this.last = this.fail(error);
+          failure ??= error;
+        }
+      }
+      if (failure) throw failure;
+    })().finally(() => {
+      if (this.caseSyncRun === run) {
+        this.caseSyncRun = undefined;
+        if (this.caseSyncQueued) {
+          this.caseSyncQueued = false;
+          void this.syncCases().catch(() => undefined);
+        }
+      }
+    });
+    this.caseSyncRun = run;
+    return run;
+  }
+
   /** Full-mode discovery is bounded to the current session snapshot, without replaying any prompts. */
   syncSessions(): Promise<DiscordSessionSync> {
     if (this.syncRun) return this.syncRun;
@@ -1452,6 +1497,12 @@ export class DiscordBridge {
     const sessions = this.deps.sessions?.() ?? [];
     this.syncState = { state: 'syncing', total: sessions.length, ready: 0, failed: 0 };
     try {
+      try {
+        await this.syncCases();
+      } catch (error) {
+        this.last = this.fail(error);
+        this.syncState.failed++;
+      }
       try {
         await this.channels.flushRetirements(this.cfg.guildId);
       } catch (err) {
