@@ -16,12 +16,18 @@ import { readJsonConfig, SETTINGS_PATH } from './route-helpers.js';
 import { SettingsUpdateSchema } from './schemas.js';
 import { mutateSettingsFile } from './settings-writer.js';
 import { discordWorkspaceResults, discordWorkspaceHasChanges } from '../discord-workspace-results.js';
-import { configuredDiscordCaseKey, configuredDiscordCaseChannel } from '../discord-case-identity.js';
-import type { DiscordNativeUiServices } from '../discord-native-ui-types.js';
+import {
+  configuredDiscordCaseKey,
+  configuredDiscordCaseChannel,
+  resolveDiscordCase,
+} from '../discord-case-identity.js';
+import type { DiscordNativeUiServices, DiscordConnection } from '../discord-native-ui-types.js';
 import type { Session } from '../session.js';
 import type { CaseInfo } from '../types.js';
 interface Deps {
   sessions(): Map<string, Session>;
+  health?(s: Session, fresh?: boolean): Promise<DiscordConnection>;
+  recover?(s: Session, current: () => boolean): Promise<boolean>;
   cases(): Promise<CaseInfo[]>;
   allowed(): boolean;
   url(): string | undefined;
@@ -166,6 +172,17 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
   };
   return {
     enabled: () => deps.allowed(),
+    connection: async (id, fresh) => {
+      const s = session(id);
+      return deps.health?.(s, fresh) ?? { state: s.paneExit ? 'agent_exited' : 'available' };
+    },
+    recover: async (id, conversation, current) => {
+      const s = session(id);
+      const valid = () =>
+        deps.allowed() && current() && deps.sessions().get(id) === s && conversationFor(s) === conversation;
+      if (!valid() || !deps.recover) return false;
+      return deps.recover(s, valid);
+    },
     sessions: async () => {
       if (!deps.allowed()) return [];
       for (const [id, old] of observed) {
@@ -178,7 +195,11 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       const visible = [...deps.sessions().values()].filter((s) => !s.suppressNotifications);
       return Promise.all(
         visible.map(async (s) => {
-          const promptSuggestion = await suggestion(s);
+          const connection = (await deps.health?.(s)) ?? {
+            state: s.paneExit ? ('agent_exited' as const) : ('available' as const),
+          };
+          const unavailable = connection.state !== 'available';
+          const promptSuggestion = unavailable ? undefined : await suggestion(s);
           const observed = deps.observed?.(s.id);
           const displayModel = s.displayModel;
           const pending = approvalInbox.listPending().find((p) => p.sessionId === s.id && p.kind !== 'idle');
@@ -193,17 +214,22 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
                   ? c.remote?.hostId === s.remote.hostId && c.remote.path === s.remote.remotePath
                   : !c.remote && c.path === s.workingDir
               )?.name || 'Unlinked workspace',
+            connection,
+            caseKey: resolveDiscordCase(
+              { id: s.id, workingDir: s.workingDir, remote: s.remote, docker: s.docker, owner: s.owner },
+              cases
+            ).key,
             conversation: conversationFor(s),
             activityConversation: deps.activityConversation?.(s),
             inputRevision: s.discordQueueRevision,
-            working: working(s),
+            working: !unavailable && working(s),
             promptSuggestion,
             lastPromptAt: s.lastRealPromptAt || undefined,
             pendingAt: pending?.createdAt,
             pendingRevision: pending ? discordApprovalRevision(pending) : undefined,
             pending: approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle'),
-            exited: !!s.paneExit,
-            ready: !working(s) && !s.paneExit && !s.guardedInputHeld && !s.guardedInputPendingWrites,
+            exited: unavailable,
+            ready: !unavailable && !working(s) && !s.paneExit && !s.guardedInputHeld && !s.guardedInputPendingWrites,
             model: observed?.model
               ? observed.model + ' (native verified)'
               : displayModel
@@ -306,6 +332,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
     },
     submitQueued: async (id, text, conversation, allowed, inputRevision) => {
       const s = session(id);
+      if (deps.health && (await deps.health(s, true)).state !== 'available') return 'blocked';
       return s.submitDiscordFollowup(
         text,
         () =>

@@ -3719,16 +3719,41 @@ export class Session extends EventEmitter {
     return true;
   }
 
+  /** Explicit Discord recovery: only an absent owned remote agent, an exited proxy and an exact pin. */
+  async resumeExitedRemote(current: () => boolean): Promise<boolean> {
+    if (
+      !current() ||
+      !this._remote ||
+      this._remote.owned === false ||
+      this._isStopped ||
+      this._adopt ||
+      this._closing ||
+      this.paneLifecycleInFlight ||
+      !this._muxSession ||
+      !this._mux
+    )
+      return false;
+    if (!(await this._mux.isPaneDead(this._muxSession.muxName))) return false;
+    const observed = await probeRemoteWorker(
+      this._remote,
+      this._remote.remoteSessionName ?? `codeman-ssh-${this.id.slice(0, 8)}`
+    );
+    if (!observed || observed.alive || !current()) return false;
+    await this._assertLaunchAllowed();
+    if (!current()) return false;
+    return this.resumeRemoteAfterWorkerReboot(current);
+  }
+
   /** COD-486: restart only a pinned conversation after a proven worker reboot. */
-  async resumeRemoteAfterWorkerReboot(): Promise<boolean> {
-    if (this._closing || this._isStopped || this.paneLifecycleInFlight) return false;
+  async resumeRemoteAfterWorkerReboot(current: () => boolean = () => true): Promise<boolean> {
+    if (!current() || this._closing || this._isStopped || this.paneLifecycleInFlight) return false;
     return this._withPaneLifecycle(async () => {
       if (!this._remote || !this._useMux || !this._mux || !this._muxSession) return false;
       const respawn = this._buildRespawnPaneOptions();
       respawn.resumeSessionId = this._claudeSessionChain.at(-1) ?? this._claudeSessionId ?? respawn.resumeSessionId;
       const options = workerResumeOptions(respawn, this._nativeResumeId);
       if (!options || !(await this._mux.muxSessionExists(this._muxSession.muxName))) return false;
-      if (this._closing || this._isStopped) return false;
+      if (!current() || this._closing || this._isStopped) return false;
       this._stopWorkingFramePoller();
       const pid = await this._mux.respawnPane(options);
       if (!pid || this._closing || this._isStopped) return false;

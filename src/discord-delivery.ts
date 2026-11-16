@@ -58,6 +58,14 @@ export interface DiscordDelivery {
     | 'invalid_command';
 }
 
+/** A transport receipt alone never proves that the native CLI accepted a prompt. */
+export function discordInputAcknowledged(record: Pick<DiscordDelivery, 'native' | 'state'>): boolean {
+  return (
+    !!record.native?.userCursor &&
+    ['submitted', 'running', 'completed', 'interrupted', 'execution_error'].includes(record.state)
+  );
+}
+
 /** Offset ordering is meaningful only inside the same exact native transcript. */
 function nativeOffset(cursor: string | undefined, conversationId: string): number | undefined {
   if (!cursor || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(conversationId)) return undefined;

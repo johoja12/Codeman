@@ -429,3 +429,33 @@ describe('read-only worker probe', () => {
     expect(command).not.toContain('send-keys');
   });
 });
+
+it.each(['live-proxy', 'live-agent', 'retained-agent', 'revoked', 'gone'])(
+  'explicit remote resume preserves live work and checks intent (%s)',
+  async (kind) => {
+    let allowed = true;
+    const probe = vi.spyOn(remoteHosts, 'probeRemoteWorker').mockImplementation(async () => {
+      if (kind === 'revoked') allowed = false;
+      return { alive: kind === 'live-agent' || kind === 'retained-agent', agentRunning: kind === 'live-agent' };
+    });
+    const launch = vi.fn(async () => {}),
+      resume = vi.fn(async () => true);
+    const fake = {
+      id: ID,
+      _remote: remote,
+      _adopt: undefined,
+      _closing: false,
+      _isStopped: false,
+      paneLifecycleInFlight: false,
+      _muxSession: { muxName: 'codeman-test' },
+      _mux: { isPaneDead: vi.fn(async () => kind !== 'live-proxy') },
+      _assertLaunchAllowed: launch,
+      resumeRemoteAfterWorkerReboot: resume,
+    } as unknown as Session;
+    const result = await Session.prototype.resumeExitedRemote.call(fake, () => allowed);
+    expect(result).toBe(kind === 'gone');
+    expect(resume).toHaveBeenCalledTimes(kind === 'gone' ? 1 : 0);
+    expect(launch).toHaveBeenCalledTimes(kind === 'gone' ? 1 : 0);
+    if (kind === 'live-proxy') expect(probe).not.toHaveBeenCalled();
+  }
+);

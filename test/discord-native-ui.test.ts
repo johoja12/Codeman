@@ -1992,3 +1992,82 @@ it.each(['message', 'channel', 'conversation', 'expiry', 'restart'])(
     expect(f.finishes.some((p) => p.content?.includes('Allow this file?'))).toBe(false);
   }
 );
+
+it('publishes recovery actions for an exited agent and keeps an ambiguous prompt unconfirmed', async () => {
+  const f = await fixture();
+  Object.assign(f.sessions[0], {
+    exited: true,
+    working: false,
+    ready: false,
+    connection: { state: 'agent_exited', canResume: true },
+    caseKey: 'case-one',
+    url: 'https://codeman.test/#session=s1',
+  });
+  f.host.services.recover = vi.fn(async () => true);
+  f.host.receipts = async () => [{ id: 'receipt', state: 'input_accepted', updated: 1, message: '666666666666666666' }];
+  f.host.retryUndelivered = vi.fn(async () => 'retried');
+  await f.ui.poll();
+  const card = [...f.messages.values()].find((m) => m.content?.includes('recovery needed'))!;
+  expect(card.content).toContain('delivery is unconfirmed');
+  const labels = discordUiNodes(card.components).map((c) => c.label);
+  expect(labels).toEqual(expect.arrayContaining(['Resume conversation', 'Start new session', 'Open in Codeman']));
+  expect(labels).not.toContain('Resume & resend');
+  await f.click(card, 'Resume conversation', undefined, { message: { id: card.id } });
+  expect(f.host.services.recover).toHaveBeenCalledOnce();
+  expect(f.host.submit).not.toHaveBeenCalled();
+  expect(f.host.retryUndelivered).not.toHaveBeenCalled();
+  await f.click(card, 'Start new session', undefined, { message: { id: card.id } });
+  expect(f.host.launch).toHaveBeenCalledWith(f.sessions[0].id, 'case-one', f.sessions[0].mode);
+  expect(f.host.postControl).toHaveBeenCalledWith(
+    f.sessions[0].id,
+    expect.any(String),
+    expect.objectContaining({ text: 'Confirm launch' }),
+    expect.any(String)
+  );
+});
+it('offers resume-and-resend only for a proven refused prompt, with actor and conversation checks', async () => {
+  const f = await fixture();
+  Object.assign(f.sessions[0], {
+    exited: true,
+    working: false,
+    ready: false,
+    connection: { state: 'agent_exited', canResume: true },
+  });
+  f.host.services.recover = vi.fn(async () => true);
+  f.host.receipts = async () => [
+    { id: 'receipt', state: 'failed', reason: 'session_unavailable', retryable: true, updated: 1 },
+  ];
+  f.host.retryUndelivered = vi.fn(async () => 'Prompt submission unconfirmed');
+  await f.ui.poll();
+  const card = [...f.messages.values()].find((m) => m.content?.includes('recovery needed'))!;
+  await f.click(card, 'Resume & resend', undefined, {
+    message: { id: card.id },
+    member: { user: { id: '999999999999999999' } },
+  });
+  expect(f.host.retryUndelivered).not.toHaveBeenCalled();
+  f.sessions[0].conversation = 'different';
+  await f.click(card, 'Resume & resend', undefined, { message: { id: card.id } });
+  expect(f.host.retryUndelivered).not.toHaveBeenCalled();
+  f.sessions[0].conversation = 'conversation-one';
+  await f.click(card, 'Resume & resend', undefined, { message: { id: card.id } });
+  expect(f.host.retryUndelivered).toHaveBeenCalledOnce();
+  expect(f.host.submit).not.toHaveBeenCalled();
+});
+it('shows unverified connections in Needs you without offering a restart of a possibly living agent', async () => {
+  const f = await fixture();
+  Object.assign(f.sessions[0], {
+    exited: true,
+    working: false,
+    ready: false,
+    connection: { state: 'unverified' },
+    caseKey: 'case-one',
+  });
+  f.host.services.recover = vi.fn(async () => true);
+  await f.ui.poll();
+  const card = [...f.messages.values()].find((m) => m.content?.includes('Connection unverified'))!;
+  expect(card).toBeDefined();
+  expect(discordUiNodes(card.components).map((c) => c.label)).not.toContain('Resume conversation');
+  const dash = await f.command('codeman');
+  expect(JSON.stringify(dash)).toContain('Connection unverified');
+  expect(f.host.services.recover).not.toHaveBeenCalled();
+});

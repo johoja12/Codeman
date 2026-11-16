@@ -8,7 +8,13 @@ import type {
 } from './discord-bridge.js';
 import type { DisplayModelSource } from './types/session.js';
 import type { DiscordHistory } from './discord-history.js';
+export interface DiscordConnection {
+  state: 'available' | 'agent_exited' | 'connection_lost' | 'unverified';
+  canResume?: boolean;
+}
 export interface DiscordUiSession {
+  connection?: DiscordConnection;
+  caseKey?: string;
   id: string;
   name: string;
   mode: string;
@@ -48,6 +54,8 @@ export interface DiscordUiCase {
 export interface DiscordNativeUiServices {
   enabled(): boolean;
   sessions(): Promise<DiscordUiSession[]>;
+  connection?(id: string, fresh?: boolean): Promise<DiscordConnection>;
+  recover?(id: string, conversation: string, current: () => boolean): Promise<boolean>;
   submitQueued(
     id: string,
     text: string,
@@ -101,9 +109,24 @@ export interface DiscordNativeUiHost {
     inputRevision?: string
   ): Promise<'accepted' | 'uncertain' | 'blocked'>;
   note(source: string, state: 'queued' | 'cancelled'): Promise<void>;
-  receipts(
-    id: string
-  ): Promise<Array<{ id: string; state: string; reason?: string; updated: number; message?: string }>>;
+  retryUndelivered?(
+    id: string,
+    receipt: string,
+    actor: string,
+    conversation: string,
+    current: () => boolean
+  ): Promise<string>;
+  receipts(id: string): Promise<
+    Array<{
+      id: string;
+      state: string;
+      reason?: string;
+      retryable?: boolean;
+      confirmed?: boolean;
+      updated: number;
+      message?: string;
+    }>
+  >;
   claim(m: DiscordInteraction): Promise<boolean>;
   file(id: string, path: string): Promise<DiscordFile>;
   postFile(channel: string, file: DiscordFile, text: string, current?: () => boolean): Promise<void>;
