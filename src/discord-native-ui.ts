@@ -77,6 +77,7 @@ const noMentions = { parse: [] as string[], users: [] as string[] };
 const row = (...components: Array<Record<string, unknown>>) => ({ type: 1, components });
 const names = ['Codeman: Send to session', 'Codeman: Queue follow-up', 'Codeman: Start session'];
 interface UiAction {
+  allowUnavailable?: boolean;
   scope: string;
   channel: string;
   actor?: string;
@@ -174,9 +175,13 @@ export class DiscordNativeUi {
       })),
     };
   }
-  private async target(id: string, conversation?: string): Promise<DiscordUiSession> {
+  private async target(id: string, conversation?: string, allowUnavailable = false): Promise<DiscordUiSession> {
     const session = (await this.host.services.sessions()).find((s) => s.id === id);
-    if (!session || session.exited || (conversation !== undefined && session.conversation !== conversation))
+    if (
+      !session ||
+      (session.exited && !allowUnavailable) ||
+      (conversation !== undefined && session.conversation !== conversation)
+    )
       throw new Error('The session or conversation changed. Reopen its controls.');
     const channel = this.host.channelForSession(id);
     if (!channel) throw new Error('This session has no current Discord destination');
@@ -317,7 +322,96 @@ export class DiscordNativeUi {
       effort: s.effort ?? (valid && known.effort ? known.effort + ' (last reported)' : undefined),
     };
   }
+  private async recoveryCard(s: DiscordUiSession): Promise<DiscordUiPayload> {
+    const ctx: UiContext = { channel: this.host.channelForSession(s.id)!, session: s.id, conversation: s.conversation };
+    const scope = this.host.scope(),
+      receipt = (await this.host.receipts(s.id))[0];
+    const action = (label: string, run: (m: DiscordInteraction) => Promise<DiscordUiPayload>) => {
+      const button = this.action(ctx, label, run);
+      this.actions.get(button.custom_id as string)!.allowUnavailable = true;
+      return button;
+    };
+    const current = (m: DiscordInteraction) => () =>
+      scope === this.host.scope() &&
+      this.host.channelForSession(s.id) === ctx.channel &&
+      this.host.config().allowed.includes(m.member?.user?.id ?? m.user?.id ?? '');
+    const buttons: Array<Record<string, unknown>> = [];
+    const connection = s.connection?.state ?? 'agent_exited';
+    if ((s.connection?.canResume || connection === 'connection_lost') && s.conversation && this.host.services.recover) {
+      buttons.push(
+        action(connection === 'connection_lost' ? 'Reconnect' : 'Resume conversation', async (m) => {
+          const ok = await this.host.services.recover!(s.id, s.conversation!, current(m));
+          return this.payload(
+            ok
+              ? 'Conversation connected. No prompt was resent.'
+              : 'Recovery could not be confirmed. Open Codeman to inspect the session.'
+          );
+        })
+      );
+      if (receipt?.retryable && this.host.retryUndelivered)
+        buttons.push(
+          action(connection === 'connection_lost' ? 'Reconnect & resend' : 'Resume & resend', async (m) =>
+            this.payload(
+              await this.host.retryUndelivered!(
+                s.id,
+                receipt.id,
+                m.member?.user?.id ?? m.user?.id ?? '',
+                s.conversation!,
+                current(m)
+              )
+            )
+          )
+        );
+    }
+    if (s.caseKey)
+      buttons.push(
+        action('Start new session', async (m) => {
+          if (!current(m)()) throw new Error('Recovery context changed');
+          const reply = await this.host.launch(s.id, s.caseKey!, s.mode);
+          if (!current(m)()) throw new Error('Recovery context changed');
+          await this.host.postControl(s.id, ctx.channel, reply, 'recovery-new:' + m.id);
+          return this.payload('Review the new-session confirmation in this thread. No task is copied automatically.');
+        })
+      );
+    if (this.host.services.connection)
+      buttons.push(
+        action('Refresh status', async (m) => {
+          await this.host.services.connection!(s.id, true);
+          if (!current(m)()) throw new Error('Session changed');
+          return this.sessionCard(await this.target(s.id, s.conversation, true));
+        })
+      );
+    if (s.url && /^https?:\/\//.test(s.url)) buttons.push({ type: 2, style: 5, label: 'Open in Codeman', url: s.url });
+    const status =
+      connection === 'agent_exited'
+        ? '🔴 Agent exited — recovery needed'
+        : connection === 'connection_lost'
+          ? '🔴 Connection lost — reconnect needed'
+          : '🔴 Connection unverified — inspect in Codeman';
+    const unconfirmed =
+      receipt &&
+      !receipt.confirmed &&
+      [
+        'input_accepted',
+        'submitting',
+        'uncertain',
+        'submitted',
+        'running',
+        'completed',
+        'interrupted',
+        'execution_error',
+      ].includes(receipt.state);
+    const link = receipt?.message
+      ? `\n[Review latest prompt](https://discord.com/channels/${this.host.config().guild}/${ctx.channel}/${receipt.message})`
+      : '';
+    return this.payload(
+      `**${safe(s.name)}**\n${status}\n${s.conversation ? 'Conversation: ' + safe(s.conversation) : 'Exact conversation identity unavailable.'}${unconfirmed ? '\n⚠ Latest prompt delivery is unconfirmed; it will not replay automatically.' : receipt?.retryable ? '\nLatest prompt was refused before terminal input.' : ''}${link}${connection === 'agent_exited' && !s.connection?.canResume ? '\nExact resume is not currently verified; open Codeman to inspect recovery.' : ''}`,
+      buttons.length ? [row(...buttons)] : []
+    );
+  }
+
   private async sessionCard(s: DiscordUiSession): Promise<DiscordUiPayload> {
+    if (s.exited) return this.recoveryCard(s);
     const settings = await this.reportedSettingsFor(s);
     const ctx: UiContext = { channel: this.host.channelForSession(s.id)!, session: s.id, conversation: s.conversation };
     const q = (await this.store.snapshot()).queue.filter(
@@ -446,7 +540,7 @@ export class DiscordNativeUi {
       controls[1].components.push({ type: 2, style: 5, label: 'Open Codeman', url: s.url });
     const task = this.host.latestPrompt?.(s.id, s.conversation) ?? '';
     return this.payload(
-      `**${safe(s.caseName)} · ${safe(s.host)}**\n${status} · ${safe(s.mode)}\n${suggestion ? '\n**Claude suggests:** ' + safe(suggestion, 600) + '\n' : ''}\n**Model:** ${safe(settings.model || 'Not reported')}\n**Effort:** ${safe(settings.effort || 'Not reported')}\n**Launch approvals:** ${safe(s.approval || 'CLI default / not reported')}\n**Conversation:** ${safe(s.conversation || 'Not yet identified')}\n${task ? '\n**Latest prompt:** ' + safe(task, 240) + '\n' : ''}${last ? '\n**Latest delivery:** ' + (stateLabels[last.state] ?? safe(last.state)) : ''}${q.some((p) => p.state === 'uncertain') ? '\n⚠ A queued submission is unconfirmed; it will not replay.' : ''}`,
+      `**${safe(s.caseName)} · ${safe(s.host)}**\n${status} · ${safe(s.mode)}\n${suggestion ? '\n**Claude suggests:** ' + safe(suggestion, 600) + '\n' : ''}\n**Model:** ${safe(settings.model || 'Not reported')}\n**Effort:** ${safe(settings.effort || 'Not reported')}\n**Launch approvals:** ${safe(s.approval || 'CLI default / not reported')}\n**Conversation:** ${safe(s.conversation || 'Not yet identified')}\n${task ? '\n**Latest prompt:** ' + safe(task, 240) + '\n' : ''}${last ? '\n**Latest delivery:** ' + (!last.confirmed && ['submitted', 'running', 'completed', 'interrupted', 'execution_error'].includes(last.state) ? 'Unconfirmed — no native acknowledgement' : (stateLabels[last.state] ?? safe(last.state))) : ''}${q.some((p) => p.state === 'uncertain') ? '\n⚠ A queued submission is unconfirmed; it will not replay.' : ''}`,
       controls
     );
   }
@@ -1232,7 +1326,7 @@ export class DiscordNativeUi {
           return true;
         }
       }
-      if (action?.session) await this.target(action.session, action.conversation);
+      if (action?.session) await this.target(action.session, action.conversation, action.allowUnavailable);
       let result: DiscordUiPayload | void;
       if (action) {
         const values: Record<string, string> = {};
@@ -1333,7 +1427,7 @@ export class DiscordNativeUi {
             ? await this.queueView(m, id)
             : command === 'results'
               ? await this.results(m, id)
-              : await this.sessionCard(await this.target(id));
+              : await this.sessionCard(await this.target(id, undefined, true));
     await this.host.request('POST', `/channels/${channel}/messages`, uiWirePayload(result));
     return true;
   }
@@ -2017,7 +2111,7 @@ export class DiscordNativeUi {
           ? e.s.working && !e.s.pending && !e.s.exited
           : view === 'finished'
             ? e.finished
-            : e.s.pending || e.error)
+            : e.s.pending || e.s.exited || e.error)
     );
     const last = Math.max(0, Math.ceil(filtered.length / 5) - 1);
     page = Math.max(0, Math.min(page, last));
@@ -2026,7 +2120,7 @@ export class DiscordNativeUi {
     const header: Array<Record<string, unknown>> = [
       text('-# CODEMAN · WORKSPACE\n## Activity\nPick up where the work is happening.'),
       text(
-        `🟡 **${entries.filter((e) => e.s.working && !e.s.pending && !e.s.exited).length} working** · ✅ **${entries.filter((e) => e.finished).length} done** · 🔴 **${entries.filter((e) => e.s.pending || e.error).length} needs you**\n-# ${all.length} sessions`
+        `🟡 **${entries.filter((e) => e.s.working && !e.s.pending && !e.s.exited).length} working** · ✅ **${entries.filter((e) => e.finished).length} done** · 🔴 **${entries.filter((e) => e.s.pending || e.s.exited || e.error).length} needs you**\n-# ${all.length} sessions`
       ),
     ];
     if (stale) header.push(text('⚠️ **Connection interrupted**\nShowing the last known activity.'));
@@ -2055,7 +2149,7 @@ export class DiscordNativeUi {
       if (i) body.push({ type: 14, divider: true, spacing: 1 });
       const channel = this.host.channelForSession(s.id);
       const threadUrl = channel ? `https://discord.com/channels/${this.host.config().guild}/${channel}` : undefined;
-      const icon = s.pending || error ? '🔴' : s.exited ? '⚫' : s.working ? '🟡' : finished ? '✅' : '⚫';
+      const icon = s.pending || s.exited || error ? '🔴' : s.exited ? '⚫' : s.working ? '🟡' : finished ? '✅' : '⚫';
       const labels = {
         prompt: 'Prompt submitted',
         update: 'Progress update',
@@ -2068,7 +2162,11 @@ export class DiscordNativeUi {
       const label = s.pending
         ? 'Needs your answer'
         : s.exited
-          ? 'Offline'
+          ? s.connection?.state === 'connection_lost'
+            ? 'Connection lost — reconnect needed'
+            : s.connection?.state === 'unverified'
+              ? 'Connection unverified'
+              : 'Agent exited — recovery needed'
           : activity
             ? activity.kind === 'question'
               ? 'Question resolved'
@@ -2077,7 +2175,9 @@ export class DiscordNativeUi {
               ? 'Working'
               : 'Idle';
       const time = activity ? ` · <t:${Math.floor(activity.at / 1000)}:R>` : '';
-      const summary = activity?.summary || (s.working ? 'Work is in progress.' : 'Ready for your next message.');
+      const summary = s.exited
+        ? 'Open the thread for recovery options; pending input is not replayed.'
+        : activity?.summary || (s.working ? 'Work is in progress.' : 'Ready for your next message.');
       let accessory: Record<string, unknown>;
       if (s.pending)
         accessory = this.action(

@@ -246,6 +246,20 @@ Controls bind the exact session, channel, message, prompt ID, revision and allow
 
 Claude's verified dialogs work through the shared approval service for local/SSH sessions. Codex and other screen-only dialogs flagged by Codeman as terminal-only remain terminal-only: it cannot safely infer their approval keystrokes. Free-text/multipart prompts that the native adapter cannot verify must be completed in the terminal. Discord shows that limitation rather than pretending approval succeeded.
 
+## Live status and recovery controls
+
+Discord distinguishes **Agent exited — recovery needed**, **Connection lost**, and **Connection unverified** from Idle. A dead local SSH client does not prove the remote agent has exited. Read-only checks verify the remote pane and supported native conversation/profile; slow or failed probes keep an unverified state. Background checks never launch a CLI or replay a task, and remote transport failures remain separate from the local clean-exit sweep.
+
+Unavailable session cards offer **Reconnect** for a living remote agent behind a dead proxy, or **Resume conversation** when an absent owned remote agent has a supported built-in launcher and an exact saved conversation. Opaque launchers, ambiguous identities and unsupported exact resume paths require web/manual recovery. **Start new session** uses the existing case-bound confirmation; **Refresh status** rechecks without typing; **Open in Codeman** appears when a reachable web URL is available. Scope, actor, conversation and live state are rechecked before recovery. A currently living agent is never restarted by a stale Resume button.
+
+**Resume & resend** (or **Reconnect & resend**) is only offered for a durable refusal made before terminal input. The original Discord text-only message is revalidated; attachments require manual review. A persistent one-use retry claim, exact conversation check and busy/dialog guards prevent replay across duplicate clicks or restart. Historical or ambiguous transport receipts are never treated as proof that a prompt was undelivered.
+
+Transport acceptance appears as **unconfirmed** (`⏳`). A green acknowledgement (`✅`) requires the exact native user cursor; it acknowledges submission, not task completion. Existing unconfirmed receipts keep a link to the original prompt for review. No unconfirmed prompt is resent automatically.
+
+![Synthetic Discord recovery-card preview](images/discord-session-recovery.png)
+
+This preview is generated from the actual recovery payload with synthetic data. Discord controls the final spacing and typography.
+
 ## Session management (Full mode)
 
 Use these commands in a session thread, its case channel, or in the configured **Parent / control channel** when no sessions exist:

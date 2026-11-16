@@ -267,3 +267,32 @@ it('rechecks case discovery permission after the saved-case reader completes', a
   });
   expect(await s.caseChannels!()).toEqual([]);
 });
+
+it('projects connection loss independently of paneExit and keeps unavailable queues blocked', async () => {
+  const native = {
+    id: 's1',
+    name: 'remote',
+    mode: 'codex',
+    workingDir: '/work',
+    nativeResumeId: 'native',
+    remote: { hostId: 'worker', remotePath: '/work', label: 'worker' },
+    isWorking: false,
+    paneExit: undefined,
+    discordQueueRevision: 'rev',
+    submitDiscordFollowup: () => {
+      throw Error('must not dispatch');
+    },
+    envOverrideValue: () => undefined,
+  } as unknown as Session;
+  const s = createDiscordNativeUiServices({
+    sessions: () => new Map([['s1', native]]),
+    cases: async () => [],
+    allowed: () => true,
+    url: () => undefined,
+    health: async () => ({ state: 'connection_lost' }),
+  });
+  const row = (await s.sessions())[0];
+  expect(row).toMatchObject({ exited: true, ready: false, working: false, connection: { state: 'connection_lost' } });
+  expect(native.paneExit).toBeUndefined();
+  expect(await s.submitQueued('s1', 'prompt', 'native', () => true, 'rev')).toBe('blocked');
+});

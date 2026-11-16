@@ -3295,3 +3295,103 @@ it('continues provisioning other cases and live sessions after a case sync error
   expect(b.sessionSync.failed).toBe(1);
   expect(sendInput).not.toHaveBeenCalled();
 });
+
+async function unavailablePromptFixture() {
+  sessions = [{ id: 's1', name: 'one' }];
+  let available = false;
+  const nativeUi = createDiscordNativeUiServices({
+    sessions: () => new Map(),
+    cases: async () => [],
+    allowed: () => true,
+    url: () => undefined,
+  });
+  nativeUi.connection = async () => ({ state: available ? 'available' : 'agent_exited', canResume: !available });
+  nativeUi.recover = vi.fn(async () => {
+    available = true;
+    return true;
+  });
+  const b = makeBridge(undefined, {
+    nativeUi,
+    now: () => 1000000,
+    agentExited: () => !available,
+    history: async () => ({ conversationId: 'native1', partial: false, turns: [] }),
+  });
+  await b.reload();
+  await b.syncSessions();
+  const thread = (await readFullMap(dir)).s1;
+  const message = {
+    id: '900000000000000001',
+    guild_id: cfg.guildId,
+    channel_id: thread,
+    author: { id: cfg.allowedUserIds[0] },
+    content: 'A refused prompt',
+  };
+  remoteMessages.set(message.id, message);
+  await b.onGatewayMessage(message);
+  return {
+    b,
+    message,
+    nativeUi,
+    receipt: 'in:' + cfg.guildId + ':' + message.id,
+    setAvailable: (value: boolean) => {
+      available = value;
+    },
+  };
+}
+it('refuses unavailable destinations before input and safely resumes/retries a verified text prompt only once', async () => {
+  const f = await unavailablePromptFixture();
+  expect(sendInput).not.toHaveBeenCalled();
+  const state = JSON.parse(await readFile(join(dir, 'discord-delivery.json'), 'utf8')).find(
+    (r: any) => r.id === f.receipt
+  );
+  expect(state).toMatchObject({ state: 'failed', reason: 'session_unavailable' });
+  expect(state.native).toBeUndefined();
+  const retry = (f.b as any).retryUndelivered.bind(f.b);
+  await retry('s1', f.receipt, cfg.allowedUserIds[0], 'native1', () => true);
+  expect(sendInput).toHaveBeenCalledExactlyOnceWith('s1', f.message.content + '\r');
+  await retry('s1', f.receipt, cfg.allowedUserIds[0], 'native1', () => true);
+  expect(sendInput).toHaveBeenCalledTimes(1);
+  expect(f.nativeUi.recover).toHaveBeenCalledOnce();
+  f.b.stop();
+  const again = makeBridge(undefined, { nativeUi: f.nativeUi, now: () => 1000000, agentExited: () => false });
+  await again.reload();
+  await again.syncSessions();
+  await (again as any).retryUndelivered('s1', f.receipt, cfg.allowedUserIds[0], 'native1', () => true);
+  expect(sendInput).toHaveBeenCalledTimes(1);
+});
+it.each(['ambiguous', 'attachments', 'revoked'])('never replays a %s prompt through recovery', async (kind) => {
+  const f = await unavailablePromptFixture();
+  if (kind === 'ambiguous') await (f.b as any).deliveries.update(f.receipt, 'input_accepted');
+  if (kind === 'attachments')
+    Object.assign(remoteMessages.get(f.message.id), {
+      attachments: [{ id: 'file', filename: 'file.png', url: 'https://cdn.discordapp.com/a.png' }],
+    });
+  await (f.b as any).retryUndelivered('s1', f.receipt, cfg.allowedUserIds[0], 'native1', () => kind !== 'revoked');
+  expect(f.nativeUi.recover).not.toHaveBeenCalled();
+  expect(sendInput).not.toHaveBeenCalled();
+});
+it('promotes receipt reactions only after native acknowledgement and clears transport-only success', async () => {
+  const f = await unavailablePromptFixture();
+  f.setAvailable(true);
+  const journal = (f.b as any).deliveries;
+  await journal.update(f.receipt, 'input_accepted');
+  await (f.b as any).refreshInputReaction('s1');
+  const green = () => posts.filter((p) => p.method === 'PUT' && decodeURIComponent(p.path).includes('/reactions/✅'));
+  expect(green()).toHaveLength(0);
+  expect(posts.some((p) => p.method === 'PUT' && decodeURIComponent(p.path).includes('/reactions/⏳'))).toBe(true);
+  await journal.update(f.receipt, 'submitted');
+  await (f.b as any).refreshInputReaction('s1');
+  expect(green()).toHaveLength(0);
+  await journal.annotate(f.receipt, {
+    native: { conversationId: 'native1', promptHash: 'a'.repeat(64), userCursor: 'native1:1:ack' },
+  });
+  await (f.b as any).refreshInputReaction('s1');
+  expect(green()).toHaveLength(1);
+});
+
+it('does not resend into work that became busy during recovery', async () => {
+  const f = await unavailablePromptFixture();
+  sessions[0].working = true;
+  await (f.b as any).retryUndelivered('s1', f.receipt, cfg.allowedUserIds[0], 'native1', () => true);
+  expect(sendInput).not.toHaveBeenCalled();
+});

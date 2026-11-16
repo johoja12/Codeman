@@ -9,6 +9,7 @@ export interface DiscordActivitySession {
   activityStatus?: SessionActivityStatus;
   waiting?: boolean;
   exited?: boolean;
+  connection?: 'available' | 'agent_exited' | 'connection_lost' | 'unverified';
 }
 
 /** All observed work shares one Discord state, avoiding rename notices between work types. */
@@ -22,6 +23,9 @@ export function discordActivityWorking(session: DiscordActivitySession): boolean
 }
 
 function activityLabel(session: DiscordActivitySession): string {
+  if (session.connection === 'agent_exited') return '🔴 Recovery needed';
+  if (session.connection === 'connection_lost') return '🔴 Connection lost';
+  if (session.connection === 'unverified') return '🔴 Connection unverified';
   if (session.exited) return '⚫ Offline';
   if (session.waiting) return '🔴 Needs input';
   if (discordActivityWorking(session)) return '🟡 Working';

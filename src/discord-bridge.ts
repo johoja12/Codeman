@@ -59,7 +59,12 @@ import { DISCORD_RECEIVED_DIR } from './web/paste-image-gc.js';
 import WebSocket from 'ws';
 import { DiscordActivity, type DiscordActivitySession } from './discord-activity.js';
 import { stripVTControlCharacters } from 'node:util';
-import { DiscordDeliveryError, DiscordDeliveryJournal, type DiscordDelivery } from './discord-delivery.js';
+import {
+  discordInputAcknowledged,
+  DiscordDeliveryError,
+  DiscordDeliveryJournal,
+  type DiscordDelivery,
+} from './discord-delivery.js';
 import { DiscordChannelProblem, type DiscordManagedChannel } from './discord-session-channels.js';
 import { WEBHOOK_SCOPES, type WebhookUrgency } from './types/push.js';
 import {
@@ -1220,11 +1225,15 @@ export class DiscordBridge {
         submit: (id, channel, actor, source, text, conversation, idle, inputRevision) =>
           this.submitUiPrompt(id, channel, actor, source, text, conversation, !!idle, inputRevision),
         note: (source, state) => this.deliveries.update(source, state),
+        retryUndelivered: (id, receipt, actor, conversation, current) =>
+          this.retryUndelivered(id, receipt, actor, conversation, current),
         receipts: async (id) =>
           (await this.deliveries.recentForSession(id)).map((r) => ({
             id: r.id,
             state: r.state,
             reason: r.reason,
+            confirmed: discordInputAcknowledged(r),
+            retryable: r.state === 'failed' && r.reason === 'session_unavailable' && !r.native && !!r.messageId,
             updated: r.updatedAt,
             message: r.messageId,
           })),
@@ -1525,6 +1534,10 @@ export class DiscordBridge {
         const result = await this.threadFor(session.id, session.name);
         if (typeof result === 'string') {
           this.syncState.ready++;
+          if (this.deps.agentExited?.(session.id)) {
+            await this.refreshInputReaction(session.id).catch(() => undefined);
+            continue;
+          }
           try {
             await this.seedConversation(session.id, result);
           } catch (error) {
@@ -2202,6 +2215,8 @@ export class DiscordBridge {
     return this.profiler.measure('observe.conversation', () => this.observeConversationNow(sessionId, channel));
   }
   private async observeConversationNow(sessionId: string, channel: string): Promise<void> {
+    await this.refreshInputReaction(sessionId).catch(() => undefined);
+    if (this.deps.agentExited?.(sessionId)) return;
     await this.seedConversation(sessionId, channel);
     const key = this.conversationKey(sessionId, channel);
     const active = this.conversationRuns.get(key);
@@ -2223,6 +2238,7 @@ export class DiscordBridge {
         this.deps.history!(sessionId, { includeTools, after })
       );
       if (!attributed) return;
+      await this.refreshInputReaction(sessionId).catch(() => undefined);
       await this.nativeUi?.observeHistory(sessionId, history).catch(() => undefined);
       if (progress.streamOff) return;
       const discordPrompts = await this.deliveries.submittedUserCursors(sessionId, channel, history.conversationId);
@@ -3700,6 +3716,149 @@ export class DiscordBridge {
     };
   }
 
+  /** Retry only a durable refusal made before terminal dispatch. Ambiguous inputs are never eligible. */
+  private retryUndelivered(
+    id: string,
+    receipt: string,
+    actor: string,
+    conversation: string,
+    current: () => boolean
+  ): Promise<string> {
+    const channel = this.channels.channelForSession(this.cfg, id);
+    if (!channel) return Promise.resolve('Session destination changed.');
+    const run = (this.inbound.get(channel) ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(() => this.retryUndeliveredNow(id, receipt, actor, conversation, current));
+    const chain = run.then(
+      () => undefined,
+      () => undefined
+    );
+    this.inbound.set(channel, chain);
+    return run.finally(() => {
+      if (this.inbound.get(channel) === chain) this.inbound.delete(channel);
+    });
+  }
+
+  private async retryUndeliveredNow(
+    id: string,
+    receipt: string,
+    actor: string,
+    conversation: string,
+    current: () => boolean
+  ): Promise<string> {
+    const channel = this.channels.channelForSession(this.cfg, id),
+      scope = this.controlScope;
+    const valid = () =>
+      !!channel &&
+      current() &&
+      this.controlScope === scope &&
+      this.cfg.allowedUserIds.includes(actor) &&
+      this.destinationMatches(id, channel);
+    const original = (await this.deliveries.recentForSession(id))[0];
+    if (
+      !valid() ||
+      !channel ||
+      !original ||
+      original.id !== receipt ||
+      original.state !== 'failed' ||
+      original.reason !== 'session_unavailable' ||
+      original.native ||
+      !original.messageId ||
+      original.channelId !== channel ||
+      original.guildId !== this.cfg.guildId
+    )
+      return 'This prompt is not proven undelivered. Inspect it before resending.';
+    const message = (await this.api.getMessage(channel, original.messageId)) as unknown as GatewayMessage | null;
+    if (
+      !message ||
+      message.channel_id !== channel ||
+      message.id !== original.messageId ||
+      message.author.bot ||
+      !this.cfg.allowedUserIds.includes(message.author.id) ||
+      message.attachments?.length ||
+      !valid()
+    )
+      return 'The original text-only prompt could not be verified. Resend it manually after review.';
+    const text = sanitiseReply(message.content ?? '');
+    if (!text) return 'The original prompt cannot be resent through this control.';
+    const key = `retry:${this.cfg.guildId}:${receipt}`;
+    const claim = await this.deliveries.claim({
+      id: key,
+      direction: 'inbound',
+      sessionId: id,
+      channelId: channel,
+      guildId: this.cfg.guildId,
+    });
+    if (!claim.fresh) return 'This retry was already received. Inspect delivery status; it will not replay.';
+    try {
+      if (!this.deps.nativeUi?.recover || !valid() || !(await this.deps.nativeUi.recover(id, conversation, valid))) {
+        await this.deliveries.update(key, 'failed', 'scope_changed');
+        return 'Recovery was not confirmed. No prompt was sent.';
+      }
+      if (!valid() || !this.deps.history) throw new Error('Recovery context changed');
+      const history = await this.deps.history(id);
+      if (
+        history.conversationId !== conversation ||
+        !valid() ||
+        this.deps.sessions?.().find((s) => s.id === id)?.working ||
+        this.deps.awaitingChoice?.(id)
+      )
+        throw new Error('Conversation changed or busy');
+      await this.deliveries.annotate(key, {
+        messageId: original.messageId,
+        native: {
+          conversationId: conversation,
+          afterCursor: history.turns.at(-1)?.cursor,
+          promptHash: hashDiscordPrompt(text),
+        },
+      });
+      await this.deliveries.update(key, 'submitting');
+      if (!valid()) {
+        await this.deliveries.update(key, 'failed', 'scope_changed');
+        return 'Session changed; no prompt was sent.';
+      }
+      const sent = await this.deps.sendInput(id, text);
+      await this.deliveries.update(key, sent ? 'input_accepted' : 'uncertain', sent ? undefined : 'input_uncertain');
+      return 'Recovery attempted; prompt submission is unconfirmed until the native conversation acknowledges it.';
+    } catch {
+      await this.deliveries.update(key, 'uncertain', 'input_uncertain');
+      return 'Recovery or submission is unconfirmed. Inspect the session before retrying.';
+    }
+  }
+
+  private inputReactions = new Map<string, string>();
+  private async refreshInputReaction(id: string): Promise<void> {
+    const record = (await this.deliveries.recentForSession(id))[0];
+    if (!record?.messageId || record.guildId !== this.cfg.guildId || !this.destinationMatches(id, record.channelId))
+      return;
+    const confirmed = discordInputAcknowledged(record);
+    if (
+      !confirmed &&
+      ![
+        'input_accepted',
+        'submitting',
+        'uncertain',
+        'submitted',
+        'running',
+        'completed',
+        'interrupted',
+        'execution_error',
+      ].includes(record.state)
+    )
+      return;
+    const emoji = confirmed ? '✅' : '⏳';
+    if (this.inputReactions.get(record.id) === emoji) return;
+    await this.api.react(record.channelId, record.messageId, emoji);
+    await this.api
+      .request(
+        'DELETE',
+        `/channels/${record.channelId}/messages/${record.messageId}/reactions/${encodeURIComponent(confirmed ? '⏳' : '✅')}/@me`
+      )
+      .catch(() => undefined);
+    if (this.inputReactions.size >= 1024) this.inputReactions.clear();
+    this.inputReactions.set(record.id, emoji);
+  }
+
   private async submitUiPrompt(
     sessionId: string,
     channel: string,
@@ -3835,7 +3994,7 @@ export class DiscordBridge {
         .react(
           m.channel_id,
           m.id,
-          ['input_accepted', 'running', 'completed', 'delivered'].includes(claim.record.state) ? '✅' : '⏳'
+          claim.record.state === 'delivered' || discordInputAcknowledged(claim.record) ? '✅' : '⏳'
         )
         .catch(() => undefined);
       return;
@@ -4011,11 +4170,14 @@ export class DiscordBridge {
         );
         return;
       }
-      if (this.deps.agentExited?.(sessionId)) {
+      const connection = await this.deps.nativeUi
+        ?.connection?.(sessionId, true)
+        .catch(() => ({ state: 'unverified' as const }));
+      if (this.deps.agentExited?.(sessionId) || (connection && connection.state !== 'available')) {
         await this.deliveries.update(id, 'failed', 'session_unavailable');
         await this.say(
           m.channel_id,
-          'The agent in that tab has exited, so nothing was typed. Reconnect or recover it first.'
+          'This session needs recovery or a verified connection. Nothing was typed. Use its session card for recovery options.'
         );
         return;
       }
@@ -4088,7 +4250,7 @@ export class DiscordBridge {
       // A crash beyond the durable boundary is ambiguous; never retry the whole input.
       const ok = await this.deps.sendInput(sessionId, keys);
       await this.deliveries.update(id, ok ? 'input_accepted' : 'uncertain', ok ? undefined : 'input_uncertain');
-      if (ok) await this.api.react(m.channel_id, m.id, '✅').catch(() => undefined);
+      if (ok) await this.api.react(m.channel_id, m.id, '⏳').catch(() => undefined);
       else
         await this.say(
           m.channel_id,

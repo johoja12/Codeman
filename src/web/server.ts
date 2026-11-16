@@ -1,3 +1,6 @@
+import { probeRemoteDiscordConversation } from '../discord-remote-conversation.js';
+import { readDiscordSessionHistory } from '../discord-history.js';
+import { DiscordSessionHealth } from './discord-session-health.js';
 import { createDiscordNativeUiServices } from './discord-native-ui-services.js';
 import { resolveDiscordCase } from '../discord-case-identity.js';
 import { DiscordModelControls } from '../discord-model-controls.js';
@@ -771,6 +774,63 @@ export class WebServer extends EventEmitter {
   /** Two-way Discord bridge (thread per tab); config in discord.json (0600). Idle until enabled in Settings. */
   /** Set by the session routes when they register (see SessionPort). */
   lastResponseFor?: (session: Session, context?: string) => Promise<{ text: string; timestamp?: string }>;
+  private discordHealth = new DiscordSessionHealth({
+    paneExited: (name) => !!this.mux.getPaneExit?.(name),
+    verify: async (session) => {
+      if (
+        !session.lastRealPromptAt ||
+        !['claude-jsonl', 'codex-rollout'].includes(getCli(session.mode)?.capabilities.transcript ?? '')
+      )
+        return true;
+      const history = await readDiscordSessionHistory(session);
+      const expected =
+        getCli(session.mode)?.capabilities.transcript === 'claude-jsonl'
+          ? session.claudeSessionId
+          : (session.nativeResumeId ?? session.codexConfig?.resumeSessionId);
+      return !!expected && history.conversationId === expected;
+    },
+  });
+  private discordRecovering = new Set<string>();
+  private async recoverDiscordSession(session: Session, current: () => boolean): Promise<boolean> {
+    if (this.discordRecovering.has(session.id)) return false;
+    this.discordRecovering.add(session.id);
+    try {
+      if (
+        !current() ||
+        isMultiUserMode() ||
+        session.suppressNotifications ||
+        session.isAdopted ||
+        !enabledClis().some((c) => c.id === session.mode)
+      )
+        return false;
+      const health = await this.discordHealth.check(session, true);
+      if (!current()) return false;
+      if (health.state === 'available') return false;
+      const recovered =
+        health.state === 'connection_lost'
+          ? !!session.muxName && (await this.mux.isPaneDead(session.muxName)) && (await session.reattachRemote())
+          : health.state === 'agent_exited' && health.canResume
+            ? await session.resumeExitedRemote(current)
+            : false;
+      this.discordHealth.invalidate(session);
+      if (!recovered || !current() || (await this.discordHealth.check(session, true)).state !== 'available')
+        return false;
+      if (
+        session.remote &&
+        getCli(session.mode)?.capabilities.transcript === 'codex-rollout' &&
+        (await probeRemoteDiscordConversation(session.remote, session.id).catch(() => undefined)) !==
+          session.nativeResumeId
+      )
+        return false;
+      if (!current()) return false;
+      this.noteRemoteReconnect(session.id, true);
+      this.persistSessionState(session);
+      this.broadcastSessionStateDebounced(session.id);
+      return true;
+    } finally {
+      this.discordRecovering.delete(session.id);
+    }
+  }
   private discordCases?: () => Promise<import('../types.js').CaseInfo[]>;
   private discordCreate?: (body: unknown) => Promise<string>;
   private discordRecover?: (id: string, action: 'reconnect' | 'resume') => Promise<string>;
@@ -801,7 +861,10 @@ export class WebServer extends EventEmitter {
                 ? c.remote?.hostId === s.remote.hostId && c.remote.path === s.remote.remotePath
                 : c.path === s.workingDir
             )?.name || s.workingDir,
-          state: s.paneExit ? 'agent exited' : s.activityProjection.activityStatus,
+          state:
+            this.discordHealth.peek(s).state === 'available'
+              ? s.activityProjection.activityStatus
+              : this.discordHealth.peek(s).state,
         }));
     },
     create: async (body) => {
@@ -865,6 +928,8 @@ export class WebServer extends EventEmitter {
         return s?.muxName ? this.mux.capturePaneTextAsync?.(s.muxName, { ansi: true }) : null;
       },
       sessions: () => this.sessions,
+      health: (s, fresh) => this.discordHealth.check(s, fresh),
+      recover: (s, current) => this.recoverDiscordSession(s, current),
       observed: (id) => this.discordModelControls.observed(id),
       cases: async () => this.discordCases?.() ?? [],
       allowed: () => !isMultiUserMode() && this.discordBridge.acceptsControls,
@@ -883,11 +948,19 @@ export class WebServer extends EventEmitter {
     sendInput: async (sessionId, text) => {
       const session = this.sessions.get(sessionId);
       if (!session || session.isAdopted) return false;
+      if (
+        (await this.discordHealth.check(session, true)).state !== 'available' ||
+        this.sessions.get(sessionId) !== session
+      )
+        return false;
       // A Discord reply is a person's own input, so it names the tab like any other prompt.
       // writeViaMux already handles PTY fallback. Retrying the entire write can duplicate a partial paste.
       return session.writeViaMux(text, { fromUser: true, preserveWhitespace: true });
     },
-    agentExited: (id) => !!this.sessions.get(id)?.paneExit,
+    agentExited: (id) => {
+      const s = this.sessions.get(id);
+      return !s || this.discordHealth.peek(s).state !== 'available';
+    },
     awaitingChoice: (id) => approvalInbox.listPending().some((item) => item.sessionId === id && item.kind !== 'idle'),
     caseForSession: async (id) => {
       const session = this.sessions.get(id);
@@ -903,6 +976,7 @@ export class WebServer extends EventEmitter {
       Array.from(this.sessions.values())
         .filter((session) => !session.suppressNotifications && !session.isAdopted)
         .map((session) => ({
+          connection: this.discordHealth.peek(session).state,
           id: session.id,
           name: session.name,
           remote: !!session.remote,
@@ -935,6 +1009,13 @@ export class WebServer extends EventEmitter {
         return {
           text: 'Use a session thread for task/history commands; !codeman help lists management commands.',
         };
+      if (command === 'status') {
+        const health = await this.discordHealth.check(session, true);
+        if (health.state !== 'available')
+          return {
+            text: `**${session.name || session.id}** · ${health.state.replaceAll('_', ' ')}\nRecovery or connection verification is needed. Use the session card for guarded recovery options; unconfirmed input is not replayed.`,
+          };
+      }
       return (
         (await discordTaskControl(
           session,
