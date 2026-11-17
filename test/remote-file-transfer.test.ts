@@ -198,3 +198,24 @@ describe('writeRemoteFileBytes (spawn wrapper, ssh mocked)', () => {
     ).rejects.toThrow('timed out connecting to 10.0.0.9');
   });
 });
+
+it('caps noisy SSH stderr and terminates the child without forwarding its contents', async () => {
+  spawn.mockReset();
+  const child = Object.assign(new PassThrough(), {
+    stdin: new PassThrough(),
+    stderr: new PassThrough(),
+    kill: vi.fn(),
+  });
+  spawn.mockReturnValue(child);
+  const transfer = writeRemoteFileBytes(REMOTE, {
+    dir: '/work/.codeman-discord',
+    filePath: '/work/.codeman-discord/file.txt',
+    bytes: Buffer.from('upload'),
+    timeoutMs: 2000,
+    transferLabel: 'Discord upload',
+    notADirectoryMessage: 'Unsafe upload directory',
+  });
+  child.stderr.emit('data', Buffer.alloc(65537, 'private'));
+  await expect(transfer).rejects.toThrow('remote error output exceeded limit');
+  expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+});
