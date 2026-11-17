@@ -206,3 +206,26 @@ describe('broadcast -> Discord tab lifecycle', () => {
     expect(s.discordBridge.stop).toHaveBeenCalledTimes(1);
   });
 });
+
+it('preserves Notifications input for an explicitly adopted tab while Full mode refuses it', async () => {
+  const s = new WebServer(0, false, true) as any;
+  const writeViaMux = vi.fn(async () => true);
+  s.sessions.set('adopted', { isAdopted: true, writeViaMux });
+  expect(await s.discordBridge.deps.sendInput('adopted', 'continue\r')).toBe(true);
+  expect(writeViaMux).toHaveBeenCalledExactlyOnceWith('continue\r', { fromUser: true });
+  Object.assign(s.discordBridge.cfg, { enabled: true, token: 'fixture', mode: 'full' });
+  expect(await s.discordBridge.deps.sendInput('adopted', 'continue\r')).toBe(false);
+  expect(writeViaMux).toHaveBeenCalledTimes(1);
+  s.discordBridge.stop();
+});
+
+it('synchronizes newly saved case channels from case events only while Full mode is active', () => {
+  const s = server();
+  const syncCases = vi.fn(async () => undefined);
+  Object.assign(s.discordBridge, { acceptsControls: true, syncCases });
+  s.broadcast('case:created', { name: 'new-case' });
+  expect(syncCases).toHaveBeenCalledOnce();
+  Object.assign(s.discordBridge, { acceptsControls: false });
+  s.broadcast('case:linked', { name: 'another-case' });
+  expect(syncCases).toHaveBeenCalledOnce();
+});
