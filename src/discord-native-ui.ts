@@ -288,17 +288,28 @@ export class DiscordNativeUi {
       await this.host.request('PUT', `/channels/${channel}/messages/pins/${message}`).catch(() => undefined);
     }
   }
-  private settingsKey(id: string, conversation: string): string {
-    return hash(JSON.stringify([this.host.scope(), this.host.channelForSession(id), id, conversation]));
+  private settingsKey(id: string, conversation: string, format?: string): string {
+    return hash(
+      JSON.stringify([
+        this.host.scope(),
+        this.host.channelForSession(id),
+        id,
+        conversation,
+        ...(format === 'codex-rollout' ? ['codex-rollout'] : []),
+      ])
+    );
   }
   private async reportedSettingsFor(s: DiscordUiSession): Promise<{ model?: string; effort?: string }> {
-    if (getCli(s.mode)?.capabilities.transcript !== 'claude-jsonl') return { model: s.model, effort: s.effort };
+    if (!['claude-jsonl', 'codex-rollout'].includes(getCli(s.mode)?.capabilities.transcript ?? ''))
+      return { model: s.model, effort: s.effort };
     const scope = this.host.scope(),
       channel = this.host.channelForSession(s.id);
     const conversation = s.activityConversation ?? s.conversation;
     const known =
       scope && channel && conversation
-        ? await this.store.reportedSettings(this.settingsKey(s.id, conversation))
+        ? await this.store.reportedSettings(
+            this.settingsKey(s.id, conversation, getCli(s.mode)?.capabilities.transcript)
+          )
         : undefined;
     const valid =
       known &&
@@ -1973,7 +1984,7 @@ export class DiscordNativeUi {
       !Number.isSafeInteger(Number(report.cursor.split(':')[1]))
     )
       return;
-    const key = this.settingsKey(id, history.conversationId),
+    const key = this.settingsKey(id, history.conversationId, report.format),
       old = await this.store.reportedSettings(key);
     if (old && (old.at > at || (old.at === at && old.cursor === report.cursor))) return;
     let changed = false;

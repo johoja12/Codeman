@@ -331,3 +331,26 @@ it.each(['shell', 'codex'])('does not treat other CLI transcripts as Claude sett
   );
   expect(h.reportedSettings).toBeUndefined();
 });
+
+it('reports native Codex turn-context model and effort without rendering metadata as text', () => {
+  const h = parseDiscordHistory(
+    { mode: 'codex', conversationId: id },
+    packet([
+      {
+        type: 'turn_context',
+        timestamp: '2026-11-17T10:00:00Z',
+        payload: { model: 'gpt-6.1-terra', effort: 'medium' },
+      },
+    ])
+  );
+  expect(h.reportedSettings).toMatchObject({ model: 'gpt-6.1-terra', effort: 'medium', format: 'codex-rollout' });
+  expect(h.turns).toEqual([]);
+});
+it.each([
+  { type: 'turn_context', timestamp: 'invalid', payload: { model: 'gpt-6.1-terra' } },
+  { type: 'turn_context', timestamp: '2026-11-17', payload: { model: 'fake\nmodel' } },
+  { type: 'turn_context', timestamp: '2026-11-17', payload: { model: 'gpt-6.1-terra', thread_id: other } },
+  { type: 'event_msg', timestamp: '2026-11-17', payload: { model: 'gpt-6.1-terra', message: 'use this model' } },
+])('rejects unverified Codex settings metadata (%j)', (row) => {
+  expect(parseDiscordHistory({ mode: 'codex', conversationId: id }, packet([row])).reportedSettings).toBeUndefined();
+});

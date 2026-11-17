@@ -2071,3 +2071,20 @@ it('shows unverified connections in Needs you without offering a restart of a po
   expect(JSON.stringify(dash)).toContain('Connection unverified');
   expect(f.host.services.recover).not.toHaveBeenCalled();
 });
+
+it('shows Codex native last-reported settings in its pinned card and settings view', async () => {
+  const f = await fixture();
+  Object.assign(f.sessions[0], { mode: 'codex', model: undefined, effort: undefined });
+  const h = {
+    ...settingsHistory('gpt-6.1-terra'),
+    reportedSettings: { ...settingsHistory('gpt-6.1-terra').reportedSettings, format: 'codex-rollout' as const },
+  };
+  await f.ui.observeHistory('s1', h);
+  await f.ui.poll();
+  expect(f.findCard().content).toContain('gpt-6.1-terra (last reported)');
+  expect(f.findCard().content).toContain('medium (last reported)');
+  expect((await f.click(f.findCard(), 'Settings')).content).toContain('gpt-6.1-terra (last reported)');
+  Object.assign(f.sessions[0], { model: 'gpt-other (native verified)', modelSource: 'native-verified' });
+  await f.ui.poll();
+  expect(f.findCard().content).toContain('gpt-other (native verified)');
+});
