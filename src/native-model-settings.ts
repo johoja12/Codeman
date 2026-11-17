@@ -1,4 +1,4 @@
-/** The narrow native-input contract for session-only model/effort controls. */
+/** @fileoverview The narrow native-input contract for session-only model/effort controls. */
 export interface NativeModelSettingsLease {
   current(): boolean;
   capture(): Promise<string>;

@@ -1,4 +1,4 @@
-/** Bounded, content-free bridge timings. CPU/heap context belongs to the entire Node process. */
+/** @fileoverview Bounded, content-free bridge timings. CPU/heap context belongs to the entire Node process. */
 import { performance } from 'node:perf_hooks';
 import { captureDiscordProfile, discordProfileCaptureActive } from './discord-profile-capture.js';
 export type DiscordProfileOperation =

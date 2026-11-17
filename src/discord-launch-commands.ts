@@ -1,4 +1,4 @@
-/** Guild-scoped launch commands. Never bulk-overwrite another integration's commands. */
+/** @fileoverview Guild-scoped launch commands. Never bulk-overwrite another integration's commands. */
 export interface DiscordLaunchApi {
   request(method: string, path: string, body?: unknown): Promise<unknown>;
 }

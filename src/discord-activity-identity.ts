@@ -1,4 +1,4 @@
-/** Display-only conversation evidence from an already authorized canonical history read. */
+/** @fileoverview Display-only conversation evidence from an already authorized canonical history read. */
 import type { DiscordSessionView as Session } from './discord-session-view.js';
 
 type ActivitySession = Pick<

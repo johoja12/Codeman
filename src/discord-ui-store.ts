@@ -1,4 +1,4 @@
-/** Private, bounded UI ownership and explicit prompt queue. Never replay ambiguous writes. */
+/** @fileoverview Private, bounded UI ownership and explicit prompt queue. Never replay ambiguous writes. */
 import fs from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { join } from 'node:path';

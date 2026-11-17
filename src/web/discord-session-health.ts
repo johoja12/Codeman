@@ -1,4 +1,4 @@
-/** Read-only Discord liveness; a dead SSH client is not an authoritative remote-agent exit. */
+/** @fileoverview Read-only Discord liveness; a dead SSH client is not an authoritative remote-agent exit. */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolveTmuxSocketName } from '../config/instance.js';
