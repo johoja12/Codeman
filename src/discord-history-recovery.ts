@@ -1,5 +1,5 @@
 import { nativeCodexStatusComposerReady } from './native-composer-ready.js';
-/** Canonical Discord history, with one guarded native status read for an unbound Codex pane. */
+/** @fileoverview Canonical Discord history, with one guarded native status read for an unbound Codex pane. */
 import type { Session } from './session.js';
 import { getCli } from './config/cli-registry/registry.js';
 import { readDiscordSessionHistory, DiscordHistoryReadError, type DiscordHistory } from './discord-history.js';

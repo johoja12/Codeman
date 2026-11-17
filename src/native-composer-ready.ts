@@ -1,5 +1,5 @@
 import { getCli } from './config/cli-registry/registry.js';
-/** Pure empty-composer proof shared by settings and queued follow-ups. */
+/** @fileoverview Pure empty-composer proof shared by settings and queued follow-ups. */
 import { readGuardedComposer } from './agent-staging.js';
 import { stripAnsi } from './utils/regex-patterns.js';
 function composerReady(mode: string, raw: string, statusOnly = false): boolean {

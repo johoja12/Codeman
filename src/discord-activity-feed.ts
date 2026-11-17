@@ -1,4 +1,4 @@
-/** Meaningful native activity only: cosmetic refreshes and reads never advance recency. */
+/** @fileoverview Meaningful native activity only: cosmetic refreshes and reads never advance recency. */
 import { z } from 'zod';
 import type { DiscordHistory } from './discord-history.js';
 import { discordDisplayText } from './discord-display-text.js';

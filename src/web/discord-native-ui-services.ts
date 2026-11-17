@@ -8,7 +8,7 @@ import type { ApprovalItem } from './approval-inbox.js';
 import { claudePromptSuggestion } from '../session-submit-verifier.js';
 import { discordActivityWorking } from '../discord-activity.js';
 import { getCli } from '../config/cli-registry/registry.js';
-/** Server adapters for native Discord UI. Reuses settings, approval and file/SSH guards. */
+/** @fileoverview Server adapters for native Discord UI. Reuses settings, approval and file/SSH guards. */
 import { approvalInbox } from './approval-inbox.js';
 import { answerPendingApproval } from './routes/approval-routes.js';
 import { discordApprovalRevision } from '../discord-task-controls.js';
