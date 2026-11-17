@@ -1,5 +1,5 @@
 import { getCli } from '../config/cli-registry/registry.js';
-/** Match the web Codex Run button for Discord launches before normal route validation/clamping. */
+/** @fileoverview Match the web Codex Run button for Discord launches before normal route validation/clamping. */
 import { SettingsUpdateSchema } from './schemas.js';
 import { readJsonConfig, SETTINGS_PATH } from './route-helpers.js';
 

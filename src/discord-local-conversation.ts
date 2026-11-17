@@ -1,4 +1,4 @@
-/** Read-only runtime profile for an exact local managed Codex pane. No credential values leave the probe. */
+/** @fileoverview Read-only runtime profile for an exact local managed Codex pane. No credential values leave the probe. */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolveTmuxSocketName } from './config/instance.js';

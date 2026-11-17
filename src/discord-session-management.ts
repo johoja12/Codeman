@@ -1,5 +1,5 @@
 import { getCli } from './config/cli-registry/registry.js';
-/** Explicit session lifecycle choices using shared web/backend services. No blank recovery or task replay. */
+/** @fileoverview Explicit session lifecycle choices using shared web/backend services. No blank recovery or task replay. */
 import { configuredDiscordCaseKey } from './discord-case-identity.js';
 import { MAX_SESSION_NAME_LENGTH } from './config/terminal-limits.js';
 import { randomUUID, createHash } from 'node:crypto';
