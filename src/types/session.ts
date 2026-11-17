@@ -165,6 +165,7 @@ export interface RemoteCase {
 }
 
 export interface SessionRemote extends RemoteSshOptions {
+  codexCommandProfileId?: string;
   hostId: string;
   label: string;
   host: string;
@@ -961,6 +962,8 @@ export interface KeepWarmStatus {
 }
 
 export interface SessionState {
+  /** Exact conversation proved by a read-only native process probe, not a first-hand hook. */
+  claudeSessionId?: string | null;
   /** Unique session identifier */
   id: string;
   /** Process ID of the PTY process, null if not running */
@@ -1236,3 +1239,6 @@ export interface SessionState {
 /**
  * Output captured from a session
  */
+
+/** Effective activity accepted by the optional Discord activity adapter. */
+export type SessionActivityStatus = SessionStatus | 'waiting_agents' | 'checking_agents';
