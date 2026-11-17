@@ -1,3 +1,4 @@
+import { nativeCodexStatusComposerReady } from './native-composer-ready.js';
 /** Canonical Discord history, with one guarded native status read for an unbound Codex pane. */
 import type { Session } from './session.js';
 import { getCli } from './config/cli-registry/registry.js';
@@ -19,15 +20,15 @@ export async function readDiscordCanonicalHistory(
         ['profile_unverified', 'profile_changed'].includes(original.code)) ||
       !permitted() ||
       !!session.docker ||
-      session.blocksIdleAutomation ||
+      (session.blocksIdleAutomation && typeof session.withNativeStatusRead !== 'function') ||
       !!session.watching?.trim() ||
       session.nativeResumeId ||
       session.codexConfig?.resumeSessionId ||
       cli?.capabilities.transcript !== 'codex-rollout' ||
       cli.capabilities.nativeSettingsProfile !== 'codex-tui' ||
-      session.isWorking ||
+      (session.isWorking && typeof session.withNativeStatusRead !== 'function') ||
       session.paneExit ||
-      typeof session.withNativeModelSettings !== 'function'
+      (typeof session.withNativeModelSettings !== 'function' && typeof session.withNativeStatusRead !== 'function')
     )
       throw original;
     const previous = attempts.get(session);
@@ -35,6 +36,12 @@ export async function readDiscordCanonicalHistory(
       await previous.run;
       return readDiscordSessionHistory(session, options);
     }
+    const statusOnly = typeof session.withNativeStatusRead === 'function';
+    const ready = (raw: string) =>
+      statusOnly ? nativeCodexStatusComposerReady(session.mode, raw) : nativeModelComposerReady(session.mode, raw);
+    const withStatus = statusOnly
+      ? session.withNativeStatusRead.bind(session)
+      : session.withNativeModelSettings.bind(session);
     const remote = session.remote,
       revision = session.nativeModelSettingsRevision,
       home = session.envOverrideValue('CODEX_HOME');
@@ -42,21 +49,30 @@ export async function readDiscordCanonicalHistory(
       permitted() &&
       session.remote === remote &&
       session.envOverrideValue('CODEX_HOME') === home &&
-      !session.blocksIdleAutomation &&
+      (statusOnly || !session.blocksIdleAutomation) &&
       !session.watching?.trim() &&
       session.nativeModelSettingsRevision === revision &&
-      !session.isWorking &&
+      (statusOnly || !session.isWorking) &&
       !session.paneExit &&
       !session.nativeResumeId;
-    const run = session.withNativeModelSettings(async (lease) => {
+    const run = withStatus(async (lease) => {
       const before = await lease.capture();
-      if (!allowed() || !lease.current() || !nativeModelComposerReady(session.mode, before)) throw original;
+      if (!allowed() || !lease.current() || !ready(before)) throw original;
       // A CLI-local status command: never a model prompt, model change or unguarded terminal write.
-      if (!(await lease.write('/status\r'))) throw original;
+      if (
+        !readCodexModelStatus(
+          stripAnsi(before)
+            .replace(/^\s*[›❯]\s+(\/status)\s*$/gm, '$1')
+            .replace(/^\s*[│┃]\s?/gm, '')
+            .replace(/\s*[│┃]\s*$/gm, '')
+        ) &&
+        !(await lease.write('/status\r'))
+      )
+        throw original;
       for (let i = 0; i < 30; i++) {
         if (!allowed() || !lease.current()) throw new Error('Conversation/input changed during transcript recovery');
         const raw = await lease.capture();
-        if (raw !== before && nativeModelComposerReady(session.mode, raw)) {
+        if (ready(raw)) {
           const text = stripAnsi(raw)
             .replace(/^\s*[›❯]\s+(\/status)\s*$/gm, '$1')
             .replace(/^\s*[│┃]\s?/gm, '')
@@ -64,7 +80,19 @@ export async function readDiscordCanonicalHistory(
           const status = readCodexModelStatus(text);
           if (status && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(status.session)) {
             const history = await readDiscordSessionHistory(session, options, status.session);
-            if (!allowed() || !lease.current() || history.conversationId !== status.session)
+            const after = await lease.capture();
+            const confirmed = readCodexModelStatus(
+              stripAnsi(after)
+                .replace(/^\s*[›❯]\s+(\/status)\s*$/gm, '$1')
+                .replace(/^\s*[│┃]\s?/gm, '')
+                .replace(/\s*[│┃]\s*$/gm, '')
+            );
+            if (
+              !allowed() ||
+              !lease.current() ||
+              history.conversationId !== status.session ||
+              confirmed?.session !== status.session
+            )
               throw new Error('Conversation changed during transcript recovery');
             session.setNativeResumeId(status.session);
             return history;

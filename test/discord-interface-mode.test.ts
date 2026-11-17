@@ -3425,3 +3425,23 @@ it('reconciles orphaned Full-mode threads on sync while retaining recovery-only 
   expect(sendInput).not.toHaveBeenCalled();
   b.stop();
 });
+
+it('automatically joins configured users to existing live session threads without task input', async () => {
+  sessions = [{ id: 's1', name: 'one' }];
+  const b = makeBridge();
+  await b.reload();
+  await b.syncSessions();
+  const joins = () =>
+    posts.filter((p) => p.method === 'PUT' && p.path.includes('/thread-members/' + cfg.allowedUserIds[0]));
+  expect(joins()).toHaveLength(1);
+  await b.pollActivity();
+  expect(joins()).toHaveLength(1);
+  b.stop();
+  const again = makeBridge();
+  await again.reload();
+  await again.syncSessions();
+  expect(joins()).toHaveLength(2);
+  expect(creations()).toHaveLength(1);
+  expect(sendInput).not.toHaveBeenCalled();
+  again.stop();
+});

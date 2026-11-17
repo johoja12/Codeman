@@ -1,5 +1,4 @@
 import { probeRemoteDiscordConversation } from '../discord-remote-conversation.js';
-import { readDiscordSessionHistory } from '../discord-history.js';
 import { DiscordSessionHealth } from './discord-session-health.js';
 import { createDiscordNativeUiServices } from './discord-native-ui-services.js';
 import { resolveDiscordCase } from '../discord-case-identity.js';
@@ -783,9 +782,26 @@ export class WebServer extends EventEmitter {
         !['claude-jsonl', 'codex-rollout'].includes(getCli(session.mode)?.capabilities.transcript ?? '')
       )
         return true;
-      const before = session.claudeSessionId;
-      const history = await readDiscordSessionHistory(session);
-      if (session.claudeSessionId !== before && this.sessions.get(session.id) === session)
+      const before = session.claudeSessionId,
+        nativeBefore = session.nativeResumeId;
+      const scope = this.discordBridge.controlScope;
+      const history = await readDiscordCanonicalHistory(
+        session,
+        {},
+        () =>
+          !!scope &&
+          scope === this.discordBridge.controlScope &&
+          !isMultiUserMode() &&
+          this.discordBridge.acceptsControls &&
+          this.sessions.get(session.id) === session &&
+          !session.isAdopted &&
+          !session.suppressNotifications &&
+          !approvalInbox.listPending().some((item) => item.sessionId === session.id && item.kind !== 'idle')
+      );
+      if (
+        (session.claudeSessionId !== before || session.nativeResumeId !== nativeBefore) &&
+        this.sessions.get(session.id) === session
+      )
         this.persistSessionState(session);
       const expected =
         getCli(session.mode)?.capabilities.transcript === 'claude-jsonl'

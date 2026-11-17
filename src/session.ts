@@ -1,4 +1,4 @@
-import { nativeModelComposerReady } from './native-composer-ready.js';
+import { nativeModelComposerReady, nativeCodexStatusComposerReady } from './native-composer-ready.js';
 /**
  * @fileoverview Core PTY session wrapper for Claude CLI interactions.
  *
@@ -6558,6 +6558,29 @@ export class Session extends EventEmitter {
   ): Promise<T> {
     return this._withNativeInputLease(operation, allowed, true);
   }
+  /** A read-only Codex status lease: /status only, including while a task is running. */
+  async withNativeStatusRead<T>(
+    operation: (lease: NativeModelSettingsLease) => Promise<T>,
+    allowed: () => boolean
+  ): Promise<T> {
+    if (getCli(this.mode)?.capabilities.nativeSettingsProfile !== 'codex-tui')
+      throw new Error('Native status requires Codex');
+    return this._withNativeInputLease(
+      async (lease) =>
+        operation({
+          ...lease,
+          write: async (input) => {
+            if (input !== '/status\r') return false;
+            const raw = await lease.capture();
+            return nativeCodexStatusComposerReady(this.mode, raw) && lease.current() ? lease.write(input) : false;
+          },
+        }),
+      allowed,
+      true,
+      false,
+      true
+    );
+  }
   /** A verified Claude question answer; only navigation and one explicit selection are writable. */
   async withNativeQuestionInput<T>(
     operation: (lease: NativeModelSettingsLease) => Promise<T>,
@@ -6598,14 +6621,15 @@ export class Session extends EventEmitter {
     operation: (lease: NativeModelSettingsLease) => Promise<T>,
     allowed: () => boolean,
     modelOnly: boolean,
-    questionOnly = false
+    questionOnly = false,
+    statusOnly = false
   ): Promise<T> {
     if (
       !getCli(this.mode)?.capabilities.nativeSettingsProfile ||
       this.docker ||
       this.guardedInputHeld ||
       this._guardedPendingWrites ||
-      (this.isWorking && !questionOnly) ||
+      (this.isWorking && !questionOnly && !statusOnly) ||
       this.paneExit ||
       this._isStopped ||
       this._closing ||
@@ -6639,13 +6663,15 @@ export class Session extends EventEmitter {
         },
         write: async (input) => {
           if (
-            !(questionOnly
-              ? input === '\r' || input === '\x1b[A' || input === '\x1b[B'
-              : modelOnly
-                ? isNativeModelSettingsInput(input)
-                : input.length <= 16000 &&
-                  input.endsWith('\r') &&
-                  !Array.from(input.slice(0, -1)).some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)) ||
+            !(statusOnly
+              ? input === '/status\r'
+              : questionOnly
+                ? input === '\r' || input === '\x1b[A' || input === '\x1b[B'
+                : modelOnly
+                  ? isNativeModelSettingsInput(input)
+                  : input.length <= 16000 &&
+                    input.endsWith('\r') &&
+                    !Array.from(input.slice(0, -1)).some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)) ||
             !current()
           )
             return false;
@@ -6661,7 +6687,7 @@ export class Session extends EventEmitter {
         cancelMenu: async () => {
           // Held keys have not reached this pane. Dismiss our own menu even if their arrival
           // invalidated the operation, so they are not replayed into its highlighted choice.
-          if (samePane()) {
+          if (samePane() && !statusOnly) {
             this._submitVerifier?.cancel();
             await this._writeViaMuxNow('\x1b', { preserveWhitespace: true, nativeModelSettings: true });
           }
