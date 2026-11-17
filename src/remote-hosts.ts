@@ -670,3 +670,24 @@ export function toAttachedSessionRemote(
     extraSshOptions: host.extraSshOptions,
   };
 }
+
+export function buildSshConnectionArgv(remote: RemoteSshOptions & Pick<RemoteHost, 'port'>): string[] {
+  const args: string[] = ['-o', 'BatchMode=yes'];
+  const hasConnectTimeout = (remote.extraSshOptions ?? []).some((opt) => /^ConnectTimeout=/i.test(opt));
+  if (!hasConnectTimeout) args.push('-o', 'ConnectTimeout=10');
+  if (remote.port) args.push('-p', String(remote.port));
+  if (remote.identityFile) args.push('-i', expandIdentityPath(remote.identityFile));
+  if (remote.jumpHost) args.push('-J', remote.jumpHost);
+  if (remote.socksProxy) {
+    args.push('-o', `ProxyCommand=nc -X 5 -x ${remote.socksProxy} %h %p`);
+  }
+  for (const opt of remote.extraSshOptions ?? []) {
+    args.push('-o', opt);
+  }
+  return args;
+}
+
+/** Shared PATH bootstrap for bounded read-only Discord probes. */
+export function withRemotePathBootstrap(command: string): string {
+  return withRemoteTmuxPath(command);
+}
