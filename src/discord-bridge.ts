@@ -1008,6 +1008,8 @@ export interface DiscordBridgeDeps {
     relativeToWorkspace?: boolean,
     approval?: DiscordFileApproval
   ) => Promise<DiscordFile>;
+  /** Unfiltered live/persisted/recovery keep IDs; undefined until restoration succeeds. */
+  retainedSessionIds?: () => Iterable<string> | undefined;
   /** Snapshot only: never discovers or starts agents. Called after restoration is released. */
   sessions?: () => Array<DiscordActivitySession & { remote?: boolean }>;
   socketFactory?: SocketFactory;
@@ -1513,6 +1515,7 @@ export class DiscordBridge {
         this.syncState.failed++;
       }
       try {
+        if (this.deps.retainedSessionIds) await this.reconcileSessionThreads(this.deps.retainedSessionIds);
         await this.channels.flushRetirements(this.cfg.guildId);
       } catch (err) {
         this.last = this.fail(err);
@@ -2527,11 +2530,28 @@ export class DiscordBridge {
     await this.firstLoad;
   }
 
+  private async reconcileSessionThreads(keep: () => Iterable<string> | undefined): Promise<number> {
+    const binding = this.controlScope;
+    const current = () =>
+      !this.stopped &&
+      !this.held &&
+      this.cfg.enabled &&
+      !!this.cfg.token &&
+      this.cfg.mode === 'full' &&
+      binding === this.controlScope;
+    if (!current()) return 0;
+    return this.channels.prune(this.cfg, keep, this.cfg.onSessionDelete, current);
+  }
+
   /** Forget thread entries for tabs that no longer exist (dropped without a delete, for example). Once, at boot. */
   async prune(liveIds: Iterable<string>): Promise<void> {
     await this.ensureLoaded();
     const live = new Set(liveIds);
-    if (this.cfg.mode === 'full') return;
+    if (this.cfg.mode === 'full') {
+      if (live.size > 0)
+        await this.reconcileSessionThreads(() => new Set([...live, ...(this.deps.retainedSessionIds?.() ?? [])]));
+      return;
+    }
     if (live.size === 0) return; // nothing restored: more likely a failed restore than an empty server
     const stale = Object.keys(this.threads).filter((id) => !live.has(id));
     if (stale.length === 0) return;
@@ -2549,7 +2569,8 @@ export class DiscordBridge {
     try {
       await this.ensureLoaded();
       const c = this.cfg;
-      if (c.mode === 'full') return 0;
+      if (c.mode === 'full')
+        return this.deps.retainedSessionIds ? await this.reconcileSessionThreads(this.deps.retainedSessionIds) : 0;
       if (c.staleThreads === 'keep' || !c.enabled || !c.token || !c.guildId || !c.parentChannelId) return 0;
       if (Object.keys(this.threads).length === 0 || this.pending.size > 0) return 0;
       const me = (await this.api.botUserId())?.id;
@@ -2589,11 +2610,14 @@ export class DiscordBridge {
     }
   }
 
-  /** Sweep now, then daily. The timer does not keep the process alive and `stop()` clears it. */
+  /** Sweep now, then each minute in Full mode (daily for legacy notifications). */
   startStaleSweep(): void {
     clearInterval(this.sweepTimer);
     void this.sweepStaleThreads();
-    this.sweepTimer = setInterval(() => void this.sweepStaleThreads(), STALE_SWEEP_INTERVAL_MS);
+    this.sweepTimer = setInterval(
+      () => void this.sweepStaleThreads(),
+      this.cfg.mode === 'full' ? 60_000 : STALE_SWEEP_INTERVAL_MS
+    );
     this.sweepTimer.unref?.();
   }
 

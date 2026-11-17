@@ -250,6 +250,10 @@ Claude's verified dialogs work through the shared approval service for local/SSH
 
 For restored Claude panes, the bridge reads the sole interactive Claude process attached to the configured remote tmux pane. Its own `HOME`/`CLAUDE_CONFIG_DIR` selects the transcript profile. A validated `--resume`/`--session-id` can replace an unbound tab-ID placeholder only after the transcript read and a second matching process probe. Existing conversation pins are preserved; first-hand SessionStart identity wins over stale startup arguments after `/clear`. Multiple agents, unsupported invocations, changed processes and conflicting profiles remain unverified. This lookup sends no terminal input and changes no account settings.
 
+### Removed-session thread cleanup
+
+Full-mode startup, manual synchronization and a periodic sweep reconcile tracked session threads against the complete restored session inventory, including persisted and pending reboot-recovery sessions. Missing sessions follow `onSessionDelete` (archive by default). The bridge validates its persisted ownership and rechecks the inventory before changing a thread. Failed cleanup retries on a later sweep. Saved case channels remain even when they have no session threads; unsupported restore state and unrelated/manual Discord threads are left alone.
+
 ## Live status and recovery controls
 
 Discord distinguishes **Agent exited — recovery needed**, **Connection lost**, and **Connection unverified** from Idle. A dead local SSH client does not prove the remote agent has exited. Read-only checks verify the remote pane and supported native conversation/profile; slow or failed probes keep an unverified state. Background checks never launch a CLI or replay a task, and remote transport failures remain separate from the local clean-exit sweep.

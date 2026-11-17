@@ -3395,3 +3395,33 @@ it('does not resend into work that became busy during recovery', async () => {
   await (f.b as any).retryUndelivered('s1', f.receipt, cfg.allowedUserIds[0], 'native1', () => true);
   expect(sendInput).not.toHaveBeenCalled();
 });
+
+it('reconciles orphaned Full-mode threads on sync while retaining recovery-only sessions', async () => {
+  await writeDiscordConfig(dir, { ...cfg, onSessionDelete: 'archive' });
+  sessions = [
+    { id: 'gone', name: 'gone' },
+    { id: 'live', name: 'live' },
+    { id: 'recovery', name: 'recovery' },
+  ];
+  let keep: string[] | undefined;
+  const b = makeBridge(undefined, { retainedSessionIds: () => keep });
+  await b.reload();
+  await b.syncSessions();
+  const gone = [...remoteChannels.values()].find((c) => c.type === 11 && c.name.includes('gone'))!.id;
+  const recovery = [...remoteChannels.values()].find((c) => c.type === 11 && c.name.includes('recovery'))!.id;
+  sessions = [{ id: 'live', name: 'live' }];
+  await b.syncSessions();
+  expect(
+    posts.filter((p) => p.method === 'PATCH' && p.path.endsWith('/channels/' + gone) && p.body?.archived)
+  ).toHaveLength(0);
+  keep = ['live', 'recovery'];
+  await b.syncSessions();
+  expect(
+    posts.some((p) => p.method === 'PATCH' && p.path.endsWith('/channels/' + gone) && p.body?.archived === true)
+  ).toBe(true);
+  expect(posts.some((p) => p.method === 'PATCH' && p.path.endsWith('/channels/' + recovery) && p.body?.archived)).toBe(
+    false
+  );
+  expect(sendInput).not.toHaveBeenCalled();
+  b.stop();
+});

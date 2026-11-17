@@ -275,7 +275,7 @@ it('provisions an empty case once and reuses its parent when the first session s
 });
 it('does not create an empty case after its configuration is revoked during discovery', async () => {
   let current = true;
-  const get = api.get;
+  const get = vi.mocked(api.get).getMockImplementation()!;
   api.get = vi.fn(async (id) => {
     const result = await get(id);
     current = false;
@@ -286,4 +286,125 @@ it('does not create an empty case after its configuration is revoked during disc
   api.get = get;
   expect(await manager().forCase(scope, identity)).toBeTruthy();
   expect(api.create).toHaveBeenCalledTimes(1);
+});
+
+it('archives only missing tracked sessions and preserves live/recovery IDs and parent case channels', async () => {
+  const m = manager();
+  const gone = await m.forSession(scope, 'gone', 'gone');
+  const live = await m.forSession(scope, 'live', 'live');
+  const recovery = await m.forSession(scope, 'recovery', 'recovery');
+  const parent = channels.get(gone)!.parent_id!;
+  expect(
+    await m.prune(
+      scope,
+      () => ['live', 'recovery'],
+      'archive',
+      () => true
+    )
+  ).toBe(1);
+  expect(channels.get(gone)?.thread_metadata?.archived).toBe(true);
+  expect(channels.get(live)?.thread_metadata?.archived).toBe(false);
+  expect(channels.get(recovery)?.thread_metadata?.archived).toBe(false);
+  expect(channels.has(parent)).toBe(true);
+  expect(
+    await manager().prune(
+      scope,
+      () => ['live', 'recovery'],
+      'archive',
+      () => true
+    )
+  ).toBe(0);
+});
+it('does nothing for unknown restoration state, changed configuration or keep policy', async () => {
+  const m = manager();
+  const id = await m.forSession(scope, 'gone', 'gone');
+  expect(
+    await m.prune(
+      scope,
+      () => undefined,
+      'archive',
+      () => true
+    )
+  ).toBe(0);
+  expect(
+    await m.prune(
+      scope,
+      () => [],
+      'archive',
+      () => false
+    )
+  ).toBe(0);
+  expect(
+    await m.prune(
+      scope,
+      () => [],
+      'keep',
+      () => true
+    )
+  ).toBe(0);
+  expect(channels.get(id)?.thread_metadata?.archived).toBe(false);
+});
+it('rechecks the current inventory after asynchronous ownership validation', async () => {
+  const m = manager();
+  const id = await m.forSession(scope, 'gone', 'gone');
+  const keep = new Set<string>();
+  const get = vi.mocked(api.get).getMockImplementation()!;
+  vi.mocked(api.get).mockImplementation(async (target) => {
+    const value = await get(target);
+    if (target === id) keep.add('gone');
+    return value;
+  });
+  expect(
+    await m.prune(
+      scope,
+      () => keep,
+      'archive',
+      () => true
+    )
+  ).toBe(0);
+  expect(channels.get(id)?.thread_metadata?.archived).toBe(false);
+});
+it('retains ownership evidence and retries a failed archive after restart', async () => {
+  const m = manager();
+  const id = await m.forSession(scope, 'gone', 'gone');
+  vi.mocked(api.edit).mockRejectedValueOnce(new Error('Discord unavailable'));
+  await expect(
+    m.prune(
+      scope,
+      () => [],
+      'archive',
+      () => true
+    )
+  ).rejects.toThrow();
+  expect(
+    await manager().prune(
+      scope,
+      () => [],
+      'archive',
+      () => true
+    )
+  ).toBe(1);
+  expect(channels.get(id)?.thread_metadata?.archived).toBe(true);
+});
+it('refuses foreign threads and does not mutate outside the bound category', async () => {
+  const m = manager();
+  const id = await m.forSession(scope, 'gone', 'gone');
+  expect(
+    await m.prune(
+      { ...scope, categoryId: '999999999999999999' },
+      () => [],
+      'archive',
+      () => true
+    )
+  ).toBe(0);
+  channels.get(id)!.owner_id = '999999999999999999';
+  await expect(
+    m.prune(
+      scope,
+      () => [],
+      'archive',
+      () => true
+    )
+  ).rejects.toThrow('ownership');
+  expect(channels.get(id)?.thread_metadata?.archived).toBe(false);
 });

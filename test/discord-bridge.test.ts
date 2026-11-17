@@ -1197,11 +1197,11 @@ describe('DiscordBridge files and startup hint', () => {
     b.stop();
   });
 
-  it('says the agent has exited and types nothing when the tab reports it', async () => {
+  it('offers recovery and types nothing when the tab reports an unavailable agent', async () => {
     const b = await make({}, undefined, undefined, () => true);
     await b.onGatewayMessage(reply({ content: 'hello', attachments: [] }));
     expect(sent).toHaveLength(0);
-    expect(String(posted.at(-1)?.body?.content)).toMatch(/exited/);
+    expect(String(posted.at(-1)?.body?.content)).toMatch(/needs recovery.*verified connection/);
     expect(posted.some((p) => p.path.includes('reactions'))).toBe(false);
     b.stop();
   });

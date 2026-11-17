@@ -429,6 +429,50 @@ export class DiscordCaseThreads {
   async rename(scope: DiscordChannelScope, id: string, name?: string): Promise<void> {
     await this.forSession(scope, id, name);
   }
+  /** Reconcile only persisted, owned session threads against an authoritative recovery-aware inventory. */
+  async prune(
+    scope: DiscordChannelScope,
+    keep: () => Iterable<string> | undefined,
+    policy: Policy,
+    current: () => boolean
+  ): Promise<number> {
+    await this.load();
+    if (policy === 'keep') return 0;
+    const absent = (id: string) => {
+      if (!current()) return false;
+      const ids = keep();
+      return ids !== undefined && !new Set(ids).has(id);
+    };
+    let done = 0,
+      failure: unknown;
+    for (const [key, e] of Object.entries(this.state.entries)
+      .filter(
+        ([, e]) =>
+          e.guildId === scope.guildId &&
+          e.categoryId === scope.categoryId &&
+          e.phase === 'active' &&
+          e.starterId &&
+          absent(e.sessionId)
+      )
+      .slice(0, 25)) {
+      try {
+        const thread = await this.verify(e, false);
+        if (!absent(e.sessionId) || this.state.entries[key]?.phase !== 'active') continue;
+        if (policy === 'delete') await this.api.remove(thread.id);
+        else if (!thread.thread_metadata?.archived) await this.api.edit(thread.id, { archived: true });
+        await this.edit((s) => {
+          s.entries[key].phase = policy === 'delete' ? 'deleted' : 'archived';
+          s.entries[key].policy = policy;
+        });
+        done++;
+      } catch (error) {
+        // Leave failed entries active so the next sync retries without losing their ownership evidence.
+        failure ??= error;
+      }
+    }
+    if (failure) throw failure;
+    return done;
+  }
   async deleted(id: string, policy: Policy, guild?: string): Promise<void> {
     await this.load();
     await this.edit((s) => {
