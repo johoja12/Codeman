@@ -336,6 +336,7 @@ const capabilitiesSchema = z
       .string()
       .regex(/^[A-Za-z0-9._-]+\.ts$/)
       .optional(),
+    nativeSettingsProfile: z.enum(['codex-tui', 'claude-tui']).optional(),
     statusLineTelemetry: z.boolean(),
     // How many columns this CLI indents its transcript body by, so a copy can take
     // that much off the clipboard. Bounded, because it is the whole strip: a copy
