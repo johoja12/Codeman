@@ -1918,6 +1918,22 @@ export class Session extends EventEmitter {
     this._contextReport = null;
   }
 
+  /** Persist an exact live remote resume binding without claiming a first-hand hook or extending its chain. */
+  adoptVerifiedRemoteClaudeResumeId(newId: string): boolean {
+    if (
+      !this._remote ||
+      this.mode !== 'claude' ||
+      this._claudeSessionIdIsFirstHand ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(newId) ||
+      (this._claudeSessionId && this._claudeSessionId !== this.id && this._claudeSessionId !== newId)
+    )
+      return false;
+    this._claudeSessionIdentityAdopted = true;
+    this._claudeAuthoritativeSessionId = newId;
+    this.adoptClaudeSessionId(newId);
+    return true;
+  }
+
   /**
    * Adopt the authoritative identity delivered by Claude's SessionStart hook.
    *

@@ -1,3 +1,4 @@
+import { probeRemoteClaudeRuntime } from './discord-remote-claude.js';
 import { discordDisplayText } from './discord-display-text.js';
 import {
   probeRemoteDiscordConversation,
@@ -646,6 +647,11 @@ function remoteHistoryScope(
     remote?.username,
     remote?.port,
     remote?.remotePath,
+    remote?.remoteSessionName,
+    remote?.owned,
+    session.claudeSessionId,
+    session.claudeSessionIdIsFirstHand,
+    session.envOverrideValue('CLAUDE_CONFIG_DIR'),
     remote?.codexCommandProfileId,
     remote?.commands?.codex,
     resumeId,
@@ -707,7 +713,22 @@ async function withDiscordSessionHistorySource<T>(
   }
   let runtime: RemoteDiscordRuntime | undefined;
   let discovered: string | undefined;
+  let claudeRuntime: RemoteDiscordRuntime | undefined;
+  const claudeIdBefore = session.claudeSessionId;
+  const firstHandBefore = session.claudeSessionIdIsFirstHand;
   try {
+    if (format === 'claude-jsonl' && remote) {
+      const cached = remoteRuntimeHomes.get(session);
+      claudeRuntime = cached?.scope === scope ? cached.runtime : await probeRemoteClaudeRuntime(remote, session.id);
+      if (!claudeRuntime) throw new DiscordHistoryReadError('profile_unverified');
+      if (configHome && configHome !== claudeRuntime.configHome) throw new DiscordHistoryReadError('profile_changed');
+      if (!configHome) configHome = claudeRuntime.configHome;
+      if (!firstHandBefore) {
+        if (!claudeRuntime.id || (id && id !== session.id && id !== claudeRuntime.id))
+          throw new DiscordHistoryReadError('profile_changed');
+        id = claudeRuntime.id;
+      }
+    }
     if (format === 'codex-rollout' && remote && !configHome) {
       const cached = remoteRuntimeHomes.get(session);
       runtime =
@@ -733,6 +754,18 @@ async function withDiscordSessionHistorySource<T>(
       after: options?.after,
     });
     if (remote) {
+      if (claudeRuntime) {
+        const fresh = await probeRemoteClaudeRuntime(remote, session.id);
+        if (
+          !fresh ||
+          fresh.fingerprint !== claudeRuntime.fingerprint ||
+          fresh.configHome !== claudeRuntime.configHome ||
+          fresh.id !== claudeRuntime.id ||
+          session.claudeSessionId !== claudeIdBefore ||
+          session.claudeSessionIdIsFirstHand !== firstHandBefore
+        )
+          throw new DiscordHistoryReadError('profile_changed');
+      }
       if (runtime) {
         const fresh = await probeRemoteDiscordRuntime(remote, session.id).catch(() => undefined);
         if (
@@ -749,8 +782,11 @@ async function withDiscordSessionHistorySource<T>(
     if (session.remote !== remote || (remoteHistoryScope(session) !== scope && !compatibleAdoption))
       throw new DiscordHistoryReadError('profile_changed');
     // The exact native file/header and current owned runtime must both confirm the binding first.
+    if (claudeRuntime && id && !firstHandBefore && session.claudeSessionId !== id)
+      session.adoptVerifiedRemoteClaudeResumeId(id);
     if (discovered && !session.nativeResumeId) session.setNativeResumeId(discovered);
-    if (runtime) remoteRuntimeHomes.set(session, { scope: remoteHistoryScope(session), runtime });
+    if (runtime || claudeRuntime)
+      remoteRuntimeHomes.set(session, { scope: remoteHistoryScope(session), runtime: (runtime ?? claudeRuntime)! });
     return history;
   } catch (error) {
     remoteRuntimeHomes.delete(session);

@@ -782,7 +782,10 @@ export class WebServer extends EventEmitter {
         !['claude-jsonl', 'codex-rollout'].includes(getCli(session.mode)?.capabilities.transcript ?? '')
       )
         return true;
+      const before = session.claudeSessionId;
       const history = await readDiscordSessionHistory(session);
+      if (session.claudeSessionId !== before && this.sessions.get(session.id) === session)
+        this.persistSessionState(session);
       const expected =
         getCli(session.mode)?.capabilities.transcript === 'claude-jsonl'
           ? session.claudeSessionId
@@ -4644,6 +4647,7 @@ export class WebServer extends EventEmitter {
   private async discordCanonicalHistory(session: Session, options?: { includeTools?: boolean; after?: string }) {
     if (session.isAdopted) throw new Error('History is unavailable for an adopted session');
     const before = session.nativeResumeId;
+    const claudeBefore = session.claudeSessionId;
     const scope = this.discordActivityIdentities.scope(session);
     try {
       const history = await readDiscordCanonicalHistory(
@@ -4655,7 +4659,8 @@ export class WebServer extends EventEmitter {
           this.sessions.get(session.id) === session &&
           !approvalInbox.listPending().some((item) => item.sessionId === session.id && item.kind !== 'idle')
       );
-      if (session.nativeResumeId !== before) this._persistSessionStateNow(session);
+      if (session.nativeResumeId !== before || session.claudeSessionId !== claudeBefore)
+        this._persistSessionStateNow(session);
       if (this.sessions.get(session.id) === session)
         this.discordActivityIdentities.remember(session, scope, history.conversationId);
       return history;
