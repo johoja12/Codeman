@@ -1549,3 +1549,20 @@ updates `lastSubmitAt` just like any other Enter.
 - **Files.** Received files come only from Discord's HTTPS hosts into `<tab folder>/.codeman-discord/` (bounded probe, refused if a symlink, self-ignoring). A sent file's real path must lie inside the tab's folder; both the folder and the file are probed with the bounded probe first.
 - **The whole last message.** A finished turn or an error posts the CLI's whole last message, not the screen: `WebServer.lastResponseFor` is the response viewer's reader (the body of `GET /api/sessions/:id/last-response`, registered on the route context by `registerSessionRoutes`), so the source is the same per-CLI transcript, or the pane split into turns where a CLI keeps none; a dialog and a shell keep the screen tail (its composer row and the status lines under it cut, never a `❯ 1.` option row). The read is bounded to 4 s and any failure or empty read falls back to the screen. It is split into at most 8 posts of 1,900 characters, a cut code fence closed and reopened, and Markdown tables become aligned code blocks (the separator test strips whitespace first: a regex over a run of spaces is quadratic, and the text is steerable by whatever the agent read). The repeat check is keyed on the text plus the turn it came from (the transcript stamp, else the last submit) and is recorded only after the first post succeeds, so a failed post is sent again and a later turn ending on the same words is not dropped. Only some CLIs raise a turn end (`/api/hook-event`: Claude's `stop` and `idle_prompt`, DeepSeek's `stop`), so the others reach this path through errors, a blocked respawn or a crash loop.
 - **Cost guards.** The alert tail is a function called only once a post will happen (no tmux exec while off), and `discord-notify` is a per-session token bucket (6 a minute, `429 RATE_LIMITED`).
+
+
+### Discord Full-mode incoming upload exception
+
+The default Discord Notifications bridge never writes files over SSH. Opt-in Full mode
+may accept an allowlisted user's incoming Discord attachment into the exact session
+workspace's `.codeman-discord/` directory. This is the narrow remote-write exception
+approved for the Discord split; it does not authorize workspace editing, arbitrary
+remote commands, or writes outside that directory.
+
+The caller validates session/configuration/actor scope and stops submitting input if it
+changes during transfer. Transfers use shared SSH connection options and concurrency
+limits, shell-escape dynamic values, reject unsafe workspace/directory/symlink components,
+limit each file to 8 MiB, create private files, and verify transferred bytes before the
+native agent receives a path. The SSH child has a hard timeout; stderr is bounded and
+remains private. A missing remote Python interpreter produces a fixed transfer failure
+in the thread, while detailed remote diagnostics are not forwarded to Discord.
