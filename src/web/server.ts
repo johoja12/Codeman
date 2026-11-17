@@ -774,6 +774,7 @@ export class WebServer extends EventEmitter {
   /** Two-way Discord bridge (thread per tab); config in discord.json (0600). Idle until enabled in Settings. */
   /** Set by the session routes when they register (see SessionPort). */
   lastResponseFor?: (session: Session, context?: string) => Promise<{ text: string; timestamp?: string }>;
+  private discordRestorationReady = false;
   private discordHealth = new DiscordSessionHealth({
     paneExited: (name) => !!this.mux.getPaneExit?.(name),
     verify: async (session) => {
@@ -975,6 +976,14 @@ export class WebServer extends EventEmitter {
         cases
       );
     },
+    retainedSessionIds: () =>
+      this.discordRestorationReady
+        ? new Set([
+            ...this.sessions.keys(),
+            ...Object.keys(this.store.getSessions()),
+            ...rebootRestoreRegistry.list(() => true).map((entry) => entry.sessionId),
+          ])
+        : undefined,
     sessions: () =>
       Array.from(this.sessions.values())
         .filter((session) => !session.suppressNotifications && !session.isAdopted)
@@ -6010,6 +6019,7 @@ export class WebServer extends EventEmitter {
     this.tabLayouts.markRestorationComplete();
     await this.cleanupStaleSessions();
     await this.tabLayouts.reconcileAfterRestoration();
+    this.discordRestorationReady = true;
     // Same gate as the tab layouts: only a restore that succeeded may decide which
     // inboxes are orphans. A failed one returns above and leaves every message alone.
     // Kept: live sessions plus every record state.json still holds (a session that
