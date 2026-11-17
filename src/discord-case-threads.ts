@@ -466,6 +466,13 @@ export class DiscordCaseThreads {
         });
         done++;
       } catch (error) {
+        if ((error as { status?: number }).status === 404 && absent(e.sessionId)) {
+          await this.edit((s) => {
+            s.entries[key].phase = 'deleted';
+          });
+          done++;
+          continue;
+        }
         // Leave failed entries active so the next sync retries without losing their ownership evidence.
         failure ??= error;
       }

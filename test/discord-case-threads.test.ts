@@ -408,3 +408,25 @@ it('refuses foreign threads and does not mutate outside the bound category', asy
   ).rejects.toThrow('ownership');
   expect(channels.get(id)?.thread_metadata?.archived).toBe(false);
 });
+
+it('retires a mapping whose owned thread is already gone without retrying it forever', async () => {
+  const m = manager();
+  const id = await m.forSession(scope, 'gone', 'gone');
+  channels.delete(id);
+  expect(
+    await m.prune(
+      scope,
+      () => [],
+      'archive',
+      () => true
+    )
+  ).toBe(1);
+  expect(
+    await manager().prune(
+      scope,
+      () => [],
+      'archive',
+      () => true
+    )
+  ).toBe(0);
+});
