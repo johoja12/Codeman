@@ -1,5 +1,5 @@
 import { getCli } from './config/cli-registry/registry.js';
-/** Native Discord controls. Tokens bind actor, origin, configuration and exact conversation. */
+/** @fileoverview Native Discord controls. Tokens bind actor, origin, configuration and exact conversation. */
 import { createHash, randomUUID } from 'node:crypto';
 import {
   activityFromHistory,

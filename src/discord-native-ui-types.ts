@@ -1,4 +1,4 @@
-/** Narrow ports: native Discord UI reuses existing session, input and file services. */
+/** @fileoverview Narrow ports: native Discord UI reuses existing session, input and file services. */
 import type {
   DiscordControlReply,
   DiscordFile,

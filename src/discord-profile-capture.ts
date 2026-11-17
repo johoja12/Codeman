@@ -1,4 +1,4 @@
-/** Opt-in bounded V8 sampling. No inspector port, debugger pause, raw profile export or heap snapshot. */
+/** @fileoverview Opt-in bounded V8 sampling. No inspector port, debugger pause, raw profile export or heap snapshot. */
 import type { Session, Profiler, HeapProfiler } from 'node:inspector';
 import { setTimeout as delay } from 'node:timers/promises';
 import { performance } from 'node:perf_hooks';

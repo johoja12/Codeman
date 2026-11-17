@@ -8,7 +8,7 @@ import type { ApprovalItem } from './approval-inbox.js';
 import { claudePromptSuggestion } from '../session-submit-verifier.js';
 import { discordActivityWorking } from '../discord-activity.js';
 import { getCli } from '../config/cli-registry/registry.js';
-/** Server adapters for native Discord UI. Reuses settings, approval and file/SSH guards. */
+/** @fileoverview Server adapters for native Discord UI. Reuses settings, approval and file/SSH guards. */
 import { approvalInbox } from './approval-inbox.js';
 import { answerPendingApproval } from './routes/approval-routes.js';
 import { discordApprovalRevision } from '../discord-task-controls.js';
@@ -237,8 +237,9 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
                 : undefined,
             modelSource: observed?.model ? 'native-verified' : displayModel?.source,
             effort: observed?.effort ? observed.effort + ' (native verified)' : undefined,
-            approval:
-              getCli(s.mode)?.launch.legacyConfigField === 'codexConfig'
+            approval: s.remote
+              ? 'CLI-controlled (remote)'
+              : getCli(s.mode)?.launch.legacyConfigField === 'codexConfig'
                 ? s.codexConfig?.baseCommand
                   ? 'Custom command authority'
                   : s.codexConfig?.dangerouslyBypassApprovals

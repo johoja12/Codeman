@@ -1,4 +1,4 @@
-/** Bounded read-only SSH transport. Never returns remote stderr or changes remote files. */
+/** @fileoverview Bounded read-only SSH transport. Never returns remote stderr or changes remote files. */
 import { spawn } from 'node:child_process';
 import { buildSshConnectionArgv, remoteSshTarget } from './remote-hosts.js';
 import { runWithRemoteSshLimit } from './remote-ssh-limiter.js';
