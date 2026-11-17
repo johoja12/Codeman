@@ -237,8 +237,9 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
                 : undefined,
             modelSource: observed?.model ? 'native-verified' : displayModel?.source,
             effort: observed?.effort ? observed.effort + ' (native verified)' : undefined,
-            approval:
-              getCli(s.mode)?.launch.legacyConfigField === 'codexConfig'
+            approval: s.remote
+              ? 'CLI-controlled (remote)'
+              : getCli(s.mode)?.launch.legacyConfigField === 'codexConfig'
                 ? s.codexConfig?.baseCommand
                   ? 'Custom command authority'
                   : s.codexConfig?.dangerouslyBypassApprovals
