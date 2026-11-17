@@ -1,3 +1,19 @@
+import { probeRemoteDiscordConversation } from '../discord-remote-conversation.js';
+import { applyDiscordLaunchDefaults } from './discord-launch-defaults.js';
+import type { DiscordSessionView } from '../discord-session-view.js';
+import { DiscordSessionHealth } from './discord-session-health.js';
+import { createDiscordNativeUiServices } from './discord-native-ui-services.js';
+import { resolveDiscordCase } from '../discord-case-identity.js';
+import { DiscordModelControls } from '../discord-model-controls.js';
+import { readDiscordModelCatalog } from '../discord-model-catalog.js';
+import { DiscordSessionManagement } from '../discord-session-management.js';
+import { discordTaskControl, discordControlCurrent } from '../discord-task-controls.js';
+import { DiscordActivityIdentities } from '../discord-activity-identity.js';
+import { readDiscordCanonicalHistory } from '../discord-history-recovery.js';
+import { discordHistoryControl, readDiscordSessionGeneratedImage } from '../discord-history.js';
+import { readDiscordSessionFile, writeDiscordRemoteAttachment } from '../discord-file-transfers.js';
+import { resolve, posix } from 'node:path';
+import { networkInterfaces } from 'node:os';
 /**
  * @fileoverview Codeman web server — central hub coordinating all subsystems.
  *
@@ -560,25 +576,408 @@ export class WebServer extends EventEmitter {
   /** Two-way Discord bridge (thread per tab); config in discord.json (0600). Idle until enabled in Settings. */
   /** Set by the session routes when they register (see SessionPort). */
   lastResponseFor?: (session: Session, context?: string) => Promise<{ text: string; timestamp?: string }>;
-  private discordBridge = new DiscordBridge({
+
+  private discordRestorationReady = false;
+  private discordHealth = new DiscordSessionHealth({
+    // An upstream host without a strict native resumer must never advertise a Resume button.
+    canResume: (session) => typeof (session as DiscordSessionView).resumeExitedRemote === 'function',
+    paneExited: (name) => !!this.mux.getPaneExit?.(name),
+    verify: async (session) => {
+      if (
+        !session.lastRealPromptAt ||
+        !['claude-jsonl', 'codex-rollout'].includes(getCli(session.mode)?.capabilities.transcript ?? '')
+      )
+        return true;
+      const before = session.claudeSessionId,
+        nativeBefore = session.nativeResumeId;
+      const scope = this.discordBridge.controlScope;
+      const history = await readDiscordCanonicalHistory(
+        session,
+        {},
+        () =>
+          !!scope &&
+          scope === this.discordBridge.controlScope &&
+          !isMultiUserMode() &&
+          this.discordBridge.acceptsControls &&
+          this.sessions.get(session.id) === session &&
+          !session.isAdopted &&
+          !(session as DiscordSessionView).suppressNotifications &&
+          !approvalInbox.listPending().some((item) => item.sessionId === session.id && item.kind !== 'idle')
+      );
+      if (
+        (session.claudeSessionId !== before || session.nativeResumeId !== nativeBefore) &&
+        this.sessions.get(session.id) === session
+      )
+        this.persistSessionState(session);
+      const expected =
+        getCli(session.mode)?.capabilities.transcript === 'claude-jsonl'
+          ? session.claudeSessionId
+          : (session.nativeResumeId ?? session.codexConfig?.resumeSessionId);
+      return !!expected && history.conversationId === expected;
+    },
+  });
+  private discordRecovering = new Set<string>();
+  private async recoverDiscordSession(session: Session, current: () => boolean): Promise<boolean> {
+    if (this.discordRecovering.has(session.id)) return false;
+    this.discordRecovering.add(session.id);
+    try {
+      if (
+        !current() ||
+        isMultiUserMode() ||
+        (session as DiscordSessionView).suppressNotifications ||
+        session.isAdopted ||
+        !enabledClis().some((c) => c.id === session.mode)
+      )
+        return false;
+      const health = await this.discordHealth.check(session, true);
+      if (!current()) return false;
+      if (health.state === 'available') return false;
+      const recovered =
+        health.state === 'connection_lost'
+          ? !!session.muxName &&
+            (await this.mux.isPaneDead(session.muxName)) &&
+            (await session.reattachRemote({ attachOnly: true }))
+          : health.state === 'agent_exited' && health.canResume
+            ? await (session as DiscordSessionView).resumeExitedRemote?.(current)
+            : false;
+      this.discordHealth.invalidate(session);
+      if (!recovered || !current() || (await this.discordHealth.check(session, true)).state !== 'available')
+        return false;
+      if (
+        session.remote &&
+        getCli(session.mode)?.capabilities.transcript === 'codex-rollout' &&
+        (await probeRemoteDiscordConversation(session.remote, session.id).catch(() => undefined)) !==
+          session.nativeResumeId
+      )
+        return false;
+      if (!current()) return false;
+      this.persistSessionState(session);
+      this.broadcastSessionStateDebounced(session.id);
+      return true;
+    } finally {
+      this.discordRecovering.delete(session.id);
+    }
+  }
+  private discordCases?: () => Promise<import('../types.js').CaseInfo[]>;
+  private discordCreate?: (body: unknown) => Promise<string>;
+  private discordRecover?: (id: string, action: 'reconnect' | 'resume') => Promise<string>;
+  private discordSessionManager: DiscordSessionManagement = new DiscordSessionManagement({
+    allowed: () => !isMultiUserMode() && this.discordBridge.acceptsControls,
+    cases: async () => this.discordCases?.() ?? [],
+    groups: async () =>
+      (await this.tabLayouts.get(ownerLayoutKey(undefined))).groups.map((g) => ({
+        id: g.id,
+        name: g.name,
+      })),
+    modes: () => enabledClis().map((c) => c.id),
+    sessions: async () => {
+      const cases = (await this.discordCases?.()) ?? [];
+      const layout = await this.tabLayouts.get(ownerLayoutKey(undefined));
+      return [...this.sessions.values()]
+        .filter((s) => !(s as DiscordSessionView).suppressNotifications && !s.isAdopted)
+        .map((s) => ({
+          id: s.id,
+          name: s.name,
+          host: s.remote?.label || 'local',
+          mode: s.mode,
+          group:
+            layout.groups.find((g) => g.refs.some((r) => r.kind === 'session' && r.id === s.id))?.name || 'Ungrouped',
+          caseName:
+            cases.find((c) =>
+              s.remote
+                ? c.remote?.hostId === s.remote.hostId && c.remote.path === s.remote.remotePath
+                : c.path === s.workingDir
+            )?.name || s.workingDir,
+          state:
+            this.discordHealth.peek(s).state === 'available'
+              ? ((s as DiscordSessionView).activityProjection?.activityStatus ?? s.toState().status)
+              : this.discordHealth.peek(s).state,
+        }));
+    },
+    create: async (body) => {
+      if (!this.discordCreate) throw new Error('Session routes unavailable');
+      return this.discordCreate(body);
+    },
+    // Durable recovery registries are an optional host capability, absent in upstream master.
+    recoveries: () => [],
+    recover: async (id, action) => {
+      if (!this.discordRecover) throw new Error('Recovery routes unavailable');
+      return this.discordRecover(id, action);
+    },
+    reconnect: async (id) => {
+      const session = this.sessions.get(id);
+      if (!session?.remote || !session.muxName) return false;
+      await this.handleRemoteSessionDropped(id);
+      return !(await this.mux.isPaneDead(session.muxName));
+    },
+  });
+  private discordModelControls: DiscordModelControls = new DiscordModelControls({
+    scope: () => (isMultiUserMode() ? undefined : this.discordBridge.controlScope),
+    target: (id) => {
+      const session = this.sessions.get(id);
+      return session
+        ? {
+            mode: session.mode,
+            generation: session.nativeModelSettingsRevision,
+            working: session.isWorking,
+            pending: approvalInbox.listPending().some((item) => item.sessionId === id && item.kind !== 'idle'),
+            exited: !!session.paneExit,
+            reportedModel: session.displayModel?.model,
+            operate: (operation, allowed) => session.withNativeModelSettings(operation, allowed),
+            catalog: () => readDiscordModelCatalog(session),
+          }
+        : undefined;
+    },
+  });
+  private readonly discordActivityIdentities = new DiscordActivityIdentities();
+  private discordBridge: DiscordBridge = new DiscordBridge({
+    fullInterfaceAllowed: () => !isMultiUserMode(),
+    nativeUi: createDiscordNativeUiServices({
+      activityConversation: (session) => this.discordActivityIdentities.get(session),
+      // Visible-pane fallback: remote Claude questions and hook confirmations must reach Discord.
+      questionObserved: async (item) => {
+        if ((this.sessions.get(item.sessionId) as DiscordSessionView | undefined)?.suppressNotifications) return true;
+        const result = await this.discordBridge.notify({
+          event: item.kind === 'permission' ? SseEvent.HookPermissionPrompt : SseEvent.HookElicitationDialog,
+          title: item.kind === 'permission' ? 'Permission Required' : 'Question Asked',
+          urgency: 'critical',
+          sessionId: item.sessionId,
+          sessionName: item.sessionName,
+          body:
+            item.kind === 'permission'
+              ? 'A tool check is waiting for permission. Review it in the terminal.'
+              : 'Choose in the terminal; this question is waiting for your answer.',
+          tail: () => item.message || '',
+          host: this.windowTitle,
+        });
+        return result?.ok === true;
+      },
+      capture: (id) => {
+        const s = this.sessions.get(id);
+        return s?.muxName ? this.mux.capturePaneTextAsync?.(s.muxName, { ansi: true }) : null;
+      },
+      sessions: () => this.sessions,
+      health: (s, fresh) => this.discordHealth.check(s, fresh),
+      recover: (s, current) => this.recoverDiscordSession(s, current),
+      observed: (id) => this.discordModelControls.observed(id),
+      cases: async () => this.discordCases?.() ?? [],
+      allowed: () => !isMultiUserMode() && this.discordBridge.acceptsControls,
+      url: () => {
+        const tunnel = this.tunnelManager.getUrl();
+        if (tunnel) return tunnel + this.basePath;
+        if (this.host === '127.0.0.1' || this.host === '::1') return undefined;
+        const lan = Object.values(networkInterfaces())
+          .flat()
+          .find((a) => a && a.family === 'IPv4' && !a.internal && /^192\.168\./.test(a.address));
+        return lan ? `${this.https ? 'https' : 'http'}://${lan.address}:${this.port}${this.basePath}` : undefined;
+      },
+    }),
     configDir: getDataDir(),
     fetchImpl: webviewFetch,
     sendInput: async (sessionId, text) => {
       const session = this.sessions.get(sessionId);
-      if (!session) return false;
+      if (!session || (this.discordBridge.acceptsControls && session.isAdopted)) return false;
+      if (
+        (this.discordBridge.acceptsControls && (await this.discordHealth.check(session, true)).state !== 'available') ||
+        this.sessions.get(sessionId) !== session
+      )
+        return false;
       // A Discord reply is a person's own input, so it names the tab like any other prompt.
-      if (await session.writeViaMux(text, { fromUser: true }).catch(() => false)) return true;
-      return session.write(text, { fromUser: true });
+      // writeViaMux already handles PTY fallback. Retrying the entire write can duplicate a partial paste.
+      return session.writeViaMux(
+        text,
+        this.discordBridge.acceptsControls ? { fromUser: true, preserveWhitespace: true } : { fromUser: true }
+      );
     },
-    agentExited: (id) => !!this.sessions.get(id)?.paneExit,
+    agentExited: (id) => {
+      const s = this.sessions.get(id);
+      return this.discordBridge.acceptsControls
+        ? !s || this.discordHealth.peek(s).state !== 'available'
+        : !!s?.paneExit;
+    },
     awaitingChoice: (id) => approvalInbox.listPending().some((item) => item.sessionId === id && item.kind !== 'idle'),
-    // Remote (ssh) sessions keep their folder on another host, so received files have nowhere local to go.
-    // An adopted session's folder is the neutral wrapper folder, which its agent need not be able to read.
+    caseForSession: async (id) => {
+      const session = this.sessions.get(id);
+      if (!session || (session as DiscordSessionView).suppressNotifications || session.isAdopted) return undefined;
+      const cases = isMultiUserMode() ? [] : ((await this.discordCases?.()) ?? []);
+      if (this.sessions.get(id) !== session) return undefined;
+      return resolveDiscordCase(
+        { id, workingDir: session.workingDir, owner: session.owner, remote: session.remote, docker: session.docker },
+        cases
+      );
+    },
+    retainedSessionIds: () =>
+      this.discordRestorationReady
+        ? new Set([
+            ...this.sessions.keys(),
+            ...Object.keys(this.store.getSessions()),
+            ...rebootRestoreRegistry.list(() => true).map((entry) => entry.sessionId),
+          ])
+        : undefined,
+    sessions: () =>
+      Array.from(this.sessions.values())
+        .filter((session) => !(session as DiscordSessionView).suppressNotifications && !session.isAdopted)
+        .map((session) => ({
+          connection: this.discordHealth.peek(session).state,
+          id: session.id,
+          name: session.name,
+          remote: !!session.remote,
+          working: session.isWorking,
+          watching: session.watching,
+          activityStatus:
+            (session as DiscordSessionView).activityProjection?.activityStatus ?? session.toState().status,
+        })),
+    history: async (id, options) => {
+      const session = this.sessions.get(id);
+      if (!session) throw new Error('Session unavailable');
+      return this.discordCanonicalHistory(session, options);
+    },
+    launchModes: () => enabledClis().map((c) => c.id),
+    launch: (scope, caseKey, mode) => this.discordSessionManager.launch(scope, caseKey, mode),
+    controlCurrent: (id, validity) => {
+      const session = this.sessions.get(id);
+      return (
+        this.discordModelControls.current(id, validity) ||
+        this.discordSessionManager.current(id, validity) ||
+        (!!session && discordControlCurrent(session, validity))
+      );
+    },
+    control: async (id, command, current = () => true) => {
+      const settings = await this.discordModelControls.control(id, command);
+      if (settings) return settings;
+      const managed = await this.discordSessionManager.control(id, command);
+      if (managed) return managed;
+      const session = this.sessions.get(id);
+      if (!session)
+        return {
+          text: 'Use a session thread for task/history commands; !codeman help lists management commands.',
+        };
+      if (command === 'status') {
+        const health = await this.discordHealth.check(session, true);
+        if (health.state !== 'available')
+          return {
+            text: `**${session.name || session.id}** · ${health.state.replaceAll('_', ' ')}\nRecovery or connection verification is needed. Use the session card for guarded recovery options; unconfirmed input is not replayed.`,
+          };
+      }
+      return (
+        (await discordTaskControl(
+          session,
+          command,
+          () => current() && this.sessions.get(id) === session && !isMultiUserMode()
+        )) ?? discordHistoryControl(session, command)
+      );
+    },
+    getGeneratedImage: async (id, image) => {
+      if (isMultiUserMode() || !this.discordBridge.acceptsControls)
+        throw new Error('Generated image delivery is unavailable');
+      const session = this.sessions.get(id);
+      if (!session) throw new Error('Session unavailable');
+      const file = await readDiscordSessionGeneratedImage(session, image);
+      if (this.sessions.get(id) !== session) throw new Error('Session changed');
+      return file;
+    },
+    attachmentContext: (id) => this.discordFileContext(id),
+    getAttachment: async (id, path, relativeToWorkspace, approval) => {
+      const session = this.sessions.get(id);
+      if (!session) throw new Error('Session unavailable');
+      if (relativeToWorkspace)
+        path = session.remote ? posix.resolve(session.remote.remotePath, path) : resolve(session.workingDir, path);
+      const remote = session.remote,
+        workingDir = session.workingDir;
+      const binding = this.discordFileContext(id);
+      if (approval && !binding) throw new Error('File approval identity is unavailable');
+      const current = () =>
+        this.sessions.get(id) === session &&
+        session.remote === remote &&
+        session.workingDir === workingDir &&
+        (!binding || this.discordFileContext(id) === binding);
+      try {
+        const file = await readDiscordSessionFile({ workingDir, remote }, path, approval);
+        if (!current()) throw new Error('Session changed during file transfer');
+        return file;
+      } catch (error) {
+        // A refusal can carry a canonical external path; never offer it in a replacement host/session.
+        if (!current()) throw new Error('Session changed during file transfer');
+        throw error;
+      }
+    },
+    saveRemoteAttachment: async (id, name, bytes) => {
+      const remote = this.sessions.get(id)?.remote;
+      if (!remote) throw new Error('Remote session unavailable');
+      return writeDiscordRemoteAttachment(remote, name, bytes);
+    },
     sessionDir: (sessionId) => {
       const session = this.sessions.get(sessionId);
       return session && !session.remote && !session.isAdopted ? session.workingDir : undefined;
     },
   });
+  private discordTail(session: Session, cutComposer: boolean): string {
+    const pane = session.muxName ? (this.mux.capturePaneText?.(session.muxName) ?? null) : null;
+    // The composer row and the status lines under it are screen chrome, not what the CLI said.
+    const glyph = cutComposer ? getCli(session.mode)?.capabilities.workDetect?.promptGlyph : undefined;
+    return screenTail(pane ?? session.textOutput ?? '', 14, 900, glyph);
+  }
+  private discordFileContext(id: string): string | undefined {
+    const s = this.sessions.get(id);
+    if (!s || s.docker || s.isAdopted || (s as DiscordSessionView).suppressNotifications || isMultiUserMode())
+      return undefined;
+    const r = s.remote;
+    return JSON.stringify([
+      id,
+      s.owner,
+      s.mode,
+      s.workingDir,
+      !!s.docker,
+      r && [r.hostId, r.host, r.username, r.port, r.remotePath, r.owned],
+      s.nativeResumeId,
+      s.claudeSessionId,
+      s.codexConfig?.resumeSessionId,
+    ]);
+  }
+  private async discordCanonicalHistory(session: Session, options?: { includeTools?: boolean; after?: string }) {
+    if (session.isAdopted) throw new Error('History is unavailable for an adopted session');
+    const before = session.nativeResumeId;
+    const claudeBefore = session.claudeSessionId;
+    const scope = this.discordActivityIdentities.scope(session);
+    try {
+      const history = await readDiscordCanonicalHistory(
+        session,
+        options,
+        () =>
+          !isMultiUserMode() &&
+          this.discordBridge.acceptsControls &&
+          this.sessions.get(session.id) === session &&
+          !approvalInbox.listPending().some((item) => item.sessionId === session.id && item.kind !== 'idle')
+      );
+      if (session.nativeResumeId !== before || session.claudeSessionId !== claudeBefore)
+        this._persistSessionStateNow(session);
+      if (this.sessions.get(session.id) === session)
+        this.discordActivityIdentities.remember(session, scope, history.conversationId);
+      return history;
+    } catch (error) {
+      this.discordActivityIdentities.forget(session);
+      throw error;
+    }
+  }
+  private async discordFullText(session: Session): Promise<{ text: string; version?: string } | undefined> {
+    if (
+      this.discordBridge.acceptsControls &&
+      ['claude-jsonl', 'codex-rollout'].includes(getCli(session.mode)?.capabilities.transcript ?? '')
+    ) {
+      const history = await this.discordCanonicalHistory(session);
+      const last = [...history.turns].reverse().find((turn) => turn.role === 'assistant');
+      return last ? { text: last.text, version: history.conversationId + ':' + last.cursor } : undefined;
+    }
+
+    if (!this.lastResponseFor) return undefined;
+    // A CLI with a transcript reader, or whose pane the viewer segments into turns; a shell has neither.
+    if (getCli(session.mode)?.capabilities.transcript === 'none' && !isExternalCliTranscriptMode(session.mode)) {
+      return undefined;
+    }
+    const r = await this.lastResponseFor(session);
+    // The turn it came from: the transcript's stamp, else when the person last submitted (a pane has no stamp).
+    return { text: r.text, version: r.timestamp || String(session.lastSubmitAt ?? '') };
+  }
   private teamWatcher: TeamWatcher = new TeamWatcher();
   private _orchestratorLoop: import('../orchestrator-loop.js').OrchestratorLoop | null = null;
   private readonly titleHostname: string;
@@ -1382,11 +1781,35 @@ export class WebServer extends EventEmitter {
     }
     registerStatusTelemetryRoutes(this.app, ctx);
     registerSystemRoutes(this.app, ctx);
-    registerCaseRoutes(this.app, ctx);
+    registerCaseRoutes(this.app, ctx, {
+      onListReady: (reader) => {
+        this.discordCases = () => {
+          if (isMultiUserMode()) throw new Error('Identity mapping required');
+          return reader({ headers: {} } as import('fastify').FastifyRequest);
+        };
+      },
+    });
     registerWorktreeRoutes(this.app, ctx);
     // The registry's lifetime is the server's: it drops per-session wake state on every
     // cleanup path and resolves in-flight wakes on shutdown.
-    this.remoteWake = registerSessionRoutes(this.app, ctx);
+    this.remoteWake = registerSessionRoutes(this.app, ctx, {
+      onCreateReady: (create) => {
+        this.discordCreate = async (body) => {
+          if (isMultiUserMode() || !this.discordBridge.acceptsControls)
+            throw new Error('Discord lifecycle unavailable');
+          const launchBody = await applyDiscordLaunchDefaults(body);
+          const result = (await create({ body: launchBody, headers: {} } as import('fastify').FastifyRequest)) as {
+            session?: { id?: string };
+          };
+          const session = result.session?.id ? this.sessions.get(result.session.id) : undefined;
+          if (!session || !this.discordBridge.acceptsControls) throw new Error('Session creation refused');
+          if (getCli(session.mode)?.capabilities.startMode === 'shell') await session.startShell();
+          else await session.startInteractive();
+          ctx.persistSessionStateNow(session);
+          return session.id;
+        };
+      },
+    });
     // The routes' ctx is a separate object: take the last-response reader they registered on it (Discord alerts).
     this.lastResponseFor = (ctx as { lastResponseFor?: WebServer['lastResponseFor'] }).lastResponseFor;
     registerAgentSessionRoutes(this.app, ctx);
@@ -2885,6 +3308,10 @@ export class WebServer extends EventEmitter {
 
   /** Keep the Discord thread in step with the tab: created, renamed, deleted. Never throws. */
   private bridgeSessionEvent(event: string, data: unknown): void {
+    if (this.discordBridge.acceptsControls && ['case:created', 'case:linked', 'case:renamed'].includes(event)) {
+      void this.discordBridge.syncCases().catch(() => undefined);
+      return;
+    }
     // Deletion is NOT handled here: `session:deleted` also fires for a detach (killMux=false), where the
     // session keeps running and can be re-attached. The real delete calls the bridge from the cleanup path.
     if (event !== SseEvent.SessionCreated && event !== SseEvent.SessionUpdated) return;
@@ -3297,28 +3724,12 @@ export class WebServer extends EventEmitter {
    * (`capture-pane -p`), never the raw output stream, which a full-screen UI repaints in place and
    * reads as garbage. A session with no pane falls back to its plain text output, else nothing.
    */
-  private discordTail(session: Session, cutComposer: boolean): string {
-    const pane = session.muxName ? (this.mux.capturePaneText?.(session.muxName) ?? null) : null;
-    // The composer row and the status lines under it are screen chrome, not what the CLI said.
-    const glyph = cutComposer ? getCli(session.mode)?.capabilities.workDetect?.promptGlyph : undefined;
-    return screenTail(pane ?? session.textOutput ?? '', 14, 900, glyph);
-  }
 
   /**
    * The CLI's whole last message from the response viewer's reader (the CLI's own transcript, or the pane
    * segmented into turns for the CLIs that keep none); undefined for a shell, which has no turns, and the
    * screen tail stands in whenever the reader finds nothing.
    */
-  private async discordFullText(session: Session): Promise<{ text: string; version?: string } | undefined> {
-    if (!this.lastResponseFor) return undefined;
-    // A CLI with a transcript reader, or whose pane the viewer segments into turns; a shell has neither.
-    if (getCli(session.mode)?.capabilities.transcript === 'none' && !isExternalCliTranscriptMode(session.mode)) {
-      return undefined;
-    }
-    const r = await this.lastResponseFor(session);
-    // The turn it came from: the transcript's stamp, else when the person last submitted (a pane has no stamp).
-    return { text: r.text, version: r.timestamp || String(session.lastSubmitAt ?? '') };
-  }
 
   /** The notification body for an event (shared by Web Push and the webhook channel). */
   private static pushBodyText(event: string, data: Record<string, unknown>, sessionName: string): string {
@@ -3469,6 +3880,7 @@ export class WebServer extends EventEmitter {
       if (restoredMail > 0) console.log(`[AgentInbox] restored ${restoredMail} pending message(s)`);
       const restored = await this.restoreMuxSessions();
       await this.finalizeRestoredState(restored);
+      this.discordRestorationReady = restored;
       void this.discordBridge
         .release()
         .then(async () => {
@@ -4555,7 +4967,7 @@ export class WebServer extends EventEmitter {
     }
     let ok = false;
     try {
-      ok = await session.reattachRemote();
+      ok = await session.reattachRemote({ attachOnly: true });
     } catch (err) {
       console.error(`[Server] Remote reattach failed for ${sessionId}:`, err);
       ok = false;

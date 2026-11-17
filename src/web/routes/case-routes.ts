@@ -307,7 +307,8 @@ async function caseVisibleToCaller(name: string, req: FastifyRequest): Promise<b
 
 export function registerCaseRoutes(
   app: FastifyInstance,
-  ctx: EventPort & ConfigPort & SessionPort & TabLayoutPort
+  ctx: EventPort & ConfigPort & SessionPort & TabLayoutPort,
+  options: { onListReady?: (reader: (request: FastifyRequest) => Promise<CaseInfo[]>) => void } = {}
 ): void {
   // ═══════════════════════════════════════════════════════════════
   // Case CRUD (list, create, link, detail, fix-plan)
@@ -315,7 +316,7 @@ export function registerCaseRoutes(
 
   // ========== List Cases ==========
 
-  app.get('/api/cases', async (req): Promise<CaseInfo[]> => {
+  const listCasesForRequest = async (req: FastifyRequest): Promise<CaseInfo[]> => {
     const cases: CaseInfo[] = [];
     const user = getAuthUser(req);
     const admin = isAdmin(req);
@@ -439,7 +440,9 @@ export function registerCaseRoutes(
     }
 
     return cases;
-  });
+  };
+  app.get('/api/cases', listCasesForRequest);
+  options.onListReady?.(listCasesForRequest);
 
   // ========== Agent-created cases (cleanup listing) ==========
 
