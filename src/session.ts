@@ -602,6 +602,7 @@ export class Session extends EventEmitter {
   private _wireActivityAt: number;
   private _wireActivitySettleUntil: number;
   private _claudeSessionId: string | null = null;
+  private _discordVerifiedClaudeId?: string;
   // Set only when the id came from the CLI's own UserPromptSubmit/Stop hook
   // payload, keyed on this pane's $CODEMAN_SESSION_ID. That binding is a fact,
   // not a correlation: it never consults cwd, so a sibling pane on the same
@@ -2024,6 +2025,33 @@ export class Session extends EventEmitter {
   }
 
   /** Codex CLI configuration for this session. */
+  /** Exact Codex binding shared with its persisted launch config. Never inferred from cwd. */
+  get nativeResumeId(): string | null {
+    return this._codexConfig?.resumeSessionId ?? null;
+  }
+  setNativeResumeId(id: string | null): void {
+    if (getCli(this.mode)?.capabilities.transcript !== 'codex-rollout') return;
+    if (id !== null && !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id)) return;
+    this._codexConfig = { ...this._codexConfig, resumeSessionId: id ?? undefined };
+  }
+  /** Native status reads must also defer to an independently observed waiting worker. */
+  get blocksIdleAutomation(): boolean {
+    return !!this.watching?.trim();
+  }
+  adoptVerifiedRemoteClaudeResumeId(newId: string): boolean {
+    if (
+      !this._remote ||
+      getCli(this.mode)?.capabilities.transcript !== 'claude-jsonl' ||
+      this._claudeSessionIdIsFirstHand ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(newId) ||
+      (this._claudeSessionId && this._claudeSessionId !== this.id && this._claudeSessionId !== newId)
+    )
+      return false;
+    this._discordVerifiedClaudeId = newId;
+    this._resumeSessionId = newId;
+    this.adoptClaudeSessionId(newId);
+    return true;
+  }
   get codexConfig(): CodexConfig | undefined {
     return this._codexConfig;
   }
@@ -2422,6 +2450,8 @@ export class Session extends EventEmitter {
 
   toState(): SessionState {
     return {
+      claudeSessionId:
+        this._discordVerifiedClaudeId === this._claudeSessionId ? this._discordVerifiedClaudeId : undefined,
       id: this.id,
       pid: this.pid,
       status: this._status,
