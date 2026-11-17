@@ -1,4 +1,4 @@
-/** Idempotent membership for configured users in verified live session threads. */
+/** @fileoverview Idempotent membership for configured users in verified live session threads. */
 export class DiscordThreadMembers {
   private due = new Map<string, number>();
   private pending = new Map<string, Promise<void>>();

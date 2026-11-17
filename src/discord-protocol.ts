@@ -1,4 +1,4 @@
-/** Shared Discord wire and control types; contains no runtime bridge behavior. */
+/** @fileoverview Shared Discord wire and control types; contains no runtime bridge behavior. */
 export interface DiscordFile {
   name: string;
   data: Uint8Array;

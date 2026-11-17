@@ -1,4 +1,4 @@
-/** Owned session channels. Names never authorize adoption or deletion; persisted identity and topic do. */
+/** @fileoverview Owned session channels. Names never authorize adoption or deletion; persisted identity and topic do. */
 import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';

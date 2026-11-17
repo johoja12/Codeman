@@ -1,4 +1,4 @@
-/** Resolve the profile of the sole interactive Claude process attached to the exact remote pane. */
+/** @fileoverview Resolve the profile of the sole interactive Claude process attached to the exact remote pane. */
 import type { SessionRemote } from './types/session.js';
 import { remoteTmuxLocation } from './tmux-manager.js';
 import { shellescape, withRemotePathBootstrap } from './remote-hosts.js';
