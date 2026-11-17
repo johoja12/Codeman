@@ -37,13 +37,23 @@ describe('remote Claude profile identity', () => {
   });
   it.each([
     `100 1 sh -c 'claude --resume ${id}'`,
-    `100 1 claude --resume ${id}\n101 100 claude --resume ${id}`,
+    `100 1 sh\n101 100 claude --resume ${id}\n102 100 claude --resume ${id}`,
     `100 1 claude -p 'do work' --resume ${id}`,
     `100 1 claude --model --resume ${id}`,
     '100 1 claude --resume --last',
     `100 1 claude --resume ${id} --session-id ${id}`,
   ])('refuses an ambiguous or noninteractive invocation: %s', async (rows) => {
     await expect(probe(rows)).rejects.toThrow();
+  });
+  it.each([
+    `100 1 claude --resume ${id}\n101 100 claude -p 'child job'`,
+    `100 1 claude --resume ${id}\n101 100 sh\n102 101 claude --resume aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa`,
+    `100 1 sh\n101 100 claude --resume ${id}\n102 101 claude -p 'child job'`,
+  ])('keeps the controlling Claude identity while nested CLI jobs run: %s', async (rows) => {
+    expect(await probe(rows)).toMatchObject({ id, configHome: '/home/guest/.claude' });
+  });
+  it('does not promote a nested interactive process under an unsupported controller', async () => {
+    await expect(probe(`100 1 claude -p 'parent job'\n101 100 claude --resume ${id}`)).rejects.toThrow();
   });
   it('rejects a process changing during the environment read', async () => {
     await expect(probe(`100 1 claude --resume ${id}`, undefined, true)).rejects.toThrow();

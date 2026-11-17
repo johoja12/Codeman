@@ -18,10 +18,21 @@ import hashlib
 agents=[]
 values={'--model','--effort','--settings','--permission-mode','--allowedTools','--disallowedTools','--add-dir','--system-prompt','--append-system-prompt','--output-format','--input-format','--mcp-config','--agent','--agents','--fallback-model','--max-budget-usd','--tools','--setting-sources','--plugin-dir'}
 flags={'--dangerously-skip-permissions','--allow-dangerously-skip-permissions','--verbose','--debug','--continue','-c','--disable-slash-commands','--strict-mcp-config','--no-chrome','--chrome'}
+commands={}
 for pid in owned:
  try:argv=shlex.split(procs[pid][1])
  except Exception:continue
- if not argv or os.path.basename(argv[0])!='claude':continue
+ if argv and os.path.basename(argv[0])=='claude':commands[pid]=argv
+def controlling(pid):
+ parent=procs[pid][0];seen=set()
+ while parent in owned:
+  if parent in seen:raise Exception('invalid process ancestry')
+  seen.add(parent)
+  if parent in commands:return False
+  parent=procs[parent][0]
+ return True
+for pid,argv in commands.items():
+ if not controlling(pid):continue
  ids=[];ok=True;i=1
  while i<len(argv):
   arg=argv[i];name=arg.split('=',1)[0]
@@ -37,7 +48,7 @@ for pid in owned:
     if i>=len(argv):ok=False;break
   elif arg not in flags:ok=False;break
   i+=1
- # A second Claude child is ambiguous even when it has an unsupported invocation.
+ # Sibling controllers remain ambiguous; nested CLI jobs do not control this pane.
  agents.append((pid,ids[0] if ok and len(ids)==1 else None,ok and len(ids)<=1))
 if len(agents)!=1 or not agents[0][2]:raise Exception('ambiguous Claude process')
 pid,identity,_=agents[0]
