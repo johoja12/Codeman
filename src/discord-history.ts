@@ -8,7 +8,7 @@ import {
 } from './discord-remote-conversation.js';
 import { getCli } from './config/cli-registry/registry.js';
 import { nativeExecutions, type DiscordNativeExecution } from './discord-native-execution.js';
-/** Read-only, exact-conversation history. No cwd guesses, model turns, tool results or reasoning. */
+/** @fileoverview Read-only, exact-conversation history. No cwd guesses, model turns, tool results or reasoning. */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash } from 'node:crypto';

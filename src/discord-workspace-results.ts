@@ -1,5 +1,5 @@
 import { gitMissingError, gitSpawnAllowed } from './utils/git-availability.js';
-/** Read-only, explicitly unattributed workspace diff. Every exported path uses the file guard. */
+/** @fileoverview Read-only, explicitly unattributed workspace diff. Every exported path uses the file guard. */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolve, posix } from 'node:path';

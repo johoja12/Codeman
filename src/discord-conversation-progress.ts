@@ -1,4 +1,4 @@
-/** Durable metadata-only native history boundaries shared by backfill and live observation. */
+/** @fileoverview Durable metadata-only native history boundaries shared by backfill and live observation. */
 import fs from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';

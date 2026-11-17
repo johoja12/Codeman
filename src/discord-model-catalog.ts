@@ -1,4 +1,4 @@
-/** Read only public model catalog fields; never return account metadata or credentials. */
+/** @fileoverview Read only public model catalog fields; never return account metadata or credentials. */
 import fs from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { homedir } from 'node:os';
