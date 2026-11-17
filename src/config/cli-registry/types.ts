@@ -348,6 +348,8 @@ export interface CliEnv {
  * Keeping them as separate fields makes that invariant structural rather than commented.
  */
 export interface CliCapabilities {
+  /** Verified native composer/menu protocol; absent means unsupported. */
+  nativeSettingsProfile?: 'codex-tui' | 'claude-tui';
   /**
    * Non-Claude run mode that uses its own TUI and output format (`isExternalCliMode`):
    * no Claude transcript, no hooks, no Claude-format token/BashTool parsing. An explicit

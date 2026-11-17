@@ -74,6 +74,8 @@ export type SessionNameSource = 'placeholder' | 'auto' | 'manual';
 
 /** Options for `Session.write()` / `Session.writeViaMux()`. */
 export interface SessionWriteOptions {
+  preserveWhitespace?: boolean;
+  nativeModelSettings?: boolean;
   /**
    * The bytes were typed by a person, or sent by an agent on their behalf
    * (browser keystrokes, `POST /api/sessions/:id/input`). Only such input can

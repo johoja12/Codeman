@@ -558,6 +558,9 @@ function isKeepAliveWrite(data: string): boolean {
  * @fires Session#autoClear - Token threshold reached, clearing context
  * @fires Session#autoCompact - Token threshold reached, compacting context
  */
+import { isNativeModelSettingsInput, type NativeModelSettingsLease } from './native-model-settings.js';
+import { nativeModelComposerReady, nativeCodexStatusComposerReady } from './native-composer-ready.js';
+import { composerTriggerRefusal } from './agent-staging.js';
 export class Session extends EventEmitter {
   readonly id: string;
   readonly workingDir: string;
@@ -5087,6 +5090,12 @@ export class Session extends EventEmitter {
   get guardedInputGeneration(): string {
     return `${this.inspectionGeneration}:${this._guardedGeometryRevision}`;
   }
+  get discordQueueRevision(): string {
+    return `${this.inspectionGeneration}:${this._guardedInputRevision}`;
+  }
+  get nativeModelSettingsRevision(): string {
+    return `${this.guardedInputGeneration}:${this._guardedInputRevision}`;
+  }
   get guardedInputPendingWrites(): number {
     return this._guardedPendingWrites;
   }
@@ -5186,6 +5195,153 @@ export class Session extends EventEmitter {
   }
   guardedInputSnapshot(): GuardedInputSnapshot | null {
     return this._readGuardedInputSnapshot(false);
+  }
+  async withNativeModelSettings<T>(
+    operation: (lease: NativeModelSettingsLease) => Promise<T>,
+    allowed: () => boolean
+  ): Promise<T> {
+    return this._withNativeInputLease(operation, allowed, true);
+  }
+  /** A read-only Codex status lease: /status only, including while a task is running. */
+  async withNativeStatusRead<T>(
+    operation: (lease: NativeModelSettingsLease) => Promise<T>,
+    allowed: () => boolean
+  ): Promise<T> {
+    if (getCli(this.mode)?.capabilities.nativeSettingsProfile !== 'codex-tui')
+      throw new Error('Native status requires Codex');
+    return this._withNativeInputLease(
+      async (lease) =>
+        operation({
+          ...lease,
+          write: async (input) => {
+            if (input !== '/status\r') return false;
+            const raw = await lease.capture();
+            return nativeCodexStatusComposerReady(this.mode, raw) && lease.current() ? lease.write(input) : false;
+          },
+        }),
+      allowed,
+      true,
+      false,
+      true
+    );
+  }
+  /** A verified Claude question answer; only navigation and one explicit selection are writable. */
+  async withNativeQuestionInput<T>(
+    operation: (lease: NativeModelSettingsLease) => Promise<T>,
+    allowed: () => boolean
+  ): Promise<T> {
+    if (getCli(this.mode)?.capabilities.nativeSettingsProfile !== 'claude-tui')
+      throw new Error('Only verified Claude question controls are supported');
+    return this._withNativeInputLease(operation, allowed, true, true);
+  }
+  /** One-shot follow-up only after a fresh empty-composer capture under the input lease. */
+  async submitDiscordFollowup(text: string, allowed: () => boolean): Promise<'accepted' | 'blocked' | 'uncertain'> {
+    const chrome = guardedComposerChrome(getCli(this.mode));
+    if (
+      !chrome ||
+      !text.endsWith('\r') ||
+      text.length > 16000 ||
+      Array.from(text.slice(0, -1)).some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127) ||
+      composerTriggerRefusal(text.slice(0, -1), chrome)
+    )
+      return 'blocked';
+    let attempted = false;
+    try {
+      return await this._withNativeInputLease(
+        async (lease) => {
+          const screen = await lease.capture();
+          if (!nativeModelComposerReady(this.mode, screen) || !lease.current() || !allowed()) return 'blocked';
+          attempted = true;
+          return (await lease.write(text)) ? 'accepted' : 'uncertain';
+        },
+        allowed,
+        false
+      );
+    } catch {
+      return attempted ? 'uncertain' : 'blocked';
+    }
+  }
+  private async _withNativeInputLease<T>(
+    operation: (lease: NativeModelSettingsLease) => Promise<T>,
+    allowed: () => boolean,
+    modelOnly: boolean,
+    questionOnly = false,
+    statusOnly = false
+  ): Promise<T> {
+    if (
+      !getCli(this.mode)?.capabilities.nativeSettingsProfile ||
+      this.docker ||
+      this.guardedInputHeld ||
+      this._guardedPendingWrites ||
+      (this.isWorking && !questionOnly && !statusOnly) ||
+      this.paneExit ||
+      this._isStopped ||
+      this._closing ||
+      this.paneLifecycleInFlight ||
+      !this._muxSession ||
+      !allowed()
+    )
+      throw new Error('The session must be idle with an available native terminal. Nothing was changed.');
+    const generation = this.guardedInputGeneration;
+    const paneGeneration = this.inspectionGeneration;
+    const revision = this._guardedInputRevision;
+    const samePane = () =>
+      this.inspectionGeneration === paneGeneration &&
+      !this._isStopped &&
+      !this._closing &&
+      !this.paneExit &&
+      !this.paneLifecycleInFlight;
+    const current = () =>
+      samePane() && this.guardedInputGeneration === generation && this._guardedInputRevision === revision && allowed();
+    this._guardedSubmitInFlight = true;
+    this._submitVerifier?.cancel();
+    try {
+      return await operation({
+        current,
+        capture: async () => {
+          if (!current()) throw new Error('The session or input changed. Nothing further was sent.');
+          const text = await this._mux?.capturePaneTextAsync?.(this._muxSession!.muxName, { ansi: true });
+          if (!current() || !text || Buffer.byteLength(text) > 128 * 1024)
+            throw new Error('The native terminal could not be verified. Use the web terminal.');
+          return text;
+        },
+        write: async (input) => {
+          if (
+            !(statusOnly
+              ? input === '/status\r'
+              : questionOnly
+                ? input === '\r' || input === '\x1b[A' || input === '\x1b[B'
+                : modelOnly
+                  ? isNativeModelSettingsInput(input)
+                  : input.length <= 16000 &&
+                    input.endsWith('\r') &&
+                    !Array.from(input.slice(0, -1)).some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)) ||
+            !current()
+          )
+            return false;
+          this._submitVerifier?.cancel();
+          const sent = await this._writeViaMuxNow(input, {
+            preserveWhitespace: true,
+            nativeModelSettings: modelOnly,
+            fromUser: !modelOnly,
+          });
+          if (modelOnly) this._submitVerifier?.cancel();
+          return sent;
+        },
+        cancelMenu: async () => {
+          // Held keys have not reached this pane. Dismiss our own menu even if their arrival
+          // invalidated the operation, so they are not replayed into its highlighted choice.
+          if (samePane() && !statusOnly) {
+            this._submitVerifier?.cancel();
+            await this._writeViaMuxNow('\x1b', { preserveWhitespace: true, nativeModelSettings: true });
+          }
+        },
+      });
+    } finally {
+      if (modelOnly) this._submitVerifier?.cancel();
+      this._guardedSubmitInFlight = false;
+      this._drainGuardedHeld();
+    }
   }
   private _readGuardedInputSnapshot(allowLease: boolean): GuardedInputSnapshot | null {
     if (
@@ -5486,19 +5642,25 @@ export class Session extends EventEmitter {
   private async _writeViaMuxNow(data: string, options: SessionWriteOptions): Promise<boolean> {
     this._guardedPendingWrites++;
     try {
-      const submittedPrompt = this._trackSubmit(data, options);
       if (this._mux && this._muxSession) {
-        const sent = await this._mux.sendInput(this.id, data);
-        if (sent) {
+        const sent = options.preserveWhitespace
+          ? await this._mux.sendInput(this.id, data, { preserveWhitespace: true })
+          : await this._mux.sendInput(this.id, data);
+        if (sent && !options.nativeModelSettings) {
+          const submittedPrompt = this._trackSubmit(data, options);
           this._emitSubmittedPrompt(submittedPrompt);
           this._verifySubmitted(data);
         }
         return sent;
       }
-      // Fallback to PTY write
       if (this.ptyProcess) {
+        // Structured multiline messages require the bracketed-paste/Enter transport above.
+        if (options.preserveWhitespace && data.includes('\n')) return false;
         this.ptyProcess.write(data);
-        this._emitSubmittedPrompt(submittedPrompt);
+        if (!options.nativeModelSettings) {
+          const submittedPrompt = this._trackSubmit(data, options);
+          this._emitSubmittedPrompt(submittedPrompt);
+        }
         return true;
       }
       return false;
