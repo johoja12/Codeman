@@ -6,7 +6,7 @@ import {
   type ClaudeVisibleQuestion,
 } from './claude-visible-question.js';
 
-/** Never replay Enter. Re-check the exact question after every navigation key under the input lease. */
+/** @fileoverview Never replay Enter. Re-check the exact question after every navigation key under the input lease. */
 export async function answerClaudeQuestion(
   session: Session,
   expected: ClaudeVisibleQuestion,

@@ -1,4 +1,4 @@
-/** Exact prompt-bound controls. Reuses the same answer checks as the web UI. */
+/** @fileoverview Exact prompt-bound controls. Reuses the same answer checks as the web UI. */
 import { createHash } from 'node:crypto';
 import { approvalInbox, type ApprovalItem } from './web/approval-inbox.js';
 import { answerPendingApproval } from './web/routes/approval-routes.js';

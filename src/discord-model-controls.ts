@@ -1,5 +1,5 @@
 import { getCli } from './config/cli-registry/registry.js';
-/** Native, verified, session-only model settings. No respawn or writes to CLI configuration files. */
+/** @fileoverview Native, verified, session-only model settings. No respawn or writes to CLI configuration files. */
 import { randomUUID } from 'node:crypto';
 import { nativeModelComposerReady } from './native-composer-ready.js';
 import { stripAnsi } from './utils/regex-patterns.js';
