@@ -122,8 +122,16 @@ export class DiscordSessionHealth {
               ? 'available'
               : 'unverified',
       };
-    if (value.state === 'available' && this.deps.verify && !(await this.deps.verify(s).catch(() => false)))
-      value = { state: 'unverified' };
+    if (value.state === 'available' && this.deps.verify) {
+      // A history read can race fresh input or a transient transport error. Require a fresh
+      // successful verification rather than promoting one failed read to a persistent warning.
+      let verified = false;
+      for (let attempt = 0; attempt < 2 && !verified; attempt++) {
+        verified = await this.deps.verify(s).catch(() => false);
+        if (key !== this.key(s)) return { state: 'unverified' };
+      }
+      if (!verified) value = { state: 'unverified' };
+    }
     if (key !== this.key(s)) return { state: 'unverified' };
     this.cache.set(s, { key, at: this.deps.now?.() ?? Date.now(), value });
     return value;

@@ -119,3 +119,26 @@ it('coalesces concurrent checks and keeps background polls responsive during a s
   await first;
   expect(remote).toHaveBeenCalledTimes(1);
 });
+
+it('retries a transient history failure before declaring a living agent unverified', async () => {
+  const verify = vi.fn().mockRejectedValueOnce(new Error('transient read')).mockResolvedValue(true);
+  const health = new DiscordSessionHealth({
+    paneExited: () => false,
+    local: async () => 'alive',
+    remote: async () => ({ alive: true, agentRunning: true }),
+    verify,
+  });
+  expect(await health.check(session(), true)).toEqual({ state: 'available' });
+  expect(verify).toHaveBeenCalledTimes(2);
+});
+it('keeps a repeatedly failing verification unverified after a bounded retry', async () => {
+  const verify = vi.fn().mockResolvedValue(false);
+  const health = new DiscordSessionHealth({
+    paneExited: () => false,
+    local: async () => 'alive',
+    remote: async () => ({ alive: true, agentRunning: true }),
+    verify,
+  });
+  expect(await health.check(session(), true)).toEqual({ state: 'unverified' });
+  expect(verify).toHaveBeenCalledTimes(2);
+});
