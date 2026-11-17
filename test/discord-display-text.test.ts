@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { discordDisplayText } from '../src/discord-display-text.js';
+import { renderHistory } from '../src/discord-history.js';
 import { buildPost, DEFAULT_DISCORD_CONFIG } from '../src/discord-bridge.js';
 const metadata =
   '<oai-mem-citation>\n<citation_entries>\nMEMORY.md:1-2|note=[internal]\n</citation_entries>\n<rollout_ids>\nprivate-id\n</rollout_ids>\n</oai-mem-citation>';
@@ -33,6 +34,15 @@ describe('Discord assistant display metadata filtering', () => {
   });
   it('does not mistake a one-line backtick span for a block fence', () => {
     expect(discordDisplayText('```inline code```\n' + metadata)).toBe('```inline code```');
+  });
+  it('cleans assistant history/export text but preserves literal user/tool content', () => {
+    const rows = [
+      { cursor: 'a', role: 'assistant' as const, text: 'Answer\n' + metadata, timestamp: '' },
+      { cursor: 'b', role: 'user' as const, text: metadata, timestamp: '' },
+    ];
+    expect(renderHistory(rows)).toContain('Answer');
+    expect(renderHistory(rows).match(/<oai-mem-citation>/g)).toHaveLength(1);
+    expect(renderHistory([rows[0]])).not.toContain('MEMORY.md');
   });
   it('cleans fallback alert bodies and terminal tails before they are fenced', () => {
     const post = buildPost(

@@ -2793,7 +2793,7 @@ export class Session extends EventEmitter {
    *
    * @returns true if the pane was respawned (reattach issued), false otherwise.
    */
-  async reattachRemote(): Promise<boolean> {
+  async reattachRemote(options: { attachOnly?: boolean } = {}): Promise<boolean> {
     if (!this._remote) return false; // not a remote session
     if (!this._useMux || !this._mux || !this._muxSession) return false;
     const mux = this._mux;
@@ -2808,7 +2808,7 @@ export class Session extends EventEmitter {
     // Confirmed the mux session (and thus the pane) exists but this reattach
     // is about to respawn it — safe to resolve/pin now.
     this._pinOmpRespawnId();
-    const newPid = await mux.respawnPane(this._buildRespawnPaneOptions());
+    const newPid = await mux.respawnPane({ ...this._buildRespawnPaneOptions(), remoteAttachOnly: options.attachOnly });
     if (!newPid) {
       console.error('[Session] reattachRemote: respawnPane failed for', this._muxSession.muxName);
       return false;

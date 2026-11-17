@@ -157,6 +157,8 @@ export interface CreateSessionOptions {
 
 /** Options for respawning a dead pane. */
 export interface RespawnPaneOptions {
+  /** Rejoin an existing remote worker without ever creating a replacement. */
+  remoteAttachOnly?: boolean;
   sessionId: string;
   workingDir: string;
   mode: SessionMode;

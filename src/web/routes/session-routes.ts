@@ -1089,7 +1089,10 @@ export function registerSessionRoutes(
   app: FastifyInstance,
   ctx: SessionPort & EventPort & ConfigPort & InfraPort & AuthPort & TabLayoutPort & KeepWarmPort,
   /** Test seam: inject a registry with fake IO instead of the real TCP/WoL probes. */
-  options: { remoteWake?: RemoteWakeRegistry } = {}
+  options: {
+    remoteWake?: RemoteWakeRegistry;
+    onCreateReady?: (create: (request: FastifyRequest) => Promise<unknown>) => void;
+  } = {}
 ): RemoteWakeRegistry {
   /**
    * Install the approval hook MODULE a CLI declares (`capabilities.approvalHookFile`,
@@ -1164,13 +1167,15 @@ export function registerSessionRoutes(
 
   // ========== Session Listing ==========
 
-  app.get('/api/sessions', async (req) => {
+  const createSessionForRequest = async (req: FastifyRequest) => {
     const list = ctx.getLightSessionsState();
     if (!isMultiUserMode()) return list;
     const user = getAuthUser(req);
     if (user.role === 'admin') return list;
     return (list as Array<{ owner?: string }>).filter((s) => canAccessOwned(user, s.owner));
-  });
+  };
+  app.get('/api/sessions', createSessionForRequest);
+  options.onCreateReady?.(createSessionForRequest);
 
   // ========== Legacy Session Tab Order (temporary synchronized compatibility bridge) ==========
 

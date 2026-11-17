@@ -315,6 +315,43 @@ describe('DiscordBridge', () => {
     await writeDiscordConfig(dir, CFG);
   });
 
+  it('keeps Notifications alerts and replies working when Full-mode metadata is corrupt', async () => {
+    writeFileSync(join(dir, 'discord-delivery.json'), '{');
+    const b = bridge();
+    try {
+      expect((await b.notify(MSG))?.ok).toBe(true);
+      t += 10_000;
+      await b.onGatewayMessage({
+        id: '555555555555555555',
+        channel_id: THREAD,
+        guild_id: GUILD,
+        content: 'continue',
+        author: { id: ME },
+      });
+      expect(sendInput).toHaveBeenCalledWith('s1', 'continue\r');
+      expect(readFileSync(join(dir, 'discord-delivery.json'), 'utf8')).toBe('{');
+    } finally {
+      b.stop();
+    }
+  });
+
+  it('retries a later identical Notifications alert after a pre-connection failure', async () => {
+    let messages = 0;
+    const b = bridge({}, async (url) => {
+      if (url.pathname.endsWith('/threads')) return jsonRes({ id: THREAD });
+      if (++messages === 1) throw Object.assign(new TypeError('DNS failure'), { cause: { code: 'ENOTFOUND' } });
+      return jsonRes({ id: 'message' });
+    });
+    try {
+      expect((await b.notify(MSG))?.ok).toBe(false);
+      t += 60 * 60_000;
+      expect((await b.notify(MSG))?.ok).toBe(true);
+      expect(messages).toBe(2);
+    } finally {
+      b.stop();
+    }
+  });
+
   it('creates the thread lazily on the first alert, reuses it, and persists the map', async () => {
     const b = bridge();
     await b.notify(MSG);

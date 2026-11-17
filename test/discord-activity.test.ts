@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DiscordActivity, discordActivityName, type DiscordActivitySession } from '../src/discord-activity.js';
+import { DiscordApi as BaseDiscordApi } from '../src/discord-bridge.js';
+class DiscordApi extends BaseDiscordApi {
+  constructor(...args: ConstructorParameters<typeof BaseDiscordApi>) {
+    super(args[0], args[1], args[2], () => true);
+  }
+}
 
 let now: number;
 let scope: string | undefined;
@@ -253,6 +259,34 @@ describe('Discord live activity', () => {
     now += 30_000;
     await activity.poll();
     expect(activity.name(sessions[0])).toBe('🔴 Needs input · hs-lab');
+  });
+  it.each(['typing', 'rename'] as const)(
+    'defers a rate-limited cosmetic %s without holding the activity sweep',
+    async (method) => {
+      const fetch = vi.fn(async () => Response.json({ retry_after: 1 }, { status: 429 }));
+      const api = new DiscordApi(
+        () => 'test-token',
+        fetch,
+        async () => {
+          scope = undefined;
+        }
+      );
+      const request =
+        method === 'typing'
+          ? api.typing('thread', () => !!scope)
+          : api.rename('thread', '🟡 Working · hs-lab', () => !!scope);
+      await expect(request).rejects.toMatchObject({ status: 429, retryAfterMs: 1000 });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(scope).toBe('guild/category');
+    }
+  );
+  it('retains a long Discord Retry-After header for the caller instead of retrying early', async () => {
+    const fetch = vi.fn(async () => Response.json({}, { status: 429, headers: { 'retry-after': '123.5' } }));
+    const sleep = vi.fn(async () => undefined);
+    const api = new DiscordApi(() => 'test-token', fetch, sleep);
+    await expect(api.request('GET', '/channels/thread')).rejects.toMatchObject({ status: 429, retryAfterMs: 123_500 });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
   });
   it('caps names at Discord limits and gives waiting/offline priority over busy', () => {
     expect(discordActivityName({ id: 's', working: true, waiting: true })).toContain('Needs input');

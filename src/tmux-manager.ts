@@ -1345,6 +1345,7 @@ export function remoteTmuxLocation(remote: SessionRemote, sessionId: string): { 
  *   when the remote path contains spaces.
  */
 export function buildRemoteLaunchCommand(options: {
+  attachOnly?: boolean;
   mode: SessionMode;
   remote: SessionRemote;
   sessionId: string;
@@ -1442,48 +1443,50 @@ export function buildRemoteLaunchCommand(options: {
   // apply on the SAME connection (and are idempotent on reattach). Options are
   // scoped per-session (`set -t <name>` / server `set -s`), NEVER `-g`, so a
   // shared remote tmux server's other sessions keep their own prefix/mouse.
-  const tmuxInvocation = [
-    `tmux -L ${REMOTE_TMUX_SOCKET} new-session -A -s ${remoteName} -c ${shellescape(remote.remotePath)} ${paneArgv}`,
-    `set -t ${remoteName} status off`,
-    `set -t ${remoteName} mouse off`,
-    `set -t ${remoteName} prefix ${NESTED_TMUX_PREFIX}`,
-    'set -s escape-time 0',
-    // COD-106 — shared/collaborative sessions: tmux defaults to sizing a window
-    // to the SMALLEST attached client, so two Codemans at different viewports
-    // would fight (clamp to the smaller). `window-size latest` sizes to the
-    // most-recently-active client instead, so concurrent clients coexist.
-    // Per-session scoped (`set -t <name>`, matching #145's hardening) so a shared
-    // remote tmux server's other sessions keep their own sizing behavior.
-    `set -t ${remoteName} window-size latest`,
-    // The prefix TABLE is server-global (unlike `prefix C-q`, which is per
-    // session). This socket is dedicated to Codeman's owned sessions, so the
-    // same reduction as the local socket applies: Ctrl+Q then )/(/s/w/L must
-    // not switch-client / choose-tree onto a sibling. Bind, then unbind-all,
-    // then bind again: a user config that left the prefix table empty makes
-    // `unbind-key -a -T prefix` fail and abort the rest of this chain.
-    // BEFORE remain-on-exit, which stays last because an old remote tmux
-    // rejects `failed` and aborts the rest of the chain.
-    ...nestedPrefixTableResetCommands(),
-    // #210: keep a CRASHED pane so the failure is still on screen. Without this,
-    // tmux destroys the pane -> window -> session (and, being the only session,
-    // the whole remote server) the instant the pane command exits, which tears the
-    // local `ssh -t` attach down with it; reconnect's `-A` then builds a fresh
-    // session and the cycle can repeat as a flap loop with no evidence surviving.
-    // That is how the exit-127 PATH bug fixed above stayed invisible.
-    //
-    // `failed`, NOT `on`: `on` keeps the pane on a CLEAN exit too, so typing
-    // `exit` in a remote shell leaves a dead pane behind, the session outlives it,
-    // and the next launch's `-A` reattaches to that corpse ("Pane is dead (status
-    // 0)") instead of starting a shell — verified against a real tmux. `failed`
-    // keeps the pane only on a non-zero exit, which is exactly the diagnostic case.
-    //
-    // LAST in the chain on purpose: tmux aborts the remaining commands of a `\;`
-    // sequence once one errors (also verified), and `failed` needs tmux >= 3.2 on
-    // the REMOTE host. Trailing, a rejection costs only this option; leading, it
-    // would silently drop status/mouse/prefix/escape-time/window-size and the
-    // prefix-table reduction with it.
-    `set -t ${remoteName} remain-on-exit failed`,
-  ].join(' \\; ');
+  const tmuxInvocation = options.attachOnly
+    ? `tmux -L ${REMOTE_TMUX_SOCKET} attach-session -t ${remoteName}`
+    : [
+        `tmux -L ${REMOTE_TMUX_SOCKET} new-session -A -s ${remoteName} -c ${shellescape(remote.remotePath)} ${paneArgv}`,
+        `set -t ${remoteName} status off`,
+        `set -t ${remoteName} mouse off`,
+        `set -t ${remoteName} prefix ${NESTED_TMUX_PREFIX}`,
+        'set -s escape-time 0',
+        // COD-106 — shared/collaborative sessions: tmux defaults to sizing a window
+        // to the SMALLEST attached client, so two Codemans at different viewports
+        // would fight (clamp to the smaller). `window-size latest` sizes to the
+        // most-recently-active client instead, so concurrent clients coexist.
+        // Per-session scoped (`set -t <name>`, matching #145's hardening) so a shared
+        // remote tmux server's other sessions keep their own sizing behavior.
+        `set -t ${remoteName} window-size latest`,
+        // The prefix TABLE is server-global (unlike `prefix C-q`, which is per
+        // session). This socket is dedicated to Codeman's owned sessions, so the
+        // same reduction as the local socket applies: Ctrl+Q then )/(/s/w/L must
+        // not switch-client / choose-tree onto a sibling. Bind, then unbind-all,
+        // then bind again: a user config that left the prefix table empty makes
+        // `unbind-key -a -T prefix` fail and abort the rest of this chain.
+        // BEFORE remain-on-exit, which stays last because an old remote tmux
+        // rejects `failed` and aborts the rest of the chain.
+        ...nestedPrefixTableResetCommands(),
+        // #210: keep a CRASHED pane so the failure is still on screen. Without this,
+        // tmux destroys the pane -> window -> session (and, being the only session,
+        // the whole remote server) the instant the pane command exits, which tears the
+        // local `ssh -t` attach down with it; reconnect's `-A` then builds a fresh
+        // session and the cycle can repeat as a flap loop with no evidence surviving.
+        // That is how the exit-127 PATH bug fixed above stayed invisible.
+        //
+        // `failed`, NOT `on`: `on` keeps the pane on a CLEAN exit too, so typing
+        // `exit` in a remote shell leaves a dead pane behind, the session outlives it,
+        // and the next launch's `-A` reattaches to that corpse ("Pane is dead (status
+        // 0)") instead of starting a shell — verified against a real tmux. `failed`
+        // keeps the pane only on a non-zero exit, which is exactly the diagnostic case.
+        //
+        // LAST in the chain on purpose: tmux aborts the remaining commands of a `\;`
+        // sequence once one errors (also verified), and `failed` needs tmux >= 3.2 on
+        // the REMOTE host. Trailing, a rejection costs only this option; leading, it
+        // would silently drop status/mouse/prefix/escape-time/window-size and the
+        // prefix-table reduction with it.
+        `set -t ${remoteName} remain-on-exit failed`,
+      ].join(' \\; ');
 
   // ssh runs its trailing args through the remote login shell, so the entire
   // tmux invocation is passed as one shell-quoted argument.
@@ -1920,6 +1923,7 @@ export function buildRemoteAttachCommand(remote: SessionRemote, remoteSessionNam
  *     (COD-104), which we then own and may explicitly kill.
  */
 function buildRemoteSessionCommand(options: {
+  attachOnly?: boolean;
   mode: SessionMode;
   remote: SessionRemote;
   sessionId: string;
@@ -3010,7 +3014,16 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       : docker
         ? buildDockerLaunchCommand(resolveDockerLaunchOptions(mode, docker, sessionId, resumeSessionId))
         : remote
-          ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
+          ? buildRemoteSessionCommand({
+              mode,
+              remote,
+              sessionId,
+              claudeMode,
+              allowedTools,
+              ompConfig,
+              resumeSessionId,
+              attachOnly: options.remoteAttachOnly,
+            })
           : localFullCmd;
 
     try {
