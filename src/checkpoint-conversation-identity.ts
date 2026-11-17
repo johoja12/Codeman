@@ -1,3 +1,4 @@
+/** @fileoverview Exact Codex conversation ownership and bounded transcript lookup. */
 import { realpathSync } from 'node:fs';
 import { open, readdir, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';

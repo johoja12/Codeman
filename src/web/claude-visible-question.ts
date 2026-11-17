@@ -1,6 +1,6 @@
 import { normalizeCapturedFrame } from './approval-inbox.js';
 
-/** Conservative visible-pane fallback for Claude's single-choice and checkbox AskUserQuestion UI.
+/** @fileoverview Conservative visible-pane fallback for Claude's single-choice and checkbox AskUserQuestion UI.
  * Never infer a dialog from transcript prose or enable single-digit answers for multi-select.
  */
 export interface ClaudeVisibleQuestion {

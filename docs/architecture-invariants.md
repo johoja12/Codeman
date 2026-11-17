@@ -1566,3 +1566,14 @@ limit each file to 8 MiB, create private files, and verify transferred bytes bef
 native agent receives a path. The SSH child has a hard timeout; stderr is bounded and
 remains private. A missing remote Python interpreter produces a fixed transfer failure
 in the thread, while detailed remote diagnostics are not forwarded to Discord.
+
+### Discord reply replay metadata
+
+`discord-reply-dedupe.json` is a private 0600 data-directory file containing at most
+2,048 reply IDs and timestamps retained for seven days. An allowed reply is claimed
+by message ID before attachments or terminal input. Store failures log once and fall
+back to memory; they never cost a reply. An unreadable or unsafe file is never
+overwritten, and reads retry later. Readable but invalid ID-only content warns and
+heals on the next write. Recovery keeps older disk rows before newer outage claims
+so bounded eviction drops the oldest IDs first. Ambiguous terminal input is never
+replayed automatically.

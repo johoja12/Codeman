@@ -1,4 +1,4 @@
-/** Explicit output references only: no directory scans, prose paths, external URLs or code examples. */
+/** @fileoverview Explicit output references only: no directory scans, prose paths, external URLs or code examples. */
 import { posix } from 'node:path';
 
 const OUTPUT =

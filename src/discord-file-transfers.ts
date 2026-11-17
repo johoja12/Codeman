@@ -1,3 +1,4 @@
+/** @fileoverview Discord file transfers component. */
 import { runDiscordRemoteRead } from './discord-remote-read.js';
 export { runDiscordRemoteRead } from './discord-remote-read.js';
 /** Bounded local/SSH attachment access using the session workspace and shared path/SSH guards. */
