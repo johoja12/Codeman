@@ -1,4 +1,4 @@
-/** Cosmetic Discord activity, derived from live session state without reading terminal output. */
+/** @fileoverview Cosmetic Discord activity, derived from live session state without reading terminal output. */
 import type { SessionActivityStatus } from './types/session.js';
 
 export interface DiscordActivitySession {
