@@ -254,6 +254,10 @@ For restored Claude panes, the bridge reads the sole interactive Claude process 
 
 Full-mode startup, manual synchronization and a periodic sweep reconcile tracked session threads against the complete restored session inventory, including persisted and pending reboot-recovery sessions. Missing sessions follow `onSessionDelete` (archive by default). The bridge validates its persisted ownership and rechecks the inventory before changing a thread. Failed cleanup retries on a later sweep. Saved case channels remain even when they have no session threads; unsupported restore state and unrelated/manual Discord threads are left alone.
 
+### Codex model information
+
+Pinned session cards and Settings can show the last model and effort reported by native Codex `turn_context` metadata. These values are scoped to the exact conversation and CLI format, labelled **last reported**, and do not override current native observations. Local managed Codex panes use the attached process's verified profile directory, including custom-command `CODEX_HOME`, rather than assuming the web service's default. The process is rechecked after reading; ambiguous or changed profiles fail closed. No model command or task input is sent to obtain this metadata.
+
 ## Live status and recovery controls
 
 Discord distinguishes **Agent exited — recovery needed**, **Connection lost**, and **Connection unverified** from Idle. A dead local SSH client does not prove the remote agent has exited. Read-only checks verify the remote pane and supported native conversation/profile; slow or failed probes keep an unverified state. Background checks never launch a CLI or replay a task, and remote transport failures remain separate from the local clean-exit sweep.

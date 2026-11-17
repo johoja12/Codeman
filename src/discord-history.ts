@@ -1,3 +1,4 @@
+import { probeLocalDiscordRuntime } from './discord-local-conversation.js';
 import { probeRemoteClaudeRuntime } from './discord-remote-claude.js';
 import { discordDisplayText } from './discord-display-text.js';
 import {
@@ -29,6 +30,8 @@ interface NativeHistoryRow {
   perTurnEffort?: unknown;
   payload?: {
     thread_id?: string;
+    model?: unknown;
+    effort?: unknown;
     type?: string;
     output?: unknown;
     role?: string;
@@ -96,7 +99,13 @@ export type DiscordReportedEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' 
 export interface DiscordHistory {
   conversationId: string;
   turns: DiscordHistoryTurn[];
-  reportedSettings?: { model: string; effort?: DiscordReportedEffort; cursor: string; timestamp: string };
+  reportedSettings?: {
+    model: string;
+    effort?: DiscordReportedEffort;
+    cursor: string;
+    timestamp: string;
+    format?: 'claude-jsonl' | 'codex-rollout';
+  };
   generatedImages?: DiscordGeneratedImage[];
   partial: boolean;
   executions?: DiscordNativeExecution[];
@@ -429,6 +438,27 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
       text = '',
       phase: DiscordHistoryTurn['phase'],
       timestamp = typeof e.timestamp === 'string' ? e.timestamp : '';
+    if (
+      format === 'codex-rollout' &&
+      e.type === 'turn_context' &&
+      source.conversationId &&
+      UUID.test(source.conversationId) &&
+      (!e.payload?.thread_id || e.payload.thread_id === source.conversationId) &&
+      typeof e.payload?.model === 'string' &&
+      /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,95}$/.test(e.payload.model) &&
+      Number.isFinite(Date.parse(timestamp))
+    ) {
+      const effort = e.payload.effort;
+      reportedSettings = {
+        format: 'codex-rollout',
+        model: e.payload.model,
+        ...(typeof effort === 'string' && /^(low|medium|high|xhigh|max|ultra|ultracode)$/.test(effort)
+          ? { effort: effort as DiscordReportedEffort }
+          : {}),
+        timestamp,
+        cursor: `${source.conversationId}:${offset}:${hash}`,
+      };
+    }
     const item = e.payload?.item;
     if (
       format === 'codex-rollout' &&
@@ -642,6 +672,7 @@ function remoteHistoryScope(
   const remote = session.remote;
   return JSON.stringify([
     session.mode,
+    session.muxName,
     remote?.hostId,
     remote?.host,
     remote?.username,
@@ -682,6 +713,23 @@ async function withDiscordSessionHistorySource<T>(
         ? configHome
         : posix.resolve(session.remote.remotePath, configHome)
       : resolve(session.workingDir, configHome);
+  let localRuntime: RemoteDiscordRuntime | undefined;
+  const localUnbound = format === 'codex-rollout' && !session.remote && !id;
+  if (format === 'codex-rollout' && !session.remote && session.muxName && !session.paneExit) {
+    localRuntime = await probeLocalDiscordRuntime(session);
+    if (!localRuntime) throw new DiscordHistoryReadError('profile_unverified');
+    if (configHome) {
+      const { canonicalizeCodexHome } = await import('./checkpoint-conversation-identity.js');
+      if (
+        canonicalizeCodexHome(configHome, session.workingDir) !==
+        canonicalizeCodexHome(localRuntime.configHome, session.workingDir)
+      )
+        throw new DiscordHistoryReadError('profile_changed');
+    }
+    configHome = localRuntime.configHome;
+    if (localRuntime.id && id && localRuntime.id !== id) throw new DiscordHistoryReadError('profile_changed');
+    id ??= localRuntime.id;
+  }
   if (recoveredId && !session.remote) {
     if (format !== 'codex-rollout' || session.docker || (id && id !== recoveredId))
       throw new DiscordHistoryReadError('profile_changed');
@@ -753,6 +801,16 @@ async function withDiscordSessionHistorySource<T>(
       includeTools: options?.includeTools,
       after: options?.after,
     });
+    if (localRuntime) {
+      const fresh = await probeLocalDiscordRuntime(session);
+      if (
+        !fresh ||
+        fresh.fingerprint !== localRuntime.fingerprint ||
+        fresh.configHome !== localRuntime.configHome ||
+        fresh.id !== localRuntime.id
+      )
+        throw new DiscordHistoryReadError('profile_changed');
+    }
     if (remote) {
       if (claudeRuntime) {
         const fresh = await probeRemoteClaudeRuntime(remote, session.id);
@@ -784,6 +842,7 @@ async function withDiscordSessionHistorySource<T>(
     // The exact native file/header and current owned runtime must both confirm the binding first.
     if (claudeRuntime && id && !firstHandBefore && session.claudeSessionId !== id)
       session.adoptVerifiedRemoteClaudeResumeId(id);
+    if (localRuntime && localUnbound && id && !session.nativeResumeId) session.setNativeResumeId(id);
     if (discovered && !session.nativeResumeId) session.setNativeResumeId(discovered);
     if (runtime || claudeRuntime)
       remoteRuntimeHomes.set(session, { scope: remoteHistoryScope(session), runtime: (runtime ?? claudeRuntime)! });
