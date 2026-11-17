@@ -27,6 +27,7 @@ import { join } from 'node:path';
 import { probePathKind } from './utils/bounded-path-probe.js';
 import { DISCORD_RECEIVED_DIR } from './web/paste-image-gc.js';
 import WebSocket from 'ws';
+import { discordDisplayText } from './discord-display-text.js';
 import { DiscordReplyDedupe } from './discord-reply-dedupe.js';
 import { WEBHOOK_SCOPES, type WebhookUrgency } from './types/push.js';
 import {
@@ -370,9 +371,10 @@ export function buildPost(msg: DiscordMessage, cfg: DiscordConfig, explicitUrgen
   } catch {
     tailText = undefined;
   }
+  tailText = tailText ? discordDisplayText(tailText) : undefined;
   const fence = tailText?.trim() ? `\n\`\`\`\n${tailText.trim().replace(/```/g, "'''")}\n\`\`\`` : '';
   const host = msg.host ? ` (${clip(msg.host, 60)})` : '';
-  const content = clip(`${head}${host}${msg.body ? `\n${msg.body}` : ''}${fence}`, MAX_CONTENT);
+  const content = clip(`${head}${host}${msg.body ? `\n${discordDisplayText(msg.body)}` : ''}${fence}`, MAX_CONTENT);
   // Agent output and session names must not be able to @everyone the server; only the allowlisted ids ping.
   return { content, allowed_mentions: { parse: [], users: ping } };
 }
