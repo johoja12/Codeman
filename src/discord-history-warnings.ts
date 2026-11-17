@@ -1,4 +1,4 @@
-/** Durable unresolved warning ownership, independent of bounded delivery receipts. No message bodies. */
+/** @fileoverview Durable unresolved warning ownership, independent of bounded delivery receipts. No message bodies. */
 import fs from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { join } from 'node:path';

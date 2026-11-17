@@ -1,4 +1,4 @@
-/** Bounded, exact-task progress reads. Continuations retain all loaded text without crossing the next prompt. */
+/** @fileoverview Bounded, exact-task progress reads. Continuations retain all loaded text without crossing the next prompt. */
 import type { DiscordHistory, DiscordHistoryTurn } from './discord-history.js';
 import { discordDisplayText } from './discord-display-text.js';
 export interface DiscordTaskUpdates {
