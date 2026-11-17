@@ -103,6 +103,7 @@ export async function writeRemoteFileBytes(remote: SessionRemote, opts: WriteRem
   await new Promise<void>((resolve, reject) => {
     const child = spawn('ssh', args, { stdio: ['pipe', 'ignore', 'pipe'] });
     const stderr: Buffer[] = [];
+    let stderrBytes = 0;
     let settled = false;
     const finish = (fn: () => void) => {
       if (settled) return;
@@ -116,7 +117,17 @@ export async function writeRemoteFileBytes(remote: SessionRemote, opts: WriteRem
         reject(new Error(`${opts.transferLabel} timed out connecting to ${remote.host}`));
       });
     }, opts.timeoutMs);
-    child.stderr.on('data', (chunk: Buffer) => stderr.push(Buffer.from(chunk)));
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (settled) return;
+      stderrBytes += chunk.length;
+      if (stderrBytes > 65536) {
+        finish(() => {
+          child.kill('SIGTERM');
+          reject(new Error(`${opts.transferLabel} failed: remote error output exceeded limit`));
+        });
+      } else stderr.push(Buffer.from(chunk));
+    });
+    child.stdin.on('error', (error) => finish(() => reject(error)));
     child.on('error', (err) => finish(() => reject(err)));
     child.on('close', (code) => {
       if (code === 0) {
