@@ -103,3 +103,17 @@ Discord for them; only the agent-initiated `codeman notify` habit is missing.
 
 See also: [Notifications And Approvals](Notifications-And-Approvals) for the other ways to hear
 from an agent, and [Security](Security) for how secrets are handled.
+
+
+## Optional Full interface
+
+Notifications remains the default. Full mode adds an owned channel per saved case and a thread
+per live session, exact Claude/Codex transcript cards, verified questions/model controls,
+explicit follow-up queues, Recent-first Activity, history/results panels, galleries and PNG/CSV tables.
+It requires a single-user host and the extra category/thread/file permissions described in the
+[complete guide](https://github.com/Ark0N/Codeman/blob/master/docs/discord-bridge.md).
+
+Reconnection is attach-only and cannot create an agent when a worker vanishes. Exited-worker
+Resume requires a strict native-resume host capability that upstream master does not yet provide.
+Unverified dialogs, ambiguous history and unsupported recovery remain in the terminal/web UI.
+Uncertain input is never replayed. The shared completion inbox is not part of Full mode.

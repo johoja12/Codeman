@@ -149,3 +149,120 @@ Readable but invalid ID metadata is replaced on the next write. Files that could
 checks. At capacity the oldest entries are evicted, so capacity never blocks new replies.
 Notifications retain their existing delivery and retry behavior; this store never suppresses
 an outbound alert or replays terminal input.
+
+
+## Opt-in Full interface
+
+Choose **Full interface** in Settings → Notifications → Discord. Notifications remains the default.
+Full mode requires a single-user host until Discord accounts can be mapped to Codeman users.
+The bot additionally needs **Manage Channels**, **Manage Threads**, **Read Message History**,
+and **Attach Files** for the features below. Restrict the category to the configured allowlist.
+Leave the category ID blank to create a private Codeman category on save, or provide an existing
+category. Test with a dedicated category before connecting live sessions.
+
+- **Cases and sessions:** each saved case gets an owned channel, even without active sessions;
+  each live session gets its own thread. Ownership uses persisted identity, never a matching name.
+  Removed sessions archive their owned threads. Configured users are reconciled as thread members.
+- **Conversation:** exact Claude/Codex native transcripts provide readable response cards, prompt
+  mirroring and bounded catch-up. Conversation, Quiet, Tools and Off views control output detail.
+  Interim updates are silent; completed turns retain the configured notification behavior.
+- **Controls:** supported Claude questions and permission prompts share the web answer checks.
+  Model/effort controls use verified native menus for this session only. Unverified dialogs require
+  the terminal. Suggestions come from the native Claude composer; send-now and queued follow-ups
+  remain explicit actions, bound to the conversation and input revision.
+- **Activity:** the pinned main-channel card defaults to Recent, with Working, Finished and
+  Attention views. Background watching counts as work. There is no shared completion inbox.
+- **History and results:** bounded history pages, transcript downloads, task updates and read-only
+  workspace results/diffs are available through native cards.
+- **Files and tables:** explicit output links, generated images, galleries, PNG table pages and CSV
+  exports preserve readable content. Files outside the workspace need a one-file approval;
+  credential locations remain blocked. Incoming CDN uploads are limited to five files of 8 MiB.
+  SSH writes are limited to the private workspace `.codeman-discord/` directory, use bounded SSH
+  IO and verify bytes before passing a path to the agent. Remote uploads require Python3.
+
+![Case-channel and session-thread design reference](images/discord-case-threads-desktop.png)
+
+![Native response-card design reference](images/discord-response-card-mobile.png)
+
+These Discord layout references use synthetic/example content. Discord controls final spacing,
+width and typography; no client CSS or paid bot is required.
+
+### Status and recovery
+
+Cards distinguish available sessions, lost connections, exited agents and unverified connections.
+A failed probe never becomes an Idle success. Verify rechecks bounded native evidence before
+accepting input. Reconnecting a living remote worker uses an attach-only command: a worker that
+vanishes cannot be replaced by a new agent. Native IDs and hashed transcript cursors are verified
+before catch-up, and uncertain input is never replayed.
+
+Exited-worker Resume is offered only when the host supplies a strict, exact-conversation resumer.
+Current upstream master does not supply that capability or the fork's durable recovery registry;
+those controls remain unavailable. Optional notification-suppression metadata is honored when
+provided by the host; the separate session-creation API feature is outside this bridge series.
+
+For an unbound Codex pane, a guarded `/status` read can recover an exact native conversation.
+Fresh empty-composer proof is mandatory, including during work. Drafts, pending dialogs, changed
+input/profile identity and ambiguous process ownership defer recovery. No newest-file or cwd guess
+is used. Other unverified CLI history/control protocols continue to require the terminal.
+
+### Commands
+
+Use session threads for task/history commands. Case channels and the configured parent/control
+channel also accept management commands when no sessions exist.
+
+| Command | Behavior |
+| --- | --- |
+| `!codeman sessions [offset]` | List session identity, host, case, group, CLI and status |
+| `!codeman open <session-id>` | Return the exact owned thread link |
+| `!codeman cases`, `!codeman groups` | List configured creation targets |
+| `!codeman create <case> <host-id-or-local> <CLI> <group-id-or-default>` | Review and confirm one session launch through the shared creation path |
+| `!codeman reconnect <session-id>` | Recheck and attach an existing remote worker without creating one |
+| `!codeman history [cursor]`, `!codeman transcript` | Read bounded exact history or download an export |
+| `!codeman pending`, `!codeman status`, `!codeman interrupt` | Inspect or explicitly control the current task |
+| `!codeman model [model-id]`, `!codeman effort [level]` | Use supported verified session-only native settings |
+| `!codeman help` | Show available commands |
+
+Creation confirmations expire and bind the actor, case, host, group and configuration. Changes
+invalidate the action. Launch success is not proof that the native CLI is ready. A failed or
+ambiguous submission is not retried as a new task.
+
+### Full-mode delivery metadata
+
+Full mode has separate bounded delivery receipts, conversation cursors, warning state and private
+UI/queue metadata. It persists accepted native provenance, confirmed multipart delivery and exact
+response references. A transport checkmark does not claim that an agent started or finished work.
+Explicit file failures prevent submission. Unknown input is never automatically replayed.
+
+Full-mode posts use stable nonces for bounded retries; rate-limit delays are honored and longer
+waits are surfaced. Formatting fingerprints prevent reusing a partially delivered plan with
+changed content. These Full-mode journal/retry rules do not apply to default Notifications, whose
+best-effort replay protection and storage-failure fallback are described above.
+
+### Diagnostics
+
+Opt-in bridge diagnostics provide bounded timing and sanitized CPU/allocation summaries without
+opening an inspector listener or exporting raw profiles, prompts, credentials or heap snapshots.
+They remain disabled by default. The bridge has no authority to start or recover a native task
+just to collect diagnostics.
+
+
+### Private Full-mode state
+
+| File | Contents |
+| --- | --- |
+| `discord-case-categories.json`, `discord-session-channels.json`, `discord-case-threads.json` | Owned category/channel/thread identities and lifecycle intent |
+| `discord-conversation-progress.json` | Exact native boundaries and prompt provenance |
+| `discord-delivery.json` | Bounded delivery receipts and native execution evidence |
+| `discord-ui.json` | Card references, queued follow-up text and activity/settings references |
+| `discord-history-warnings.json` | References for unresolved owned history warnings |
+
+These private files live under the configured instance data directory. Queue contents are private;
+startup does not replay uncertain submissions. Notifications uses the separate reply-ID store above.
+
+### Settings and table rendering previews
+
+![Desktop settings verified in Chromium](images/discord-upstream-settings-desktop.png)
+
+![Mobile settings verified in Chromium](images/discord-upstream-settings-mobile.png)
+
+![Table PNG rendered by the application using synthetic data](images/discord-upstream-table.png)
