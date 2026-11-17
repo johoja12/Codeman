@@ -705,3 +705,20 @@ session-create flow, or via the per-host **"Discover existing sessions"** button
   Key Pattern.
 - `docs/security-architecture.md` — overall network/auth model.
 - COD-104 (tmux prereq + durable launch), COD-105 (discover + attach, detach-not-kill ownership), COD-107 (shell-safe connection args).
+
+
+### Discord Full-mode incoming upload exception
+
+The default Discord Notifications bridge never writes files over SSH. Opt-in Full mode
+may accept an allowlisted user's incoming Discord attachment into the exact session
+workspace's `.codeman-discord/` directory. This is the narrow remote-write exception
+approved for the Discord split; it does not authorize workspace editing, arbitrary
+remote commands, or writes outside that directory.
+
+The caller validates session/configuration/actor scope and stops submitting input if it
+changes during transfer. Transfers use shared SSH connection options and concurrency
+limits, shell-escape dynamic values, reject unsafe workspace/directory/symlink components,
+limit each file to 8 MiB, create private files, and verify transferred bytes before the
+native agent receives a path. The SSH child has a hard timeout; stderr is bounded and
+remains private. A missing remote Python interpreter produces a fixed transfer failure
+in the thread, while detailed remote diagnostics are not forwarded to Discord.
