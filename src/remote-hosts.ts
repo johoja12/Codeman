@@ -691,3 +691,51 @@ export function buildSshConnectionArgv(remote: RemoteSshOptions & Pick<RemoteHos
 export function withRemotePathBootstrap(command: string): string {
   return withRemoteTmuxPath(command);
 }
+
+export interface RemoteWorkerObservation {
+  bootId?: string;
+  alive: boolean;
+  agentRunning?: boolean;
+}
+
+export function buildRemoteWorkerProbeCommand(
+  remote: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions & Pick<SessionRemote, 'owned'>,
+  remoteSessionName: string
+): string {
+  const [ssh, ...args] = buildSshConnectionArgs(remote);
+  const socket = remote.owned === false ? 'codeman' : 'codeman-remote';
+  const command = withRemoteTmuxPath(
+    `if [ -r /proc/sys/kernel/random/boot_id ]; then cat /proc/sys/kernel/random/boot_id; ` +
+      `else sysctl -n kern.boottime 2>/dev/null; fi; ` +
+      `if tmux -L ${socket} has-session -t ${shellescape(remoteSessionName)} 2>/dev/null; ` +
+      `then printf 'ALIVE '; tmux -L ${socket} display-message -p -t ${shellescape(remoteSessionName)} '#{pane_dead}'; ` +
+      `else printf 'GONE\\n'; fi`
+  );
+  return [ssh, ...args, remoteSshTarget(remote), shellescape(command)].join(' ');
+}
+
+export function parseRemoteWorkerObservation(stdout: string): RemoteWorkerObservation | undefined {
+  const lines = stdout.trim().split('\n');
+  const status = lines.pop();
+  if (status !== 'ALIVE 0' && status !== 'ALIVE 1' && status !== 'GONE') return undefined;
+  const boot = lines.join('\n').trim();
+  const bootId =
+    /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(boot) ||
+    /^\{ sec = \d+, usec = \d+ \}.*$/.test(boot)
+      ? boot
+      : undefined;
+  return { alive: status !== 'GONE', agentRunning: status === 'ALIVE 0', bootId };
+}
+
+export async function probeRemoteWorker(
+  remote: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions & Pick<SessionRemote, 'owned'>,
+  remoteSessionName: string
+): Promise<RemoteWorkerObservation | undefined> {
+  if (process.env.VITEST) return { alive: true, agentRunning: true };
+  try {
+    const { stdout } = await execAsync(buildRemoteWorkerProbeCommand(remote, remoteSessionName), { timeout: 15_000 });
+    return parseRemoteWorkerObservation(stdout);
+  } catch {
+    return undefined;
+  }
+}

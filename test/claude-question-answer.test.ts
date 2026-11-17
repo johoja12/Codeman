@@ -134,3 +134,44 @@ it('rejects double clicks, a replaced conversation and revoked caller scope', as
   );
   expect(other.writes).toEqual([]);
 });
+
+it('projects verified native questions as selectable inbox options shared by Discord and the web API', async () => {
+  const { createDiscordNativeUiServices } = await import('../src/web/discord-native-ui-services.js');
+  const h = harness();
+  const services = createDiscordNativeUiServices({
+    sessions: () => new Map([[h.s.id, h.s]]),
+    cases: async () => [],
+    allowed: () => true,
+    url: () => undefined,
+    capture: () => frame(),
+  });
+  await services.sessions();
+  const q = services.question(h.s.id)!;
+  expect(q.terminalOnly).toBe(false);
+  expect(q.options.map((o) => o.label)).toEqual(['Red', 'Blue', 'Green']);
+  await expect(services.answer(h.s.id, q.id, q.revision, '2')).resolves.toContain('Answer sent');
+  expect(h.writes).toEqual(['\x1b[B', '\r']);
+});
+
+it('does not let an old card follow changed user input or a later identical question', async () => {
+  const { createDiscordNativeUiServices } = await import('../src/web/discord-native-ui-services.js');
+  const h = harness();
+  const services = createDiscordNativeUiServices({
+    sessions: () => new Map([[h.s.id, h.s]]),
+    cases: async () => [],
+    allowed: () => true,
+    url: () => undefined,
+    capture: () => frame(),
+  });
+  await services.sessions();
+  const old = services.question(h.s.id)!;
+  Object.assign(h.s, { discordQueueRevision: 'changed-input' });
+  await services.sessions();
+  const fresh = services.question(h.s.id)!;
+  expect(fresh.id).not.toBe(old.id);
+  await expect(services.answer(h.s.id, old.id, old.revision, '1')).rejects.toThrow('Question changed');
+  expect(h.writes).toEqual([]);
+  await services.answer(h.s.id, fresh.id, fresh.revision, '1');
+  await services.sessions();
+  expect(services.question(h.s.id)!.id).not.toBe(fresh.id);
+});
