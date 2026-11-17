@@ -1,3 +1,4 @@
+import { answerClaudeQuestion } from '../claude-question-answer.js';
 /**
  * @fileoverview Approvals Inbox routes.
  *
@@ -19,6 +20,7 @@
  */
 
 import { FastifyInstance } from 'fastify';
+import type { Session } from '../../session.js';
 import { ApiErrorCode, createErrorResponse } from '../../types.js';
 import { ApprovalAnswerSchema } from '../schemas.js';
 import { parseBody, getAuthUser, canAccessOwned, findSessionOrFail } from '../route-helpers.js';
@@ -63,6 +65,93 @@ function keystrokesFor(
   }
 }
 
+/** Shared checked answer path; caller must authorize this exact session before calling. */
+export async function answerPendingApproval(
+  session: Session,
+  id: string,
+  answer: { action: 'approve' | 'deny' | 'option' | 'text'; option?: number; text?: string },
+  allowed: () => boolean = () => true
+) {
+  const item = approvalInbox.getById(id);
+  if (!item || item.sessionId !== session.id)
+    return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Approval not found or no longer pending');
+  if (item.nativeQuestion) {
+    const native = item.nativeQuestion;
+    if (
+      getCli(session.mode)?.capabilities.nativeSettingsProfile !== 'claude-tui' ||
+      native.state !== 'pending' ||
+      answer.action !== 'option' ||
+      !native.dialog.choices.some((o) => o.n === answer.option)
+    )
+      return createErrorResponse(
+        ApiErrorCode.CONFLICT,
+        'This question cannot accept this answer. Open the current question.'
+      );
+    native.state = 'answering';
+    const current = () =>
+      allowed() &&
+      approvalInbox.getById(item.id) === item &&
+      native.state === 'answering' &&
+      session.claudeSessionId === native.conversation &&
+      session.discordQueueRevision === native.inputRevision;
+    const outcome = await answerClaudeQuestion(session, native.dialog, answer.option!, current);
+    if (outcome === 'accepted') {
+      native.state = 'answered';
+      approvalInbox.take(item.id);
+      return { success: true, data: { id: item.id, sessionId: item.sessionId, action: answer.action } };
+    }
+    native.state = outcome === 'uncertain' ? 'uncertain' : 'pending';
+    if (outcome === 'uncertain') item.answerInTerminal = true;
+    approvalInbox.onUpdated?.(item);
+    return createErrorResponse(
+      ApiErrorCode.CONFLICT,
+      outcome === 'uncertain'
+        ? 'Answer delivery is unconfirmed. Check the terminal before retrying; no selection will be replayed.'
+        : 'The current dialog or input changed. Nothing was submitted; open the current question.'
+    );
+  }
+  // Alert-only items: the dialog belongs to a TUI whose keystroke contract Codeman
+  // has not measured, so '1'/Esc would be a blind keystroke into a foreign composer.
+  // Two sources today: a supervised-hook CLI (DeepSeek Harness), whose item clears on
+  // the harness's own working/stop reports, and a dialog read off the screen of a
+  // hook-less CLI (codex, web/screen-blocked.ts), which clears when it leaves the
+  // screen and was read from text the agent writes, so it must never steer a key.
+  // Checked BEFORE the hooks gate below: a codex session has no hooks, and "this mode
+  // cannot have pending approvals" would be false about the item the caller holds.
+  if (item.answerInTerminal) {
+    return createErrorResponse(
+      ApiErrorCode.INVALID_INPUT,
+      `${getCli(session.mode)?.label ?? session.mode} approvals must be answered in the terminal: the dialog belongs to a TUI whose keystrokes Codeman cannot verify.`
+    );
+  }
+  if (!hooksAvailableForMode(session.mode, sessionHookOptions(session))) {
+    return createErrorResponse(ApiErrorCode.CONFLICT, 'Session mode cannot have pending approvals');
+  }
+
+  // Re-capture the pane before aiming keystrokes at it: if the dialog was
+  // answered in the terminal moments ago, the digit would land in whatever
+  // now has focus. Conclusive only for items whose frame parsed options.
+  if (!approvalInbox.verifyStillAnswerable(item.id)) {
+    return createErrorResponse(ApiErrorCode.CONFLICT, 'The dialog is no longer on screen');
+  }
+
+  const resolved = keystrokesFor(item, answer);
+  if ('error' in resolved) {
+    return createErrorResponse(ApiErrorCode.INVALID_INPUT, resolved.error);
+  }
+
+  const taken = approvalInbox.take(item.id);
+  if (!taken) {
+    return createErrorResponse(ApiErrorCode.CONFLICT, 'Approval was resolved by another actor');
+  }
+  const written = await session.writeViaMux(resolved.keys);
+  if (!written) {
+    approvalInbox.restore(taken);
+    return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Session is not accepting input');
+  }
+  return { success: true, data: { id: item.id, sessionId: item.sessionId, action: answer.action } };
+}
+
 export function registerApprovalRoutes(app: FastifyInstance, ctx: SessionPort): void {
   // List pending approvals. Items whose session is gone resolve lazily; items
   // whose session the caller cannot access are filtered (never 403-leaked),
@@ -101,46 +190,7 @@ export function registerApprovalRoutes(app: FastifyInstance, ctx: SessionPort): 
     // Throws 404 (not 403) for sessions the caller does not own, same
     // no-existence-leak rule as every other session route.
     const session = findSessionOrFail(ctx, item.sessionId, req);
-    // Alert-only items: the dialog belongs to a TUI whose keystroke contract Codeman
-    // has not measured, so '1'/Esc would be a blind keystroke into a foreign composer.
-    // Two sources today: a supervised-hook CLI (DeepSeek Harness), whose item clears on
-    // the harness's own working/stop reports, and a dialog read off the screen of a
-    // hook-less CLI (codex, web/screen-blocked.ts), which clears when it leaves the
-    // screen and was read from text the agent writes, so it must never steer a key.
-    // Checked BEFORE the hooks gate below: a codex session has no hooks, and "this mode
-    // cannot have pending approvals" would be false about the item the caller holds.
-    if (item.answerInTerminal) {
-      return createErrorResponse(
-        ApiErrorCode.INVALID_INPUT,
-        `${getCli(session.mode)?.label ?? session.mode} approvals must be answered in the terminal: the dialog belongs to a TUI whose keystrokes Codeman cannot verify.`
-      );
-    }
-    if (!hooksAvailableForMode(session.mode, sessionHookOptions(session))) {
-      return createErrorResponse(ApiErrorCode.CONFLICT, 'Session mode cannot have pending approvals');
-    }
-
-    // Re-capture the pane before aiming keystrokes at it: if the dialog was
-    // answered in the terminal moments ago, the digit would land in whatever
-    // now has focus. Conclusive only for items whose frame parsed options.
-    if (!approvalInbox.verifyStillAnswerable(item.id)) {
-      return createErrorResponse(ApiErrorCode.CONFLICT, 'The dialog is no longer on screen');
-    }
-
-    const resolved = keystrokesFor(item, answer);
-    if ('error' in resolved) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, resolved.error);
-    }
-
-    const taken = approvalInbox.take(item.id);
-    if (!taken) {
-      return createErrorResponse(ApiErrorCode.CONFLICT, 'Approval was resolved by another actor');
-    }
-    const written = await session.writeViaMux(resolved.keys);
-    if (!written) {
-      approvalInbox.restore(taken);
-      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Session is not accepting input');
-    }
-    return { success: true, data: { id: item.id, sessionId: item.sessionId, action: answer.action } };
+    return answerPendingApproval(session, item.id, answer);
   });
 
   /**
