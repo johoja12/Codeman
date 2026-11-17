@@ -1,3 +1,4 @@
+import type { ClaudeVisibleQuestion } from './claude-visible-question.js';
 /**
  * @fileoverview Approvals Inbox: server-side registry of prompts waiting on a human.
  *
@@ -14,10 +15,10 @@
  * - Module-level singleton in the style of `session-wait-registry.ts`: no
  *   `Session` import, no IO; the server injects emit callbacks (`onPending`/
  *   `onUpdated`/`onResolved`), which keeps this unit-testable and cycle-free.
- * - Items are in-memory only. A server restart drops them; the next prompt
- *   re-fires the hook. Answerable items are Claude's alone; the DeepSeek status
- *   bridge and the screen-read dialogs of a hook-less CLI (codex, see
- *   `web/screen-blocked.ts`) open alert-only items (`answerInTerminal`).
+ * - Items are in-memory only. A server restart drops them; hook prompts and
+ *   confirmed non-Claude turn ends recreate items. Screen-read dialogs and
+ *   supervised-hook CLIs create alert-only items (`answerInTerminal`), while
+ *   the fork retains verified Codex/OpenCode idle-prompt replies.
  * - Answer flow is take-then-write: `take()` removes the item BEFORE keystrokes
  *   are sent so a double-tap cannot double-send; `restore()` re-inserts on a
  *   failed write unless a newer prompt arrived meanwhile.
@@ -33,6 +34,7 @@
  */
 
 import { stripAnsi, CLAUDE_WORKING_LINE_PATTERN } from '../utils/index.js';
+import type { SessionMode } from '../types.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -52,13 +54,23 @@ export interface ApprovalOption {
   label: string;
 }
 
+export interface NativeQuestionControl {
+  conversation: string;
+  inputRevision: string;
+  dialog: ClaudeVisibleQuestion;
+  state: 'pending' | 'answering' | 'uncertain' | 'answered';
+}
 export interface ApprovalItem {
   /** `${sessionId}:${seq}`, stable across re-captures, unique per prompt. */
   id: string;
   sessionId: string;
   sessionName: string;
   kind: ApprovalKind;
+  /** CLI mode that produced the prompt; lets clients localize generated labels. */
+  mode?: SessionMode;
   createdAt: number;
+  /** Coordinator receipt order used to prevent older prompts surviving a newer completion. */
+  sourceSequence?: number;
   /** Sanitized hook fields (already bounded by sanitizeHookData). */
   toolName?: string;
   toolSummary?: string;
@@ -95,6 +107,7 @@ export interface ApprovalItem {
    * Deny actions, and the UI offers "Open session" instead of answer buttons.
    */
   answerInTerminal?: boolean;
+  nativeQuestion?: NativeQuestionControl;
 }
 
 export interface ApprovalResolvedInfo {
@@ -102,12 +115,16 @@ export interface ApprovalResolvedInfo {
   sessionId: string;
   kind: ApprovalKind;
   resolution: ApprovalResolution;
+  /** Sequence of the exact removed item; absent for legacy/generation-neutral items. */
+  sourceSequence?: number;
 }
 
 interface NotePromptArgs {
   sessionId: string;
+  sourceSequence?: number;
   sessionName: string;
   kind: ApprovalKind;
+  mode?: SessionMode;
   toolName?: string;
   toolSummary?: string;
   message?: string;
@@ -123,6 +140,7 @@ interface NotePromptArgs {
    * `ApprovalItem.answerInTerminal`.
    */
   answerInTerminal?: boolean;
+  nativeQuestion?: NativeQuestionControl;
   /**
    * An idle prompt that should open ALREADY acknowledged for a reason other than
    * `watching`, e.g. `cache keep-alive` when the turn that just ended was Codeman's own
@@ -170,6 +188,10 @@ const MAX_OPTION_LABEL_CHARS = 120;
  * newline; a mid-row jump becomes a space so adjacent words don't merge.
  */
 // eslint-disable-next-line no-control-regex
+const CHARACTER_SET_PATTERN = /\x1b[()][0-2A-Z]/g;
+// eslint-disable-next-line no-control-regex
+const CURSOR_FORWARD_PATTERN = /\x1b\[(\d*)C/g;
+// eslint-disable-next-line no-control-regex
 const CURSOR_POSITION_PATTERN = /\x1b\[(?:(\d+)(?:;(\d+))?)?[Hf]/g;
 
 /**
@@ -177,17 +199,23 @@ const CURSOR_POSITION_PATTERN = /\x1b\[(?:(\d+)(?:;(\d+))?)?[Hf]/g;
  * lines, strip ANSI, right-trim lines, drop trailing blanks, keep the last
  * MAX_CONTEXT_LINES lines.
  */
-export function normalizeCapturedFrame(raw: string | null | undefined): string | undefined {
+export function normalizeCapturedFrame(
+  raw: string | null | undefined,
+  limits: { maxLines: number; maxChars: number } = { maxLines: MAX_CONTEXT_LINES, maxChars: MAX_CONTEXT_CHARS }
+): string | undefined {
   if (!raw) return undefined;
-  const rowed = raw.replace(CURSOR_POSITION_PATTERN, (_m, _row, col) => (!col || col === '1' ? '\n' : ' '));
+  const rowed = raw
+    .replace(CHARACTER_SET_PATTERN, '')
+    .replace(CURSOR_FORWARD_PATTERN, (_m, count) => ' '.repeat(Math.min(256, Number(count || 1))))
+    .replace(CURSOR_POSITION_PATTERN, (_m, _row, col) => (!col || col === '1' ? '\n' : ' '));
   const lines = stripAnsi(rowed)
     .split('\n')
     .map((line) => line.replace(/\s+$/, ''));
   while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
   while (lines.length > 0 && lines[0] === '') lines.shift();
   if (lines.length === 0) return undefined;
-  const text = lines.slice(-MAX_CONTEXT_LINES).join('\n');
-  return text.length > MAX_CONTEXT_CHARS ? text.slice(-MAX_CONTEXT_CHARS) : text;
+  const text = lines.slice(-limits.maxLines).join('\n');
+  return text.length > limits.maxChars ? text.slice(-limits.maxChars) : text;
 }
 
 /**
@@ -284,12 +312,17 @@ export class ApprovalInbox {
       sessionId: args.sessionId,
       sessionName: args.sessionName,
       kind: args.kind,
+      mode: args.mode,
       createdAt: Date.now(),
+      sourceSequence: args.sourceSequence,
       toolName: args.toolName,
       toolSummary: args.toolSummary,
       message: args.message,
       cwd: args.cwd,
       ...(args.answerInTerminal ? { answerInTerminal: true } : {}),
+      ...(args.nativeQuestion
+        ? { nativeQuestion: args.nativeQuestion, options: args.nativeQuestion.dialog.choices }
+        : {}),
     };
     if (args.kind === 'idle' && (args.preAcknowledged || args.watching)) {
       item.acknowledgedAt = item.createdAt;
@@ -485,11 +518,30 @@ export class ApprovalInbox {
    * transition passes `['idle']` so a mid-turn flap cannot false-clear a
    * pending permission/question dialog.
    */
-  resolveForSession(sessionId: string, resolution: ApprovalResolution, kinds?: ApprovalKind[]): void {
+  resolveForSession(
+    sessionId: string,
+    resolution: ApprovalResolution,
+    kinds?: ApprovalKind[],
+    throughSourceSequence?: number
+  ): void {
     const item = this.items.get(sessionId);
     if (!item) return;
     if (kinds && !kinds.includes(item.kind)) return;
+    if (
+      throughSourceSequence !== undefined &&
+      item.sourceSequence !== undefined &&
+      item.sourceSequence > throughSourceSequence
+    ) {
+      return;
+    }
     this.remove(item, resolution);
+  }
+
+  /** Drop an ordering token that belongs to a replaced coordinator generation. */
+  resetSourceSequenceForSession(sessionId: string, kinds: ApprovalKind[]): void {
+    const item = this.items.get(sessionId);
+    if (!item || !kinds.includes(item.kind)) return;
+    delete item.sourceSequence;
   }
 
   /** Clear all timers (shutdown/tests). Items become inert; no events fire after this. */
@@ -553,7 +605,13 @@ export class ApprovalInbox {
     for (const timer of this.itemTimers.get(item.id) ?? []) clearTimeout(timer);
     this.itemTimers.delete(item.id);
     if (!this.stopped) {
-      this.onResolved?.({ id: item.id, sessionId: item.sessionId, kind: item.kind, resolution });
+      this.onResolved?.({
+        id: item.id,
+        sessionId: item.sessionId,
+        kind: item.kind,
+        resolution,
+        ...(item.sourceSequence !== undefined ? { sourceSequence: item.sourceSequence } : {}),
+      });
     }
   }
 
