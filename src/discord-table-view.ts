@@ -1,4 +1,4 @@
-/** Bounded, data-only Discord table views and exports. No HTML or external resources are evaluated. */
+/** @fileoverview Bounded, data-only Discord table views and exports. No HTML or external resources are evaluated. */
 import type { DiscordTable } from './discord-tables.js';
 
 export function interactiveDiscordTable(table: DiscordTable): boolean {

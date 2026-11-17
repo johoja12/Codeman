@@ -1,4 +1,4 @@
-/** One owned channel per case, one exact, durable starter-message thread per live session. */
+/** @fileoverview One owned channel per case, one exact, durable starter-message thread per live session. */
 import fs from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
