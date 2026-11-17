@@ -2,10 +2,10 @@ import { getCli } from './config/cli-registry/registry.js';
 /** Pure empty-composer proof shared by settings and queued follow-ups. */
 import { readGuardedComposer } from './agent-staging.js';
 import { stripAnsi } from './utils/regex-patterns.js';
-export function nativeModelComposerReady(mode: string, raw: string): boolean {
+function composerReady(mode: string, raw: string, statusOnly = false): boolean {
   const profile = getCli(mode)?.capabilities.nativeSettingsProfile;
   if (!profile) return false;
-  if (/\besc to interrupt\b/i.test(stripAnsi(raw).split('\n').slice(-12).join('\n'))) return false;
+  if (!statusOnly && /\besc to interrupt\b/i.test(stripAnsi(raw).split('\n').slice(-12).join('\n'))) return false;
   const rows = raw.split('\n');
   let composer = -1;
   for (let i = rows.length - 1; i >= 0; i--) {
@@ -41,4 +41,12 @@ export function nativeModelComposerReady(mode: string, raw: string): boolean {
           : /^\s*(?:.*\? for shortcuts.*|.*(?:bypass permissions|accept edits|plan mode|shift\+tab|ctrl\+t|context left).*|─+|(?:Fable|Opus|Sonnet|Haiku)\s+\d+(?:\.\d+)?(?:\s+\([^\n)]{1,40}\))?\s+in:[\d,]+\s+out:[\d,]+(?:\s+ctx:\d{1,3}%)?(?:\s+cache:[^\n]{0,40})?(?:\s+Not logged in · Run \/login)?)$/i,
     }) === ''
   );
+}
+
+export function nativeModelComposerReady(mode: string, raw: string): boolean {
+  return composerReady(mode, raw);
+}
+/** Only Codex /status is read-only and supported during an active task. Draft proof remains mandatory. */
+export function nativeCodexStatusComposerReady(mode: string, raw: string): boolean {
+  return getCli(mode)?.capabilities.nativeSettingsProfile === 'codex-tui' && composerReady(mode, raw, true);
 }

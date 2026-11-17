@@ -416,3 +416,36 @@ it('limits Claude question leases to arrows and Enter without admitting prompts,
     )
   ).rejects.toThrow('Only verified Claude');
 });
+
+it('admits only /status on a working Codex pane and preserves task prompt timestamps', async () => {
+  const h = harness({ lastSubmitAt: 123, lastRealPromptAt: 111 });
+  h.access._isWorking = true;
+  h.mux.capturePaneTextAsync.mockResolvedValue(
+    '• Working (2m • esc to interrupt)\n› \x1b[2mAsk Codex to do anything\x1b[22m\n  GPT-6.1-Sol · /work\n  ? for shortcuts'
+  );
+  await h.session.withNativeStatusRead(
+    async (lease) => {
+      for (const text of ['/model\r', 'task\r', '\x03', '\x1b']) expect(await lease.write(text)).toBe(false);
+      expect(await lease.write('/status\r')).toBe(true);
+      await lease.cancelMenu();
+    },
+    () => true
+  );
+  expect(h.written).toEqual(['/status\r']);
+  expect(h.session.lastSubmitAt).toBe(123);
+  expect(h.session.lastRealPromptAt).toBe(111);
+});
+it('will not write status over a busy pane draft', async () => {
+  const h = harness();
+  h.access._isWorking = true;
+  h.mux.capturePaneTextAsync.mockResolvedValue(
+    '• Working (2m • esc to interrupt)\n› draft\n  GPT-6.1-Sol · /work\n  ? for shortcuts'
+  );
+  await h.session.withNativeStatusRead(
+    async (lease) => {
+      expect(await lease.write('/status\r')).toBe(false);
+    },
+    () => true
+  );
+  expect(h.written).toEqual([]);
+});

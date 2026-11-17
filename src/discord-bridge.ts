@@ -1,3 +1,4 @@
+import { DiscordThreadMembers } from './discord-thread-members.js';
 import { DiscordProfiling } from './discord-profiling.js';
 import { DiscordHistoryWarnings } from './discord-history-warnings.js';
 /**
@@ -1082,6 +1083,7 @@ export class DiscordBridge {
   private readonly now: () => number;
   private readonly deliveries: DiscordDeliveryJournal;
   private readonly channels: DiscordCaseThreads;
+  private readonly threadMembers: DiscordThreadMembers;
   private readonly categories: DiscordCaseCategories;
   private readonly conversationProgress: DiscordConversationProgressStore;
   private readonly conversationRuns = new Map<string, Promise<void>>();
@@ -1322,6 +1324,16 @@ export class DiscordBridge {
         this.cfg.categoryId === scope.categoryId &&
         (!this.deps.sessions || this.deps.sessions().some((s) => s.id === id))
     );
+    this.threadMembers = new DiscordThreadMembers({
+      scope: () =>
+        !this.stopped && !this.held && this.cfg.enabled && this.cfg.mode === 'full' ? this.controlScope : undefined,
+      users: () => this.cfg.allowedUserIds,
+      current: (id, thread) => this.destinationMatches(id, thread) && !!this.deps.sessions?.().some((s) => s.id === id),
+      verify: async (id, thread) => !!(await this.channels.activityOwned(this.cfg, id, thread)),
+      add: (thread, user, current) =>
+        this.api.request('PUT', `/channels/${thread}/thread-members/${user}`, undefined, 0, current),
+      now: this.now,
+    });
     this.activity = new DiscordActivity({
       scope: () =>
         !this.stopped && !this.held && this.cfg.enabled && this.cfg.token ? this.destinationScope() : undefined,
@@ -1367,9 +1379,20 @@ export class DiscordBridge {
     const session = this.activitySessions().find((s) => s.id === id);
     return session ? this.activity.name({ ...session, name: name ?? session.name }) : name;
   }
-  /** Cosmetic status only: safe to call without a native transcript or a working agent. */
+  /** Refresh activity and reconcile configured membership independently of native history. */
   pollActivity(): Promise<void> {
-    return this.profiler.measure('poll.activity', () => this.activity.poll());
+    return this.profiler.measure('poll.activity', async () => {
+      try {
+        await this.activity.poll();
+      } finally {
+        if (this.cfg.mode === 'full' && !this.stopped && !this.held) {
+          for (const s of this.deps.sessions?.() ?? []) {
+            const thread = this.channels.channelForSession(this.cfg, s.id);
+            if (thread) await this.threadMembers.ensure(s.id, thread).catch(() => undefined);
+          }
+        }
+      }
+    });
   }
 
   async provisionCategory(config: DiscordConfig): Promise<string> {
@@ -2844,11 +2867,12 @@ export class DiscordBridge {
       const scope = this.destinationScope();
       return this.channels
         .forSession(this.cfg, sessionId, this.activityName(sessionId, name))
-        .then((id) =>
-          scope === this.destinationScope()
-            ? id
-            : this.fail(new BridgeProblem('Discord destination configuration changed'))
-        )
+        .then(async (id) => {
+          if (scope !== this.destinationScope())
+            return this.fail(new BridgeProblem('Discord destination configuration changed'));
+          await this.threadMembers.ensure(sessionId, id).catch(() => undefined);
+          return id;
+        })
         .catch((err) => this.fail(err));
     }
     const existing = this.threads[sessionId];

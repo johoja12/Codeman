@@ -118,3 +118,37 @@ it('rejects a local profile change before adopting status identity', async () =>
   await expect(readDiscordCanonicalHistory(session, {}, () => true)).rejects.toThrow('changed');
   expect(session.setNativeResumeId).not.toHaveBeenCalled();
 });
+
+it('automatically recovers a busy Codex pane with only a guarded status read', async () => {
+  Object.assign(session, { isWorking: true, withNativeStatusRead: session.withNativeModelSettings });
+  screen = '• Working (2m • esc to interrupt)\n' + composer;
+  expect(await readDiscordCanonicalHistory(session, {}, () => allowed)).toEqual(history);
+  expect(write).toHaveBeenCalledExactlyOnceWith('/status\r');
+  expect(session.setNativeResumeId).toHaveBeenCalledWith(id);
+});
+it('uses an already displayed native status without typing another command', async () => {
+  Object.assign(session, { isWorking: true, withNativeStatusRead: session.withNativeModelSettings });
+  screen =
+    '/status\nModel: GPT-6.1-Sol (reasoning medium)\nSession: ' +
+    id +
+    '\n• Working (2m • esc to interrupt)\n' +
+    composer;
+  expect(await readDiscordCanonicalHistory(session, {}, () => allowed)).toEqual(history);
+  expect(write).not.toHaveBeenCalled();
+});
+it('leaves a draft untouched while automatically checking a busy session', async () => {
+  Object.assign(session, { isWorking: true, withNativeStatusRead: session.withNativeModelSettings });
+  screen = '• Working (2m • esc to interrupt)\n› my draft\n  GPT-6.1-Sol · /work\n  ? for shortcuts';
+  await expect(readDiscordCanonicalHistory(session, {}, () => allowed)).rejects.toThrow();
+  expect(write).not.toHaveBeenCalled();
+});
+it('refuses an identity that changes on the final native capture', async () => {
+  Object.assign(session, { withNativeStatusRead: session.withNativeModelSettings });
+  vi.mocked(readDiscordSessionHistory).mockImplementation(async (_s, _o, recovered) => {
+    if (!recovered) throw new Error('identity unavailable');
+    screen = screen.replace(id, 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa');
+    return history;
+  });
+  await expect(readDiscordCanonicalHistory(session, {}, () => allowed)).rejects.toThrow('changed');
+  expect(session.setNativeResumeId).not.toHaveBeenCalled();
+});

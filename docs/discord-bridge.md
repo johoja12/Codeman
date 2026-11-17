@@ -258,6 +258,12 @@ Full-mode startup, manual synchronization and a periodic sweep reconcile tracked
 
 Pinned session cards and Settings can show the last model and effort reported by native Codex `turn_context` metadata. These values are scoped to the exact conversation and CLI format, labelled **last reported**, and do not override current native observations. Local managed Codex panes use the attached process's verified profile directory, including custom-command `CODEX_HOME`, rather than assuming the web service's default. The process is rechecked after reading; ambiguous or changed profiles fail closed. No model command or task input is sent to obtain this metadata.
 
+### Automatic identity and thread membership reconciliation
+
+The bridge retries missing native Codex conversation identities automatically. A dedicated input lease permits only the CLI-local `/status` read, including during an active task, after verifying an empty composer. It never submits a task, changes a model, clears a draft, interrupts work or starts a replacement agent. An already visible status is read without another command. The exact transcript and a second native capture must confirm the same conversation before its ID is persisted. Drafts, revoked access, changed profiles and permission dialogs defer recovery; background checks retry later.
+
+In Full mode, configured allowed users are added to verified live session threads after creation and during reconciliation, including existing threads after restart. Requests use idempotent thread-member PUTs, bounded caching and retry backoff. Archived, locked, foreign and removed-session destinations are skipped; membership failures do not recreate threads, remove members, or replay input. Notification-only behavior is unchanged.
+
 ## Live status and recovery controls
 
 Discord distinguishes **Agent exited — recovery needed**, **Connection lost**, and **Connection unverified** from Idle. A dead local SSH client does not prove the remote agent has exited. Read-only checks verify the remote pane and supported native conversation/profile; slow or failed probes keep an unverified state. Background checks never launch a CLI or replay a task, and remote transport failures remain separate from the local clean-exit sweep.
