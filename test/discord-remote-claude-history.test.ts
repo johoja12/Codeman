@@ -88,3 +88,22 @@ it('persists a verified resume without inventing a hook or accepting a foreign p
   s.adoptClaudeSessionStartId(local);
   expect(s.adoptVerifiedRemoteClaudeResumeId(id)).toBe(false);
 });
+
+it.each(['keyboard input', 'terminal resize'])('preserves a verified Claude transcript during %s', async () => {
+  const f = fixture(id, true);
+  Object.assign(f.s, { inspectionGeneration: 'pane-owner-1', nativeModelSettingsRevision: 'input-geometry-1' });
+  f.read.mockImplementation(async () => {
+    Object.assign(f.s, { nativeModelSettingsRevision: 'input-geometry-2' });
+    return Buffer.from(
+      JSON.stringify({
+        offset: 0,
+        partial: false,
+        data: Buffer.from(
+          JSON.stringify({ type: 'user', sessionId: id, message: { content: 'fixture' } }) + '\n'
+        ).toString('base64'),
+      })
+    );
+  });
+  await expect(f.run()).resolves.toHaveProperty('conversationId', id);
+  expect(f.s.adoptVerifiedRemoteClaudeResumeId).not.toHaveBeenCalled();
+});
