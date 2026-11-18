@@ -2088,3 +2088,33 @@ it('shows Codex native last-reported settings in its pinned card and settings vi
   await f.ui.poll();
   expect(f.findCard().content).toContain('gpt-other (native verified)');
 });
+
+it.each([
+  ['worker_unreachable', 'Worker unreachable', 'network'],
+  ['ssh_auth_failed', 'SSH authentication failed', 'SSH user and key'],
+  ['ssh_host_key', 'SSH trust changed', 'host key'],
+  ['conversation_unverified', 'Conversation unverified', 'conversation or profile'],
+] as const)(
+  'explains %s in both the recovery card and Activity view without enabling resume',
+  async (reason, label, detail) => {
+    const f = await fixture();
+    Object.assign(f.sessions[0], {
+      exited: true,
+      working: false,
+      ready: false,
+      connection: { state: 'unverified', reason },
+      caseKey: 'case-one',
+    });
+    f.host.services.recover = vi.fn(async () => true);
+    await f.ui.poll();
+    const card = [...f.messages.values()].find((m) => m.content?.includes(label))!;
+    expect(card).toBeDefined();
+    expect(card.content).toContain(detail);
+    const labels = discordUiNodes(card.components).map((c) => c.label);
+    expect(labels).not.toContain('Resume conversation');
+    expect(labels).not.toContain('Reconnect');
+    if (reason !== 'conversation_unverified') expect(labels).not.toContain('Start new session');
+    expect(JSON.stringify(await f.command('codeman'))).toContain(label);
+    expect(f.host.services.recover).not.toHaveBeenCalled();
+  }
+);

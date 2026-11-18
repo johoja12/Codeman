@@ -68,7 +68,7 @@ it('rejects a result whose pinned conversation changes during the read', async (
       return { alive: false, agentRunning: false };
     },
   });
-  expect(await health.check(s, true)).toEqual({ state: 'unverified' });
+  expect(await health.check(s, true)).toEqual({ state: 'unverified', reason: 'session_changing' });
 });
 it('keeps local exits separate from Docker connection failures and rejects unreadable panes', async () => {
   const local = session(false);
@@ -101,7 +101,7 @@ it('keeps a living agent unverified when its pinned conversation/profile cannot 
     remote: async () => ({ alive: true, agentRunning: true }),
     verify: async () => false,
   });
-  expect(await health.check(session(), true)).toEqual({ state: 'unverified' });
+  expect(await health.check(session(), true)).toEqual({ state: 'unverified', reason: 'conversation_unverified' });
 });
 it('coalesces concurrent checks and keeps background polls responsive during a slow host read', async () => {
   let release!: (value: { alive: boolean; agentRunning: boolean }) => void;
@@ -139,6 +139,47 @@ it('keeps a repeatedly failing verification unverified after a bounded retry', a
     remote: async () => ({ alive: true, agentRunning: true }),
     verify,
   });
-  expect(await health.check(session(), true)).toEqual({ state: 'unverified' });
+  expect(await health.check(session(), true)).toEqual({ state: 'unverified', reason: 'conversation_unverified' });
   expect(verify).toHaveBeenCalledTimes(2);
+});
+
+it.each([
+  ['unreachable', 'worker_unreachable'],
+  ['authentication', 'ssh_auth_failed'],
+  ['host_key', 'ssh_host_key'],
+  ['probe_failed', 'worker_check_failed'],
+] as const)('keeps remote %s distinct and automatically clears it on recovery', async (failure, reason) => {
+  const s = session();
+  const remoteProbe = vi.fn().mockResolvedValue({ failure });
+  const verify = vi.fn(async () => true);
+  const health = new DiscordSessionHealth({ paneExited: () => false, local: async () => 'alive', remoteProbe, verify });
+  expect(await health.check(s, true)).toEqual({ state: 'unverified', reason });
+  expect(health.peek(s)).toEqual({ state: 'unverified', reason });
+  expect(verify).not.toHaveBeenCalled();
+  remoteProbe.mockResolvedValue({ observation: { alive: true, agentRunning: true } });
+  expect(await health.check(s, true)).toEqual({ state: 'available' });
+  expect(verify).toHaveBeenCalledOnce();
+});
+it('does not claim a worker is unreachable when the probe throws without network evidence', async () => {
+  const health = new DiscordSessionHealth({
+    paneExited: () => false,
+    local: async () => 'alive',
+    remoteProbe: async () => {
+      throw new Error('unexpected');
+    },
+  });
+  expect(await health.check(session(), true)).toEqual({ state: 'unverified', reason: 'worker_check_failed' });
+});
+it('keeps an unreadable local pane distinct from an unverified conversation', async () => {
+  const health = new DiscordSessionHealth({ paneExited: () => false, local: async () => 'unknown' });
+  expect(await health.check(session(false), true)).toEqual({ state: 'unverified', reason: 'pane_unverified' });
+});
+
+it('does not call an unreadable SSH attachment disconnected while its worker is alive', async () => {
+  const health = new DiscordSessionHealth({
+    paneExited: () => false,
+    local: async () => 'unknown',
+    remoteProbe: async () => ({ observation: { alive: true, agentRunning: true } }),
+  });
+  expect(await health.check(session(), true)).toEqual({ state: 'unverified', reason: 'pane_unverified' });
 });

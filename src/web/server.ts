@@ -1,3 +1,4 @@
+import { discordConnectionLabel, discordConnectionDetail } from '../discord-connection-status.js';
 import { probeRemoteDiscordConversation } from '../discord-remote-conversation.js';
 import { DiscordSessionHealth } from './discord-session-health.js';
 import { createDiscordNativeUiServices } from './discord-native-ui-services.js';
@@ -1005,6 +1006,7 @@ export class WebServer extends EventEmitter {
         .filter((session) => !session.suppressNotifications && !session.isAdopted)
         .map((session) => ({
           connection: this.discordHealth.peek(session).state,
+          connectionReason: this.discordHealth.peek(session).reason,
           id: session.id,
           name: session.name,
           remote: !!session.remote,
@@ -1041,7 +1043,7 @@ export class WebServer extends EventEmitter {
         const health = await this.discordHealth.check(session, true);
         if (health.state !== 'available')
           return {
-            text: `**${session.name || session.id}** · ${health.state.replaceAll('_', ' ')}\nRecovery or connection verification is needed. Use the session card for guarded recovery options; unconfirmed input is not replayed.`,
+            text: `**${session.name || session.id}** · ${discordConnectionLabel(health)}\n${discordConnectionDetail(health)}\nUnconfirmed input is not replayed.`,
           };
       }
       return (

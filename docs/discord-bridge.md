@@ -439,3 +439,23 @@ For bottleneck triage, compare `history.remote` p95 and active reads with due
 session counts, inspect Discord 429/5xx counters, and compare UI polling/control
 wall times with the sampled CPU hotspots. An idle bridge profile can legitimately
 contain zero bridge CPU or allocation samples.
+
+
+## Connection status distinctions
+
+Thread titles, the Activity view, session cards and status replies use the same health reason:
+
+| Status | Meaning / next step |
+| --- | --- |
+| Worker unreachable | SSH cannot reach the worker. Check power, network or its configured address. |
+| SSH authentication failed | The worker rejected SSH authentication. Check the configured user and key. |
+| SSH trust changed | SSH rejected the worker identity. Verify its host key before reconnecting. |
+| Worker check failed | No valid worker observation was obtained; this does not prove an exit or network failure. |
+| Terminal disconnected | The terminal attachment is lost. Use Reconnect when offered. |
+| Agent exited | The agent stopped. Exact-conversation recovery is offered only when verified safe. |
+| Conversation unverified | The terminal is reachable, but its exact conversation/profile is not verified. |
+| Terminal check failed | The local pane cannot be inspected; an agent exit has not been established. |
+| Session updating | A launch, reconnect or identity change raced the check; verification will retry. |
+| Status check failed | An unexpected check failed without a more specific diagnosis. |
+
+Network, authentication and trust failures do not offer a new session or automatic resume. Cards retain Refresh status and Open in Codeman where available. Verification retries automatically; corrected conditions clear the reason on a successful check. A status refresh never resends input or weakens exact-conversation checks. Raw SSH errors and credentials are never displayed.
