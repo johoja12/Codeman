@@ -541,17 +541,43 @@ export function parseRemoteWorkerObservation(stdout: string): RemoteWorkerObserv
   return { alive: status !== 'GONE', agentRunning: status === 'ALIVE 0', bootId };
 }
 
+export type RemoteWorkerProbeFailure = 'unreachable' | 'authentication' | 'host_key' | 'probe_failed';
+export interface RemoteWorkerProbeResult {
+  observation?: RemoteWorkerObservation;
+  failure?: RemoteWorkerProbeFailure;
+}
+/** Whitelisted SSH failure categories only; raw stderr must never reach a status card. */
+export function classifyRemoteWorkerProbeFailure(error: unknown): RemoteWorkerProbeFailure {
+  if ((error as { code?: unknown } | null)?.code !== 255) return 'probe_failed';
+  const stderr = String((error as { stderr?: unknown } | null)?.stderr ?? '').slice(0, 65536);
+  if (/host key verification failed|remote host identification has changed/i.test(stderr)) return 'host_key';
+  if (/permission denied|authentication failed|too many authentication failures/i.test(stderr)) return 'authentication';
+  if (
+    /no route to host|network is unreachable|connection refused|connection timed out|operation timed out|could not resolve hostname/i.test(
+      stderr
+    )
+  )
+    return 'unreachable';
+  return 'probe_failed';
+}
+export async function probeRemoteWorkerDetailed(
+  remote: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions & Pick<SessionRemote, 'owned'>,
+  remoteSessionName: string
+): Promise<RemoteWorkerProbeResult> {
+  if (process.env.VITEST) return { observation: { alive: true, agentRunning: true } };
+  try {
+    const { stdout } = await execAsync(buildRemoteWorkerProbeCommand(remote, remoteSessionName), { timeout: 15_000 });
+    const observation = parseRemoteWorkerObservation(stdout);
+    return observation ? { observation } : { failure: 'probe_failed' };
+  } catch (error) {
+    return { failure: classifyRemoteWorkerProbeFailure(error) };
+  }
+}
 export async function probeRemoteWorker(
   remote: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions & Pick<SessionRemote, 'owned'>,
   remoteSessionName: string
 ): Promise<RemoteWorkerObservation | undefined> {
-  if (process.env.VITEST) return { alive: true, agentRunning: true };
-  try {
-    const { stdout } = await execAsync(buildRemoteWorkerProbeCommand(remote, remoteSessionName), { timeout: 15_000 });
-    return parseRemoteWorkerObservation(stdout);
-  } catch {
-    return undefined;
-  }
+  return (await probeRemoteWorkerDetailed(remote, remoteSessionName)).observation;
 }
 
 /**

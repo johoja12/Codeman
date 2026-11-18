@@ -2,7 +2,11 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolveTmuxSocketName } from '../config/instance.js';
-import { probeRemoteWorker, type RemoteWorkerObservation } from '../remote-hosts.js';
+import {
+  probeRemoteWorkerDetailed,
+  type RemoteWorkerObservation,
+  type RemoteWorkerProbeResult,
+} from '../remote-hosts.js';
 import { workerResumeOptions } from '../remote-worker-recovery.js';
 import type { Session } from '../session.js';
 import type { DiscordConnection } from '../discord-native-ui-types.js';
@@ -25,6 +29,7 @@ interface Deps {
   paneExited(name: string): boolean;
   local?(name: string): Promise<PaneLiveness>;
   remote?(session: Session): Promise<RemoteWorkerObservation | undefined>;
+  remoteProbe?(session: Session): Promise<RemoteWorkerProbeResult>;
   verify?(session: Session): Promise<boolean>;
   now?(): number;
 }
@@ -47,7 +52,7 @@ export class DiscordSessionHealth {
     this.cache.delete(s);
   }
   peek(s: Session): DiscordConnection {
-    if (s.paneLifecycleInFlight) return { state: 'unverified' };
+    if (s.paneLifecycleInFlight) return { state: 'unverified', reason: 'session_changing' };
     const saved = this.cache.get(s);
     if (saved?.key === this.key(s)) return saved.value;
     if (s.paneExit) return { state: 'agent_exited' };
@@ -58,7 +63,7 @@ export class DiscordSessionHealth {
     const pending = this.checking.get(s);
     if (pending) return fresh ? pending : Promise.resolve(this.peek(s));
     const run = this.checkNow(s, fresh)
-      .catch(() => ({ state: 'unverified' as const }))
+      .catch(() => ({ state: 'unverified' as const, reason: 'check_failed' as const }))
       .finally(() => {
         if (this.checking.get(s) === run) this.checking.delete(s);
       });
@@ -85,14 +90,28 @@ export class DiscordSessionHealth {
           }
         })();
     let value: DiscordConnection;
-    if (s.paneLifecycleInFlight) value = { state: 'unverified' };
+    if (s.paneLifecycleInFlight) value = { state: 'unverified', reason: 'session_changing' };
     else if (s.remote) {
-      const remote = await (
-        this.deps.remote
-          ? this.deps.remote(s)
-          : probeRemoteWorker(s.remote, s.remote.remoteSessionName ?? `codeman-ssh-${s.id.slice(0, 8)}`)
-      ).catch(() => undefined);
-      if (!remote) value = { state: 'unverified' };
+      const probe = (await (
+        this.deps.remoteProbe
+          ? this.deps.remoteProbe(s)
+          : this.deps.remote
+            ? this.deps.remote(s).then((observation) => ({ observation }))
+            : probeRemoteWorkerDetailed(s.remote, s.remote.remoteSessionName ?? `codeman-ssh-${s.id.slice(0, 8)}`)
+      ).catch(() => ({ failure: 'probe_failed' as const }))) as RemoteWorkerProbeResult;
+      const remote = probe.observation;
+      if (!remote)
+        value = {
+          state: 'unverified',
+          reason:
+            probe.failure === 'unreachable'
+              ? 'worker_unreachable'
+              : probe.failure === 'authentication'
+                ? 'ssh_auth_failed'
+                : probe.failure === 'host_key'
+                  ? 'ssh_host_key'
+                  : 'worker_check_failed',
+        };
       else if (!remote.alive || remote.agentRunning === false) {
         const state = s.toState();
         const pinned = workerResumeOptions(
@@ -109,7 +128,19 @@ export class DiscordSessionHealth {
         value = { state: 'agent_exited', canResume: !remote.alive && local === 'dead' && !!pinned && !s.isAdopted };
       } else
         value = {
-          state: remote.agentRunning !== true ? 'unverified' : local === 'alive' ? 'available' : 'connection_lost',
+          state:
+            remote.agentRunning !== true
+              ? 'unverified'
+              : local === 'alive'
+                ? 'available'
+                : local === 'dead'
+                  ? 'connection_lost'
+                  : 'unverified',
+          ...(remote.agentRunning !== true
+            ? { reason: 'worker_check_failed' as const }
+            : local === 'unknown'
+              ? { reason: 'pane_unverified' as const }
+              : {}),
         };
     } else
       value = {
@@ -121,6 +152,7 @@ export class DiscordSessionHealth {
             : local === 'alive'
               ? 'available'
               : 'unverified',
+        ...(local === 'unknown' ? { reason: 'pane_unverified' as const } : {}),
       };
     if (value.state === 'available' && this.deps.verify) {
       // A history read can race fresh input or a transient transport error. Require a fresh
@@ -128,11 +160,11 @@ export class DiscordSessionHealth {
       let verified = false;
       for (let attempt = 0; attempt < 2 && !verified; attempt++) {
         verified = await this.deps.verify(s).catch(() => false);
-        if (key !== this.key(s)) return { state: 'unverified' };
+        if (key !== this.key(s)) return { state: 'unverified', reason: 'session_changing' };
       }
-      if (!verified) value = { state: 'unverified' };
+      if (!verified) value = { state: 'unverified', reason: 'conversation_unverified' };
     }
-    if (key !== this.key(s)) return { state: 'unverified' };
+    if (key !== this.key(s)) return { state: 'unverified', reason: 'session_changing' };
     this.cache.set(s, { key, at: this.deps.now?.() ?? Date.now(), value });
     return value;
   }

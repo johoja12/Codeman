@@ -1,3 +1,4 @@
+import { discordConnectionLabel, discordConnectionDetail } from './discord-connection-status.js';
 import { getCli } from './config/cli-registry/registry.js';
 /** Native Discord controls. Tokens bind actor, origin, configuration and exact conversation. */
 import { createHash, randomUUID } from 'node:crypto';
@@ -374,7 +375,7 @@ export class DiscordNativeUi {
           )
         );
     }
-    if (s.caseKey)
+    if (s.caseKey && !['worker_unreachable', 'ssh_auth_failed', 'ssh_host_key'].includes(s.connection?.reason ?? ''))
       buttons.push(
         action('Start new session', async (m) => {
           if (!current(m)()) throw new Error('Recovery context changed');
@@ -393,12 +394,12 @@ export class DiscordNativeUi {
         })
       );
     if (s.url && /^https?:\/\//.test(s.url)) buttons.push({ type: 2, style: 5, label: 'Open in Codeman', url: s.url });
+    const health = s.connection ?? { state: connection };
     const status =
-      connection === 'agent_exited'
-        ? '🔴 Agent exited — recovery needed'
-        : connection === 'connection_lost'
-          ? '🔴 Connection lost — reconnect needed'
-          : '🔴 Connection unverified — inspect in Codeman';
+      discordConnectionLabel(health) +
+      (connection === 'agent_exited' ? ' — recovery needed' : '') +
+      '\n' +
+      discordConnectionDetail(health);
     const unconfirmed =
       receipt &&
       !receipt.confirmed &&
@@ -2173,11 +2174,7 @@ export class DiscordNativeUi {
       const label = s.pending
         ? 'Needs your answer'
         : s.exited
-          ? s.connection?.state === 'connection_lost'
-            ? 'Connection lost — reconnect needed'
-            : s.connection?.state === 'unverified'
-              ? 'Connection unverified'
-              : 'Agent exited — recovery needed'
+          ? discordConnectionLabel(s.connection ?? { state: 'agent_exited' })
           : activity
             ? activity.kind === 'question'
               ? 'Question resolved'

@@ -10,6 +10,15 @@ import type { DisplayModelSource } from './types/session.js';
 import type { DiscordHistory } from './discord-history.js';
 export interface DiscordConnection {
   state: 'available' | 'agent_exited' | 'connection_lost' | 'unverified';
+  reason?:
+    | 'worker_unreachable'
+    | 'ssh_auth_failed'
+    | 'ssh_host_key'
+    | 'worker_check_failed'
+    | 'conversation_unverified'
+    | 'pane_unverified'
+    | 'session_changing'
+    | 'check_failed';
   canResume?: boolean;
 }
 export interface DiscordUiSession {
