@@ -157,3 +157,30 @@ it('silences every update chunk and only allows the first final chunk to notify'
   expect(final[0].flags! & DISCORD_SUPPRESS_NOTIFICATIONS).toBe(0);
   expect(final.slice(1).every((p) => !!(p.flags! & DISCORD_SUPPRESS_NOTIFICATIONS))).toBe(true);
 });
+
+it('renders local source citations as labels with literal paths in actual response cards', () => {
+  const path = '/mnt/syncthing/projects/thirdculturecoffee/branch_demand_order/models/demand_order.py:572';
+  const text = `This is verified from [the current source](${path}); I haven’t checked a specific production BDO.`;
+  const expected = `This is verified from the current source (\`${path}\`); I haven’t checked a specific production BDO.`;
+  expect(formatDiscordResponseText(text)).toBe(expected);
+  expect(body(discordResponsePosts(text)[0])).toContain(expected);
+});
+
+it('preserves web links, images, code and unsafe destinations while formatting local references', () => {
+  const unchanged = [
+    '[Docs](https://example.com/a_b.py:572)',
+    '[Network](//example.com/file.py)',
+    '![Image](/work/output.png)',
+    '[Bad](javascript:alert)',
+    '[Download report](/work/report.pdf)',
+    '\\[Literal](/work/source.py:12)',
+    '\`[Example](/work/source_file.py:1)\`',
+    '```md\n[Example](/work/source_file.py:1)\n```',
+    '    [Example](/work/source_file.py:1)',
+  ];
+  for (const text of unchanged) expect(formatDiscordResponseText(text)).toBe(text);
+  expect(formatDiscordResponseText('[File](<./folder/source file.py:12>)')).toBe(
+    'File (\`./folder/source file.py:12\`)'
+  );
+  expect(formatDiscordResponseText('[File](src/source_file.ts:12)')).toBe('File (\`src/source_file.ts:12\`)');
+});
