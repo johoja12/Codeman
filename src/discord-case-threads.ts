@@ -47,6 +47,7 @@ interface State {
   entries: Record<string, Entry>;
   current: Record<string, string>;
   deleted: Record<string, Policy>;
+  caseDeletes: Record<string, DiscordChannelScope & { caseKey: string }>;
 }
 const snow = (v: unknown): v is string => typeof v === 'string' && /^\d{15,25}$/.test(v);
 const scopeKey = (s: DiscordChannelScope, id: string) => JSON.stringify([s.guildId, s.categoryId, id]);
@@ -64,11 +65,12 @@ const slug = (name: string | undefined) =>
     .replace(/^-+|-+$/g, '')
     .slice(0, 100) || 'case';
 export class DiscordCaseThreads {
-  private state: State = { instance: randomUUID(), entries: {}, current: {}, deleted: {} };
+  private state: State = { instance: randomUUID(), entries: {}, current: {}, deleted: {}, caseDeletes: {} };
   private loaded?: Promise<void>;
   private writes: Promise<unknown> = Promise.resolve();
   private pending = new Map<string, Promise<string>>();
   private retirement?: Promise<void>;
+  private caseRetirement?: Promise<void>;
   private me?: Promise<string>;
   private readonly parents: DiscordSessionChannels;
   constructor(
@@ -107,12 +109,17 @@ export class DiscordCaseThreads {
         const info = await fs.lstat(path);
         if (!info.isFile() || info.isSymbolicLink() || info.size > 4 * 1024 * 1024) throw new Error();
         const raw = JSON.parse(await fs.readFile(path, 'utf8')) as State;
+        if (raw && raw.caseDeletes === undefined) raw.caseDeletes = {};
         if (
           !raw ||
           !/^[a-f0-9-]{36}$/.test(raw.instance) ||
           !raw.entries ||
           !raw.current ||
           !raw.deleted ||
+          !raw.caseDeletes ||
+          typeof raw.caseDeletes !== 'object' ||
+          Array.isArray(raw.caseDeletes) ||
+          Object.keys(raw.caseDeletes).length > 4096 ||
           typeof raw.entries !== 'object' ||
           Array.isArray(raw.entries) ||
           typeof raw.current !== 'object' ||
@@ -152,6 +159,15 @@ export class DiscordCaseThreads {
         }
         for (const [id, policy] of Object.entries(raw.deleted))
           if (!id || id.length > 100 || !['keep', 'archive', 'delete'].includes(policy)) throw new Error();
+        for (const [key, value] of Object.entries(raw.caseDeletes))
+          if (
+            !value ||
+            !snow(value.guildId) ||
+            !snow(value.categoryId) ||
+            !/^[a-f0-9]{64}$/.test(value.caseKey) ||
+            key !== scopeKey(value, value.caseKey)
+          )
+            throw new Error('Invalid case deletion intent');
         this.state = raw;
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'ENOENT')
@@ -167,6 +183,7 @@ export class DiscordCaseThreads {
       if (
         Object.keys(next.entries).length > 4096 ||
         Object.keys(next.current).length > 4096 ||
+        Object.keys(next.caseDeletes).length > 4096 ||
         Object.keys(next.deleted).length > 4096
       )
         throw new DiscordChannelProblem('Case/thread ownership registry is full');
@@ -281,6 +298,71 @@ export class DiscordCaseThreads {
     return this.active(this.state.entries[key], key) && !t.thread_metadata?.archived && !t.thread_metadata?.locked
       ? { name: t.name ?? '' }
       : false;
+  }
+  async requestCaseDeletion(scope: DiscordChannelScope, caseKey: string): Promise<void> {
+    if (!/^[a-f0-9]{64}$/.test(caseKey)) throw new DiscordChannelProblem('Invalid deleted case identity');
+    await this.edit((s) => {
+      s.caseDeletes[scopeKey(scope, caseKey)] = { ...scope, caseKey };
+    });
+  }
+  async hasCaseDeletions(): Promise<boolean> {
+    await this.load();
+    return Object.keys(this.state.caseDeletes).length > 0;
+  }
+  /** Only durable explicit deletion intents authorize parent cleanup, never missing discovery rows. */
+  flushCaseDeletions(
+    scope: DiscordChannelScope,
+    configured: ReadonlySet<string>,
+    protectedCases: ReadonlySet<string>,
+    liveIds: () => ReadonlySet<string>,
+    current: () => boolean
+  ): Promise<void> {
+    if (this.caseRetirement) return this.caseRetirement;
+    const run = (async () => {
+      await this.load();
+      let failure: unknown;
+      for (const [key, e] of Object.entries(this.state.caseDeletes)
+        .filter(([, e]) => e.guildId === scope.guildId && e.categoryId === scope.categoryId)
+        .slice(0, 25)) {
+        try {
+          if (!current()) return;
+          if (configured.has(e.caseKey)) {
+            await this.edit((s) => {
+              delete s.caseDeletes[key];
+            });
+            continue;
+          }
+          const allowed = () =>
+            current() &&
+            this.pending.size === 0 &&
+            !protectedCases.has(e.caseKey) &&
+            !Object.values(this.state.entries).some(
+              (t) =>
+                t.guildId === scope.guildId &&
+                t.categoryId === scope.categoryId &&
+                t.caseKey === e.caseKey &&
+                liveIds().has(t.sessionId)
+            );
+          if (!allowed()) continue;
+          if (!(await this.parents.removeOwnedCase(scope, e.caseKey, allowed))) continue;
+          if (!current()) return;
+          await this.edit((s) => {
+            if (!current()) return;
+            delete s.caseDeletes[key];
+            for (const t of Object.values(s.entries))
+              if (t.guildId === scope.guildId && t.categoryId === scope.categoryId && t.caseKey === e.caseKey)
+                t.phase = 'deleted';
+          });
+        } catch (error) {
+          failure ??= error;
+        }
+      }
+      if (failure) throw failure;
+    })().finally(() => {
+      if (this.caseRetirement === run) this.caseRetirement = undefined;
+    });
+    this.caseRetirement = run;
+    return run;
   }
   /** Creates only the owned parent channel; no session, starter message or thread. */
   async forCase(

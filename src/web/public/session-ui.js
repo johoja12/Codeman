@@ -6932,7 +6932,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   async deleteCase(name) {
-    if (!confirm(`Delete case "${name}"? Linked cases will only be unlinked (folder preserved). Created cases will be permanently deleted.`)) {
+    if (!confirm(`Delete case "${name}"? Linked cases will only be unlinked (folder preserved). Created cases will be permanently deleted. Any owned Discord case channel and its history will also be deleted after its session tabs are closed.`)) {
       return;
     }
 
@@ -7200,7 +7200,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   async deleteCaseMobile(name) {
-    if (!confirm(`Delete case "${name}"?`)) return;
+    if (!confirm(`Delete case "${name}"? Any owned Discord case channel and its history will also be deleted after its session tabs are closed.`)) return;
     try {
       const res = await fetch(`/api/cases/${encodeURIComponent(name)}`, { method: 'DELETE' });
       const data = await res.json();

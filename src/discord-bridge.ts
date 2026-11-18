@@ -1061,6 +1061,7 @@ export class DiscordBridge {
   private syncRun?: Promise<DiscordSessionSync>;
   private caseSyncRun?: Promise<void>;
   private caseSyncQueued = false;
+  private caseSyncRevision = 0;
   private syncQueued = false;
   private syncState: DiscordSessionSync = { state: 'idle', total: 0, ready: 0, failed: 0 };
   private stopped = false;
@@ -1463,6 +1464,7 @@ export class DiscordBridge {
 
   /** Synchronize saved case parents without creating agents, starters or session threads. */
   syncCases(): Promise<void> {
+    const revision = ++this.caseSyncRevision;
     if (this.caseSyncRun) {
       this.caseSyncQueued = true;
       return this.caseSyncRun;
@@ -1477,7 +1479,8 @@ export class DiscordBridge {
         !this.held &&
         this.acceptsControls &&
         this.deps.nativeUi?.enabled() === true &&
-        binding === this.controlScope;
+        binding === this.controlScope &&
+        revision === this.caseSyncRevision;
       const cases = (await this.deps.nativeUi?.caseChannels?.()) ?? [];
       const unique = new Map(cases.map((c) => [c.key, c]));
       let failure: unknown;
@@ -1491,6 +1494,26 @@ export class DiscordBridge {
         }
       }
       if (failure) throw failure;
+      const sessions = this.deps.sessions?.() ?? [];
+      if (sessions.length && !this.deps.caseForSession) return;
+      const activeCases = await Promise.all(sessions.map((s) => this.deps.caseForSession?.(s.id)));
+      const sessionSnapshot = sessions
+        .map((s) => s.id)
+        .sort()
+        .join('\n');
+      const deletionCurrent = () =>
+        current() &&
+        (this.deps.sessions?.() ?? [])
+          .map((s) => s.id)
+          .sort()
+          .join('\n') === sessionSnapshot;
+      await this.channels.flushCaseDeletions(
+        scope,
+        new Set(unique.keys()),
+        new Set(activeCases.flatMap((c) => (c ? [c.key] : []))),
+        () => new Set((this.deps.sessions?.() ?? []).map((s) => s.id)),
+        deletionCurrent
+      );
     })().finally(() => {
       if (this.caseSyncRun === run) {
         this.caseSyncRun = undefined;
@@ -1504,6 +1527,12 @@ export class DiscordBridge {
     return run;
   }
 
+  async caseDeleted(caseKey: string): Promise<void> {
+    await this.ensureLoaded();
+    if (!this.acceptsControls || !this.deps.nativeUi?.enabled() || this.stopped || this.held) return;
+    await this.channels.requestCaseDeletion(this.cfg, caseKey);
+    await this.syncCases();
+  }
   /** Full-mode discovery is bounded to the current session snapshot, without replaying any prompts. */
   syncSessions(): Promise<DiscordSessionSync> {
     if (this.syncRun) return this.syncRun;
@@ -2592,8 +2621,10 @@ export class DiscordBridge {
     try {
       await this.ensureLoaded();
       const c = this.cfg;
-      if (c.mode === 'full')
+      if (c.mode === 'full') {
+        if (await this.channels.hasCaseDeletions()) await this.syncCases();
         return this.deps.retainedSessionIds ? await this.reconcileSessionThreads(this.deps.retainedSessionIds) : 0;
+      }
       if (c.staleThreads === 'keep' || !c.enabled || !c.token || !c.guildId || !c.parentChannelId) return 0;
       if (Object.keys(this.threads).length === 0 || this.pending.size > 0) return 0;
       const me = (await this.api.botUserId())?.id;

@@ -1,3 +1,4 @@
+import { configuredDiscordCaseChannel } from '../../discord-case-identity.js';
 /**
  * @fileoverview Case management routes.
  * Handles CRUD for cases (directories under ~/codeman-cases and linked folders),
@@ -2429,12 +2430,25 @@ export function registerCaseRoutes(
     const remoteCases = await readRemoteCases(CODEMAN_CONFIG_DIR);
     const remoteCase = remoteCases.find((item) => item.name === name && canAccessOwned(user, item.owner));
     if (remoteCase) {
+      const discordHost = (await readRemoteHosts(CODEMAN_CONFIG_DIR)).find((h) => h.id === remoteCase.hostId);
+      const discordCaseKey = discordHost
+        ? configuredDiscordCaseChannel({
+            name,
+            path: remoteCase.remotePath,
+            remote: {
+              hostId: discordHost.id,
+              host: discordHost.host,
+              username: discordHost.username,
+              path: remoteCase.remotePath,
+            },
+          })?.key
+        : undefined;
       await writeRemoteCases(
         CODEMAN_CONFIG_DIR,
         remoteCases.filter((item) => !(item.name === name && canAccessOwned(user, item.owner)))
       );
       ctx.store.deleteCaseDefaultGroup(ownerLayoutKey(ownerFor(req)), name);
-      ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'remote-unlinked' });
+      ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'remote-unlinked', discordCaseKey });
       await forgetCaseDefault(remoteCase.owner);
       return { success: true, data: { name } };
     }
@@ -2468,7 +2482,20 @@ export function registerCaseRoutes(
           .rm(join(dataPath('docker-seeds'), `${sessionDocker.containerName}.json`), { force: true })
           .catch(() => {});
       }
-      ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'docker-unlinked' });
+      ctx.broadcast(SseEvent.CaseDeleted, {
+        name,
+        type: 'docker-unlinked',
+        discordCaseKey: configuredDiscordCaseChannel({
+          name,
+          path: dockerCase.hostWorkspacePath,
+          docker: {
+            hostId: dockerCase.hostId,
+            container: dockerCase.container ?? dockerContainerName(dockerCase.name),
+            path: dockerCase.hostWorkspacePath,
+            containerWorkdir: dockerCase.containerWorkdir,
+          },
+        })?.key,
+      });
       await forgetCaseDefault(dockerCase.owner);
       return { success: true, data: { name } };
     }
@@ -2488,7 +2515,11 @@ export function registerCaseRoutes(
         });
         ctx.store.deleteCaseDefaultGroup(ownerLayoutKey(ownerFor(req)), name);
         ctx.store.deleteCaseCodexCommandSelection(codexProfileOwner(ownerFor(req)), name);
-        ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'unlinked' });
+        ctx.broadcast(SseEvent.CaseDeleted, {
+          name,
+          type: 'unlinked',
+          discordCaseKey: configuredDiscordCaseChannel({ name, path: linkedCases[name] })?.key,
+        });
         await forgetCaseDefault();
         return { success: true, data: { name } };
       } catch (err) {
@@ -2507,7 +2538,11 @@ export function registerCaseRoutes(
       await fs.rm(casePath, { recursive: true, force: true });
       ctx.store.deleteCaseDefaultGroup(ownerLayoutKey(ownerFor(req)), name);
       ctx.store.deleteCaseCodexCommandSelection(codexProfileOwner(ownerFor(req)), name);
-      ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'deleted' });
+      ctx.broadcast(SseEvent.CaseDeleted, {
+        name,
+        type: 'deleted',
+        discordCaseKey: configuredDiscordCaseChannel({ name, path: casePath })?.key,
+      });
       await forgetCaseDefault();
       return { success: true, data: { name } };
     } catch (err) {

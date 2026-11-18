@@ -4195,6 +4195,12 @@ export class WebServer extends EventEmitter {
 
   /** Keep the Discord thread in step with the tab: created, renamed, deleted. Never throws. */
   private bridgeSessionEvent(event: string, data: unknown): void {
+    if (event === SseEvent.CaseDeleted) {
+      const key = (data as { discordCaseKey?: unknown })?.discordCaseKey;
+      if (typeof key === 'string' && /^[a-f0-9]{64}$/.test(key))
+        void this.discordBridge.caseDeleted(key).catch(() => undefined);
+      return;
+    }
     if (event === SseEvent.CaseCreated || event === SseEvent.CaseLinked || event === SseEvent.CaseRenamed) {
       void this.discordBridge.syncCases().catch(() => undefined);
       return;
