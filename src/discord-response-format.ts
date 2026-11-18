@@ -84,6 +84,28 @@ export function discordDetailPages(text: string): string[] {
   return splitMarkdown(text, 1700, 8192, true);
 }
 
+/** Discord cannot resolve local file destinations. Keep their exact path readable without a broken link. */
+function localFileReferences(line: string): string {
+  if (!line.includes('](')) return line;
+  return line.replace(
+    /(?<![!\\])\[([^\]\n]{1,200})\]\(\s*(<[^>\n]{1,2048}>|[^\s()\n]{1,2048})\s*\)/g,
+    (match, label: string, raw: string) => {
+      const path = raw.startsWith('<') ? raw.slice(1, -1) : raw;
+      if (
+        path.startsWith('//') ||
+        !/\.(?:py|[cm]?[jt]sx?|json|ya?ml|toml|ini|cfg|conf|md|rs|go|sh|bash|zsh|c|h|cpp|hpp|java|rb|sql|xml|html|css|scss)(?::\d+(?::\d+)?)?(?:#L\d+(?:-L\d+)?)?$/i.test(
+          path
+        ) ||
+        // eslint-disable-next-line no-control-regex
+        /[`\x00-\x1f\x7f]/.test(path) ||
+        !/^(?:\/(?!\/)|\.\.?\/|~\/|file:\/\/\/|sandbox:\/|[A-Za-z0-9_.-]+\/)/.test(path)
+      )
+        return match;
+      return label + ' (`' + path + '`)';
+    }
+  );
+}
+
 /** Only style obvious prose, never fenced/indented code, inline code, URLs or Markdown links. */
 function readableLine(line: string): string {
   // Mixed Markdown/URLs are left alone instead of guessing their token boundaries.
@@ -155,7 +177,7 @@ export function formatDiscordResponseText(text: string): string {
       if (label) line = item[1] + '**' + label[1] + '**' + item[2].slice(label[1].length);
       if (out.length && out.at(-1)?.trim()) out.push('');
     }
-    out.push(readableLine(line));
+    out.push(readableLine(localFileReferences(line)));
   }
   return out.join('\n');
 }
