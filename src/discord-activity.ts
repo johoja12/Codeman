@@ -107,12 +107,30 @@ export class DiscordActivity {
     for (let i = 0; i < sessions.length; i += 4)
       await Promise.all(sessions.slice(i, i + 4).map((s) => this.update(s.id, scope, generation)));
   }
+  /** Cosmetic reconciliation must settle even if a dependency never completes. Late work loses its lease. */
   private async update(id: string, scope: string, generation: number): Promise<void> {
+    let active = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        active = false;
+        resolve();
+      }, 30_000);
+    });
+    try {
+      await Promise.race([this.updateNow(id, scope, generation, () => active), deadline]);
+    } finally {
+      active = false;
+      clearTimeout(timer);
+    }
+  }
+  private async updateNow(id: string, scope: string, generation: number, active: () => boolean): Promise<void> {
     const destination = this.deps.destination(id);
     if (!destination) return;
     let progress = this.progress.get(id);
     const current = () => {
       if (
+        !active() ||
         generation !== this.generation ||
         scope !== this.deps.scope() ||
         destination !== this.deps.destination(id) ||
@@ -170,7 +188,7 @@ export class DiscordActivity {
       // older title after our PATCH. Reconcile the real title, not just our cache.
       if (typeof verified === 'object') progress.name = verified.name;
     } catch (error) {
-      progress.verifyRetryAt = this.deps.now() + retryAfter(error);
+      if (current()) progress.verifyRetryAt = this.deps.now() + retryAfter(error);
       return;
     }
     // Typing has its own endpoint/budget and must not wait behind a rename's 429.
@@ -182,7 +200,7 @@ export class DiscordActivity {
           return !!s && discordActivityWorking(s) && !s.waiting && !s.exited;
         });
       } catch (error) {
-        progress.typingRetryAt = this.deps.now() + retryAfter(error);
+        if (current()) progress.typingRetryAt = this.deps.now() + retryAfter(error);
       }
     }
     try {
@@ -196,7 +214,7 @@ export class DiscordActivity {
       }
     } catch (error) {
       // Cosmetic failures never block agent execution or response delivery.
-      progress.renameRetryAt = this.deps.now() + retryAfter(error);
+      if (current()) progress.renameRetryAt = this.deps.now() + retryAfter(error);
     }
   }
 }

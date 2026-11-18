@@ -290,3 +290,65 @@ describe('Discord live activity', () => {
     expect(discordActivityName({ id: 'abcdefgh-ijkl', name: ' \n ' })).toBe('⚫ Idle · abcdefgh');
   });
 });
+
+it('releases a stuck ownership check, reaches later batches, and ignores its eventual result', async () => {
+  vi.useFakeTimers();
+  try {
+    sessions = Array.from({ length: 5 }, (_, i) => ({ id: 's' + i, name: 'session ' + i, working: false }));
+    let release!: (value: boolean) => void;
+    verify.mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          release = resolve;
+        })
+    );
+    const first = activity.poll();
+    expect(activity.poll()).toBe(first);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await first;
+    expect(rename).toHaveBeenCalledWith('thread', '⚫ Idle · session 4', expect.any(Function));
+    expect(rename.mock.calls.some((c) => c[1].includes('session 0'))).toBe(false);
+    sessions[0].name = 'recovered';
+    now += 30_000;
+    await activity.poll();
+    expect(rename).toHaveBeenCalledWith('thread', '⚫ Idle · recovered', expect.any(Function));
+    const count = rename.mock.calls.length;
+    release(true);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(rename).toHaveBeenCalledTimes(count);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('expires a hung connection-warning rename and reconciles a verified web-created session', async () => {
+  vi.useFakeTimers();
+  try {
+    sessions[0] = { id: 's1', name: 'w1-meetily', working: false, connection: 'unverified' };
+    let release!: () => void;
+    rename.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          release = resolve;
+        })
+    );
+    const first = activity.poll();
+    await vi.advanceTimersByTimeAsync(1);
+    const guard = rename.mock.calls[0][2];
+    expect(guard()).toBe(true);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await first;
+    expect(guard()).toBe(false);
+    sessions[0].connection = 'available';
+    now += 30_000;
+    await activity.poll();
+    expect(activity.name(sessions[0])).toBe('⚫ Idle · w1-meetily');
+    release();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(activity.name(sessions[0])).toBe('⚫ Idle · w1-meetily');
+  } finally {
+    vi.useRealTimers();
+  }
+});
