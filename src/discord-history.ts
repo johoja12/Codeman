@@ -688,7 +688,8 @@ function remoteHistoryScope(
     resumeId,
     session.codexConfig?.resumeSessionId,
     session.envOverrideValue('CODEX_HOME'),
-    session.nativeModelSettingsRevision,
+    // Transcript identity survives typing and resizing; pane lifecycle and ownership do not.
+    session.inspectionGeneration,
   ]);
 }
 

@@ -114,3 +114,40 @@ describe('verified remote history identity adoption', () => {
     expect(session.setNativeResumeId).not.toHaveBeenCalled();
   });
 });
+
+it.each(['keyboard input', 'terminal resize'])('keeps an exact transcript read valid during %s', async () => {
+  Object.assign(session, {
+    nativeResumeId: id,
+    inspectionGeneration: 'pane-owner-1',
+    nativeModelSettingsRevision: 'input-geometry-1',
+  });
+  vi.mocked(runDiscordRemoteRead).mockImplementation(async () => {
+    Object.assign(session, { nativeModelSettingsRevision: 'input-geometry-2' });
+    return packet;
+  });
+  await expect(readDiscordSessionHistory(session)).resolves.toHaveProperty('conversationId', id);
+  expect(session.setNativeResumeId).not.toHaveBeenCalled();
+});
+it('still refuses a real pane or owner change during a read', async () => {
+  Object.assign(session, {
+    nativeResumeId: id,
+    inspectionGeneration: 'pane-owner-1',
+    nativeModelSettingsRevision: 'input-geometry-1',
+  });
+  vi.mocked(runDiscordRemoteRead).mockImplementation(async () => {
+    Object.assign(session, { inspectionGeneration: 'pane-owner-2', nativeModelSettingsRevision: 'input-geometry-2' });
+    return packet;
+  });
+  await expect(readDiscordSessionHistory(session)).rejects.toThrow(/changed/);
+});
+it('reuses a verified runtime home across typing and resizing but rechecks its process', async () => {
+  Object.assign(session, {
+    nativeResumeId: id,
+    inspectionGeneration: 'pane-owner-1',
+    nativeModelSettingsRevision: 'input-geometry-1',
+  });
+  await readDiscordSessionHistory(session);
+  Object.assign(session, { nativeModelSettingsRevision: 'input-geometry-2' });
+  await readDiscordSessionHistory(session);
+  expect(probeRemoteDiscordRuntime).toHaveBeenCalledTimes(3);
+});
