@@ -184,3 +184,61 @@ it('preserves web links, images, code and unsafe destinations while formatting l
   );
   expect(formatDiscordResponseText('[File](src/source_file.ts:12)')).toBe('File (\`src/source_file.ts:12\`)');
 });
+
+it('renders the screenshot URL-labelled link as one clickable autolink in response cards', () => {
+  const text = '**Demo app:** [http://10.20.200.203/](http://10.20.200.203/)';
+  expect(formatDiscordResponseText(text)).toBe('**Demo app:** <http://10.20.200.203/>');
+  expect(body(discordResponsePosts(text)[0])).toContain('**Demo app:** <http://10.20.200.203/>');
+});
+it('normalizes a URL outside inline code without rewriting its literal example', () => {
+  const link = '[http://10.20.200.203/](http://10.20.200.203/)';
+  expect(formatDiscordResponseText('Use `kubectl`: ' + link + ' and `' + link + '`')).toBe(
+    'Use `kubectl`: <http://10.20.200.203/> and `' + link + '`'
+  );
+});
+
+it.each([
+  'http://10.20.200.203/',
+  'https://example.test/a_b?q=one&next=two#part',
+  'http://localhost:8080/demo',
+  'http://[2001:db8::1]:8080/demo',
+  'https://example.test/docs/a_(b(c))',
+  'HTTP://EXAMPLE.TEST/CaseSensitive',
+])('preserves the exact URL including path/query/fragment: %s', (url) => {
+  expect(formatDiscordResponseText(`[${url}](${url})`)).toBe(`<${url}>`);
+  expect(formatDiscordResponseText(`[${url}](<${url}>)`)).toBe(`<${url}>`);
+  expect(formatDiscordResponseText(`[${url}](${url} "Optional title")`)).toBe(`<${url}>`);
+});
+it.each([
+  '[Demo app](http://10.20.200.203/)',
+  '[https://example.test/Path](https://example.test/path)',
+  '[https://label.test](https://destination.test)',
+  '![http://10.20.200.203/](http://10.20.200.203/)',
+  '\\[http://10.20.200.203/](http://10.20.200.203/)',
+  '`[http://10.20.200.203/](http://10.20.200.203/)`',
+  '``[http://10.20.200.203/](http://10.20.200.203/)``',
+  '```md\n[http://10.20.200.203/](http://10.20.200.203/)\n```',
+  '    [http://10.20.200.203/](http://10.20.200.203/)',
+  '> [http://10.20.200.203/](http://10.20.200.203/)',
+  '[javascript:alert(1)](javascript:alert(1))',
+  '[http://](http://)',
+])('leaves descriptive/mismatched links and literal syntax unchanged: %s', (text) => {
+  expect(formatDiscordResponseText(text)).toBe(text);
+});
+it('keeps multiline inline code literal but fixes a prose link after its closing delimiter', () => {
+  const link = '[http://10.20.200.203/](http://10.20.200.203/)';
+  expect(formatDiscordResponseText('`literal\n' + link + '\nend` Live: ' + link)).toBe(
+    '`literal\n' + link + '\nend` Live: <http://10.20.200.203/>'
+  );
+});
+it('does not change notification permissions when normalizing a URL link', () => {
+  const post = discordResponsePosts('@everyone [http://10.20.200.203/](http://10.20.200.203/)')[0];
+  expect(body(post)).toContain('<http://10.20.200.203/>');
+  expect(post.allowed_mentions).toEqual({ parse: [], users: [] });
+});
+
+it('normalizes redundant URL labels in silent progress updates too', () => {
+  const post = discordProgressPost('Working', 'Demo: [http://10.20.200.203/](http://10.20.200.203/)', 1);
+  expect(post.components?.[1].content).toBe('Demo: <http://10.20.200.203/>');
+  expect(post.flags! & DISCORD_SUPPRESS_NOTIFICATIONS).toBeTruthy();
+});
