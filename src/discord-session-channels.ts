@@ -298,6 +298,42 @@ export class DiscordSessionChannels {
       throw new DiscordChannelProblem('Session channel ownership changed; refusing to rename it');
     await this.api.edit(e.channelId, { name: (this.options.name ?? discordSessionChannelName)(name, id) });
   }
+  /** Explicit case deletion only; unlike session tombstones, a re-added case may create a new parent. */
+  async removeOwnedCase(scope: DiscordChannelScope, id: string, current: () => boolean): Promise<boolean> {
+    await this.load();
+    if (this.options.kind !== 'case' || !current()) return false;
+    const key = keyOf(scope, id),
+      e = this.state.entries[key];
+    if (!e || e.state === 'deleted') return true;
+    if (this.pending.has(key)) return false;
+    if (!e.channelId) {
+      const candidates = (await this.api.list(scope.guildId))?.filter((c) => this.owned(e, c));
+      if (!current() || this.state.entries[key] !== e) return false;
+      if (!candidates || candidates.length === 0) return false;
+      if (candidates.length !== 1)
+        throw new DiscordChannelProblem('Case channel creation is ambiguous; refusing cleanup');
+      e.channelId = candidates[0].id;
+      await this.save();
+    }
+    let channel: DiscordManagedChannel | null;
+    try {
+      channel = await this.api.get(e.channelId!);
+    } catch (error) {
+      if ((error as { status?: number }).status !== 404) throw error;
+      if (!current() || this.state.entries[key] !== e) return false;
+      e.state = 'deleted';
+      await this.save();
+      return true;
+    }
+    if (!this.owned(e, channel)) throw new DiscordChannelProblem('Case channel ownership changed; refusing cleanup');
+    if (!current() || this.state.entries[key] !== e) return false;
+    await this.api.remove(e.channelId!);
+    if (this.state.entries[key] === e) {
+      e.state = 'deleted';
+      await this.save();
+    }
+    return true;
+  }
   async deleted(id: string, policy: DiscordChannelDelete, activeGuild?: string): Promise<void> {
     await this.load();
     if (Object.keys(this.state.deleted).length >= 4096 && !this.state.deleted[id])

@@ -1453,6 +1453,10 @@ describe('case-routes', () => {
       expect(res.statusCode).toBe(200);
       expect(fs.rm).toHaveBeenCalled();
       expect(harness.ctx.store.deleteCaseDefaultGroup).toHaveBeenCalledWith('@single', 'old-local');
+      expect(harness.ctx.broadcast).toHaveBeenCalledWith(
+        'case:deleted',
+        expect.objectContaining({ type: 'deleted', discordCaseKey: expect.stringMatching(/^[a-f0-9]{64}$/) })
+      );
       expect(vi.mocked(fs.rm).mock.invocationCallOrder[0]).toBeLessThan(
         vi.mocked(harness.ctx.store.deleteCaseDefaultGroup).mock.invocationCallOrder[0]
       );
@@ -1491,6 +1495,10 @@ describe('case-routes', () => {
       const deleted = await harness.app.inject({ method: 'DELETE', url: '/api/cases/linked-next' });
       expect(deleted.statusCode).toBe(200);
       expect(harness.ctx.store.deleteCaseDefaultGroup).toHaveBeenCalledWith('@single', 'linked-next');
+      expect(harness.ctx.broadcast).toHaveBeenCalledWith(
+        'case:deleted',
+        expect.objectContaining({ type: 'unlinked', discordCaseKey: expect.stringMatching(/^[a-f0-9]{64}$/) })
+      );
     });
 
     it('migrates and clears remote case defaults after successful operations', async () => {
@@ -1528,6 +1536,10 @@ describe('case-routes', () => {
       const deleted = await harness.app.inject({ method: 'DELETE', url: '/api/cases/remote-next' });
       expect(deleted.statusCode).toBe(200);
       expect(harness.ctx.store.deleteCaseDefaultGroup).toHaveBeenCalledWith('@single', 'remote-next');
+      expect(harness.ctx.broadcast).toHaveBeenCalledWith(
+        'case:deleted',
+        expect.objectContaining({ type: 'remote-unlinked', discordCaseKey: expect.stringMatching(/^[a-f0-9]{64}$/) })
+      );
     });
 
     it('migrates and clears Docker case defaults after successful operations', async () => {
@@ -1576,6 +1588,10 @@ describe('case-routes', () => {
       const deleted = await harness.app.inject({ method: 'DELETE', url: '/api/cases/docker-next' });
       expect(deleted.statusCode).toBe(200);
       expect(harness.ctx.store.deleteCaseDefaultGroup).toHaveBeenCalledWith('@single', 'docker-next');
+      expect(harness.ctx.broadcast).toHaveBeenCalledWith(
+        'case:deleted',
+        expect.objectContaining({ type: 'docker-unlinked', discordCaseKey: expect.stringMatching(/^[a-f0-9]{64}$/) })
+      );
     });
   });
 

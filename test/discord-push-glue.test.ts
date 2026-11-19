@@ -38,6 +38,7 @@ function server(): Internals {
     sessionRenamed: vi.fn(async () => undefined),
     sessionDeleted: vi.fn(async () => undefined),
     forgetTab: vi.fn(),
+    caseDeleted: vi.fn(async () => undefined),
     stop: vi.fn(),
   };
   return s;
@@ -228,4 +229,13 @@ describe('broadcast -> Discord tab lifecycle', () => {
     await (s as unknown as { stop: () => Promise<void> }).stop();
     expect(s.discordBridge.stop).toHaveBeenCalledTimes(1);
   });
+});
+
+it('forwards only explicit case deletion identities to Discord cleanup', async () => {
+  const s = server();
+  s.broadcast(SseEvent.CaseDeleted, { name: 'gone', discordCaseKey: 'a'.repeat(64) });
+  expect(s.discordBridge.caseDeleted).toHaveBeenCalledExactlyOnceWith('a'.repeat(64));
+  s.broadcast(SseEvent.CaseDeleted, { name: 'unknown' });
+  s.broadcast(SseEvent.CaseDeleted, { name: 'bad', discordCaseKey: 'wrong' });
+  expect(s.discordBridge.caseDeleted).toHaveBeenCalledTimes(1);
 });
