@@ -106,6 +106,42 @@ function localFileReferences(line: string): string {
   );
 }
 
+/** A URL used as its own masked-link label is shown literally by Discord. Keep it as an autolink. */
+function urlLabelLinks(line: string, initialTicks = 0): string {
+  if (line.length > 8192 || !line.includes('](') || !/\[https?:\/\//i.test(line)) return line;
+  const code: Array<[number, number]> = [];
+  let ticks = initialTicks,
+    start = 0;
+  for (const marker of line.matchAll(/`+/g)) {
+    let slashes = 0;
+    for (let at = marker.index - 1; at >= 0 && line[at] === '\\'; at--) slashes++;
+    if (slashes % 2) continue;
+    if (!ticks) {
+      ticks = marker[0].length;
+      start = marker.index;
+    } else if (ticks === marker[0].length) {
+      code.push([start, marker.index + marker[0].length]);
+      ticks = 0;
+    }
+  }
+  if (ticks) code.push([start, line.length]);
+  return line.replace(
+    /(?<![!\\])\[(https?:\/\/[^\s<>]{1,2048}?)\]\([ \t]*((?:<\1>|\1))(?:[ \t]+"[^"\n]{0,200}")?[ \t]*\)/gi,
+    (match, url: string, raw: string, offset: number) => {
+      if (code.some(([from, to]) => offset < to && offset + match.length > from)) return match;
+      const target = raw.startsWith('<') ? raw.slice(1, -1) : raw;
+      // /i permits uppercase schemes; URL paths and queries must still match exactly.
+      if (target !== url) return match;
+      try {
+        new URL(url);
+      } catch {
+        return match;
+      }
+      return '<' + url + '>';
+    }
+  );
+}
+
 /** Only style obvious prose, never fenced/indented code, inline code, URLs or Markdown links. */
 function readableLine(line: string): string {
   // Mixed Markdown/URLs are left alone instead of guessing their token boundaries.
@@ -147,8 +183,9 @@ export function formatDiscordResponseText(text: string): string {
   let inlineTicks = 0;
   for (const original of formatDiscordTables(text).split('\n')) {
     if (inlineTicks) {
+      const visible = urlLabelLinks(original, inlineTicks);
       inlineTicks = inlineCodeState(original, inlineTicks);
-      out.push(original);
+      out.push(visible);
       continue;
     }
     const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(original);
@@ -166,12 +203,17 @@ export function formatDiscordResponseText(text: string): string {
     if (!fence && !/^(?: {4}|\t|>)/.test(original) && original.includes('`')) {
       inlineTicks = inlineCodeState(original, 0);
     }
-    if (original.length > 8192 || /^(?: {4}|\t|>)/.test(original) || original.includes('`')) {
+    if (original.length > 8192 || /^(?: {4}|\t|>)/.test(original)) {
       out.push(original);
       continue;
     }
-    const item = /^(\d+[.)] )(.*)$/.exec(original);
-    let line = original;
+    const visible = urlLabelLinks(original);
+    if (original.includes('`')) {
+      out.push(visible);
+      continue;
+    }
+    const item = /^(\d+[.)] )(.*)$/.exec(visible);
+    let line = visible;
     if (item) {
       const label = /^([\p{L}][\p{L}\p{N} &/()_-]{0,59}:)(?=\s|$)/u.exec(item[2]);
       if (label) line = item[1] + '**' + label[1] + '**' + item[2].slice(label[1].length);
@@ -235,7 +277,7 @@ export function discordProgressPost(
   count: number,
   controls: DiscordPost['components'] = []
 ): DiscordPost {
-  const compact = update.replace(/\s+/g, ' ').slice(0, 420);
+  const compact = formatDiscordResponseText(update).replace(/\s+/g, ' ').slice(0, 420);
   return {
     content: '',
     flags: DISCORD_COMPONENTS_V2 | 4 | DISCORD_SUPPRESS_NOTIFICATIONS,
