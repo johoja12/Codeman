@@ -3445,3 +3445,46 @@ it('automatically joins configured users to existing live session threads withou
   expect(sendInput).not.toHaveBeenCalled();
   again.stop();
 });
+
+it('deletes a parent only after an explicit case deletion, not after discovery stops listing it', async () => {
+  sessions = [];
+  let cases = [{ key: 'a'.repeat(64), name: 'case-to-delete' }];
+  const nativeUi = createDiscordNativeUiServices({
+    sessions: () => new Map(),
+    cases: async () => [],
+    allowed: () => true,
+    url: () => undefined,
+  });
+  nativeUi.caseChannels = async () => cases;
+  const b = makeBridge(undefined, { nativeUi });
+  await b.reload();
+  await b.syncSessions();
+  await vi.waitFor(() => expect([...remoteChannels.values()].some((c) => c.name === 'case-to-delete')).toBe(true));
+  const parent = [...remoteChannels.values()].find((c) => c.name === 'case-to-delete')!.id;
+  cases = [];
+  await b.syncCases();
+  expect(remoteChannels.has(parent)).toBe(true);
+  await b.caseDeleted('a'.repeat(64));
+  await vi.waitFor(() => expect(remoteChannels.has(parent)).toBe(false));
+  expect(sendInput).not.toHaveBeenCalled();
+  b.stop();
+});
+it('keeps the shared parent when an alias survives an explicit case deletion', async () => {
+  sessions = [];
+  const nativeUi = createDiscordNativeUiServices({
+    sessions: () => new Map(),
+    cases: async () => [],
+    allowed: () => true,
+    url: () => undefined,
+  });
+  nativeUi.caseChannels = async () => [{ key: 'a'.repeat(64), name: 'surviving-alias' }];
+  const b = makeBridge(undefined, { nativeUi });
+  await b.reload();
+  await b.syncSessions();
+  await vi.waitFor(() => expect([...remoteChannels.values()].some((c) => c.name === 'surviving-alias')).toBe(true));
+  const parent = [...remoteChannels.values()].find((c) => c.name === 'surviving-alias')!.id;
+  await b.caseDeleted('a'.repeat(64));
+  expect(remoteChannels.has(parent)).toBe(true);
+  expect(posts.some((p) => p.method === 'DELETE' && p.path.endsWith('/' + parent))).toBe(false);
+  b.stop();
+});

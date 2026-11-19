@@ -430,3 +430,158 @@ it('retires a mapping whose owned thread is already gone without retrying it for
     )
   ).toBe(0);
 });
+
+describe('explicit case deletion', () => {
+  const flush = (
+    m: DiscordCaseThreads,
+    live = new Set<string>(),
+    configured = new Set<string>(),
+    protectedCases = new Set<string>(),
+    current = () => true
+  ) => m.flushCaseDeletions(scope, configured, protectedCases, () => live, current);
+  it('never treats a missing discovery row as deletion', async () => {
+    const m = manager();
+    const parent = await m.forCase(scope, identity);
+    await flush(m);
+    expect(channels.has(parent)).toBe(true);
+    expect(api.remove).not.toHaveBeenCalled();
+  });
+  it('removes only the explicitly deleted owned parent and allows the same case to be re-added', async () => {
+    const m = manager();
+    const parent = await m.forCase(scope, identity);
+    const sibling = await m.forCase(scope, { key: 'b'.repeat(64), name: 'other' });
+    await m.requestCaseDeletion(scope, identity.key);
+    await flush(m);
+    expect(api.remove).toHaveBeenCalledExactlyOnceWith(parent);
+    expect(channels.has(sibling)).toBe(true);
+    expect(m.caseForChannel(scope, parent)).toBeUndefined();
+    expect(await m.hasCaseDeletions()).toBe(false);
+    expect(await manager().forCase(scope, identity)).not.toBe(parent);
+  });
+  it('defers active sessions, persists the intent through restart, and cleans up after they end', async () => {
+    const m = manager();
+    const thread = await m.forSession(scope, 'live');
+    const parent = channels.get(thread)!.parent_id!;
+    await m.requestCaseDeletion(scope, identity.key);
+    await flush(m, new Set(['live']));
+    expect(api.remove).not.toHaveBeenCalled();
+    const restored = manager();
+    expect(await restored.hasCaseDeletions()).toBe(true);
+    await flush(restored);
+    expect(api.remove).toHaveBeenCalledWith(parent);
+    expect(restored.sessionForChannel(scope, thread)).toBeUndefined();
+  });
+  it('protects an active case even before its session thread is created', async () => {
+    const m = manager();
+    await m.forCase(scope, identity);
+    await m.requestCaseDeletion(scope, identity.key);
+    await flush(m, new Set(), new Set(), new Set([identity.key]));
+    expect(api.remove).not.toHaveBeenCalled();
+    expect(await m.hasCaseDeletions()).toBe(true);
+  });
+  it('cancels deletion if an alias or re-added case still has the same exact identity', async () => {
+    const m = manager();
+    await m.forCase(scope, identity);
+    await m.requestCaseDeletion(scope, identity.key);
+    await flush(m, new Set(), new Set([identity.key]));
+    expect(await m.hasCaseDeletions()).toBe(false);
+    await flush(m);
+    expect(api.remove).not.toHaveBeenCalled();
+  });
+  it('refuses changed ownership and retries after the recorded marker is restored', async () => {
+    const m = manager();
+    const parent = await m.forCase(scope, identity);
+    const c = channels.get(parent)!;
+    const topic = c.topic;
+    c.topic = 'foreign';
+    await m.requestCaseDeletion(scope, identity.key);
+    await expect(flush(m)).rejects.toThrow('ownership');
+    expect(api.remove).not.toHaveBeenCalled();
+    c.topic = topic;
+    await flush(m);
+    expect(api.remove).toHaveBeenCalledWith(parent);
+  });
+  it('retries a failed delete after restart without losing the deletion intent', async () => {
+    const m = manager();
+    const parent = await m.forCase(scope, identity);
+    await m.requestCaseDeletion(scope, identity.key);
+    vi.mocked(api.remove).mockRejectedValueOnce(new Error('network'));
+    await expect(flush(m)).rejects.toThrow('network');
+    await flush(manager());
+    expect(channels.has(parent)).toBe(false);
+  });
+  it('abandons cleanup when the configuration or live-session snapshot changes during ownership checks', async () => {
+    const m = manager();
+    const parent = await m.forCase(scope, identity);
+    await m.requestCaseDeletion(scope, identity.key);
+    let current = true;
+    const get = api.get;
+    api.get = vi.fn(async (id) => {
+      const c = await get(id);
+      if (id === parent) current = false;
+      return c;
+    });
+    await flush(m, new Set(), new Set(), new Set(), () => current);
+    expect(api.remove).not.toHaveBeenCalled();
+    expect(await m.hasCaseDeletions()).toBe(true);
+  });
+  it('settles an already removed parent without deleting a sibling', async () => {
+    const m = manager();
+    const parent = await m.forCase(scope, identity);
+    await m.requestCaseDeletion(scope, identity.key);
+    channels.delete(parent);
+    await flush(m);
+    expect(api.remove).not.toHaveBeenCalled();
+    expect(await m.hasCaseDeletions()).toBe(false);
+  });
+});
+
+it('reconciles a lost parent-create response by exact marker before deletion, without creating again', async () => {
+  const m = manager();
+  const create = api.create;
+  api.create = vi.fn(async (...args) => {
+    await create(...args);
+    throw new Error('response lost');
+  });
+  await expect(m.forCase(scope, identity)).rejects.toThrow('response lost');
+  const parent = [...channels.values()].find((c) => c.type === 0)!.id;
+  await m.requestCaseDeletion(scope, identity.key);
+  await m.flushCaseDeletions(
+    scope,
+    new Set(),
+    new Set(),
+    () => new Set(),
+    () => true
+  );
+  expect(api.remove).toHaveBeenCalledExactlyOnceWith(parent);
+  expect(api.create).toHaveBeenCalledTimes(1);
+});
+
+it('keeps deletion evidence if the case binding changes while Discord acknowledges removal', async () => {
+  const m = manager();
+  const parent = await m.forCase(scope, identity);
+  await m.requestCaseDeletion(scope, identity.key);
+  let current = true;
+  api.remove = vi.fn(async (id) => {
+    channels.delete(id);
+    current = false;
+  });
+  await m.flushCaseDeletions(
+    scope,
+    new Set(),
+    new Set(),
+    () => new Set(),
+    () => current
+  );
+  expect(api.remove).toHaveBeenCalledWith(parent);
+  expect(await m.hasCaseDeletions()).toBe(true);
+  current = true;
+  await m.flushCaseDeletions(
+    scope,
+    new Set(),
+    new Set(),
+    () => new Set(),
+    () => current
+  );
+  expect(await m.hasCaseDeletions()).toBe(false);
+});
