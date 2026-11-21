@@ -14,6 +14,12 @@ vi.mock('web-push', () => ({
   default: { sendNotification, setVapidDetails: vi.fn(), generateVAPIDKeys: vi.fn() },
 }));
 
+import { readFileSync } from 'node:fs';
+import { getCli } from '../src/config/cli-registry/index.js';
+import { compileVersionRegex } from '../src/config/cli-registry/patterns.js';
+import { isBlockedScreen } from '../src/session-activity.js';
+import { raiseScreenBlocked, clearScreenBlocked } from '../src/web/screen-blocked.js';
+import { approvalInbox } from '../src/web/approval-inbox.js';
 import { WebServer } from '../src/web/server.js';
 import { SseEvent } from '../src/web/sse-events.js';
 
@@ -95,6 +101,45 @@ describe('bridge deps', () => {
 });
 
 describe('sendPushNotifications -> Discord', () => {
+  it('routes current Codex question tabs to Discord with readable question context, without web push', async () => {
+    const frame = readFileSync(new URL('./fixtures/codex-dialogs/question-tabs-current.txt', import.meta.url), 'utf8');
+    const detect = getCli('codex')!.capabilities.workDetect!;
+    expect(isBlockedScreen(frame, compileVersionRegex(detect.blockedLine!)!, detect.blockedLines)).toBe(true);
+    const s = server();
+    s.sessions.set('current-question', { muxName: 'codeman-current-question', textOutput: '', mode: 'codex' });
+    s.mux = { capturePaneText: () => frame };
+    let delivery: Promise<void> | undefined;
+    const id = raiseScreenBlocked(
+      { id: 'current-question', name: 'w30-buildmesh', mode: 'codex' },
+      {
+        broadcast: vi.fn(),
+        broadcastSessionStateDebounced: vi.fn(),
+        sendPushNotifications: (event, data) => {
+          delivery = s.sendPushNotifications(event, data);
+        },
+      },
+      frame
+    );
+    try {
+      await delivery;
+      expect(s.discordBridge.notify).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          event: 'hook:permission_prompt',
+          sessionId: 'current-question',
+          urgency: 'critical',
+        })
+      );
+      const message = s.discordBridge.notify.mock.calls[0][0];
+      expect(message.tail()).toContain('Which account should it use?');
+      expect(message.tail()).toContain('Reconnect as me');
+      expect(message.tail()).toContain('Tab/Arrow keys to navigate');
+      expect(approvalInbox.getForSession('current-question')?.answerInTerminal).toBe(true);
+      expect(sendNotification).not.toHaveBeenCalled();
+    } finally {
+      clearScreenBlocked('current-question', id);
+    }
+  });
+
   it('posts a permission prompt with zero push subscriptions, with the rendered screen as the tail', async () => {
     const s = server();
     s.sessions.set('s1', { muxName: 'codeman-s1', textOutput: '', mode: 'claude' });

@@ -817,7 +817,12 @@ const CODEX: CliEntry = {
     // run) and its footer below anything the agent prints. The longest option list
     // measured, a question at 36 columns, put the `›` row 16 non-blank rows up; 20 leaves
     // room for longer option text, and a dialog whose marker scrolls out of the window is
-    // simply not seen (the behaviour before this field). Not matched on purpose:
+    // simply not seen (the behaviour before this field). Current Codex question tabs
+    // use `Enter to select · Tab/Arrow keys to navigate · Esc to cancel`, sometimes
+    // wrapped. Require the question-specific Tab/Arrow hint, not just Enter/cancel
+    // (also used by native menus), and allow up to the existing 24-row hard cap for
+    // option descriptions. This remains alert-only; no option keystrokes are sent.
+    // Not matched on purpose:
     // `Implement this plan?` after a plan turn, whose `enter select · esc back` footer is
     // the same as `/model`, `/permissions` and `/review`, menus the user opened at the
     // keyboard; the plan turn has ended there, and the session reads idle as before.
@@ -828,8 +833,8 @@ const CODEX: CliEntry = {
       workingLine: '[Ee]sc to interrupt',
       watchingLine: String.raw`^\s{0,4}(\d+ background terminals?) running · /ps to view · /stop to close$`,
       watchingLines: 4,
-      blockedLine: String.raw`(?:^|\n) {0,4}› \d\. [\s\S]*\n {2}(?:Press enter to confirm|tab (?:to add|or esc to clear) notes|enter continue)(?:[^\n]|\n {2}(?=[a-z←])){0,120}(?:cancel|interrupt|quit|back|answer|all)$`,
-      blockedLines: 20,
+      blockedLine: String.raw`(^|\n) {0,4}› \d\. [\s\S]*\n *(Press enter to confirm|tab (to add|or esc to clear) notes|enter continue|Enter(?=[\s\S]*Tab/Arrow))([^\n]|\n  (?=\S)){0,120}(cancel|interrupt|quit|back|answer|all)$`,
+      blockedLines: 24,
       // The rows codex draws under an idle composer, tested one at a time by guarded
       // stage/submit (agent-staging.ts): the model footer (`  gpt-5.6-terra default ·
       // ~/case`, effort words from CODEX_EFFORT_WORDS as in modelDetect below), the

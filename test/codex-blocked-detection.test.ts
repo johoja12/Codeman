@@ -50,6 +50,7 @@ const DIALOGS = [
   'edit-approval.txt',
   'network-escalation-approval.txt',
   'question.txt',
+  'question-tabs-current.txt', // Current question tabs and capitalized navigation footer.
   'question-option2-selected.txt',
   'question-1of2.txt', // `| ←/→ to navigate questions |` in the hint
   'question-2of2-submit-all.txt', // `enter to submit all` on the last question
@@ -417,5 +418,34 @@ describe('Session.screenBlocked', () => {
     (session as unknown as { _resetBuffers(): void })._resetBuffers();
     expect(session.screenBlocked).toBe(false);
     expect(changes.map((c) => c.blocked)).toEqual([true, false]);
+  });
+});
+
+describe('current Codex question tabs', () => {
+  const screen = () => fixture('question-tabs-current.txt');
+  it('supports another selected option and a wrapped navigation footer', () => {
+    expect(blocked(screen().replace('› 1.', '  1.').replace('  3.', '› 3.'))).toBe(true);
+    expect(
+      blocked(
+        screen().replace(
+          ' · Tab/Arrow keys to navigate · Esc to cancel',
+          '\n  Tab/Arrow keys to navigate\n  Esc to cancel'
+        )
+      )
+    ).toBe(true);
+  });
+  it('keeps long option descriptions within the existing hard cap', () => {
+    const expanded = screen().replace('  2. Ask', '     More detail.\n'.repeat(9) + '  2. Ask');
+    expect(isBlockedScreen(expanded, CODEX_BLOCKED, 20)).toBe(false);
+    expect(blocked(expanded)).toBe(true);
+  });
+  it('does not mistake quoted question chrome or native menus for a blocked question', () => {
+    expect(
+      blocked(screen() + '\n› Ask Codex to do anything\n  GPT-6.2-Sol medium · ~/project\n  ? for shortcuts')
+    ).toBe(false);
+    expect(blocked(screen().replace(' · Tab/Arrow keys to navigate', ''))).toBe(false);
+    expect(blocked(screen().replace('Enter to select', 'enter select').replace('Esc to cancel', 'esc back'))).toBe(
+      false
+    );
   });
 });

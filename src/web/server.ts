@@ -4651,7 +4651,8 @@ export class WebServer extends EventEmitter {
     const pane = session.muxName ? (this.mux.capturePaneText?.(session.muxName) ?? null) : null;
     // The composer row and the status lines under it are screen chrome, not what the CLI said.
     const glyph = cutComposer ? getCli(session.mode)?.capabilities.workDetect?.promptGlyph : undefined;
-    return screenTail(pane ?? session.textOutput ?? '', 14, 900, glyph);
+    // Keep multi-question tabs and the question above their longer option descriptions.
+    return screenTail(pane ?? session.textOutput ?? '', cutComposer ? 14 : 24, cutComposer ? 900 : 1400, glyph);
   }
 
   /** No credentials: binds a one-file grant to its current owner, host, workspace and native identity. */
