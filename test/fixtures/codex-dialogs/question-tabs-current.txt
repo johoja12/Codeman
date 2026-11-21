@@ -1,0 +1,23 @@
+• Buildmesh needs your decision about its staging PR connection.
+
+←  □ PR account  □ Publish gate  ✓ Submit  →
+
+Buildmesh opens its staging PRs through a connected Bitbucket account.
+Which account should it use?
+
+› 1. Reconnect as me (Recommended)
+     Reconnect the staging repo's Bitbucket connection with your own account.
+     You complete browser consent; the agent handles the rest.
+
+  2. Ask the account owner to exclude them
+     Keep the connection and exclude the staging branches from the other merge flow.
+
+  3. Dedicated bot account
+     Connect a separate Bitbucket bot/service account for Buildmesh.
+     Someone must create the account and grant repository access.
+
+  4. Type something.
+───────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
