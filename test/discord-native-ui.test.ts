@@ -2179,11 +2179,13 @@ it('missed input requires author-only private review and explicit one-use confir
   expect(resend).not.toHaveBeenCalled();
   const panel = await f.click(card, 'Review missed message');
   expect(panel.content).toContain('Nothing has been typed');
+  expect(f.responses.at(-1)).toEqual({ type: 5, data: { flags: 64 } });
   expect(resend).not.toHaveBeenCalled();
   const confirm = f.component(panel, 'Send without queue');
   await f.ui.interaction(f.event(confirm));
   await f.ui.interaction(f.event(confirm));
   expect(resend).toHaveBeenCalledTimes(1);
+  expect(f.responses.some((r) => (r as { type: number }).type === 6)).toBe(true);
   expect(f.host.submit).not.toHaveBeenCalled();
 });
 it.each(['source', 'conversation', 'scope'])('missed review rejects changed %s', async (change) => {
