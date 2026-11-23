@@ -2137,3 +2137,25 @@ it('shows queued questions while retaining the working status and terminal-only 
   expect(result.content).toContain('Shift+←');
   expect(result.components).toHaveLength(0);
 });
+
+it('reports the stuck read stage and coalesces control polls without restarting mutating work', async () => {
+  const f = await fixture();
+  let release!: (sessions: DiscordUiSession[]) => void;
+  const sessions = vi.fn(
+    () =>
+      new Promise<DiscordUiSession[]>((resolve) => {
+        release = resolve;
+      })
+  );
+  f.host.services.sessions = sessions;
+  const poll = f.ui.poll();
+  await vi.waitFor(() => expect(f.ui.pollDiagnostics().stage).toBe('session-snapshot'));
+  f.advance(65000);
+  expect(f.ui.pollDiagnostics()).toMatchObject({ active: true, stale: true, stage: 'session-snapshot' });
+  void f.ui.poll();
+  void f.ui.poll();
+  expect(sessions).toHaveBeenCalledTimes(1);
+  release([]);
+  await poll;
+  expect(f.ui.pollDiagnostics().active).toBe(false);
+});

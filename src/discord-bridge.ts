@@ -1065,6 +1065,82 @@ export class DiscordBridge {
   private syncQueued = false;
   private syncState: DiscordSessionSync = { state: 'idle', total: 0, ready: 0, failed: 0 };
   private stopped = false;
+  private conversationPoll?: Promise<void>;
+  private uiRefresh?: Promise<void>;
+  private uiRefreshAt = 0;
+  private uiRefreshStage?: 'controls' | 'cards';
+  private uiHistory = new Map<string, { at: number; pending?: import('./discord-history.js').DiscordHistory }>();
+  private observeUiHistory(id: string, history: import('./discord-history.js').DiscordHistory): void {
+    if (!history.turns.length && !history.reportedSettings && !history.executions?.length) return;
+    const active = this.uiHistory.get(id);
+    if (active) {
+      const pending = active.pending;
+      active.pending =
+        pending?.conversationId === history.conversationId
+          ? {
+              ...history,
+              turns: history.turns.length ? history.turns : pending.turns,
+              executions: history.executions?.length ? history.executions : pending.executions,
+              reportedSettings: history.reportedSettings ?? pending.reportedSettings,
+            }
+          : history;
+      return;
+    }
+    if (this.uiHistory.size >= 128) return;
+    const state = { at: this.now(), pending: history as import('./discord-history.js').DiscordHistory | undefined };
+    this.uiHistory.set(id, state);
+    void (async () => {
+      while (state.pending && !this.stopped) {
+        const next = state.pending;
+        state.pending = undefined;
+        await this.nativeUi?.observeHistory(id, next);
+      }
+    })()
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.uiHistory.get(id) === state) {
+          this.uiHistory.delete(id);
+          if (state.pending && !this.stopped) this.observeUiHistory(id, state.pending);
+        }
+      });
+  }
+  private presentation = new Map<string, { at: number; timedOut: boolean }>();
+  /** Optional render metadata may finish late, but never posts or submits on its own. */
+  private async optionalUi<T>(key: string, work: () => Promise<T>, fallback: T): Promise<T> {
+    if (this.presentation.has(key) || this.presentation.size >= 128) return fallback;
+    const state = { at: this.now(), timedOut: false };
+    this.presentation.set(key, state);
+    return new Promise<T>((resolve) => {
+      const timer = setTimeout(() => {
+        state.timedOut = true;
+        resolve(fallback);
+      }, 30000);
+      timer.unref?.();
+      Promise.resolve()
+        .then(work)
+        .then(resolve, () => resolve(fallback))
+        .finally(() => {
+          clearTimeout(timer);
+          if (this.presentation.get(key) === state) this.presentation.delete(key);
+        });
+    });
+  }
+  private refreshUiInBackground(): void {
+    if (this.uiRefresh) return;
+    this.uiRefreshAt = this.now();
+    const run = (async () => {
+      this.uiRefreshStage = 'controls';
+      await this.profiler.measure('ui.controls', () => this.refreshControls()).catch(() => undefined);
+      this.uiRefreshStage = 'cards';
+      await this.profiler.measure('ui.poll', async () => this.nativeUi?.poll()).catch(() => undefined);
+    })().finally(() => {
+      if (this.uiRefresh === run) {
+        this.uiRefresh = undefined;
+        this.uiRefreshStage = undefined;
+      }
+    });
+    this.uiRefresh = run;
+  }
   private outputTimer?: ReturnType<typeof setInterval>;
   private activityTimer?: ReturnType<typeof setInterval>;
   private readonly activity: DiscordActivity;
@@ -1112,6 +1188,25 @@ export class DiscordBridge {
         pendingNotifications: this.pendingNotifications,
         pendingThreads: this.pending.size,
         activeConversations: this.conversationRuns.size,
+        uiRefresh: {
+          active: !!this.uiRefresh,
+          stage: this.uiRefreshStage,
+          ageMs: this.uiRefresh ? Math.max(0, now - this.uiRefreshAt) : 0,
+        },
+        uiPoll: this.nativeUi?.pollDiagnostics(),
+        historyObservers: [...this.uiHistory].map(([id, state]) => ({
+          sessionRef: createHash('sha256').update(id).digest('hex').slice(0, 12),
+          ageMs: Math.max(0, now - state.at),
+          pending: !!state.pending,
+        })),
+        pendingPresentation: [...this.presentation].map(([key, state]) => ({
+          stage: key.split(':')[0],
+          sessionRef: key.includes(':')
+            ? createHash('sha256').update(key.split(':')[1]).digest('hex').slice(0, 12)
+            : undefined,
+          ageMs: Math.max(0, now - state.at),
+          timedOut: state.timedOut,
+        })),
         syncQueued: this.syncQueued,
         sessionSync: this.sessionSync,
         cacheEntries: {
@@ -1641,7 +1736,7 @@ export class DiscordBridge {
         };
         await this.conversationProgress.set(key, progress);
       }
-      await this.nativeUi?.observeHistory(sessionId, history).catch(() => undefined);
+      this.observeUiHistory(sessionId, history);
       if (progress.seeded) return;
       const latestReply = [...history.turns]
         .reverse()
@@ -1709,13 +1804,19 @@ export class DiscordBridge {
   }
 
   /** Bounded round-robin polling: only native text, never redraw/scrollback snapshots. */
-  async pollConversations(): Promise<void> {
-    return this.profiler.measure('poll.conversations', () => this.pollConversationsNow());
+  pollConversations(): Promise<void> {
+    if (this.conversationPoll) return this.conversationPoll;
+    const run = this.profiler
+      .measure('poll.conversations', () => this.pollConversationsNow())
+      .finally(() => {
+        if (this.conversationPoll === run) this.conversationPoll = undefined;
+      });
+    this.conversationPoll = run;
+    return run;
   }
   private async pollConversationsNow(): Promise<void> {
     if (this.stopped || this.held || !this.cfg.enabled || this.cfg.mode !== 'full' || !this.deps.history) return;
-    await this.profiler.measure('ui.controls', () => this.refreshControls());
-    await this.profiler.measure('ui.poll', async () => this.nativeUi?.poll()).catch(() => undefined);
+    this.refreshUiInBackground();
     const sessions = this.deps.sessions?.() ?? [];
     if (!sessions.length) return;
     const batch = Array.from(
@@ -2294,7 +2395,7 @@ export class DiscordBridge {
       );
       if (!attributed) return;
       await this.refreshInputReaction(sessionId).catch(() => undefined);
-      await this.nativeUi?.observeHistory(sessionId, history).catch(() => undefined);
+      this.observeUiHistory(sessionId, history);
       if (progress.streamOff) return;
       const discordPrompts = await this.deliveries.submittedUserCursors(sessionId, channel, history.conversationId);
       const at = progress.cursor ? history.turns.findIndex((t) => t.cursor === progress!.cursor) : -1;
@@ -2424,14 +2525,17 @@ export class DiscordBridge {
           const confirmed = proof?.state === 'completed';
           const controls =
             turn.role === 'assistant' && owner && this.nativeUi
-              ? await this.nativeUi
-                  .responseControls(sessionId, channel, owner, turn.cursor, {
-                    updates: history.turns
-                      .slice(Math.max(0, history.turns.findIndex((t) => t.cursor === owner) + 1), position)
-                      .some((t) => t.role === 'assistant' && t.phase === 'commentary'),
-                    download: visible.length > 1900,
-                  })
-                  .catch(() => [])
+              ? await this.optionalUi(
+                  'controls:' + sessionId + ':' + turn.cursor,
+                  () =>
+                    this.nativeUi!.responseControls(sessionId, channel, owner, turn.cursor, {
+                      updates: history.turns
+                        .slice(Math.max(0, history.turns.findIndex((t) => t.cursor === owner) + 1), position)
+                        .some((t) => t.role === 'assistant' && t.phase === 'commentary'),
+                      download: visible.length > 1900,
+                    }),
+                  []
+                )
               : [];
           const label = this.deps.sessions?.().find((s) => s.id === sessionId)?.name;
           const responseOptions = {
@@ -2442,9 +2546,12 @@ export class DiscordBridge {
           };
           const tablePosts =
             turn.role === 'assistant' && owner && this.nativeUi
-              ? await this.nativeUi
-                  .tableResponsePosts(sessionId, channel, owner, turn.cursor, visible, responseOptions)
-                  .catch(() => undefined)
+              ? await this.optionalUi(
+                  'tables:' + sessionId + ':' + turn.cursor,
+                  () =>
+                    this.nativeUi!.tableResponsePosts(sessionId, channel, owner, turn.cursor, visible, responseOptions),
+                  undefined
+                )
               : undefined;
           const responsePosts =
             tablePosts ??
@@ -2488,7 +2595,7 @@ export class DiscordBridge {
         };
         await this.conversationProgress.set(key, progress);
       }
-      await this.nativeUi?.observeHistory(sessionId, history).catch(() => undefined);
+      this.observeUiHistory(sessionId, history);
       if (history.turns.length - (at + 1) <= 20) await sendImagesThrough(history.scannedCursor);
       // Raw tool/metadata pages still make durable progress after all visible turns were delivered.
       if (history.verifiedAfter && history.scannedCursor && history.turns.length - (at + 1) <= 20) {
@@ -2522,12 +2629,15 @@ export class DiscordBridge {
       const updatesUser = progress.activeUser ?? user?.cursor;
       const progressControls =
         updatesUser && this.nativeUi
-          ? await this.nativeUi
-              .responseControls(sessionId, channel, updatesUser, undefined, {
-                updates: updates.length > 0,
-                download: false,
-              })
-              .catch(() => [])
+          ? await this.optionalUi(
+              'progress:' + sessionId,
+              () =>
+                this.nativeUi!.responseControls(sessionId, channel, updatesUser, undefined, {
+                  updates: updates.length > 0,
+                  download: false,
+                }),
+              []
+            )
           : [];
       const progressPost = discordProgressPost(status, '', updates.length, progressControls);
       const hash = createHash('sha256').update(JSON.stringify(progressPost)).digest('hex');

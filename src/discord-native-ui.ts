@@ -108,6 +108,27 @@ export class DiscordNativeUi {
   private consumedGroups = new Map<string, number>();
   lastError: string | null = null;
   private polls?: Promise<void>;
+  private pollStage?: { name: string; session?: string; at: number };
+  pollDiagnostics() {
+    const ageMs = this.pollStage ? Math.max(0, this.host.now() - this.pollStage.at) : 0;
+    return {
+      active: !!this.polls,
+      stage: this.pollStage?.name,
+      sessionRef: this.pollStage?.session ? hash(this.pollStage.session).slice(0, 12) : undefined,
+      ageMs,
+      stale: ageMs >= 60000,
+    };
+  }
+  private async pollStep<T>(name: string, work: () => Promise<T>, session?: string): Promise<T> {
+    const stage = { name, session, at: this.host.now() };
+    this.pollStage = stage;
+    try {
+      return await work();
+    } finally {
+      if (this.pollStage === stage) this.pollStage = undefined;
+    }
+  }
+
   private registrations?: Promise<void>;
   private registeredScope = '';
   private commands = new Map<string, string>();
@@ -1056,17 +1077,17 @@ export class DiscordNativeUi {
   private async runPoll(): Promise<void> {
     if (!this.host.scope()) return;
     this.prune();
-    await this.refreshQuestionPanels();
-    await this.register();
-    await this.retireLegacyCards();
+    await this.pollStep('question-panels', () => this.refreshQuestionPanels());
+    await this.pollStep('registration', () => this.register());
+    await this.pollStep('legacy-card-cleanup', () => this.retireLegacyCards());
     let sessions: DiscordUiSession[];
     try {
-      sessions = await this.host.services.sessions();
+      sessions = await this.pollStep('session-snapshot', () => this.host.services.sessions());
     } catch (error) {
       await this.publishDashboard();
       throw error;
     }
-    await this.observeSessionActivity(sessions);
+    await this.pollStep('session-activity', () => this.observeSessionActivity(sessions));
     const list = sessions.filter((s) => this.host.channelForSession(s.id));
     for (let i = 0; i < Math.min(3, list.length); i++) {
       const s = list[(this.cardCursor + i) % list.length];
@@ -1074,15 +1095,17 @@ export class DiscordNativeUi {
       if ((this.errors.get(key) ?? 0) > this.host.now()) continue;
       try {
         const channel = this.host.channelForSession(s.id)!;
-        if (!(await this.host.passive(s.id, channel))) continue;
+        if (!(await this.pollStep('ownership', () => this.host.passive(s.id, channel), s.id))) continue;
+        const receipt = await this.pollStep('receipts', () => this.host.receipts(s.id), s.id);
+        const snapshot = await this.pollStep('queue-snapshot', () => this.store.snapshot(), s.id);
         // Tokens rotate every two minutes, and immediately after process restart.
         const signature = hash(
           JSON.stringify([
             this.host.scope(),
             this.host.latestPrompt?.(s.id, s.conversation),
             s,
-            (await this.host.receipts(s.id))[0],
-            (await this.store.snapshot()).queue.filter((p) => p.session === s.id),
+            receipt[0],
+            snapshot.queue.filter((p) => p.session === s.id),
             Math.floor(this.host.now() / 120000),
             this.epoch,
           ])
@@ -1090,8 +1113,12 @@ export class DiscordNativeUi {
         const oldTokens = this.cardActions.get(key) ?? [];
         if (this.cardActions.get(key + ':signature')?.[0] !== signature) {
           const before = new Set(this.actions.keys());
-          const payload = await this.sessionCard(s);
-          await this.upsert(key, channel, payload, !this.cardActions.has(key));
+          const payload = await this.pollStep('session-card', () => this.sessionCard(s), s.id);
+          await this.pollStep(
+            'publish-card',
+            () => this.upsert(key, channel, payload, !this.cardActions.has(key)),
+            s.id
+          );
           oldTokens.forEach((t) => this.actions.delete(t));
           this.cardActions.set(
             key,
@@ -1099,14 +1126,14 @@ export class DiscordNativeUi {
           );
           this.cardActions.set(key + ':signature', [signature]);
         }
-        await this.dispatchQueue(s);
+        await this.pollStep('queue-dispatch', () => this.dispatchQueue(s), s.id);
       } catch (e) {
         this.lastError = e instanceof Error ? e.message : 'Session card update failed';
         this.errors.set(key, this.host.now() + 30000);
       }
     }
     this.cardCursor += Math.min(3, list.length);
-    await this.publishDashboard(sessions);
+    await this.pollStep('dashboard', () => this.publishDashboard(sessions));
   }
   private async publishDashboard(sessions?: DiscordUiSession[]): Promise<void> {
     if (this.host.now() >= this.dashboardDue) {
