@@ -2450,8 +2450,10 @@ it('links the live Activity row to the final message actually delivered by the b
   await b.pollConversations();
   const sent = [...remoteMessages.values()].find((m) => visibleText(m) === 'Exact delivered final.');
   expect(sent).toBeDefined();
+  await (b as unknown as { uiRefresh?: Promise<void> }).uiRefresh;
   now += 21000;
   await b.pollConversations();
+  await (b as unknown as { uiRefresh?: Promise<void> }).uiRefresh;
   const dashboard = [...remoteMessages.values()].find((m) =>
     discordUiNodes(m.components).some((c) => String(c.content ?? '').includes('## Activity'))
   );
@@ -3487,4 +3489,113 @@ it('keeps the shared parent when an alias survives an explicit case deletion', a
   expect(remoteChannels.has(parent)).toBe(true);
   expect(posts.some((p) => p.method === 'DELETE' && p.path.endsWith('/' + parent))).toBe(false);
   b.stop();
+});
+
+it('delivers transcript output while control refresh never finishes, and coalesces timer ticks', async () => {
+  sessions = [{ id: 's1', name: 'w29-test' }];
+  let appended = false;
+  const history = vi.fn(async () => ({
+    conversationId: 'native1',
+    turns: [
+      { role: 'assistant' as const, cursor: 'native1:old', text: 'Earlier response' },
+      ...(appended ? [{ role: 'assistant' as const, cursor: 'native1:new', text: 'Newest response must arrive' }] : []),
+    ],
+  }));
+  const b = makeBridge(undefined, { history });
+  await b.reload();
+  await b.syncSessions();
+  const poll = vi.fn(() => new Promise<void>(() => {}));
+  const observe = vi.fn(() => new Promise<void>(() => {}));
+  Object.assign(b, {
+    nativeUi: {
+      stop: () => undefined,
+      poll,
+      observeHistory: observe,
+      pollDiagnostics: () => ({ active: true, stage: 'session-snapshot' }),
+    },
+  });
+  appended = true;
+  const first = b.pollConversations();
+  const repeats = Array.from({ length: 50 }, () => b.pollConversations());
+  const completed = await Promise.race([
+    first.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 2000)),
+  ]);
+  expect(completed).toBe(true);
+  expect(repeats.every((p) => p === first)).toBe(true);
+  expect(posts.some((p) => p.method === 'POST' && visibleText(p.body)?.includes('Newest response must arrive'))).toBe(
+    true
+  );
+  await b.pollConversations();
+  expect(poll).toHaveBeenCalledTimes(1);
+  expect(observe).toHaveBeenCalledTimes(1);
+  expect(b.profiling().operations.find((o) => o.name === 'poll.conversations')?.active).toBe(0);
+  expect(b.profiling().bridge.uiPoll?.stage).toBe('session-snapshot');
+  expect(sendInput).not.toHaveBeenCalled();
+});
+
+it('bounds optional rendering metadata without restarting pending work or publishing late results', async () => {
+  const b = makeBridge();
+  vi.useFakeTimers();
+  try {
+    let release!: (value: string[]) => void;
+    const work = vi.fn(
+      () =>
+        new Promise<string[]>((resolve) => {
+          release = resolve;
+        })
+    );
+    const internal = b as unknown as { optionalUi<T>(key: string, work: () => Promise<T>, fallback: T): Promise<T> };
+    const pending = internal.optionalUi('response-fixture', work, [] as string[]);
+    await vi.advanceTimersByTimeAsync(30001);
+    expect(await pending).toEqual([]);
+    expect(await internal.optionalUi('response-fixture', work, [])).toEqual([]);
+    expect(work).toHaveBeenCalledTimes(1);
+    expect(b.profiling().bridge.pendingPresentation[0].timedOut).toBe(true);
+    release(['late controls']);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(b.profiling().bridge.pendingPresentation).toEqual([]);
+    expect(posts).toEqual([]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('retains the latest history observation while an earlier UI update is pending', async () => {
+  const b = makeBridge();
+  let release!: () => void;
+  const observe = vi
+    .fn()
+    .mockImplementationOnce(
+      () =>
+        new Promise<void>((r) => {
+          release = r;
+        })
+    )
+    .mockResolvedValue(undefined);
+  Object.assign(b, { nativeUi: { stop: () => undefined, observeHistory: observe } });
+  const internal = b as unknown as {
+    observeUiHistory(
+      id: string,
+      history: { conversationId: string; turns: Array<{ role: 'assistant'; cursor: string; text: string }> }
+    ): void;
+  };
+  internal.observeUiHistory('s1', {
+    conversationId: 'first',
+    turns: [{ role: 'assistant', cursor: 'first', text: 'first' }],
+  });
+  internal.observeUiHistory('s1', {
+    conversationId: 'middle',
+    turns: [{ role: 'assistant', cursor: 'middle', text: 'middle' }],
+  });
+  internal.observeUiHistory('s1', {
+    conversationId: 'latest',
+    turns: [{ role: 'assistant', cursor: 'latest', text: 'latest' }],
+  });
+  internal.observeUiHistory('s1', { conversationId: 'latest', turns: [] });
+  expect(observe).toHaveBeenCalledTimes(1);
+  release();
+  await vi.waitFor(() => expect(observe).toHaveBeenCalledTimes(2));
+  expect(observe.mock.calls[1][1].conversationId).toBe('latest');
+  expect(sendInput).not.toHaveBeenCalled();
 });

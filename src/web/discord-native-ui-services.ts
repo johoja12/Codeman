@@ -22,7 +22,7 @@ import {
   configuredDiscordCaseChannel,
   resolveDiscordCase,
 } from '../discord-case-identity.js';
-import type { DiscordNativeUiServices, DiscordConnection } from '../discord-native-ui-types.js';
+import type { DiscordNativeUiServices, DiscordConnection, DiscordUiSession } from '../discord-native-ui-types.js';
 import type { Session } from '../session.js';
 import type { CaseInfo } from '../types.js';
 interface Deps {
@@ -36,6 +36,18 @@ interface Deps {
   activityConversation?(session: Session): string | undefined;
   questionObserved?(item: ApprovalItem): boolean | void | Promise<boolean | void>;
   observed?(id: string): { model: string; effort?: string } | undefined;
+}
+/** Deadlines apply only to observations; late reads cannot publish or submit input. */
+export const DISCORD_OBSERVATION_TIMEOUT_MS = 30000;
+function observedRead<T>(read: () => T | Promise<T>, fallback: T): Promise<T> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), DISCORD_OBSERVATION_TIMEOUT_MS);
+    timer.unref?.();
+    Promise.resolve()
+      .then(read)
+      .then(resolve, () => resolve(fallback))
+      .finally(() => clearTimeout(timer));
+  });
 }
 /** Match the native history reader: Claude IDs do not live in Codex resume fields. */
 const conversationFor = (s: Session): string | undefined =>
@@ -63,6 +75,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       conversation: string;
       revision: string;
       delivered: boolean;
+      notifying?: boolean;
       kind: 'question' | 'permission';
       queuedCount?: number;
       generation?: string;
@@ -70,6 +83,42 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       control?: ApprovalItem['nativeQuestion'];
     }
   >();
+  const notifyObserved = (id: string) => {
+    const entry = observed.get(id);
+    if (!entry || entry.delivered || entry.notifying) return;
+    const item = approvalInbox.getById(entry.id);
+    if (!item) return;
+    entry.notifying = true;
+    // Do not let the outbound notification queue hold the session snapshot hostage.
+    void Promise.resolve()
+      .then(() => deps.questionObserved?.(item))
+      .then((ok) => {
+        if (observed.get(id) === entry) entry.delivered = ok !== false;
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        entry.notifying = false;
+      });
+  };
+  let caseRead: Promise<CaseInfo[]> | undefined;
+  const healthReads = new WeakMap<Session, Promise<DiscordConnection>>();
+  const captureReads = new WeakMap<Session, Promise<string | null | undefined>>();
+  const health = (s: Session) =>
+    observedRead(
+      async () => {
+        let run = healthReads.get(s);
+        if (!run) {
+          run = Promise.resolve()
+            .then(() => deps.health!(s))
+            .finally(() => {
+              if (healthReads.get(s) === run) healthReads.delete(s);
+            });
+          healthReads.set(s, run);
+        }
+        return run;
+      },
+      { state: 'unverified', reason: 'check_failed' } as DiscordConnection
+    );
   const reading = new Set<string>();
   const suggestion = async (s: Session) => {
     if (
@@ -88,7 +137,18 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       const generation = s.inspectionGeneration;
       const revision = s.discordQueueRevision,
         conversation = conversationFor(s);
-      const frame = await deps.capture?.(s.id);
+      const frame = await observedRead(async () => {
+        let run = captureReads.get(s);
+        if (!run) {
+          run = Promise.resolve()
+            .then(() => deps.capture?.(s.id))
+            .finally(() => {
+              if (captureReads.get(s) === run) captureReads.delete(s);
+            });
+          captureReads.set(s, run);
+        }
+        return run;
+      }, undefined);
       if (
         !deps.allowed() ||
         deps.sessions().get(s.id) !== s ||
@@ -148,8 +208,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
           };
           observed.set(s.id, previous);
         }
-        const item = approvalInbox.getById(previous.id);
-        if (item && !previous.delivered) previous.delivered = (await deps.questionObserved?.(item)) !== false;
+        notifyObserved(s.id);
         return undefined;
       }
       const dialog = parseClaudeVisibleQuestion(frame);
@@ -205,7 +264,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
         ) {
           item.nativeQuestion.dialog = dialog;
         }
-        if (item && !current.delivered) current.delivered = (await deps.questionObserved?.(item)) !== false;
+        notifyObserved(s.id);
         return undefined;
       }
       if (
@@ -245,11 +304,20 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
           observed.delete(id);
         }
       }
-      const cases = await deps.cases();
+      const cases = await observedRead(() => {
+        if (!caseRead)
+          caseRead = Promise.resolve()
+            .then(() => deps.cases())
+            .finally(() => {
+              caseRead = undefined;
+            });
+        return caseRead;
+      }, [] as CaseInfo[]);
+      if (!deps.allowed()) return [];
       const visible = [...deps.sessions().values()].filter((s) => !s.suppressNotifications);
-      return Promise.all(
-        visible.map(async (s) => {
-          const connection = (await deps.health?.(s)) ?? {
+      const projected = await Promise.all(
+        visible.map(async (s): Promise<DiscordUiSession> => {
+          const connection = (deps.health ? await health(s) : undefined) ?? {
             state: s.paneExit ? ('agent_exited' as const) : ('available' as const),
           };
           const unavailable = connection.state !== 'available';
@@ -304,6 +372,11 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
           };
         })
       );
+      return deps.allowed()
+        ? projected.filter((row) =>
+            visible.some((s) => s.id === row.id && deps.sessions().get(s.id) === s && !s.suppressNotifications)
+          )
+        : [];
     },
     caseChannels: async () => {
       if (!deps.allowed()) return [];

@@ -412,6 +412,20 @@ for its most recent 128 completions. Poll skips identify in-flight reads,
 not-yet-due sessions, concurrency limits and missing destinations. Queue and cache
 counts help distinguish slow reads from growing work queues.
 
+Control-card refresh runs independently of transcript delivery. A stuck refresh is
+coalesced instead of accumulating timer calls; it does not block streamed replies.
+Read-only health/capture observations have a 30-second deadline. Pending question
+notifications run separately from session snapshots. Optional response-control metadata
+also has a deadline: output falls back to ordinary response cards while the original
+metadata operation remains coalesced until it settles. Mutating card/queue work is not
+cancelled and restarted, preventing late duplicate effects.
+
+The bridge status also reports the current control-refresh stage, its age, and bounded
+pending optional-rendering stages. The UI poll exposes a stage and a short SHA-256
+session reference for correlating a slow card without including a raw session ID.
+Stages cover registration, session snapshot, ownership, receipts, card publication,
+queue dispatch and dashboard updates. A stage older than 60 seconds is flagged stale.
+
 These wall times include network/disk waits. Nested and overlapping operation
 totals must not be summed as CPU time. The Node RSS, heap and CPU fields explicitly
 cover the **whole process**. Cached text payload bytes are only the UTF-8 lengths
