@@ -50,6 +50,25 @@ afterEach(async () => {
 });
 
 describe('delivery journal', () => {
+  it('reserves missed input once, persists the claim and never replays an interrupted confirmation', async () => {
+    const journal = new DiscordDeliveryJournal(dir, () => now);
+    const native = { conversationId: 'exact-native', promptHash: 'a'.repeat(64) };
+    await journal.claim({ ...meta, reason: 'missed_gateway', native });
+    // A crash during discovery permits review, never automatic submission.
+    const restored = new DiscordDeliveryJournal(dir, () => now);
+    expect(await restored.get(meta.id)).toMatchObject({ state: 'failed', reason: 'missed_gateway', native });
+    expect(await restored.takeMissed(meta.id, 'changed', native.promptHash)).toBe(false);
+    expect(await restored.takeMissed(meta.id, native.conversationId, 'b'.repeat(64))).toBe(false);
+    const claims = await Promise.all(
+      Array.from({ length: 8 }, () => restored.takeMissed(meta.id, native.conversationId, native.promptHash))
+    );
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    const restarted = new DiscordDeliveryJournal(dir, () => now);
+    expect(await restarted.get(meta.id)).toMatchObject({ state: 'uncertain', reason: 'missed_gateway', native });
+    expect(await restarted.takeMissed(meta.id, native.conversationId, native.promptHash)).toBe(false);
+    expect(await readFile(join(dir, 'discord-delivery.json'), 'utf8')).not.toContain(MESSAGE_EVENT.content);
+  });
+
   it('durably claims an ID once under concurrency, with private permissions', async () => {
     const journal = new DiscordDeliveryJournal(dir, () => now);
     const claims = await Promise.all(Array.from({ length: 10 }, () => journal.claim(meta)));

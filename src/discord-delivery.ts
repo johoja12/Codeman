@@ -55,7 +55,8 @@ export interface DiscordDelivery {
     | 'delivery_uncertain'
     | 'rate_limited'
     | 'input_too_large'
-    | 'invalid_command';
+    | 'invalid_command'
+    | 'missed_gateway';
 }
 
 /** A transport receipt alone never proves that the native CLI accepted a prompt. */
@@ -146,8 +147,8 @@ export class DiscordDeliveryJournal {
         createdAt: r.createdAt,
         updatedAt: r.updatedAt,
       };
-      // Retain only this fixed refusal proof; never restore arbitrary external reason text.
-      if (r.reason === 'discord_refused') record.reason = 'discord_refused';
+      // Retain only these fixed recovery proofs; never restore arbitrary external reason text.
+      if (r.reason === 'discord_refused' || r.reason === 'missed_gateway') record.reason = r.reason;
       if (r.payloadHash !== undefined) {
         if (typeof r.payloadHash !== 'string' || !/^[a-f0-9]{64}$/.test(r.payloadHash))
           throw new DiscordDeliveryError('Invalid Discord delivery fingerprint');
@@ -177,9 +178,16 @@ export class DiscordDeliveryJournal {
           userCursor: r.native.userCursor,
         };
       }
+      if (record.reason === 'missed_gateway' && record.state === 'received') record.state = 'failed';
       if (['received', 'files_transferred', 'awaiting_choice', 'submitting'].includes(record.state)) {
-        record.reason = record.state === 'submitting' ? 'restart_during_submit' : 'restart_before_submit';
-        record.state = record.reason === 'restart_during_submit' ? 'uncertain' : 'failed';
+        const missed = record.reason === 'missed_gateway';
+        if (!missed) record.reason = record.state === 'submitting' ? 'restart_during_submit' : 'restart_before_submit';
+        record.state =
+          missed && record.state === 'submitting'
+            ? 'uncertain'
+            : record.reason === 'restart_during_submit'
+              ? 'uncertain'
+              : 'failed';
         record.updatedAt = this.now();
       }
       this.records.set(record.id, record);
@@ -260,6 +268,36 @@ export class DiscordDeliveryJournal {
     });
   }
 
+  async get(id: string): Promise<DiscordDelivery | undefined> {
+    await this.load();
+    await this.chain;
+    const record = this.records.get(id);
+    return record ? structuredClone(record) : undefined;
+  }
+  /** Reserve explicit historical-input confirmation before any input or queue side effect. */
+  takeMissed(id: string, conversation: string, promptHash: string): Promise<boolean> {
+    return this.serial(async () => {
+      await this.load();
+      const before = this.records.get(id);
+      if (
+        !before ||
+        before.direction !== 'inbound' ||
+        before.reason !== 'missed_gateway' ||
+        before.state !== 'failed' ||
+        before.native?.conversationId !== conversation ||
+        before.native.promptHash !== promptHash
+      )
+        return false;
+      this.records.set(id, { ...before, state: 'submitting', updatedAt: this.now() });
+      try {
+        await this.persist();
+      } catch (error) {
+        this.records.set(id, before);
+        throw error;
+      }
+      return true;
+    });
+  }
   update(id: string, state: DiscordDeliveryState, reason?: DiscordDelivery['reason']): Promise<void> {
     return this.serial(async () => {
       await this.load();

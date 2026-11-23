@@ -2159,3 +2159,60 @@ it('reports the stuck read stage and coalesces control polls without restarting 
   await poll;
   expect(f.ui.pollDiagnostics().active).toBe(false);
 });
+
+it('missed input requires author-only private review and explicit one-use confirmation', async () => {
+  const f = await fixture();
+  const source = { id: snow(), channel_id: channel, author: { id: actor }, content: 'Continue the current task' };
+  const request = f.host.request;
+  f.host.request = vi.fn(async (method, path, body) =>
+    method === 'GET' && path.endsWith('/' + source.id) ? source : request(method, path, body)
+  );
+  const resend = vi.fn(async () => ({ handled: true, text: 'Confirmed' }));
+  await f.ui.missedInputCard('s1', channel, source, 'conversation-one', false, resend);
+  const card = [...f.messages.values()].find((m) => m.content?.includes('Historical message needs review'))!;
+  expect(card).toBeDefined();
+  await f.ui.missedInputCard('s1', channel, source, 'conversation-one', false, resend);
+  expect([...f.messages.values()].filter((m) => m.content?.includes('Historical message needs review'))).toHaveLength(
+    1
+  );
+  await f.click(card, 'Review missed message', undefined, { member: { user: { id: '999999999999999999' } } });
+  expect(resend).not.toHaveBeenCalled();
+  const panel = await f.click(card, 'Review missed message');
+  expect(panel.content).toContain('Nothing has been typed');
+  expect(resend).not.toHaveBeenCalled();
+  const confirm = f.component(panel, 'Send without queue');
+  await f.ui.interaction(f.event(confirm));
+  await f.ui.interaction(f.event(confirm));
+  expect(resend).toHaveBeenCalledTimes(1);
+  expect(f.host.submit).not.toHaveBeenCalled();
+});
+it.each(['source', 'conversation', 'scope'])('missed review rejects changed %s', async (change) => {
+  const f = await fixture();
+  const source = { id: snow(), channel_id: channel, author: { id: actor }, content: 'Continue the current task' };
+  const request = f.host.request;
+  f.host.request = vi.fn(async (method, path, body) =>
+    method === 'GET' && path.endsWith('/' + source.id)
+      ? { ...source, content: change === 'source' ? 'edited' : source.content }
+      : request(method, path, body)
+  );
+  const resend = vi.fn(async () => ({ handled: true, text: 'Confirmed' }));
+  await f.ui.missedInputCard('s1', channel, source, 'conversation-one', false, resend);
+  const card = [...f.messages.values()].find((m) => m.content?.includes('Historical message needs review'))!;
+  if (change === 'conversation') f.sessions[0].conversation = 'changed';
+  if (change === 'scope') f.setScope('changed');
+  await f.click(card, 'Review missed message');
+  expect(resend).not.toHaveBeenCalled();
+  expect(f.finishes.at(-1)?.content ?? '').not.toContain('Nothing has been typed');
+});
+
+it('adopts an existing missed-message card after restart without posting another', async () => {
+  const f = await fixture();
+  const source = { id: snow(), channel_id: channel, author: { id: actor }, content: 'Continue current work' };
+  const resend = vi.fn(async () => ({ handled: true, text: 'Confirmed' }));
+  await f.ui.missedInputCard('s1', channel, source, 'conversation-one', false, resend);
+  await new DiscordNativeUi(f.host).missedInputCard('s1', channel, source, 'conversation-one', false, resend);
+  expect([...f.messages.values()].filter((m) => m.content?.includes('Historical message needs review'))).toHaveLength(
+    1
+  );
+  expect(resend).not.toHaveBeenCalled();
+});

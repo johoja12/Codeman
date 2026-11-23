@@ -476,3 +476,9 @@ Thread titles, the Activity view, session cards and status replies use the same 
 | Status check failed | An unexpected check failed without a more specific diagnosis. |
 
 Network, authentication and trust failures do not offer a new session or automatic resume. Cards retain Refresh status and Open in Codeman where available. Verification retries automatically; corrected conditions clear the reason on a successful check. A status refresh never resends input or weakens exact-conversation checks. Raw SSH errors and credentials are never displayed.
+
+## Missed-message recovery
+
+In Full mode, the bridge checks owned session threads after connecting or resuming and periodically while connected. It inspects the latest 50 messages per thread, rotating two threads per pass. Ordinary allowlisted human text between one minute and 24 hours old can receive a **Review missed message** card when there is no delivery receipt. Attachments, management commands, unavailable conversations and notification-suppressed sessions are excluded. Existing receipts and matching native user prompts are not replayed.
+
+Discovery never types into a terminal. Only the original author can open the private review and choose **Send without queue**, after checking that the instruction still belongs in the displayed current conversation. Confirmation rechecks the source message, destination and native conversation, then reserves a durable one-use delivery claim. A crash or uncertain result prevents automatic replay. History checks are bounded and cannot prove an instruction was never entered elsewhere; inspect the current session before confirming. Older messages and attachments should be resent explicitly if still wanted.

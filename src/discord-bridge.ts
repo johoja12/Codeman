@@ -1,3 +1,4 @@
+import { eligibleMissedInput } from './discord-missed-input.js';
 import { DiscordThreadMembers } from './discord-thread-members.js';
 import { DiscordProfiling } from './discord-profiling.js';
 import { DiscordHistoryWarnings } from './discord-history-warnings.js';
@@ -748,6 +749,9 @@ export interface GatewayMessage {
   channel_id: string;
   guild_id?: string;
   content: string;
+  timestamp?: string;
+  webhook_id?: string;
+  type?: number;
   author: { id: string; bot?: boolean };
   attachments?: Array<{ id: string; filename: string; size: number; url: string }>;
 }
@@ -781,13 +785,18 @@ export class DiscordGateway {
   private acked = true;
   private attempts = 0;
   private stopped = true;
+  private events = { ready: 0, resumed: 0, invalidSession: 0, lastConnectedAt: 0, lastMessageAt: 0 };
+  diagnostics() {
+    return { ...this.events };
+  }
 
   constructor(
     private readonly token: () => string,
     private readonly onMessage: (m: GatewayMessage) => void,
     private readonly socketFactory: SocketFactory = defaultSocket,
     private readonly backoffMs: (attempt: number) => number = (n) => Math.min(1000 * 2 ** n, 60_000),
-    private readonly onInteraction?: (interaction: DiscordInteraction) => void
+    private readonly onInteraction?: (interaction: DiscordInteraction) => void,
+    private readonly onConnected?: (kind: 'ready' | 'resumed') => void
   ) {}
 
   start(): void {
@@ -905,6 +914,7 @@ export class DiscordGateway {
         sock.close(4000);
         break;
       case 9: // invalid session: resumable only if d === true
+        this.events.invalidSession++;
         if (p.d !== true) {
           this.sessionId = null;
           this.seq = null;
@@ -915,17 +925,24 @@ export class DiscordGateway {
       case 0:
         if (p.t === 'READY') {
           const d = p.d as { session_id?: string; resume_gateway_url?: string };
+          this.events.ready++;
+          this.events.lastConnectedAt = Date.now();
           this.sessionId = d.session_id ?? null;
           this.resumeUrl = d.resume_gateway_url ? `${d.resume_gateway_url}/?v=10&encoding=json` : null;
           this.state = 'connected';
           this.lastError = null;
           this.attempts = 0;
+          this.onConnected?.('ready');
         } else if (p.t === 'RESUMED') {
+          this.events.resumed++;
+          this.events.lastConnectedAt = Date.now();
           this.state = 'connected';
           this.attempts = 0;
+          this.onConnected?.('resumed');
         } else if (p.t === 'INTERACTION_CREATE') {
           this.onInteraction?.(p.d as DiscordInteraction);
         } else if (p.t === 'MESSAGE_CREATE') {
+          this.events.lastMessageAt = Date.now();
           this.onMessage(p.d as GatewayMessage);
         }
         break;
@@ -1065,6 +1082,234 @@ export class DiscordBridge {
   private syncQueued = false;
   private syncState: DiscordSessionSync = { state: 'idle', total: 0, ready: 0, failed: 0 };
   private stopped = false;
+  private missedScan?: Promise<void>;
+  private missedScanDue = 0;
+  private missedScanIndex = 0;
+  private missedStats = { scans: 0, discovered: 0, lastError: undefined as 'scan_failed' | undefined };
+  private recoverMissedInBackground(): void {
+    if (
+      this.missedScan ||
+      this.now() < this.missedScanDue ||
+      this.stopped ||
+      this.held ||
+      !this.acceptsControls ||
+      this.cfg.mode !== 'full' ||
+      !this.nativeUi ||
+      !this.deps.nativeUi?.enabled() ||
+      !this.deps.history ||
+      this.gatewayState !== 'connected'
+    )
+      return;
+    this.missedScanDue = this.now() + 5000;
+    const run = this.scanMissedInput()
+      .catch(() => {
+        this.missedStats.lastError = 'scan_failed';
+      })
+      .finally(() => {
+        if (this.missedScan === run) this.missedScan = undefined;
+      });
+    this.missedScan = run;
+  }
+  private async scanMissedInput(): Promise<void> {
+    const scope = this.controlScope;
+    const sessions = (this.deps.sessions?.() ?? []).filter((s) => this.channels.channelForSession(this.cfg, s.id));
+    if (!scope || !sessions.length) return;
+    const batch = Array.from(
+      { length: Math.min(2, sessions.length) },
+      (_, i) => sessions[(this.missedScanIndex + i) % sessions.length]
+    );
+    this.missedScanIndex = (this.missedScanIndex + batch.length) % sessions.length;
+    let views: ReturnType<import('./discord-native-ui-types.js').DiscordNativeUiServices['sessions']> | undefined;
+    const valid = (id: string, channel: string) =>
+      !this.stopped &&
+      !this.held &&
+      this.acceptsControls &&
+      this.controlScope === scope &&
+      !!this.deps.nativeUi?.enabled() &&
+      !!this.deps.sessions?.().some((s) => s.id === id) &&
+      this.destinationMatches(id, channel);
+    let failed = false;
+    await Promise.all(
+      batch.map(async (s) => {
+        const channel = this.channels.channelForSession(this.cfg, s.id)!;
+        try {
+          if (
+            this.inbound.has(channel) ||
+            !valid(s.id, channel) ||
+            !(await this.channels.activityOwned(this.cfg, s.id, channel))
+          )
+            return;
+          const messages = (await this.api.channelMessages(channel)) as GatewayMessage[];
+          if (!Array.isArray(messages) || !valid(s.id, channel)) return;
+          const candidates: Array<{
+            source: GatewayMessage;
+            record?: import('./discord-delivery.js').DiscordDelivery;
+          }> = [];
+          for (const source of messages.slice(0, 50)) {
+            if (
+              !eligibleMissedInput(source, {
+                channel,
+                guild: this.cfg.guildId,
+                allowed: this.cfg.allowedUserIds,
+                now: this.now(),
+              })
+            )
+              continue;
+            const record = await this.deliveries.get(`in:${this.cfg.guildId}:${source.id}`);
+            if (
+              record &&
+              (record.sessionId !== s.id || record.channelId !== channel || record.reason !== 'missed_gateway')
+            )
+              continue;
+            candidates.push({ source, record });
+          }
+          if (!candidates.length) return;
+          views ??= this.deps.nativeUi!.sessions();
+          const view = (await views).find((v) => v.id === s.id);
+          if (!view?.conversation || view.exited || !valid(s.id, channel) || this.inbound.has(channel)) return;
+          let history: import('./discord-history.js').DiscordHistory | undefined;
+          let offered = 0;
+          for (const candidate of candidates) {
+            const { source } = candidate;
+            let record = candidate.record;
+            if (!record || record.state === 'failed') {
+              if (!record && offered++ >= 3) continue;
+              history ??= await this.deps.history!(s.id);
+              if (history.conversationId !== view.conversation || !valid(s.id, channel) || this.inbound.has(channel))
+                return;
+              const promptHash = hashDiscordPrompt(source.content);
+              if (!record) {
+                const claim = await this.deliveries.claim({
+                  id: `in:${this.cfg.guildId}:${source.id}`,
+                  direction: 'inbound',
+                  sessionId: s.id,
+                  channelId: channel,
+                  guildId: this.cfg.guildId,
+                  messageId: source.id,
+                  reason: 'missed_gateway',
+                  native: { conversationId: view.conversation, promptHash },
+                });
+                if (!claim.fresh) continue;
+                this.missedStats.discovered++;
+                await this.deliveries.update(claim.record.id, 'failed', 'missed_gateway');
+                record = (await this.deliveries.get(claim.record.id))!;
+              }
+              const nativeMatch = history.turns.some(
+                (t) => t.role === 'user' && hashDiscordPrompt(t.text) === promptHash
+              );
+              const changed =
+                record.native?.conversationId !== view.conversation || record.native.promptHash !== promptHash;
+              if (nativeMatch || changed) {
+                await this.deliveries.update(record.id, 'cancelled', 'missed_gateway');
+                record = (await this.deliveries.get(record.id))!;
+              }
+            }
+            if (!valid(s.id, channel)) return;
+            await this.nativeUi!.missedInputCard(
+              s.id,
+              channel,
+              source,
+              record.native?.conversationId ?? view.conversation,
+              record.state !== 'failed',
+              () => this.resendMissedInput(s.id, channel, source, view.conversation!, scope)
+            );
+          }
+        } catch {
+          failed = true;
+        }
+      })
+    );
+    this.missedStats.scans++;
+    this.missedStats.lastError = failed ? 'scan_failed' : undefined;
+  }
+  private async resendMissedInput(
+    id: string,
+    channel: string,
+    original: GatewayMessage,
+    conversation: string,
+    scope: string
+  ): Promise<{ handled: boolean; text: string }> {
+    const key = `in:${this.cfg.guildId}:${original.id}`;
+    const valid = () =>
+      !this.stopped &&
+      !this.held &&
+      this.acceptsControls &&
+      this.controlScope === scope &&
+      !!this.deps.nativeUi?.enabled() &&
+      !!this.deps.sessions?.().some((s) => s.id === id) &&
+      this.destinationMatches(id, channel) &&
+      this.cfg.allowedUserIds.includes(original.author.id);
+    if (!valid() || !this.deps.history)
+      return { handled: false, text: 'Session or configuration changed. Nothing was submitted.' };
+    const source = (await this.api.getMessage(channel, original.id)) as GatewayMessage;
+    const promptHash = hashDiscordPrompt(original.content);
+    if (
+      !source ||
+      source.author?.id !== original.author.id ||
+      hashDiscordPrompt(source.content ?? '') !== promptHash ||
+      !eligibleMissedInput(source, {
+        channel,
+        guild: this.cfg.guildId,
+        allowed: this.cfg.allowedUserIds,
+        now: this.now(),
+      })
+    )
+      return {
+        handled: false,
+        text: 'Original message changed or expired. Send a new message instead; nothing was submitted.',
+      };
+    const history = await this.deps.history(id);
+    const view = (await this.deps.nativeUi!.sessions()).find((s) => s.id === id);
+    if (!valid() || view?.conversation !== conversation || view.exited || history.conversationId !== conversation)
+      return {
+        handled: false,
+        text: 'The exact session conversation is unavailable or changed. Nothing was submitted.',
+      };
+    if (history.turns.some((t) => t.role === 'user' && hashDiscordPrompt(t.text) === promptHash)) {
+      const record = await this.deliveries.get(key);
+      if (record?.state === 'failed' && record.reason === 'missed_gateway')
+        await this.deliveries.update(key, 'cancelled', 'missed_gateway');
+      return { handled: true, text: 'A matching user prompt already exists in this conversation. Nothing was resent.' };
+    }
+    if (!valid() || !(await this.deliveries.takeMissed(key, conversation, promptHash)))
+      return {
+        handled: true,
+        text: 'This historical input was already reviewed or its state changed. It will not replay.',
+      };
+    try {
+      const result = await this.submitUiPrompt(
+        id,
+        channel,
+        source.author.id,
+        'missed:' + source.id,
+        sanitiseReply(source.content)!,
+        conversation,
+        false,
+        undefined,
+        valid
+      );
+      await this.deliveries.update(
+        key,
+        result === 'accepted' ? 'delivered' : result === 'blocked' ? 'failed' : 'uncertain',
+        'missed_gateway'
+      );
+      return {
+        handled: result !== 'blocked',
+        text:
+          result === 'accepted'
+            ? 'Input delivered after your confirmation. Native submission is not yet confirmed.'
+            : result === 'blocked'
+              ? 'Session unavailable or a dialog is pending. Nothing was sent; review again when ready.'
+              : 'Delivery is unconfirmed. Inspect the terminal; this message will not be replayed.',
+      };
+    } catch {
+      await this.deliveries.update(key, 'uncertain', 'missed_gateway').catch(() => undefined);
+      return {
+        handled: true,
+        text: 'Delivery is unconfirmed. Check the session before any new attempt. Nothing will replay automatically.',
+      };
+    }
+  }
   private conversationPoll?: Promise<void>;
   private uiRefresh?: Promise<void>;
   private uiRefreshAt = 0;
@@ -1176,6 +1421,8 @@ export class DiscordBridge {
         enabled: this.cfg.enabled,
         mode: this.cfg.mode,
         gateway: this.gatewayState,
+        gatewayEvents: this.gateway?.diagnostics(),
+        inboundRecovery: { ...this.missedStats, active: !!this.missedScan },
         sessions: sessions.length,
         remoteSessions: sessions.filter((s) => s.remote).length,
         eligibleSessions: eligible.length,
@@ -1817,6 +2064,7 @@ export class DiscordBridge {
   private async pollConversationsNow(): Promise<void> {
     if (this.stopped || this.held || !this.cfg.enabled || this.cfg.mode !== 'full' || !this.deps.history) return;
     this.refreshUiInBackground();
+    this.recoverMissedInBackground();
     const sessions = this.deps.sessions?.() ?? [];
     if (!sessions.length) return;
     const batch = Array.from(
@@ -2886,7 +3134,11 @@ export class DiscordBridge {
         (m) => void this.onGatewayMessage(m).catch(() => undefined),
         this.deps.socketFactory,
         this.deps.backoffMs,
-        (interaction) => void this.onGatewayInteraction(interaction).catch(() => undefined)
+        (interaction) => void this.onGatewayInteraction(interaction).catch(() => undefined),
+        () => {
+          this.missedScanDue = 0;
+          this.recoverMissedInBackground();
+        }
       );
       this.gateway.start();
     }
@@ -4057,13 +4309,15 @@ export class DiscordBridge {
     text: string,
     conversation: string,
     idle: boolean,
-    inputRevision?: string
+    inputRevision?: string,
+    guard?: () => boolean
   ): Promise<'accepted' | 'uncertain' | 'blocked'> {
     const run = (this.inbound.get(channel) ?? Promise.resolve()).then(
       async (): Promise<'accepted' | 'uncertain' | 'blocked'> => {
         const scope = this.controlScope;
         const current = () =>
           this.acceptsControls &&
+          (!guard || guard()) &&
           this.controlScope === scope &&
           this.cfg.allowedUserIds.includes(actor) &&
           this.destinationMatches(sessionId, channel) &&
