@@ -130,3 +130,9 @@ A message's **Apps** menu offers **Codeman: Send to session**, **Codeman: Queue 
 ### Tables in responses
 
 Recognized Markdown tables appear automatically as PNG tables with aligned columns, repeated headers and alternating rows. Tap the image to zoom. Larger tables have Previous/Next image pages; browsing opens a private panel, so it does not replace the shared response. Download CSV preserves all original rows and cell text. Prose stays beside the table, and literal table examples inside code blocks stay as code.
+
+## Missed-message recovery
+
+In Full mode, the bridge checks owned session threads after connecting or resuming and periodically while connected. It inspects the latest 50 messages per thread, rotating two threads per pass. Ordinary allowlisted human text between one minute and 24 hours old can receive a **Review missed message** card when there is no delivery receipt. Attachments, management commands, unavailable conversations and notification-suppressed sessions are excluded. Existing receipts and matching native user prompts are not replayed.
+
+Discovery never types into a terminal. Only the original author can open the private review and choose **Send without queue**, after checking that the instruction still belongs in the displayed current conversation. Confirmation rechecks the source message, destination and native conversation, then reserves a durable one-use delivery claim. A crash or uncertain result prevents automatic replay. History checks are bounded and cannot prove an instruction was never entered elsewhere; inspect the current session before confirming. Older messages and attachments should be resent explicitly if still wanted.

@@ -1400,6 +1400,84 @@ export class DiscordNativeUi {
     }
     return true;
   }
+  /** Historical input is never submitted by discovery: require a fresh actor-bound confirmation. */
+  async missedInputCard(
+    id: string,
+    channel: string,
+    source: GatewayMessage,
+    conversation: string,
+    handled: boolean,
+    resend: () => Promise<{ handled: boolean; text: string }>
+  ): Promise<void> {
+    const key = `session:missed:${id}:${source.id}`;
+    const storeKey = hash(this.host.config().guild + ':' + channel + ':' + key);
+    if (handled && !(await this.store.snapshot()).cards[storeKey]) return;
+    const link = `https://discord.com/channels/${this.host.config().guild}/${channel}/${source.id}`;
+    const closed = () =>
+      this.upsert(
+        key,
+        channel,
+        this.payload(
+          '**Missed message review closed**\nThis historical message will not be automatically resent. Check the current session and delivery status before sending anything again.\n[Original message](' +
+            link +
+            ')'
+        )
+      );
+    if (handled) {
+      await closed();
+      return;
+    }
+    const ctx = { channel, session: id, conversation, actor: source.author.id };
+    const button = this.action(
+      ctx,
+      'Review missed message',
+      async (m) => {
+        const fresh = (await this.host.request('GET', `/channels/${channel}/messages/${source.id}`)) as GatewayMessage;
+        if (sourceSignature(fresh) !== sourceSignature(source))
+          throw new Error('Original message changed; send a new message instead.');
+        const current = await this.target(id, conversation);
+        const confirm = { ...ctx, group: 'missed:' + m.id + ':' + source.id };
+        return this.payload(
+          '**Review historical input**\nSession: ' +
+            safe(current.name) +
+            '\nConversation: `' +
+            safe(conversation) +
+            '`\n\n' +
+            safe(source.content, 1000) +
+            '\n\nThere is no delivery receipt for this message. Bounded history checks cannot prove it was never entered elsewhere. Confirm only if you still want this instruction applied to this exact session now. Nothing has been typed.',
+          [
+            row(
+              this.action(
+                confirm,
+                'Send without queue',
+                async () => {
+                  const result = await resend();
+                  if (result.handled) await closed();
+                  return this.payload(result.text);
+                },
+                undefined,
+                1
+              ),
+              this.action(confirm, 'Cancel', async () => this.payload('Cancelled. Nothing was submitted.'))
+            ),
+          ]
+        );
+      },
+      undefined,
+      2,
+      'missed:' + source.id
+    );
+    await this.upsert(
+      key,
+      channel,
+      this.payload(
+        '**Historical message needs review**\nA recent message has no delivery receipt in this session. It may have arrived while the bridge was disconnected. Nothing will be resent automatically. Only its original author can confirm.\n[Original message](' +
+          link +
+          ')',
+        [row(button)]
+      )
+    );
+  }
   /** Public review button, followed by a private one-use, actor-bound file grant. */
   async fileApprovalButton(
     id: string,

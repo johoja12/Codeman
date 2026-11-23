@@ -222,6 +222,32 @@ describe('DiscordGateway', () => {
     return { gw, sockets, urls, seen };
   }
 
+  it('distinguishes READY, RESUMED and invalid sessions without exposing gateway credentials', () => {
+    const socket = new FakeSocket(),
+      connected = vi.fn();
+    const gw = new DiscordGateway(
+      () => TOKEN,
+      () => {},
+      () => socket,
+      () => 10,
+      undefined,
+      connected
+    );
+    gw.start();
+    socket.recv({
+      op: 0,
+      t: 'READY',
+      s: 1,
+      d: { session_id: 'private-session', resume_gateway_url: 'wss://private.example' },
+    });
+    socket.recv({ op: 0, t: 'RESUMED', s: 2, d: {} });
+    expect(connected.mock.calls).toEqual([['ready'], ['resumed']]);
+    socket.recv({ op: 9, d: false });
+    expect(gw.diagnostics()).toMatchObject({ ready: 1, resumed: 1, invalidSession: 1 });
+    expect(JSON.stringify(gw.diagnostics())).not.toMatch(/private|secret|token/);
+    gw.stop();
+  });
+
   it('identifies with the three intents, heartbeats, and surfaces MESSAGE_CREATE', () => {
     const { gw, sockets, seen } = setup();
     gw.start();
