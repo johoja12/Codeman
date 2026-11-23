@@ -78,6 +78,8 @@ const noMentions = { parse: [] as string[], users: [] as string[] };
 const row = (...components: Array<Record<string, unknown>>) => ({ type: 1, components });
 const names = ['Codeman: Send to session', 'Codeman: Queue follow-up', 'Codeman: Start session'];
 interface UiAction {
+  /** Actor-bound public buttons still need a new ephemeral reply. */
+  privateReply?: boolean;
   allowUnavailable?: boolean;
   scope: string;
   channel: string;
@@ -1352,7 +1354,9 @@ export class DiscordNativeUi {
     // All network/disk and provider work happens after Discord's immediate acknowledgement.
     await this.host.respond(
       m,
-      !recovering && action?.actor && m.type === 3 ? { type: 6 } : { type: 5, data: { flags: 64 } }
+      !recovering && action?.actor && !action.privateReply && m.type === 3
+        ? { type: 6 }
+        : { type: 5, data: { flags: 64 } }
     );
     try {
       if (!(await this.host.claim(m))) {
@@ -1467,6 +1471,7 @@ export class DiscordNativeUi {
       2,
       'missed:' + source.id
     );
+    this.actions.get(button.custom_id as string)!.privateReply = true;
     await this.upsert(
       key,
       channel,
