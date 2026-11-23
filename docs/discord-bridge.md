@@ -412,6 +412,8 @@ for its most recent 128 completions. Poll skips identify in-flight reads,
 not-yet-due sessions, concurrency limits and missing destinations. Queue and cache
 counts help distinguish slow reads from growing work queues.
 
+Candidate priority rotates on every transcript poll, so busy sessions cannot permanently occupy the first slots of fixed polling groups. Existing per-session cooldowns and separate local/remote concurrency limits still apply.
+
 Control-card refresh runs independently of transcript delivery. A stuck refresh is
 coalesced instead of accumulating timer calls; it does not block streamed replies.
 Read-only health/capture observations have a 30-second deadline. Pending question
