@@ -431,7 +431,15 @@ export class DiscordNativeUi {
     );
     const receipts = await this.host.receipts(s.id);
     const last = receipts[0];
-    const status = s.exited ? '⚫ Agent exited' : s.pending ? '🔴 Needs input' : s.working ? '🟡 Working' : '⚫ Idle';
+    const status = s.exited
+      ? '⚫ Agent exited'
+      : s.queuedQuestionCount
+        ? `🔴 ${s.working ? 'Working · ' : ''}${s.queuedQuestionCount} queued ${s.queuedQuestionCount === 1 ? 'question' : 'questions'}`
+        : s.pending
+          ? '🔴 Needs input'
+          : s.working
+            ? '🟡 Working'
+            : '⚫ Idle';
     const stateLabels: Record<string, string> = {
       received: 'Received',
       awaiting_choice: 'Waiting for send/queue choice',
