@@ -1823,7 +1823,8 @@ export class DiscordBridge {
       { length: Math.min(8, sessions.length) },
       (_, i) => sessions[(this.outputIndex + i) % sessions.length]
     );
-    this.outputIndex = (this.outputIndex + batch.length) % sessions.length;
+    // Every session eventually leads a window, including when pool limits skip later candidates.
+    this.outputIndex = (this.outputIndex + 1) % sessions.length;
     const reads: Promise<void>[] = [];
     for (const session of batch) {
       if (this.outputReads.has(session.id)) {
