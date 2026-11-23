@@ -35,6 +35,7 @@ export interface DiscordUiSession {
   inputRevision?: string;
   working: boolean;
   pending: boolean;
+  queuedQuestionCount?: number;
   exited: boolean;
   ready: boolean;
   model?: string;

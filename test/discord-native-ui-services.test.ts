@@ -49,7 +49,7 @@ describe('native Discord server services', () => {
   });
 });
 
-it('projects background work as busy and captures only ready Claude suggestions', async () => {
+it('projects background work as busy and captures Claude suggestions or Codex queued questions', async () => {
   const s = {
     id: 's1',
     name: 'Claude',
@@ -84,7 +84,7 @@ it('projects background work as busy and captures only ready Claude suggestions'
   expect((await services.sessions())[0]).toMatchObject({ working: true, ready: false, promptSuggestion: undefined });
   Object.assign(s, { mode: 'codex', activityProjection: { activityStatus: 'idle' } });
   expect((await services.sessions())[0].promptSuggestion).toBeUndefined();
-  expect(captures).toBe(3);
+  expect(captures).toBe(4);
 });
 
 it.each([

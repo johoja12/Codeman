@@ -1,3 +1,4 @@
+import { codexQueuedQuestionCount } from './codex-queued-question.js';
 import {
   parseClaudeVisibleQuestion,
   parseClaudeHookConfirmation,
@@ -63,13 +64,16 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       revision: string;
       delivered: boolean;
       kind: 'question' | 'permission';
+      queuedCount?: number;
+      generation?: string;
+      missingReads?: number;
       control?: ApprovalItem['nativeQuestion'];
     }
   >();
   const reading = new Set<string>();
   const suggestion = async (s: Session) => {
     if (
-      getCli(s.mode)?.capabilities.nativeSettingsProfile !== 'claude-tui' ||
+      !['claude-tui', 'codex-tui'].includes(getCli(s.mode)?.capabilities.nativeSettingsProfile ?? '') ||
       reading.has(s.id) ||
       s.paneExit ||
       s.guardedInputHeld ||
@@ -81,6 +85,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       return undefined;
     reading.add(s.id);
     try {
+      const generation = s.inspectionGeneration;
       const revision = s.discordQueueRevision,
         conversation = conversationFor(s);
       const frame = await deps.capture?.(s.id);
@@ -90,6 +95,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
         s.paneExit ||
         s.guardedInputHeld ||
         s.guardedInputPendingWrites ||
+        generation !== s.inspectionGeneration ||
         revision !== s.discordQueueRevision ||
         conversation !== conversationFor(s) ||
         approvalInbox
@@ -98,6 +104,54 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       )
         return undefined;
       if (!frame) return undefined;
+      if (getCli(s.mode)?.capabilities.nativeSettingsProfile === 'codex-tui') {
+        let previous = observed.get(s.id);
+        const retire = () => {
+          if (previous && approvalInbox.getForSession(s.id)?.id === previous.id)
+            approvalInbox.resolveForSession(s.id, 'superseded');
+          observed.delete(s.id);
+          previous = undefined;
+        };
+        if (previous && (previous.conversation !== conversation || previous.generation !== s.inspectionGeneration))
+          retire();
+        const count = codexQueuedQuestionCount(frame);
+        if (count === undefined || !conversation) return undefined;
+        if (!count) {
+          if (previous && (previous.missingReads = (previous.missingReads ?? 0) + 1) >= 2) retire();
+          return undefined;
+        }
+        if (previous) previous.missingReads = 0;
+        if (!previous || previous.queuedCount !== count || !approvalInbox.getById(previous.id)) {
+          const delivered = previous?.queuedCount === count && previous.delivered;
+          const text = `Codex has ${count} queued ${count === 1 ? 'question' : 'questions'} for you. Work may continue. Open this session in Codeman and press Shift+← to review and answer. The collapsed indicator does not show the question text or choices.`;
+          const item = approvalInbox.notePrompt({
+            sessionId: s.id,
+            sessionName: s.name || s.id.slice(0, 8),
+            mode: s.mode,
+            kind: 'question',
+            toolName: 'QueuedQuestion',
+            answerInTerminal: true,
+            message: text,
+            context: frame,
+            cwd: s.workingDir,
+          });
+          previous = {
+            id: item.id,
+            text,
+            conversation,
+            revision,
+            delivered: !!delivered,
+            kind: 'question',
+            queuedCount: count,
+            generation: s.inspectionGeneration,
+            missingReads: 0,
+          };
+          observed.set(s.id, previous);
+        }
+        const item = approvalInbox.getById(previous.id);
+        if (item && !previous.delivered) previous.delivered = (await deps.questionObserved?.(item)) !== false;
+        return undefined;
+      }
       const dialog = parseClaudeVisibleQuestion(frame);
       const permission = dialog ? undefined : parseClaudeHookConfirmation(frame);
       const compaction = dialog || permission ? undefined : parseClaudeCompactionPrompt(frame);
@@ -200,7 +254,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
           };
           const unavailable = connection.state !== 'available';
           const promptSuggestion = unavailable ? undefined : await suggestion(s);
-          const observed = deps.observed?.(s.id);
+          const modelObservation = deps.observed?.(s.id);
           const displayModel = s.displayModel;
           const pending = approvalInbox.listPending().find((p) => p.sessionId === s.id && p.kind !== 'idle');
           return {
@@ -224,19 +278,20 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
             inputRevision: s.discordQueueRevision,
             working: !unavailable && working(s),
             promptSuggestion,
+            queuedQuestionCount: observed.get(s.id)?.id === pending?.id ? observed.get(s.id)?.queuedCount : undefined,
             lastPromptAt: s.lastRealPromptAt || undefined,
             pendingAt: pending?.createdAt,
             pendingRevision: pending ? discordApprovalRevision(pending) : undefined,
             pending: approvalInbox.listPending().some((p) => p.sessionId === s.id && p.kind !== 'idle'),
             exited: unavailable,
             ready: !unavailable && !working(s) && !s.paneExit && !s.guardedInputHeld && !s.guardedInputPendingWrites,
-            model: observed?.model
-              ? observed.model + ' (native verified)'
+            model: modelObservation?.model
+              ? modelObservation.model + ' (native verified)'
               : displayModel
                 ? `${displayModel.model} (${displayModel.source})`
                 : undefined,
-            modelSource: observed?.model ? 'native-verified' : displayModel?.source,
-            effort: observed?.effort ? observed.effort + ' (native verified)' : undefined,
+            modelSource: modelObservation?.model ? 'native-verified' : displayModel?.source,
+            effort: modelObservation?.effort ? modelObservation.effort + ' (native verified)' : undefined,
             approval:
               getCli(s.mode)?.launch.legacyConfigField === 'codexConfig'
                 ? s.codexConfig?.baseCommand

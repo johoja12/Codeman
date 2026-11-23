@@ -2118,3 +2118,22 @@ it.each([
     expect(f.host.services.recover).not.toHaveBeenCalled();
   }
 );
+
+it('shows queued questions while retaining the working status and terminal-only answer path', async () => {
+  const f = await fixture();
+  Object.assign(f.sessions[0], { working: true, pending: true, ready: false, queuedQuestionCount: 2 });
+  f.setQuestion({
+    id: 'queued-q',
+    revision: 'queued-r',
+    kind: 'question',
+    text: 'Codex has 2 queued questions. Open Codeman and press Shift+←.',
+    options: [],
+    terminalOnly: true,
+  });
+  await f.ui.poll();
+  expect(f.findCard().content).toContain('Working · 2 queued questions');
+  expect(f.findCard().content).not.toContain('Agent exited');
+  const result = await f.click(f.findCard(), 'Question');
+  expect(result.content).toContain('Shift+←');
+  expect(result.components).toHaveLength(0);
+});
