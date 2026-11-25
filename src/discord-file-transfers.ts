@@ -4,6 +4,7 @@ import { constants } from 'node:fs';
 import { basename, isAbsolute, relative, sep, posix } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { RemoteFrameSshPool } from './remote-frame-ssh-pool.js';
 import { isBlockedAttachmentPath, loadAttachmentGuardConfig } from './config/attachment-guard.js';
 import { remoteProbePaths } from './remote-files.js';
 import { writeRemoteFileBytes } from './remote-file-transfer.js';
@@ -75,42 +76,64 @@ export function discordRemoteReadCommand(root: string, path: string, maxBytes = 
     'python3 -c ' + shellescape(READ_SCRIPT) + ' ' + shellescape(JSON.stringify({ root, path, limit: maxBytes }))
   );
 }
+const readConnections = new RemoteFrameSshPool();
+// Object-scoped transport ownership is stricter than sharing by host credentials:
+// independently constructed session connections never share an app-owned master.
+const readOwners = new WeakMap<SessionRemote, string>();
+export function closeDiscordReadConnections(): Promise<void> {
+  return readConnections.close();
+}
+
 export async function runDiscordRemoteRead(remote: SessionRemote, command: string): Promise<Buffer> {
-  return runWithRemoteSshLimit(
-    () =>
-      new Promise<Buffer>((resolve, reject) => {
-        const child = spawn('ssh', [...buildSshConnectionArgv(remote), remoteSshTarget(remote), command], {
-          stdio: ['ignore', 'pipe', 'pipe'],
-        });
-        const chunks: Buffer[] = [];
-        let bytes = 0,
-          stderr = 0,
-          settled = false;
-        const finish = (err?: Error) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          if (err) {
-            child.kill('SIGTERM');
-            reject(err);
-          } else resolve(Buffer.concat(chunks));
-        };
-        const timer = setTimeout(() => finish(new DiscordFileProblem('Remote file transfer timed out')), 30000);
-        child.stdout.on('data', (data: Buffer) => {
-          if (settled) return;
-          bytes += data.length;
-          if (bytes > DISCORD_FILE_LIMIT) finish(new DiscordFileProblem('The file is over 8 MB'));
-          else chunks.push(Buffer.from(data));
-        });
-        child.stderr.on('data', (data: Buffer) => {
-          stderr += data.length;
-          if (stderr > 65536) finish(new DiscordFileProblem('Remote file transfer failed'));
-        });
-        child.on('error', () => finish(new DiscordFileProblem('Remote file transfer failed')));
-        child.on('close', (code) =>
-          finish(code === 0 ? undefined : new DiscordFileProblem('Remote file could not be read safely'))
-        );
-      })
+  let owner = readOwners.get(remote);
+  if (!owner) {
+    owner = randomUUID();
+    readOwners.set(remote, owner);
+  }
+  return runWithRemoteSshLimit(() =>
+    readConnections.withConnection(
+      buildSshConnectionArgv(remote),
+      remoteSshTarget(remote),
+      owner,
+      (argv) =>
+        new Promise<Buffer>((resolve, reject) => {
+          const child = spawn('ssh', [...argv, command], {
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+          const chunks: Buffer[] = [];
+          let bytes = 0,
+            stderr = 0,
+            settled = false;
+          const finish = (err?: Error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            if (err) {
+              child.kill('SIGTERM');
+              reject(err);
+            } else resolve(Buffer.concat(chunks));
+          };
+          const timer = setTimeout(() => finish(new DiscordFileProblem('Remote file transfer timed out')), 30000);
+          child.stdout.on('data', (data: Buffer) => {
+            if (settled) return;
+            bytes += data.length;
+            if (bytes > DISCORD_FILE_LIMIT) finish(new DiscordFileProblem('The file is over 8 MB'));
+            else chunks.push(Buffer.from(data));
+          });
+          child.stderr.on('data', (data: Buffer) => {
+            stderr += data.length;
+            if (stderr > 65536) finish(new DiscordFileProblem('Remote file transfer failed'));
+          });
+          child.on('error', () => finish(new DiscordFileProblem('Remote file transfer failed')));
+          child.on('close', (code) =>
+            finish(
+              code === 0
+                ? undefined
+                : Object.assign(new DiscordFileProblem('Remote file could not be read safely'), { code })
+            )
+          );
+        })
+    )
   );
 }
 

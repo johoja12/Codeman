@@ -75,6 +75,7 @@ export class RemoteFrameSshPool {
         .digest('hex');
       let socket = this.sockets.get(key);
       if (!socket) {
+        if (this.sockets.size >= 64) return null;
         const path = join(this.directory, key.slice(0, 32));
         // OpenSSH uses a Unix-domain socket. A long custom TMPDIR must fall back to ordinary SSH.
         if (Buffer.byteLength(path) > 90) return null;
@@ -129,6 +130,16 @@ export class RemoteFrameSshPool {
     owner: string | undefined,
     options: { timeout: number; maxBuffer: number }
   ): Promise<string> {
+    return this.withConnection(baseArgv, target, owner, (argv) => this.execute([...argv, command], options));
+  }
+
+  /** Share only authenticated transport. Each operation retains its own I/O bounds and fresh checks. */
+  async withConnection<T>(
+    baseArgv: string[],
+    target: string,
+    owner: string | undefined,
+    operation: (argv: string[]) => Promise<T>
+  ): Promise<T> {
     const socket = this.socketFor(baseArgv, target, owner);
     if (socket) await this.discardStaleSocket(socket);
     const argv = socket
@@ -141,11 +152,10 @@ export class RemoteFrameSshPool {
           '-o',
           `ControlPath=${socket.path}`,
           target,
-          command,
         ]
-      : [...baseArgv, target, command];
+      : [...baseArgv, target];
     try {
-      return await this.execute(argv, options);
+      return await operation(argv);
     } catch (error) {
       if (socket && isTransportFailure(error)) {
         this.sockets.delete(socket.key);

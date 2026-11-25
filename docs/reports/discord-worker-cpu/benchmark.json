@@ -1,0 +1,182 @@
+{
+  "livePanes": 15,
+  "captureRequests": 16,
+  "captures": [
+    {
+      "kind": "before",
+      "wallMs": 160.48,
+      "nodeCpuMs": 107.44,
+      "helperAndMasterCpuMs": 140,
+      "tmuxCommands": 16
+    },
+    {
+      "kind": "after",
+      "wallMs": 55.67,
+      "nodeCpuMs": 31.98,
+      "helperAndMasterCpuMs": 40,
+      "tmuxCommands": 4
+    },
+    {
+      "kind": "after",
+      "wallMs": 56.15,
+      "nodeCpuMs": 31.56,
+      "helperAndMasterCpuMs": 30,
+      "tmuxCommands": 4
+    },
+    {
+      "kind": "before",
+      "wallMs": 115.95,
+      "nodeCpuMs": 89.69,
+      "helperAndMasterCpuMs": 130,
+      "tmuxCommands": 16
+    },
+    {
+      "kind": "before",
+      "wallMs": 111.63,
+      "nodeCpuMs": 71.84,
+      "helperAndMasterCpuMs": 120,
+      "tmuxCommands": 16
+    },
+    {
+      "kind": "after",
+      "wallMs": 55.21,
+      "nodeCpuMs": 26.25,
+      "helperAndMasterCpuMs": 40,
+      "tmuxCommands": 4
+    }
+  ],
+  "profiles": [
+    {
+      "kind": "before",
+      "wallMs": 150.15,
+      "nodeCpuMs": 6.15,
+      "helperAndMasterCpuMs": 150
+    },
+    {
+      "kind": "after",
+      "wallMs": 27.44,
+      "nodeCpuMs": 1.7,
+      "helperAndMasterCpuMs": 20
+    },
+    {
+      "kind": "after",
+      "wallMs": 33.47,
+      "nodeCpuMs": 1.07,
+      "helperAndMasterCpuMs": 30
+    },
+    {
+      "kind": "before",
+      "wallMs": 151.61,
+      "nodeCpuMs": 6.42,
+      "helperAndMasterCpuMs": 150
+    },
+    {
+      "kind": "before",
+      "wallMs": 185.4,
+      "nodeCpuMs": 5.73,
+      "helperAndMasterCpuMs": 160
+    },
+    {
+      "kind": "after",
+      "wallMs": 36.34,
+      "nodeCpuMs": 1.39,
+      "helperAndMasterCpuMs": 20
+    }
+  ],
+  "ssh": [
+    {
+      "hostIndex": 1,
+      "warmup": {
+        "kind": "warmup",
+        "wallMs": 503.4,
+        "nodeCpuMs": 8.3,
+        "helperAndMasterCpuMs": 260
+      },
+      "samples": [
+        {
+          "kind": "before",
+          "wallMs": 537.78,
+          "nodeCpuMs": 9.59,
+          "helperAndMasterCpuMs": 300
+        },
+        {
+          "kind": "after",
+          "wallMs": 70,
+          "nodeCpuMs": 8.41,
+          "helperAndMasterCpuMs": 20
+        },
+        {
+          "kind": "after",
+          "wallMs": 39.42,
+          "nodeCpuMs": 9.6,
+          "helperAndMasterCpuMs": 30
+        },
+        {
+          "kind": "before",
+          "wallMs": 513.95,
+          "nodeCpuMs": 5.88,
+          "helperAndMasterCpuMs": 260
+        },
+        {
+          "kind": "before",
+          "wallMs": 540.85,
+          "nodeCpuMs": 6.2,
+          "helperAndMasterCpuMs": 290
+        },
+        {
+          "kind": "after",
+          "wallMs": 71.76,
+          "nodeCpuMs": 8.3,
+          "helperAndMasterCpuMs": 30
+        }
+      ]
+    },
+    {
+      "hostIndex": 2,
+      "warmup": {
+        "kind": "warmup",
+        "wallMs": 660.7,
+        "nodeCpuMs": 5.63,
+        "helperAndMasterCpuMs": 330
+      },
+      "samples": [
+        {
+          "kind": "before",
+          "wallMs": 582.18,
+          "nodeCpuMs": 9.05,
+          "helperAndMasterCpuMs": 230
+        },
+        {
+          "kind": "after",
+          "wallMs": 51.08,
+          "nodeCpuMs": 10.94,
+          "helperAndMasterCpuMs": 20
+        },
+        {
+          "kind": "after",
+          "wallMs": 55.72,
+          "nodeCpuMs": 14.37,
+          "helperAndMasterCpuMs": 40
+        },
+        {
+          "kind": "before",
+          "wallMs": 671.47,
+          "nodeCpuMs": 7.85,
+          "helperAndMasterCpuMs": 310
+        },
+        {
+          "kind": "before",
+          "wallMs": 722,
+          "nodeCpuMs": 8.06,
+          "helperAndMasterCpuMs": 300
+        },
+        {
+          "kind": "after",
+          "wallMs": 194,
+          "nodeCpuMs": 19.55,
+          "helperAndMasterCpuMs": 30
+        }
+      ]
+    }
+  ]
+}
