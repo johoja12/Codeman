@@ -40,7 +40,8 @@ def linux_pane_processes(root):
   if parent is not None and ppid!=parent:raise Exception('process tree changed')
   total+=size
   if total>4*1024*1024:raise Exception('process inventory limit')
-  procs[pid]=(ppid,argv);stamps[pid]=stamp
+  # Preserve the shared command-string contract, with lossless argv quoting.
+  procs[pid]=(ppid,' '.join(shlex.quote(arg) for arg in argv));stamps[pid]=stamp
   tasks=os.listdir('/proc/'+str(pid)+'/task');threads_seen+=len(tasks)
   if threads_seen>4096:raise Exception('process thread limit')
   children=set()
@@ -106,7 +107,7 @@ def command_at(argv):
  return None
 ids=[];native=0;native_pids=[]
 for pid in owned:
- try:argv=procs[pid][1] if sys.platform=='linux' else shlex.split(procs[pid][1])
+ try:argv=shlex.split(procs[pid][1])
  except Exception:continue
  if not argv or os.path.basename(argv[0]) not in ('codex','codx'):continue
  if sys.platform=='linux' and proc_stamp(pid)!=proc_stamps[pid]:raise Exception('process changed')

@@ -6,10 +6,10 @@ const exec = promisify(execFile);
 const id = '07be20d6-c98c-428d-9d40-17d8c935f6bd';
 async function probe(rows: string, env = { HOME: '/home/guest' }, changed = false) {
   const REMOTE_CLAUDE_RUNTIME_PROBE = remoteClaudeRuntimeProbe();
-  const at = REMOTE_CLAUDE_RUNTIME_PROBE.indexOf('import hashlib');
+  const at = REMOTE_CLAUDE_RUNTIME_PROBE.indexOf('\nimport hashlib\nagents=[]');
   const stub = `\ndef runtime_environment(pid):return ${JSON.stringify(env)}\n`;
   const script =
-    `import subprocess\nn=0\ndef output(cmd,**kw):\n global n\n if cmd[0]=='tmux':return '100'\n if '-axo' in cmd:return ${JSON.stringify(rows)}\n n+=1\n return 'stamp'+str(n if ${changed ? 'True' : 'False'} else 1)\nsubprocess.check_output=output\n` +
+    `import subprocess,sys\nsys.platform='fixture-portable'\nn=0\ndef output(cmd,**kw):\n global n\n if cmd[0]=='tmux':return '100'\n if '-axo' in cmd:return ${JSON.stringify(rows)}\n n+=1\n return 'stamp'+str(n if ${changed ? 'True' : 'False'} else 1)\nsubprocess.check_output=output\n` +
     REMOTE_CLAUDE_RUNTIME_PROBE.slice(0, at) +
     stub +
     REMOTE_CLAUDE_RUNTIME_PROBE.slice(at);
