@@ -546,7 +546,8 @@ export function parseDiscordHistory(source: DiscordHistorySource, raw: string): 
           model,
           ...(effort ? { effort } : {}),
           timestamp,
-          cursor: `${source.conversationId}:${offset}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`,
+          // Reuse the row digest: hashing the whole packet per assistant row is quadratic.
+          cursor: `${source.conversationId}:${offset}:${hash}`,
         };
       }
       let body = e.message?.content;
