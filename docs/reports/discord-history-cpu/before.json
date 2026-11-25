@@ -1,0 +1,26 @@
+{
+  "benchmark": "synthetic Claude history parsing",
+  "results": [
+    {
+      "rows": 64,
+      "packetBytes": 50118,
+      "medianWallMs": 10.777,
+      "medianCpuMs": 11.819,
+      "runs": 5
+    },
+    {
+      "rows": 512,
+      "packetBytes": 401302,
+      "medianWallMs": 403.453,
+      "medianCpuMs": 401.146,
+      "runs": 5
+    },
+    {
+      "rows": 1536,
+      "packetBytes": 1204830,
+      "medianWallMs": 4826.046,
+      "medianCpuMs": 3885.016,
+      "runs": 5
+    }
+  ]
+}

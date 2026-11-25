@@ -266,6 +266,17 @@ describe('passive Claude settings metadata', () => {
     perTurnEffort: 'medium',
     ...extra,
   });
+  it('binds reported settings to the exact native row rather than the surrounding packet', () => {
+    const assistant = row({ message: { model: 'claude-opus-5-5', content: 'Visible answer' } });
+    const source = { mode: 'claude' as const, conversationId: id };
+    const initial = parseDiscordHistory(source, packet([assistant]));
+    const appended = parseDiscordHistory(
+      source,
+      packet([assistant, { type: 'user', sessionId: id, message: { content: 'Next prompt' } }])
+    );
+    expect(initial.reportedSettings?.cursor).toBe(initial.turns[0].cursor);
+    expect(appended.reportedSettings?.cursor).toBe(initial.reportedSettings?.cursor);
+  });
   it('reads actual model and per-turn effort even when a tool-only record has no visible text', () => {
     const h = parseDiscordHistory({ mode: 'claude', conversationId: id }, packet([row()]));
     expect(h.reportedSettings).toMatchObject({
