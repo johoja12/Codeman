@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { expect, it } from 'vitest';
 import { REMOTE_CODEX_RUNTIME_PROBE, REMOTE_CODEX_RESUME_PROBE } from '../src/discord-remote-conversation.js';
+import { remoteClaudeRuntimeProbe } from '../src/discord-remote-claude.js';
 const exec = promisify(execFile);
 const id = '01a197ca-f81d-7cf1-82b0-7dbdd241eb22';
 interface Proc {
@@ -25,6 +26,7 @@ async function probe(
   nodes = basic(),
   options: {
     runtime?: boolean;
+    protocol?: 'claude';
     env?: string;
     deny?: string;
     malformed?: string;
@@ -76,18 +78,33 @@ os.listdir=lambda p: [str(i) for i in range(4097)] if ${options.threadLimit ? 'T
 os.readlink=lambda p:real_link(mapped(p))
 def command(cmd,**kwargs):
  if cmd[0]=='tmux':return '100'
+ if ${options.protocol === 'claude' ? 'True' : 'False'} and cmd[0]=='ps' and '-p' in cmd:
+  selected=cmd[cmd.index('-p')+1]
+  if selected!='101':raise Exception('unowned Claude stamp')
+  return real_open(fixture_root+'/'+selected+'/stat').read()+real_open(fixture_root+'/'+selected+'/cmdline','rb').read().hex()
  raise Exception('unexpected subprocess: Linux must not launch ps')
 subprocess.check_output=command
 `;
-    const result = await exec(
-      'python3',
-      [
-        '-c',
-        prelude + (options.runtime ? REMOTE_CODEX_RUNTIME_PROBE : REMOTE_CODEX_RESUME_PROBE),
-        JSON.stringify({ location: { socket: 'fixture', sessionName: 'fixture' } }),
-      ],
-      { timeout: 15000 }
-    );
+    let result;
+    try {
+      result = await exec(
+        'python3',
+        [
+          '-c',
+          prelude +
+            (options.protocol === 'claude'
+              ? remoteClaudeRuntimeProbe()
+              : options.runtime
+                ? REMOTE_CODEX_RUNTIME_PROBE
+                : REMOTE_CODEX_RESUME_PROBE),
+          JSON.stringify({ location: { socket: 'fixture', sessionName: 'fixture' } }),
+        ],
+        { timeout: 15000 }
+      );
+    } catch (error) {
+      const stderr = (error as { stderr?: string }).stderr;
+      throw new Error(stderr?.trim().split('\n').at(-1) ?? 'Probe failed');
+    }
     return JSON.parse(result.stdout);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -159,3 +176,38 @@ it('refuses pane replacement during traversal and excessive thread inventories',
   await expect(probe(basic(), { change: 'root' })).rejects.toThrow('pane process changed');
   await expect(probe(basic(), { threadLimit: true })).rejects.toThrow('thread limit');
 });
+
+it('shares the Linux inventory with Claude without changing its profile or argv contract', async () => {
+  const nodes = basic();
+  nodes[1].argv = ['/opt/claude', '--resume', id];
+  const result = await probe(nodes, {
+    protocol: 'claude',
+    env: 'HOME=/home/test\0CLAUDE_CONFIG_DIR=/claude account\0API_KEY=SECRET\0',
+  });
+  expect(result).toMatchObject({
+    id,
+    configHome: '/claude account',
+    fingerprint: expect.stringMatching(/^[a-f0-9]{64}$/),
+  });
+  expect(JSON.stringify(result)).not.toMatch(/SECRET|API_KEY/);
+});
+it('retains Linux Claude nested-controller and sibling-ambiguity checks', async () => {
+  const nodes = basic();
+  nodes[1].argv = ['claude', '--resume', id];
+  nodes[1].threads = { '101': [102] };
+  nodes.push({ pid: 102, parent: 101, argv: ['claude', '-p', 'nested job'] });
+  expect((await probe(nodes, { protocol: 'claude' })).id).toBe(id);
+  nodes[1].threads = { '101': [] };
+  nodes[0].threads!['100'].push(102);
+  nodes[2].parent = 100;
+  nodes[2].argv = ['claude', '--resume', id];
+  await expect(probe(nodes, { protocol: 'claude' })).rejects.toThrow('ambiguous Claude');
+});
+it.each(['pid', 'argv'] as const)(
+  'retains Linux Claude %s replacement checks during environment reads',
+  async (change) => {
+    const nodes = basic();
+    nodes[1].argv = ['claude', '--resume', id];
+    await expect(probe(nodes, { protocol: 'claude', change })).rejects.toThrow('process changed');
+  }
+);
