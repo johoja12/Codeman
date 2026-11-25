@@ -1,0 +1,103 @@
+{
+  "sessions": 16,
+  "workload": "same-turn status, geometry, duplicate plain frame",
+  "warning": "Read-only live workload microbenchmark; not whole-service CPU or evidence of duplicate-capture frequency in production",
+  "samples": [
+    {
+      "mode": "before",
+      "workload": "inventory-only",
+      "tmuxCommands": 32,
+      "wallMs": 162.49,
+      "nodeCpuMs": 122.02,
+      "reapedHelperCpuMs": 280
+    },
+    {
+      "mode": "after",
+      "workload": "inventory-only",
+      "tmuxCommands": 1,
+      "wallMs": 10.5,
+      "nodeCpuMs": 5.88,
+      "reapedHelperCpuMs": 0
+    },
+    {
+      "mode": "before",
+      "workload": "inventory-plus-duplicate-frames",
+      "tmuxCommands": 64,
+      "wallMs": 388.53,
+      "nodeCpuMs": 237.76,
+      "reapedHelperCpuMs": 580
+    },
+    {
+      "mode": "after",
+      "workload": "inventory-plus-duplicate-frames",
+      "tmuxCommands": 17,
+      "wallMs": 73.12,
+      "nodeCpuMs": 48.34,
+      "reapedHelperCpuMs": 100
+    },
+    {
+      "mode": "after",
+      "workload": "inventory-only",
+      "tmuxCommands": 1,
+      "wallMs": 11.06,
+      "nodeCpuMs": 3.72,
+      "reapedHelperCpuMs": 20
+    },
+    {
+      "mode": "before",
+      "workload": "inventory-only",
+      "tmuxCommands": 32,
+      "wallMs": 144.35,
+      "nodeCpuMs": 91.62,
+      "reapedHelperCpuMs": 260
+    },
+    {
+      "mode": "after",
+      "workload": "inventory-plus-duplicate-frames",
+      "tmuxCommands": 17,
+      "wallMs": 74.6,
+      "nodeCpuMs": 50.68,
+      "reapedHelperCpuMs": 120
+    },
+    {
+      "mode": "before",
+      "workload": "inventory-plus-duplicate-frames",
+      "tmuxCommands": 64,
+      "wallMs": 396.46,
+      "nodeCpuMs": 250.99,
+      "reapedHelperCpuMs": 570
+    },
+    {
+      "mode": "before",
+      "workload": "inventory-only",
+      "tmuxCommands": 32,
+      "wallMs": 330.17,
+      "nodeCpuMs": 154.26,
+      "reapedHelperCpuMs": 410
+    },
+    {
+      "mode": "after",
+      "workload": "inventory-only",
+      "tmuxCommands": 1,
+      "wallMs": 18.77,
+      "nodeCpuMs": 14.92,
+      "reapedHelperCpuMs": 0
+    },
+    {
+      "mode": "before",
+      "workload": "inventory-plus-duplicate-frames",
+      "tmuxCommands": 64,
+      "wallMs": 431.63,
+      "nodeCpuMs": 241.09,
+      "reapedHelperCpuMs": 630
+    },
+    {
+      "mode": "after",
+      "workload": "inventory-plus-duplicate-frames",
+      "tmuxCommands": 17,
+      "wallMs": 100.32,
+      "nodeCpuMs": 51.83,
+      "reapedHelperCpuMs": 130
+    }
+  ]
+}

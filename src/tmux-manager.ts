@@ -22,6 +22,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { SameTurnRead } from './same-turn-read.js';
 import { collectDescendants, descendantsInPaneGroup } from './proc-tree.js';
 import { getCli } from './config/cli-registry/registry.js';
 import type { CliDockerResume, CliEntry } from './config/cli-registry/types.js';
@@ -789,6 +790,35 @@ export function parseTmuxCodexProviderEnvironment(output: string): CodexProvider
     environment[key as (typeof CODEX_PROVIDER_ENVIRONMENT_KEYS)[number]] = value;
   }
   return environment;
+}
+
+interface PollPane extends PaneInfo {
+  active: boolean;
+  dead: boolean | undefined;
+}
+
+/** Active-window inventory: matches tmux's default session target semantics. */
+export function parsePollingPanes(output: string): Map<string, PollPane[]> {
+  const result = new Map<string, PollPane[]>();
+  for (const line of output.split('\n')) {
+    const [session, windowActive, paneId, index, pid, width, height, active, dead] = line.split('|');
+    if (!session || windowActive !== '1' || !/^%\d+$/.test(paneId ?? '')) continue;
+    const numbers = [index, pid, width, height].map((value) => Number(value));
+    if ([index, pid, width, height].some((value) => !/^\d+$/.test(value ?? ''))) continue;
+    if (!numbers.every(Number.isSafeInteger)) continue;
+    const panes = result.get(session) ?? [];
+    panes.push({
+      paneId,
+      paneIndex: numbers[0],
+      panePid: numbers[1],
+      width: numbers[2],
+      height: numbers[3],
+      active: active === '1',
+      dead: dead === '1' ? true : dead === '0' ? false : undefined,
+    });
+    result.set(session, panes);
+  }
+  return result;
 }
 
 export type TmuxEnvironmentExecutor = (file: string, args: string[]) => Promise<{ stdout: string }>;
@@ -2818,6 +2848,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   private readonly checkpointExecutor?: (command: string) => Promise<void>;
   private readonly checkpointDelayMs: number;
   private readonly paneTextExecutor: TmuxPaneTextExecutor;
+  private readonly injectedPaneTextExecutor: boolean;
+  private readonly queuedPaneCaptures = new SameTurnRead<string | null>();
+  private readonly queuedPaneInventory = new SameTurnRead<Map<string, PollPane[]> | null>();
   /** tmux 3.7+ can resize pane history after creation; older releases cannot. */
   private liveHistoryResizeSupported: boolean | null = null;
   private readonly remoteFrameSshPool = new RemoteFrameSshPool();
@@ -2835,6 +2868,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     this.checkpointExecutor = options.checkpointExecutor;
     this.checkpointDelayMs = options.checkpointDelayMs ?? 50;
     this.paneTextExecutor = options.paneTextExecutor ?? executePaneTextCapture;
+    this.injectedPaneTextExecutor = options.paneTextExecutor !== undefined;
     this.setMaxListeners(50);
     if (!IS_TEST_MODE) {
       this.loadSessions();
@@ -3589,17 +3623,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * Returns true if the session exists but the pane's command has exited.
    */
   async isPaneDead(muxName: string): Promise<boolean> {
-    if (IS_TEST_MODE) return false;
+    if (IS_TEST_MODE && !this.injectedPaneTextExecutor) return false;
     if (!isValidMuxName(muxName)) return false;
-    try {
-      const { stdout } = await execAsync(`${this.tmux()} display-message -t "${muxName}" -p '#{pane_dead}'`, {
-        encoding: 'utf-8',
-        timeout: EXEC_TIMEOUT_MS,
-      });
-      return stdout.trim() === '1';
-    } catch {
-      return false;
-    }
+    const panes = await this.pollingPanes();
+    return panes?.get(muxName)?.find((pane) => pane.active)?.dead === true;
   }
 
   /**
@@ -4837,11 +4864,13 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
 
     this.mouseSyncInterval = setInterval(async () => {
-      if (IS_TEST_MODE) return;
+      if (IS_TEST_MODE && !this.injectedPaneTextExecutor) return;
 
-      for (const session of this.sessions.values()) {
-        const panes = await this.listPanes(session.muxName);
-        const count = panes.length;
+      const sessions = [...this.sessions.values()];
+      const inventories = await Promise.all(sessions.map((session) => this.listPanes(session.muxName)));
+      for (const [index, session] of sessions.entries()) {
+        if (this.sessions.get(session.sessionId) !== session) continue;
+        const count = inventories[index].length;
         if (count === 0) continue;
 
         const prev = this.lastPaneCount.get(session.muxName);
@@ -4989,13 +5018,21 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   }
 
   async runRemoteReconnectTick(now: number, enabled: boolean, recoverWorkerReboots = false): Promise<void> {
-    for (const session of this.sessions.values()) {
+    const sessions = [...this.sessions.values()].filter(
+      (session) => session.remote && enabled && !this.reconnectGuard.has(session.sessionId)
+    );
+    const generation = this.paneExitGeneration;
+    const dead = await Promise.all(sessions.map((session) => this.isPaneDead(session.muxName)));
+    // A replacement during the read invalidates the whole observation, not just an exit cache.
+    if (generation !== this.paneExitGeneration) return;
+    for (const [index, session] of sessions.entries()) {
+      if (this.sessions.get(session.sessionId) !== session) continue;
       if (!session.remote || !enabled || this.reconnectGuard.has(session.sessionId)) continue;
       const sessionId = session.sessionId;
       const state = this.reconnectState.get(sessionId);
       // Healthy panes discard transport liveness. The one-time baseline probe
       // below is only needed when worker reboot recovery is enabled.
-      const paneDead = await this.isPaneDead(session.muxName);
+      const paneDead = dead[index];
       if (!paneDead) {
         // A live pane makes whatever the probe last said STALE, so forget it:
         // after a successful reattach (or a manual restart) the next dead pane
@@ -5452,37 +5489,38 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
   }
 
+  /** No retained snapshot: requests queued together share one shell-free read. */
+  private pollingPanes(): Promise<Map<string, PollPane[]> | null> {
+    return this.queuedPaneInventory.read('inventory', async () => {
+      try {
+        const { stdout } = await this.paneTextExecutor(
+          'tmux',
+          [
+            '-L',
+            this.tmuxSocket,
+            'list-panes',
+            '-a',
+            '-F',
+            '#{session_name}|#{window_active}|#{pane_id}|#{pane_index}|#{pane_pid}|#{pane_width}|#{pane_height}|#{pane_active}|#{pane_dead}',
+          ],
+          { encoding: 'utf8', timeout: ASYNC_TEXT_CAPTURE_TIMEOUT_MS, maxBuffer: ASYNC_TEXT_CAPTURE_MAX_BUFFER }
+        );
+        if (Buffer.byteLength(stdout, 'utf8') > ASYNC_TEXT_CAPTURE_MAX_BUFFER) return null;
+        return parsePollingPanes(stdout);
+      } catch {
+        return null;
+      }
+    });
+  }
+
   async listPanes(muxName: string): Promise<PaneInfo[]> {
-    if (IS_TEST_MODE) return [];
+    if (IS_TEST_MODE && !this.injectedPaneTextExecutor) return [];
     if (!isValidMuxName(muxName)) {
       console.error('[TmuxManager] Invalid session name in listPanes:', muxName);
       return [];
     }
 
-    try {
-      const output = (
-        await execAsync(
-          `${this.tmux()} list-panes -t "${muxName}" -F '#{pane_id}:#{pane_index}:#{pane_pid}:#{pane_width}:#{pane_height}'`,
-          { encoding: 'utf-8', timeout: EXEC_TIMEOUT_MS }
-        )
-      ).stdout.trim();
-
-      return output
-        .split('\n')
-        .map((line) => {
-          const [paneId, indexStr, pidStr, widthStr, heightStr] = line.split(':');
-          return {
-            paneId,
-            paneIndex: parseInt(indexStr, 10),
-            panePid: parseInt(pidStr, 10),
-            width: parseInt(widthStr, 10),
-            height: parseInt(heightStr, 10),
-          };
-        })
-        .filter((p) => !Number.isNaN(p.paneIndex));
-    } catch {
-      return [];
-    }
+    return (await this.pollingPanes())?.get(muxName)?.map(({ active: _active, dead: _dead, ...pane }) => pane) ?? [];
   }
 
   /**
@@ -5593,6 +5631,16 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   async capturePaneTextAsync(muxName: string, opts?: { signal?: AbortSignal; ansi?: boolean }): Promise<string | null> {
     if (!SAFE_TMUX_SOCKET_PATTERN.test(this.tmuxSocket) || !isValidMuxName(muxName)) return null;
 
+    // Signal-bearing callers retain exclusive cancellation ownership. Requests
+    // after dispatch always get a new read, including submit verification.
+    if (opts?.signal) return this.executePaneText(muxName, opts);
+    return this.queuedPaneCaptures.read(`${muxName}:${opts?.ansi === true}`, () => this.executePaneText(muxName, opts));
+  }
+
+  private async executePaneText(
+    muxName: string,
+    opts?: { signal?: AbortSignal; ansi?: boolean }
+  ): Promise<string | null> {
     const execOptions: TmuxPaneTextExecOptions = {
       encoding: 'utf8',
       timeout: ASYNC_TEXT_CAPTURE_TIMEOUT_MS,
