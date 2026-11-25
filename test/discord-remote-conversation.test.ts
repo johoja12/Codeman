@@ -6,7 +6,7 @@ const exec = promisify(execFile);
 const id = '01a1a603-1c4a-7f12-b20d-117d6b4da904';
 async function probe(rows: string, panes = '100') {
   const script =
-    `import subprocess\nsubprocess.check_output=lambda cmd,**kwargs: ${JSON.stringify(panes)} if cmd[0]=='tmux' else ${JSON.stringify(rows)}\n` +
+    `import subprocess,sys\nsys.platform='fixture-portable'\nsubprocess.check_output=lambda cmd,**kwargs: ${JSON.stringify(panes)} if cmd[0]=='tmux' else ${JSON.stringify(rows)}\n` +
     REMOTE_CODEX_RESUME_PROBE;
   const r = await exec('python3', [
     '-c',

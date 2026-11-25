@@ -1,0 +1,39 @@
+{
+  "benchmark": "read-only exact local Codex profile",
+  "runs": 5,
+  "identityStable": true,
+  "medianWallMs": 290.925882,
+  "medianTotalCpuMs": 263.082,
+  "samples": [
+    {
+      "elapsedMs": 393.022554,
+      "selfCpuMs": 140.88899999999998,
+      "childCpuMs": 187.06699999999998,
+      "totalCpuMs": 327.95599999999996
+    },
+    {
+      "elapsedMs": 327.6803349999999,
+      "selfCpuMs": 118.28099999999999,
+      "childCpuMs": 170.87199999999996,
+      "totalCpuMs": 289.15299999999996
+    },
+    {
+      "elapsedMs": 290.925882,
+      "selfCpuMs": 122.50599999999999,
+      "childCpuMs": 140.576,
+      "totalCpuMs": 263.082
+    },
+    {
+      "elapsedMs": 270.73604,
+      "selfCpuMs": 109.092,
+      "childCpuMs": 139.822,
+      "totalCpuMs": 248.914
+    },
+    {
+      "elapsedMs": 212.596086,
+      "selfCpuMs": 89.08,
+      "childCpuMs": 109.785,
+      "totalCpuMs": 198.865
+    }
+  ]
+}

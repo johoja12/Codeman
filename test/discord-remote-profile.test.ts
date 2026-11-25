@@ -7,7 +7,8 @@ const exec = promisify(execFile);
 const id = '01a197ca-f81d-7cf1-82b0-7dbdd241eb22';
 async function probe(env: string, rows = `100 1 /bin/zsh\n101 100 /opt/codex resume ${id}`, changed = false) {
   const prelude = `import subprocess,io,builtins,os,sys
-sys.platform='linux'
+# Exercise portable ps identity with the Linux environment decoder fixture.
+sys.platform='fixture-portable'
 rows=${JSON.stringify(rows)}
 env=${JSON.stringify(env)}.encode()
 count=0

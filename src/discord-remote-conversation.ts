@@ -3,24 +3,87 @@ import type { SessionRemote } from './types/session.js';
 import { remoteTmuxLocation } from './tmux-manager.js';
 import { withRemotePathBootstrap, shellescape } from './remote-hosts.js';
 import { runDiscordRemoteRead } from './discord-file-transfers.js';
-export const REMOTE_CODEX_RESUME_PROBE = String.raw`
+/** Linux reads only the exact pane tree, including children spawned by worker threads. */
+export const LINUX_CODEX_PROC_READER = String.raw`
+def proc_bytes(pid,leaf,limit):
+ with open('/proc/'+str(pid)+'/'+leaf,'rb') as f:value=f.read(limit+1)
+ if len(value)>limit:raise Exception('process metadata limit')
+ return value
+def proc_identity(pid):
+ value=proc_bytes(pid,'stat',16384)
+ at=value.rfind(b') ')
+ if at<0 or value.split(b' ',1)[0]!=str(pid).encode():raise Exception('invalid process identity')
+ fields=value[at+2:].split()
+ if len(fields)<20 or not fields[1].isdigit() or not fields[19].isdigit():raise Exception('invalid process identity')
+ return (int(fields[1]),fields[19])
+def proc_record(pid):
+ import hashlib
+ before=proc_identity(pid);raw=proc_bytes(pid,'cmdline',4*1024*1024)
+ if before!=proc_identity(pid):raise Exception('process changed')
+ if raw and not raw.endswith(b'\0'):raise Exception('invalid process arguments')
+ argv=[v.decode('utf-8') for v in raw.split(b'\0')[:-1]] if raw else []
+ stamp=str(before[0])+':'+before[1].decode('ascii')+':'+hashlib.sha256(raw).hexdigest()
+ return (before[0],argv,stamp,len(raw))
+def proc_stamp(pid):
+ return proc_record(pid)[2]
+def linux_pane_processes(root):
+ procs={};stamps={};seen=set();queue=[(root,None,0)];total=0;threads_seen=0
+ while queue:
+  pid,parent,depth=queue.pop(0)
+  if pid in seen:continue
+  seen.add(pid)
+  if len(seen)>64:raise Exception('ambiguous process tree')
+  try:ppid,argv,stamp,size=proc_record(pid)
+  except FileNotFoundError:
+   if pid==root:raise
+   continue
+  if parent is not None and ppid!=parent:raise Exception('process tree changed')
+  total+=size
+  if total>4*1024*1024:raise Exception('process inventory limit')
+  procs[pid]=(ppid,argv);stamps[pid]=stamp
+  tasks=os.listdir('/proc/'+str(pid)+'/task');threads_seen+=len(tasks)
+  if threads_seen>4096:raise Exception('process thread limit')
+  children=set()
+  for task in tasks:
+   if not task.isdigit():raise Exception('invalid process thread')
+   try:data=proc_bytes(pid,'task/'+task+'/children',65536)
+   except FileNotFoundError:continue
+   for value in data.split():
+    if not value.isdigit() or len(value)>10:raise Exception('invalid process child')
+    children.add(int(value))
+   if len(children)>64:raise Exception('ambiguous process tree')
+  if children and depth>=16:raise Exception('process tree depth limit')
+  queue.extend((child,pid,depth+1) for child in sorted(children))
+ if root not in procs or proc_stamp(root)!=stamps[root]:raise Exception('pane process changed')
+ return procs,stamps
+`;
+
+export const REMOTE_CODEX_RESUME_PROBE =
+  String.raw`
 import subprocess,json,sys,re,os,shlex
 s=json.loads(sys.argv[1]);loc=s['location'];uuid=r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}'
 panes=subprocess.check_output(['tmux','-L',loc['socket'],'list-panes','-t',loc['sessionName'],'-F','#{pane_pid}'],text=True,timeout=4).strip().splitlines()
 if len(panes)!=1 or not panes[0].isdigit():raise Exception('ambiguous pane')
-root=int(panes[0]);rows=subprocess.check_output(['ps','-ww','-axo','pid=,ppid=,command='],text=True,timeout=5)
-if len(rows)>4*1024*1024:raise Exception('process inventory limit')
-procs={}
-for row in rows.splitlines():
- m=re.match(r'\s*(\d+)\s+(\d+)\s+(.*)',row)
- if m:procs[int(m[1])]=(int(m[2]),m[3])
-if root not in procs:raise Exception('pane process missing')
-owned={root}
-for _ in range(16):
- new=owned|{pid for pid,(parent,cmd) in procs.items() if parent in owned}
- if new==owned:break
- owned=new
-if len(owned)>64:raise Exception('ambiguous process tree')
+root=int(panes[0])
+` +
+  LINUX_CODEX_PROC_READER +
+  String.raw`
+if sys.platform=='linux':
+ procs,proc_stamps=linux_pane_processes(root);owned=set(procs)
+else:
+ rows=subprocess.check_output(['ps','-ww','-axo','pid=,ppid=,command='],text=True,timeout=5)
+ if len(rows)>4*1024*1024:raise Exception('process inventory limit')
+ procs={}
+ for row in rows.splitlines():
+  m=re.match(r'\s*(\d+)\s+(\d+)\s+(.*)',row)
+  if m:procs[int(m[1])]=(int(m[2]),m[3])
+ if root not in procs:raise Exception('pane process missing')
+ owned={root}
+ for _ in range(16):
+  new=owned|{pid for pid,(parent,cmd) in procs.items() if parent in owned}
+  if new==owned:break
+  owned=new
+ if len(owned)>64:raise Exception('ambiguous process tree')
 # Locate the command, not command-like words in prompts or option values.
 value_options={'-c','--config','-m','--model','-p','--profile','-s','--sandbox','-a','--ask-for-approval','-C','--cd','-i','--image','--add-dir','--enable','--disable','--local-provider','--remote','--remote-auth-token-env'}
 flag_options={'--oss','--full-auto','--dangerously-bypass-approvals-and-sandbox','--no-alt-screen','--search','--help','-h','--version','-V'}
@@ -43,9 +106,10 @@ def command_at(argv):
  return None
 ids=[];native=0;native_pids=[]
 for pid in owned:
- try:argv=shlex.split(procs[pid][1])
+ try:argv=procs[pid][1] if sys.platform=='linux' else shlex.split(procs[pid][1])
  except Exception:continue
  if not argv or os.path.basename(argv[0]) not in ('codex','codx'):continue
+ if sys.platform=='linux' and proc_stamp(pid)!=proc_stamps[pid]:raise Exception('process changed')
  command=command_at(argv)
  if command is not None and argv[command] in auxiliary:continue
  native+=1;native_pids.append(pid)
@@ -129,6 +193,10 @@ if native!=1:
  print(json.dumps({'id':None}));sys.exit(0)
 pid=native_pids[0]
 def stamp():
+ if sys.platform=='linux':
+  value=proc_stamp(pid)
+  if value!=proc_stamps[pid]:raise Exception('process changed')
+  return value
  value=subprocess.check_output(['ps','-ww','-p',str(pid),'-o','lstart=','-o','command='],text=True,timeout=4)
  if not value.strip() or len(value)>65536:raise Exception('process changed')
  return value
