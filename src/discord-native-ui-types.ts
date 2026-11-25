@@ -63,7 +63,8 @@ export interface DiscordUiCase {
 }
 export interface DiscordNativeUiServices {
   enabled(): boolean;
-  sessions(): Promise<DiscordUiSession[]>;
+  /** Omit selection for a full refresh; selected IDs must not probe unrelated sessions. */
+  sessions(selection?: readonly string[]): Promise<DiscordUiSession[]>;
   connection?(id: string, fresh?: boolean): Promise<DiscordConnection>;
   recover?(id: string, conversation: string, current: () => boolean): Promise<boolean>;
   submitQueued(

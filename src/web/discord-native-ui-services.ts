@@ -296,7 +296,7 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
       if (!valid() || !deps.recover) return false;
       return deps.recover(s, valid);
     },
-    sessions: async () => {
+    sessions: async (selection) => {
       if (!deps.allowed()) return [];
       for (const [id, old] of observed) {
         if (!deps.sessions().has(id)) {
@@ -314,7 +314,10 @@ export function createDiscordNativeUiServices(deps: Deps): DiscordNativeUiServic
         return caseRead;
       }, [] as CaseInfo[]);
       if (!deps.allowed()) return [];
-      const visible = [...deps.sessions().values()].filter((s) => !s.suppressNotifications);
+      const selected = selection === undefined ? undefined : new Set(selection);
+      const visible = [...deps.sessions().values()].filter(
+        (s) => !s.suppressNotifications && (!selected || selected.has(s.id))
+      );
       const projected = await Promise.all(
         visible.map(async (s): Promise<DiscordUiSession> => {
           const connection = (deps.health ? await health(s) : undefined) ?? {

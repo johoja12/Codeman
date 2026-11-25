@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { createDiscordNativeUiServices } from '../src/web/discord-native-ui-services.js';
@@ -295,4 +295,51 @@ it('projects connection loss independently of paneExit and keeps unavailable que
   expect(row).toMatchObject({ exited: true, ready: false, working: false, connection: { state: 'connection_lost' } });
   expect(native.paneExit).toBeUndefined();
   expect(await s.submitQueued('s1', 'prompt', 'native', () => true, 'rev')).toBe('blocked');
+});
+
+it('targets one session without probing unrelated sessions and retains complete default refreshes', async () => {
+  const sessions = new Map(
+    Array.from({ length: 17 }, (_, i) => {
+      const id = 's' + i;
+      return [
+        id,
+        {
+          id,
+          name: id,
+          mode: 'codex',
+          nativeResumeId: 'conversation-' + i,
+          workingDir: '/tmp',
+          isWorking: true,
+          activityProjection: { activityStatus: 'busy' },
+        } as unknown as Session,
+      ] as const;
+    })
+  );
+  const health = vi.fn(async () => ({ state: 'available' as const }));
+  const capture = vi.fn(async () => 'Ordinary terminal output');
+  const services = createDiscordNativeUiServices({
+    sessions: () => sessions,
+    cases: async () => [],
+    allowed: () => true,
+    url: () => undefined,
+    health,
+    capture,
+  });
+  expect((await services.sessions(['s3'])).map((s) => s.id)).toEqual(['s3']);
+  expect(health).toHaveBeenCalledTimes(1);
+  expect(capture).toHaveBeenCalledTimes(1);
+  expect(capture).toHaveBeenCalledWith('s3');
+  health.mockClear();
+  capture.mockClear();
+  expect(await services.sessions()).toHaveLength(17);
+  expect(health).toHaveBeenCalledTimes(17);
+  expect(capture).toHaveBeenCalledTimes(17);
+  health.mockClear();
+  capture.mockClear();
+  expect(await services.sessions([])).toEqual([]);
+  expect(await services.sessions(['missing'])).toEqual([]);
+  Object.assign(sessions.get('s3')!, { suppressNotifications: true });
+  expect(await services.sessions(['s3'])).toEqual([]);
+  expect(health).not.toHaveBeenCalled();
+  expect(capture).not.toHaveBeenCalled();
 });

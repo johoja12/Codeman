@@ -200,7 +200,7 @@ export class DiscordNativeUi {
     };
   }
   private async target(id: string, conversation?: string, allowUnavailable = false): Promise<DiscordUiSession> {
-    const session = (await this.host.services.sessions()).find((s) => s.id === id);
+    const session = (await this.host.services.sessions([id])).find((s) => s.id === id);
     if (
       !session ||
       (session.exited && !allowUnavailable) ||

@@ -2218,3 +2218,13 @@ it('adopts an existing missed-message card after restart without posting another
   );
   expect(resend).not.toHaveBeenCalled();
 });
+
+it('response controls request a fresh snapshot of only their target session', async () => {
+  const f = await fixture();
+  const snapshot = vi.fn(f.host.services.sessions);
+  f.host.services.sessions = snapshot;
+  await f.ui.responseControls('s1', channel, 'u1');
+  expect(snapshot).toHaveBeenCalledWith(['s1']);
+  expect(snapshot.mock.calls.every(([selection]) => selection?.length === 1 && selection[0] === 's1')).toBe(true);
+  expect(f.host.submit).not.toHaveBeenCalled();
+});
