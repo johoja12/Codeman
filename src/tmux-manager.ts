@@ -23,6 +23,7 @@
 
 import { EventEmitter } from 'node:events';
 import { SameTurnRead } from './same-turn-read.js';
+import { TmuxCaptureBatcher } from './tmux-capture-batcher.js';
 import { collectDescendants, descendantsInPaneGroup } from './proc-tree.js';
 import { getCli } from './config/cli-registry/registry.js';
 import type { CliDockerResume, CliEntry } from './config/cli-registry/types.js';
@@ -2849,6 +2850,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   private readonly checkpointDelayMs: number;
   private readonly paneTextExecutor: TmuxPaneTextExecutor;
   private readonly injectedPaneTextExecutor: boolean;
+  private readonly captureBatcher: TmuxCaptureBatcher;
   private readonly queuedPaneCaptures = new SameTurnRead<string | null>();
   private readonly queuedPaneInventory = new SameTurnRead<Map<string, PollPane[]> | null>();
   /** tmux 3.7+ can resize pane history after creation; older releases cannot. */
@@ -2869,6 +2871,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     this.checkpointDelayMs = options.checkpointDelayMs ?? 50;
     this.paneTextExecutor = options.paneTextExecutor ?? executePaneTextCapture;
     this.injectedPaneTextExecutor = options.paneTextExecutor !== undefined;
+    this.captureBatcher = new TmuxCaptureBatcher(this.tmuxSocket, this.paneTextExecutor);
     this.setMaxListeners(50);
     if (!IS_TEST_MODE) {
       this.loadSessions();
@@ -5150,6 +5153,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   }
 
   destroy(): void {
+    this.captureBatcher.close();
     this.invalidateAllWindowResizes();
     this.stopStatsCollection();
     this.stopPaneExitWatcher();
@@ -5163,12 +5167,16 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     this.remoteProbeAt.clear();
     this.remoteObservedBoot.clear();
     this.remoteCaptureBackoff.clear();
-    void this.remoteFrameSshPool.close().catch(() => {});
+    void this.closeRemoteFrameConnections().catch(() => {});
   }
 
   /** Release app-owned SSH control masters before web-server shutdown. */
   closeRemoteFrameConnections(): Promise<void> {
-    return this.remoteFrameSshPool.close();
+    return Promise.all([
+      this.remoteFrameSshPool.close(),
+      import('./discord-file-transfers.js').then((m) => m.closeDiscordReadConnections()),
+      import('./discord-local-conversation.js').then((m) => m.closeDiscordInspectionWorkers()),
+    ]).then(() => undefined);
   }
 
   registerSession(session: MuxSession): void {
@@ -5641,6 +5649,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     muxName: string,
     opts?: { signal?: AbortSignal; ansi?: boolean }
   ): Promise<string | null> {
+    // Preserve injected-executor contracts for existing isolated tests; the
+    // production batcher has its own real protocol/cancellation tests.
+    if (!process.env.VITEST) return this.captureBatcher.capture(muxName, opts);
     const execOptions: TmuxPaneTextExecOptions = {
       encoding: 'utf8',
       timeout: ASYNC_TEXT_CAPTURE_TIMEOUT_MS,

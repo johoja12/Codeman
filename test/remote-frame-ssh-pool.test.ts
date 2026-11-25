@@ -132,4 +132,15 @@ describe('remote visible-frame SSH connection pool (COD-441)', () => {
     await expect(pool.capture(BASE, TARGET, 'capture-frame', 'alice', OPTIONS)).resolves.toBe('frame');
     expect(controlPath(calls.at(-1)!)).toBe(path);
   });
+  it('bounds private socket bookkeeping and falls back without overriding user transport', async () => {
+    const calls: string[][] = [];
+    const pool = new RemoteFrameSshPool(async (argv) => {
+      calls.push(argv);
+      return 'frame';
+    });
+    pools.push(pool);
+    for (let i = 0; i < 65; i++) await pool.capture(BASE, TARGET, 'read', `owner-${i}`, OPTIONS);
+    expect(controlPath(calls[63])).toBeTruthy();
+    expect(calls[64]).toEqual([...BASE, TARGET, 'read']);
+  });
 });
