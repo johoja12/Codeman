@@ -1164,7 +1164,7 @@ export class DiscordBridge {
             candidates.push({ source, record });
           }
           if (!candidates.length) return;
-          views ??= this.deps.nativeUi!.sessions();
+          views ??= this.deps.nativeUi!.sessions(batch.map((item) => item.id));
           const view = (await views).find((v) => v.id === s.id);
           if (!view?.conversation || view.exited || !valid(s.id, channel) || this.inbound.has(channel)) return;
           let history: import('./discord-history.js').DiscordHistory | undefined;
@@ -1259,7 +1259,7 @@ export class DiscordBridge {
         text: 'Original message changed or expired. Send a new message instead; nothing was submitted.',
       };
     const history = await this.deps.history(id);
-    const view = (await this.deps.nativeUi!.sessions()).find((s) => s.id === id);
+    const view = (await this.deps.nativeUi!.sessions([id])).find((s) => s.id === id);
     if (!valid() || view?.conversation !== conversation || view.exited || history.conversationId !== conversation)
       return {
         handled: false,
